@@ -2602,8 +2602,6 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
 
             with layer_recorder.section("layer.cleanup") if layer_recorder else nullcontext():
                 layers[i] = layer.to(orig_device)
-                saliency_cache.clear_cache()
-                gradients_cache.clear_cache()
                 del layer
                 del gptq
                 del saliency_dict, gradients_dict
