@@ -17,24 +17,29 @@ shift 3
 GRAD_LRS_STR=${GRAD_LRS:-"0.0003"}
 N_SAMPLES=${N_SAMPLES:-512}
 SEQ_LEN=${SEQ_LEN:-1024}
-BSZ=${BSZ:-4}
+BSZ=${BSZ:-16}
 BACKWARD_SAMPLES=${BACKWARD_SAMPLES:-32}
-BACKWARD_BSZ=${BACKWARD_BSZ:-4}
+BACKWARD_BSZ=${BACKWARD_BSZ:-16}
 FINAL_LAYER_FULL_BACKWARD=${FINAL_LAYER_FULL_BACKWARD:-0}
 BLOCKSIZE=${BLOCKSIZE:-256}
-BLOCK_ATOMIC_QUANT=${BLOCK_ATOMIC_QUANT:-0}
+BLOCK_ATOMIC_QUANT=${BLOCK_ATOMIC_QUANT:-1}
 GRAD_OPTIMIZER=${GRAD_OPTIMIZER:-adam}
 FINAL_LAYER_GRAD_OPTIMIZER=${FINAL_LAYER_GRAD_OPTIMIZER:-sgd}
 GRAD_CLIP=${GRAD_CLIP:-1.0}
 # --grad_refresh_loss {kl,hidden_mse,fisher_diag_mse}
 GRAD_REFRESH_LOSS=${GRAD_REFRESH_LOSS:-fisher_diag_mse}
 FINAL_LAYER_GRAD_LR=${FINAL_LAYER_GRAD_LR:-0.3}
+PRE_GD_STEPS=${PRE_GD_STEPS:-5}
+PRE_GRAD_LR=${PRE_GRAD_LR:-0.0003}
+PRE_FINAL_LAYER_GRAD_LR=${PRE_FINAL_LAYER_GRAD_LR:-0.3}
+PRE_GRAD_OPTIMIZER=${PRE_GRAD_OPTIMIZER:-adam}
+PRE_FINAL_LAYER_GRAD_OPTIMIZER=${PRE_FINAL_LAYER_GRAD_OPTIMIZER:-sgd}
 #--grad_reg_strategy {none,l2,hessian,quant_error_gate,quant_error_gate_optimized}
-GRAD_REG_STRATEGY=${GRAD_REG_STRATEGY:-none}
+GRAD_REG_STRATEGY=${GRAD_REG_STRATEGY:-quant_error_gate_optimized}
 GRAD_REG_LAMBDA=${GRAD_REG_LAMBDA:-0.01}
 GRAD_GATE_FLOOR=${GRAD_GATE_FLOOR:-0.01}
 GRAD_GATE_SHARPNESS=${GRAD_GATE_SHARPNESS:-5.0}
-GRAD_GATE_SINE_AMP=${GRAD_GATE_SINE_AMP:-0.01}
+GRAD_GATE_SINE_AMP=${GRAD_GATE_SINE_AMP:-0.0005}
 GRAD_HESSIAN_TOPK=${GRAD_HESSIAN_TOPK:-20}
 PROJ_LR_SCALE=${PROJ_LR_SCALE:-1.0}
 DOWN_PROJ_LR_SCALE=${DOWN_PROJ_LR_SCALE:-1.0}
@@ -87,6 +92,16 @@ else
     PRE_CLIP_TAG="_nopreclip"
 fi
 
+PRE_FINAL_LAYER_GRAD_LR_ARGS=()
+if [[ -n "${PRE_FINAL_LAYER_GRAD_LR}" && "${PRE_FINAL_LAYER_GRAD_LR}" != "none" ]]; then
+    PRE_FINAL_LAYER_GRAD_LR_ARGS=(--pre_final_layer_grad_lr "${PRE_FINAL_LAYER_GRAD_LR}")
+fi
+
+PRE_FINAL_LAYER_GRAD_OPTIMIZER_ARGS=()
+if [[ -n "${PRE_FINAL_LAYER_GRAD_OPTIMIZER}" && "${PRE_FINAL_LAYER_GRAD_OPTIMIZER}" != "none" ]]; then
+    PRE_FINAL_LAYER_GRAD_OPTIMIZER_ARGS=(--pre_final_layer_grad_optimizer "${PRE_FINAL_LAYER_GRAD_OPTIMIZER}")
+fi
+
 for grad_lr in "${GRAD_LRS[@]}"; do
     grad_lr_tag=$(sanitize_float "${grad_lr}")
     final_layer_grad_lr_tag=$(sanitize_float "${FINAL_LAYER_GRAD_LR}")
@@ -108,7 +123,17 @@ for grad_lr in "${GRAD_LRS[@]}"; do
     if [[ "${GRAD_HESSIAN_TOPK}" != "-1" ]]; then
         grad_hessian_suffix="_ghtk${GRAD_HESSIAN_TOPK}"
     fi
-    exp_name="${BASE_EXP}_block_gd_${GRAD_OPTIMIZER}${refresh_suffix}${reg_suffix}${grad_hessian_suffix}_lr${grad_lr_tag}_fllr${final_layer_grad_lr_tag}_s${second_order_tag}${PRE_CLIP_TAG}${BLOCK_ATOMIC_TAG}${FINAL_LAYER_FULL_BACKWARD_TAG}"
+    pre_gd_suffix=""
+    if [[ "${PRE_GD_STEPS}" != "0" ]]; then
+        pre_gd_suffix="_pregd${PRE_GD_STEPS}_lr$(sanitize_float "${PRE_GRAD_LR}")_opt${PRE_GRAD_OPTIMIZER}"
+        if [[ -n "${PRE_FINAL_LAYER_GRAD_LR}" && "${PRE_FINAL_LAYER_GRAD_LR}" != "none" ]]; then
+            pre_gd_suffix="${pre_gd_suffix}_fllr$(sanitize_float "${PRE_FINAL_LAYER_GRAD_LR}")"
+        fi
+        if [[ -n "${PRE_FINAL_LAYER_GRAD_OPTIMIZER}" && "${PRE_FINAL_LAYER_GRAD_OPTIMIZER}" != "none" ]]; then
+            pre_gd_suffix="${pre_gd_suffix}_flopt${PRE_FINAL_LAYER_GRAD_OPTIMIZER}"
+        fi
+    fi
+    exp_name="${BASE_EXP}_block_gd_${GRAD_OPTIMIZER}${refresh_suffix}${reg_suffix}${grad_hessian_suffix}_lr${grad_lr_tag}_fllr${final_layer_grad_lr_tag}_s${second_order_tag}${pre_gd_suffix}${PRE_CLIP_TAG}${BLOCK_ATOMIC_TAG}${FINAL_LAYER_FULL_BACKWARD_TAG}"
 
     echo "============================================================"
     echo "Running GPTQ+ LR sweep"
@@ -130,6 +155,11 @@ for grad_lr in "${GRAD_LRS[@]}"; do
     echo "  proj_s : ${PROJ_LR_SCALE}"
     echo "  down_s : ${DOWN_PROJ_LR_SCALE}"
     echo "  preclip: ${PRE_CLIP}"
+    echo "  pregd  : ${PRE_GD_STEPS}"
+    echo "  prelr  : ${PRE_GRAD_LR}"
+    echo "  preopt : ${PRE_GRAD_OPTIMIZER}"
+    echo "  preflr : ${PRE_FINAL_LAYER_GRAD_LR:-<default>}"
+    echo "  prefo  : ${PRE_FINAL_LAYER_GRAD_OPTIMIZER:-<default>}"
     echo "  gradlr : ${grad_lr}"
     echo "  fllr   : ${FINAL_LAYER_GRAD_LR}"
     echo "  so_scl : ${SECOND_ORDER_SCALE}"
@@ -157,6 +187,11 @@ for grad_lr in "${GRAD_LRS[@]}"; do
         --grad_clip "${GRAD_CLIP}" \
         --final_layer_grad_lr "${FINAL_LAYER_GRAD_LR}" \
         --grad_hessian_topk "${GRAD_HESSIAN_TOPK}" \
+        --pre_gd_steps "${PRE_GD_STEPS}" \
+        --pre_grad_lr "${PRE_GRAD_LR}" \
+        --pre_grad_optimizer "${PRE_GRAD_OPTIMIZER}" \
+        "${PRE_FINAL_LAYER_GRAD_LR_ARGS[@]}" \
+        "${PRE_FINAL_LAYER_GRAD_OPTIMIZER_ARGS[@]}" \
         "${PRE_CLIP_ARGS[@]}" \
         "${BLOCK_ATOMIC_ARGS[@]}" \
         "${FINAL_LAYER_FULL_BACKWARD_ARGS[@]}" \
