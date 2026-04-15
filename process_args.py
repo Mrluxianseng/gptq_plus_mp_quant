@@ -41,6 +41,19 @@ def parse_gen():
     parser.add_argument("--k_asym", action="store_true", help="K cache asymmetric quantization")
     parser.add_argument("--v_asym", action="store_true", help="V cache asymmetric quantization")
     parser.add_argument("--w_clip", action="store_true", help="Enable weight clipping")
+    parser.add_argument(
+        "--pre_clip",
+        dest="pre_clip",
+        action="store_true",
+        help="Enable the manual pre-quantization weight clipping stage before stat collection and pre-GD.",
+    )
+    parser.add_argument(
+        "--no_pre_clip",
+        dest="pre_clip",
+        action="store_false",
+        help="Disable the manual pre-quantization weight clipping stage and skip pre-GD.",
+    )
+    parser.set_defaults(pre_clip=True)
     parser.add_argument("--a_clip_ratio", type=float, default=1.0, help="Activation clipping ratio")
     parser.add_argument("--k_clip_ratio", type=float, default=1.0, help="K cache clipping ratio")
     parser.add_argument("--v_clip_ratio", type=float, default=1.0, help="V cache clipping ratio")
@@ -99,6 +112,38 @@ def parse_gen():
         default="kl",
         choices=["kl", "hidden_mse", "fisher_diag_mse"],
         help="Loss used to compute the true refresh gradient in block_backward/block_gd.",
+    )
+    parser.add_argument(
+        "--pre_gd_steps",
+        type=int,
+        default=0,
+        help="Number of gradient descent steps to run after preclip/stat collection and before GPTQ quantization.",
+    )
+    parser.add_argument(
+        "--pre_grad_lr",
+        type=float,
+        default=0.0,
+        help="Learning rate for the pre-quantization gradient descent phase on non-final transformer layers.",
+    )
+    parser.add_argument(
+        "--pre_final_layer_grad_lr",
+        type=float,
+        default=None,
+        help="Optional override for pre-quantization gradient descent learning rate in the final transformer layer.",
+    )
+    parser.add_argument(
+        "--pre_grad_optimizer",
+        type=str,
+        default="sgd",
+        choices=["sgd", "adam"],
+        help="Optimizer used for the pre-quantization gradient descent phase.",
+    )
+    parser.add_argument(
+        "--pre_final_layer_grad_optimizer",
+        type=str,
+        default=None,
+        choices=["sgd", "adam"],
+        help="Optional override for the pre-quantization optimizer used only in the final transformer layer.",
     )
     parser.add_argument(
         "--proj_lr_scale",
@@ -250,6 +295,20 @@ def parse_gen():
         raise ValueError("`grad_clip` must be non-zero. Use a negative value to disable clipping.")
     if args.final_layer_grad_lr is not None and args.final_layer_grad_lr < 0:
         raise ValueError(f"`final_layer_grad_lr` must be non-negative when provided. Got {args.final_layer_grad_lr}.")
+    if args.pre_gd_steps < 0:
+        raise ValueError(f"`pre_gd_steps` must be non-negative. Got {args.pre_gd_steps}.")
+    if args.pre_grad_lr < 0:
+        raise ValueError(f"`pre_grad_lr` must be non-negative. Got {args.pre_grad_lr}.")
+    if args.pre_final_layer_grad_lr is not None and args.pre_final_layer_grad_lr < 0:
+        raise ValueError(f"`pre_final_layer_grad_lr` must be non-negative when provided. Got {args.pre_final_layer_grad_lr}.")
+    if args.pre_gd_steps > 0 and args.pre_clip and args.w_clip:
+        effective_pre_final_lr = args.pre_final_layer_grad_lr if args.pre_final_layer_grad_lr is not None else args.pre_grad_lr
+        if args.pre_grad_lr == 0 and effective_pre_final_lr == 0:
+            raise ValueError("`pre_gd_steps > 0` requires `pre_grad_lr` or `pre_final_layer_grad_lr` to be positive.")
+    if args.pre_gd_steps > 0 and not args.pre_clip:
+        logging.info("`pre_clip` is disabled, so pre-GD will be skipped.")
+    if args.pre_gd_steps > 0 and args.pre_clip and not args.w_clip:
+        logging.info("`w_clip` is disabled, so pre-clip and pre-GD will be skipped.")
     if args.proj_lr_scale < 0:
         raise ValueError(f"`proj_lr_scale` must be non-negative. Got {args.proj_lr_scale}.")
     if args.down_proj_lr_scale < 0:

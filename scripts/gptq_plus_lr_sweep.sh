@@ -39,6 +39,7 @@ GRAD_HESSIAN_TOPK=${GRAD_HESSIAN_TOPK:-20}
 PROJ_LR_SCALE=${PROJ_LR_SCALE:-1.0}
 DOWN_PROJ_LR_SCALE=${DOWN_PROJ_LR_SCALE:-1.0}
 SECOND_ORDER_SCALE=${SECOND_ORDER_SCALE:-1.0}
+PRE_CLIP=${PRE_CLIP:-1}
 ALPHA=${ALPHA:-0.05}
 KL_TOPK=${KL_TOPK:-20}
 LM_EVAL_BATCH_SIZE=${LM_EVAL_BATCH_SIZE:-32}
@@ -77,6 +78,15 @@ if [[ "${FINAL_LAYER_FULL_BACKWARD}" == "1" ]]; then
     FINAL_LAYER_FULL_BACKWARD_TAG="_flfb"
 fi
 
+PRE_CLIP_ARGS=()
+PRE_CLIP_TAG=""
+if [[ "${PRE_CLIP}" == "1" ]]; then
+    PRE_CLIP_ARGS=(--pre_clip)
+else
+    PRE_CLIP_ARGS=(--no_pre_clip)
+    PRE_CLIP_TAG="_nopreclip"
+fi
+
 for grad_lr in "${GRAD_LRS[@]}"; do
     grad_lr_tag=$(sanitize_float "${grad_lr}")
     final_layer_grad_lr_tag=$(sanitize_float "${FINAL_LAYER_GRAD_LR}")
@@ -98,7 +108,7 @@ for grad_lr in "${GRAD_LRS[@]}"; do
     if [[ "${GRAD_HESSIAN_TOPK}" != "-1" ]]; then
         grad_hessian_suffix="_ghtk${GRAD_HESSIAN_TOPK}"
     fi
-    exp_name="${BASE_EXP}_block_gd_${GRAD_OPTIMIZER}${refresh_suffix}${reg_suffix}${grad_hessian_suffix}_lr${grad_lr_tag}_fllr${final_layer_grad_lr_tag}_s${second_order_tag}${BLOCK_ATOMIC_TAG}${FINAL_LAYER_FULL_BACKWARD_TAG}"
+    exp_name="${BASE_EXP}_block_gd_${GRAD_OPTIMIZER}${refresh_suffix}${reg_suffix}${grad_hessian_suffix}_lr${grad_lr_tag}_fllr${final_layer_grad_lr_tag}_s${second_order_tag}${PRE_CLIP_TAG}${BLOCK_ATOMIC_TAG}${FINAL_LAYER_FULL_BACKWARD_TAG}"
 
     echo "============================================================"
     echo "Running GPTQ+ LR sweep"
@@ -119,6 +129,7 @@ for grad_lr in "${GRAD_LRS[@]}"; do
     echo "  gh_topk: ${GRAD_HESSIAN_TOPK}"
     echo "  proj_s : ${PROJ_LR_SCALE}"
     echo "  down_s : ${DOWN_PROJ_LR_SCALE}"
+    echo "  preclip: ${PRE_CLIP}"
     echo "  gradlr : ${grad_lr}"
     echo "  fllr   : ${FINAL_LAYER_GRAD_LR}"
     echo "  so_scl : ${SECOND_ORDER_SCALE}"
@@ -146,6 +157,7 @@ for grad_lr in "${GRAD_LRS[@]}"; do
         --grad_clip "${GRAD_CLIP}" \
         --final_layer_grad_lr "${FINAL_LAYER_GRAD_LR}" \
         --grad_hessian_topk "${GRAD_HESSIAN_TOPK}" \
+        "${PRE_CLIP_ARGS[@]}" \
         "${BLOCK_ATOMIC_ARGS[@]}" \
         "${FINAL_LAYER_FULL_BACKWARD_ARGS[@]}" \
         --proj_lr_scale "${PROJ_LR_SCALE}" --down_proj_lr_scale "${DOWN_PROJ_LR_SCALE}" \
