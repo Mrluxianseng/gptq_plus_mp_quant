@@ -358,42 +358,6 @@ class GPTQPlus:
             gate_zero[:, col_mask] = zero
         return gate_scale, gate_zero
 
-    def _build_actorder_permutation(self, weight_sub, groupsize, row_start, row_end, groups=None):
-        act_priority = self.act_square.to(weight_sub.device).float()
-        if self.quantizer.bits >= 16 or not self.quantizer.ready():
-            return torch.argsort(act_priority, descending=True)
-
-        scale_map, zero_map = self._build_gate_quant_maps(
-            self.quantizer,
-            weight_sub,
-            groupsize,
-            row_start,
-            row_end,
-            groups=groups,
-            perm=None,
-        )
-        clip_min, clip_max = compute_quant_clip_bounds(
-            scale_map,
-            zero_map,
-            self.quantizer.maxq,
-            self.quantizer.sym,
-        )
-        clipped_weight = clip_tensor_to_quant_bounds(weight_sub, clip_min, clip_max)
-        clip_excess_sq = (weight_sub.float() - clipped_weight.float()).square().sum(dim=0)
-        clipped_mask = clip_excess_sq > 0
-
-        clipped_indices = torch.nonzero(clipped_mask, as_tuple=False).flatten()
-        unclipped_indices = torch.nonzero(~clipped_mask, as_tuple=False).flatten()
-        perm_parts = []
-        if clipped_indices.numel() > 0:
-            clipped_scores = clip_excess_sq[clipped_indices] * act_priority[clipped_indices]
-            perm_parts.append(clipped_indices[torch.argsort(clipped_scores, descending=True)])
-        if unclipped_indices.numel() > 0:
-            perm_parts.append(unclipped_indices[torch.argsort(act_priority[unclipped_indices], descending=True)])
-        if not perm_parts:
-            return torch.arange(weight_sub.shape[1], device=weight_sub.device)
-        return torch.cat(perm_parts, dim=0)
-
     @staticmethod
     def _nearest_quant_grid(weight_slice, scale_slice, zero_slice, maxq, sym):
         scale_slice = scale_slice.clamp(min=1e-8)
@@ -598,13 +562,7 @@ class GPTQPlus:
                     invperm = None
                     if actorder:
                         with profile_recorder.section("fasterquant.subgroup.actorder_permute") if profile_recorder else nullcontext():
-                            perm = self._build_actorder_permutation(
-                                W_sub,
-                                groupsize,
-                                row_start,
-                                row_end,
-                                groups=groups,
-                            )
+                            perm = torch.argsort(self.act_square, descending=True)
                             W_sub = W_sub[:, perm]
                             H_sub = H_sub[perm][:, perm]
                             gradients_sub = gradients_sub[:, perm]
