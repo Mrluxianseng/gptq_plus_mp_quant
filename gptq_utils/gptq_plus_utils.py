@@ -326,26 +326,36 @@ class GPTQPlus:
             raise ValueError(f"`grad_gate_sine_amp` must be non-negative. Got {grad_gate_sine_amp}.")
 
     @staticmethod
-    def _build_gate_quant_maps(base_quantizer, weight_sub, groupsize):
+    def _build_gate_quant_maps(base_quantizer, weight_sub, groupsize, row_start, row_end, groups=None, perm=None):
         gate_scale = torch.zeros_like(weight_sub)
         gate_zero = torch.zeros_like(weight_sub)
         if groupsize == -1:
-            gate_quantizer = copy.deepcopy(base_quantizer)
-            gate_quantizer.find_params(weight_sub)
-            gate_scale.copy_(gate_quantizer.scale.to(weight_sub.device).expand_as(weight_sub))
-            gate_zero.copy_(gate_quantizer.zero.to(weight_sub.device).expand_as(weight_sub))
+            gate_scale.copy_(
+                base_quantizer.scale.to(weight_sub.device)[row_start:row_end].expand_as(weight_sub)
+            )
+            gate_zero.copy_(
+                base_quantizer.zero.to(weight_sub.device)[row_start:row_end].expand_as(weight_sub)
+            )
             return gate_scale, gate_zero
 
-        for col_start in range(0, weight_sub.shape[1], groupsize):
-            col_end = min(col_start + groupsize, weight_sub.shape[1])
-            gate_quantizer = copy.deepcopy(base_quantizer)
-            gate_quantizer.find_params(weight_sub[:, col_start:col_end])
-            gate_scale[:, col_start:col_end] = gate_quantizer.scale.to(weight_sub.device).expand_as(
-                weight_sub[:, col_start:col_end]
-            )
-            gate_zero[:, col_start:col_end] = gate_quantizer.zero.to(weight_sub.device).expand_as(
-                weight_sub[:, col_start:col_end]
-            )
+        if groups is None:
+            raise ValueError("`groups` must be provided when groupsize != -1.")
+
+        device = weight_sub.device
+        if perm is None:
+            group_ids = torch.arange(weight_sub.shape[1], device=device) // groupsize
+        else:
+            group_ids = perm.to(device) // groupsize
+
+        for group_id, gate_quantizer in enumerate(groups):
+            col_mask = group_ids == group_id
+            if not torch.any(col_mask):
+                continue
+            num_group_cols = int(col_mask.sum().item())
+            scale = gate_quantizer.scale.to(device)[row_start:row_end].expand(-1, num_group_cols)
+            zero = gate_quantizer.zero.to(device)[row_start:row_end].expand(-1, num_group_cols)
+            gate_scale[:, col_mask] = scale
+            gate_zero[:, col_mask] = zero
         return gate_scale, gate_zero
 
     @staticmethod
@@ -521,6 +531,16 @@ class GPTQPlus:
                 with profile_recorder.section("fasterquant.quantizer_find_params_initial") if profile_recorder else nullcontext():
                     self.quantizer.find_params(W)
 
+            shared_groups = None
+            if groupsize != -1:
+                with profile_recorder.section("fasterquant.quantizer_build_groups") if profile_recorder else nullcontext():
+                    shared_groups = []
+                    for col_start in range(0, self.columns, groupsize):
+                        col_end = min(col_start + groupsize, self.columns)
+                        quantizer = copy.deepcopy(self.quantizer)
+                        quantizer.find_params(W[:, col_start:col_end])
+                        shared_groups.append(quantizer)
+
             rows_per_sub = self.rows // self.num_groups
             subgroup_states = []
             for sub_idx in range(self.num_groups):
@@ -536,14 +556,7 @@ class GPTQPlus:
                         H_sub[dead, dead] = 1
                         W_sub[:, dead] = 0
 
-                    groups = None
-                    if static_groups and groupsize != -1:
-                        with profile_recorder.section("fasterquant.subgroup.static_groups") if profile_recorder else nullcontext():
-                            groups = []
-                            for i in range(0, self.columns, groupsize):
-                                quantizer = copy.deepcopy(self.quantizer)
-                                quantizer.find_params(W[:, i : (i + groupsize)])
-                                groups.append(quantizer)
+                    groups = shared_groups
 
                     perm = None
                     invperm = None
@@ -554,9 +567,19 @@ class GPTQPlus:
                             H_sub = H_sub[perm][:, perm]
                             gradients_sub = gradients_sub[:, perm]
                             invperm = torch.argsort(perm)
-
-                    hessian_reg = H_sub.clone()
-                    gate_scale, gate_zero = self._build_gate_quant_maps(self.quantizer, W_sub, groupsize)
+                    
+                    with profile_recorder.section("fasterquant.subgroup.H_sub_clone") if profile_recorder else nullcontext():
+                        hessian_reg = H_sub.clone()
+                    with profile_recorder.section("fasterquant.subgroup.build_gate_quant_maps") if profile_recorder else nullcontext():
+                        gate_scale, gate_zero = self._build_gate_quant_maps(
+                            self.quantizer,
+                            W_sub,
+                            groupsize,
+                            row_start=row_start,
+                            row_end=row_end,
+                            groups=groups,
+                            perm=perm,
+                        )
 
                     with profile_recorder.section("fasterquant.subgroup.allocate_buffers") if profile_recorder else nullcontext():
                         Losses = torch.zeros_like(W_sub)
@@ -652,33 +675,40 @@ class GPTQPlus:
                             )
 
                         if block_atomic_quant:
-                            for i in range(count):
-                                with profile_recorder.section("fasterquant.column.total") if profile_recorder else nullcontext():
-                                    w = W_block_start[:, i]
+                            if groupsize == -1:
+                                # In per-row quantization each column uses the same row-wise scale,
+                                # so atomic block quantization can quantize the whole block at once
+                                # without changing the final quantized result.
+                                with profile_recorder.section("fasterquant.block.atomic_quantize_full") if profile_recorder else nullcontext():
+                                    q, int_weight, scale = self.quantizer.fake_quantize(
+                                        W_block_start,
+                                        st_idx=state["row_start"],
+                                        end_idx=state["row_end"],
+                                    )
+                                    Q1.copy_(q)
+                                    W_int1.copy_(int_weight)
+                                    Scale1.copy_(scale.expand_as(W_block_start))
+                            else:
+                                for i in range(count):
+                                    with profile_recorder.section("fasterquant.column.total") if profile_recorder else nullcontext():
+                                        w = W_block_start[:, i]
 
-                                    quantizer = self.quantizer
-                                    if groupsize != -1:
-                                        if not static_groups:
-                                            group_anchor = i1 + i - ((i1 + i) % groupsize)
-                                            with profile_recorder.section("fasterquant.column.quantizer_find_params") if profile_recorder else nullcontext():
-                                                self.quantizer.find_params(
-                                                    W[:, group_anchor : (group_anchor + groupsize)]
-                                                )
-                                        else:
+                                        quantizer = self.quantizer
+                                        if groupsize != -1:
                                             idx = i1 + i
                                             if actorder:
                                                 idx = state["perm"][idx]
                                             quantizer = state["groups"][idx // groupsize]
 
-                                    with profile_recorder.section("fasterquant.column.quantize") if profile_recorder else nullcontext():
-                                        q, int_weight, scale = quantizer.fake_quantize(
-                                            w.unsqueeze(1),
-                                            st_idx=state["row_start"],
-                                            end_idx=state["row_end"],
-                                        )
-                                    Q1[:, i] = q.flatten()
-                                    W_int1[:, i] = int_weight.flatten()
-                                    Scale1[:, i] = scale.flatten()
+                                        with profile_recorder.section("fasterquant.column.quantize") if profile_recorder else nullcontext():
+                                            q, int_weight, scale = quantizer.fake_quantize(
+                                                w.unsqueeze(1),
+                                                st_idx=state["row_start"],
+                                                end_idx=state["row_end"],
+                                            )
+                                        Q1[:, i] = q.flatten()
+                                        W_int1[:, i] = int_weight.flatten()
+                                        Scale1[:, i] = scale.flatten()
 
                             with profile_recorder.section("fasterquant.block.atomic_err_solve") if profile_recorder else nullcontext():
                                 residual_block = W_block_start - Q1 - GHinv1_eff
@@ -699,17 +729,10 @@ class GPTQPlus:
 
                                     quantizer = self.quantizer
                                     if groupsize != -1:
-                                        if not static_groups:
-                                            if (i1 + i) % groupsize == 0:
-                                                with profile_recorder.section("fasterquant.column.quantizer_find_params") if profile_recorder else nullcontext():
-                                                    self.quantizer.find_params(
-                                                        W[:, (i1 + i) : (i1 + i + groupsize)]
-                                                    )
-                                        else:
-                                            idx = i1 + i
-                                            if actorder:
-                                                idx = state["perm"][idx]
-                                            quantizer = state["groups"][idx // groupsize]
+                                        idx = i1 + i
+                                        if actorder:
+                                            idx = state["perm"][idx]
+                                        quantizer = state["groups"][idx // groupsize]
 
                                     with profile_recorder.section("fasterquant.column.quantize") if profile_recorder else nullcontext():
                                         q, int_weight, scale = quantizer.fake_quantize(

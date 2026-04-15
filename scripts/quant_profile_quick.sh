@@ -17,6 +17,7 @@ NUM_GROUPS=${NUM_GROUPS:-4}
 BSZ=${BSZ:-4}
 ALPHA=${ALPHA:-0.05}
 BLOCKSIZE=${BLOCKSIZE:-256}
+BLOCK_ATOMIC_QUANT=${BLOCK_ATOMIC_QUANT:-1}
 BACKWARD_SAMPLES=${BACKWARD_SAMPLES:-32}
 BACKWARD_BSZ=${BACKWARD_BSZ:-4}
 GRAD_LR=${GRAD_LR:-0.00005}
@@ -83,6 +84,10 @@ python analyze_quant_profile.py \
     --act_order \
     --w_clip \
 )
+
+if [[ "${BLOCK_ATOMIC_QUANT}" == "1" ]]; then
+    CMD+=(--block_atomic_quant)
+fi
 
 if [[ -n "${FINAL_LAYER_GRAD_LR}" ]]; then
     CMD+=(--final_layer_grad_lr "${FINAL_LAYER_GRAD_LR}")
