@@ -35,6 +35,7 @@ GRAD_REG_LAMBDA=${GRAD_REG_LAMBDA:-0.01}
 GRAD_GATE_FLOOR=${GRAD_GATE_FLOOR:-0.01}
 GRAD_GATE_SHARPNESS=${GRAD_GATE_SHARPNESS:-5.0}
 GRAD_GATE_SINE_AMP=${GRAD_GATE_SINE_AMP:-0.01}
+GRAD_HESSIAN_TOPK=${GRAD_HESSIAN_TOPK:-20}
 PROJ_LR_SCALE=${PROJ_LR_SCALE:-1.0}
 DOWN_PROJ_LR_SCALE=${DOWN_PROJ_LR_SCALE:-1.0}
 SECOND_ORDER_SCALE=${SECOND_ORDER_SCALE:-1.0}
@@ -93,7 +94,11 @@ for grad_lr in "${GRAD_LRS[@]}"; do
     if [[ "${GRAD_REFRESH_LOSS}" != "kl" ]]; then
         refresh_suffix="_${GRAD_REFRESH_LOSS}"
     fi
-    exp_name="${BASE_EXP}_block_gd_${GRAD_OPTIMIZER}${refresh_suffix}${reg_suffix}_lr${grad_lr_tag}_fllr${final_layer_grad_lr_tag}_s${second_order_tag}${BLOCK_ATOMIC_TAG}${FINAL_LAYER_FULL_BACKWARD_TAG}"
+    grad_hessian_suffix=""
+    if [[ "${GRAD_HESSIAN_TOPK}" != "-1" ]]; then
+        grad_hessian_suffix="_ghtk${GRAD_HESSIAN_TOPK}"
+    fi
+    exp_name="${BASE_EXP}_block_gd_${GRAD_OPTIMIZER}${refresh_suffix}${reg_suffix}${grad_hessian_suffix}_lr${grad_lr_tag}_fllr${final_layer_grad_lr_tag}_s${second_order_tag}${BLOCK_ATOMIC_TAG}${FINAL_LAYER_FULL_BACKWARD_TAG}"
 
     echo "============================================================"
     echo "Running GPTQ+ LR sweep"
@@ -111,6 +116,7 @@ for grad_lr in "${GRAD_LRS[@]}"; do
     echo "  gate_f : ${GRAD_GATE_FLOOR}"
     echo "  gate_k : ${GRAD_GATE_SHARPNESS}"
     echo "  gate_a : ${GRAD_GATE_SINE_AMP}"
+    echo "  gh_topk: ${GRAD_HESSIAN_TOPK}"
     echo "  proj_s : ${PROJ_LR_SCALE}"
     echo "  down_s : ${DOWN_PROJ_LR_SCALE}"
     echo "  gradlr : ${grad_lr}"
@@ -139,6 +145,7 @@ for grad_lr in "${GRAD_LRS[@]}"; do
         --final_layer_grad_optimizer "${FINAL_LAYER_GRAD_OPTIMIZER}" \
         --grad_clip "${GRAD_CLIP}" \
         --final_layer_grad_lr "${FINAL_LAYER_GRAD_LR}" \
+        --grad_hessian_topk "${GRAD_HESSIAN_TOPK}" \
         "${BLOCK_ATOMIC_ARGS[@]}" \
         "${FINAL_LAYER_FULL_BACKWARD_ARGS[@]}" \
         --proj_lr_scale "${PROJ_LR_SCALE}" --down_proj_lr_scale "${DOWN_PROJ_LR_SCALE}" \

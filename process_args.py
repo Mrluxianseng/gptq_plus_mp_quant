@@ -168,6 +168,15 @@ def parse_gen():
         help="How to update the first-order term during GPTQ+ quantization.",
     )
     parser.add_argument("--kl_topk", type=int, default=-1, help="Top-k KL loss")
+    parser.add_argument(
+        "--grad_hessian_topk",
+        type=int,
+        default=-1,
+        help=(
+            "When > 0, restrict the grad/hessian label sampling, saliency NLL, and KL loss "
+            "to the full-precision top-k logits support. Disabled when <= 0."
+        ),
+    )
     parser.add_argument("--bsz", type=int, default=1, help="Batch size for computing hessians and gradients")
     parser.add_argument(
         "--backward_samples",
@@ -251,6 +260,8 @@ def parse_gen():
         raise ValueError(f"`grad_gate_sharpness` must be non-negative. Got {args.grad_gate_sharpness}.")
     if args.grad_gate_sine_amp < 0:
         raise ValueError(f"`grad_gate_sine_amp` must be non-negative. Got {args.grad_gate_sine_amp}.")
+    if args.grad_hessian_topk == 0:
+        raise ValueError("`grad_hessian_topk` must be positive or negative to disable. Use -1 to disable.")
     logging.info(args)
 
     # Disable parallelism in tokenizers to prevent warnings when forking in the seed generation step

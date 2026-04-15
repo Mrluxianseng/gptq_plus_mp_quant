@@ -1975,63 +1975,91 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     position=1,
                     leave=False,
                 ):
-                    with layer_recorder.section("layer.grad_hessian.forward") if layer_recorder else nullcontext():
-                        out = layer(
-                            inps[j : j + args.bsz].to(dev),
-                            attention_mask=batch_attention_mask,
-                            position_ids=batch_position_ids,
-                            position_embeddings=batch_position_embeddings,
-                        )
-                        logits = hidden2logits(out, analyzer)
-                        logits_fp = hidden2logits(fp_inps[j : j + args.bsz].to(dev), analyzer)
-                        out_hidden = out[0] if isinstance(out, (tuple, list)) else out
-                        labels = torch.distributions.Categorical(logits=logits_fp).sample()
-                        nll_loss = F.cross_entropy(
-                            logits.view(-1, logits.size(-1)),
-                            labels.view(-1),
-                            reduction="sum",
-                        )
-
-                    saliency_cache.enable_hooks()
-                    with layer_recorder.section("layer.grad_hessian.saliency_backward") if layer_recorder else nullcontext():
-                        model.zero_grad()
-                        nll_loss.backward(retain_graph=True)
-                    saliency_cache.disable_hooks()
-
-                    with layer_recorder.section("layer.grad_hessian.kl_forward") if layer_recorder else nullcontext():
-                        if args.kl_topk > 0:
-                            logits_fp, indices = logits_fp.topk(args.kl_topk, dim=-1, sorted=False)
-                            logits = logits.gather(-1, indices)
-                        kl_loss = F.kl_div(
-                            F.log_softmax(logits, dim=-1),
-                            F.softmax(logits_fp, dim=-1),
-                            reduction="none",
-                        )
-                        kl_loss = kl_loss.sum(dim=-1).mean()
-                        if layer_refresh_loss_type == "fisher_diag_mse":
-                            out_hidden.retain_grad()
-
-                            def layer_output_grad_hook(grad):
-                                bsz_local, seq_len_local, hidden_dim = grad.shape
-                                group_size = hidden_dim // args.num_groups
-                                token_count = bsz_local * seq_len_local
-                                grad_unmean = grad.float() * token_count
-                                grad_squared = grad_unmean.pow(2).view(
-                                    bsz_local, seq_len_local, args.num_groups, group_size
+                    with layer_recorder.section("layer.grad_hessian.batch.total") if layer_recorder else nullcontext():
+                        with layer_recorder.section("layer.grad_hessian.forward") if layer_recorder else nullcontext():
+                            with layer_recorder.section("layer.grad_hessian.forward.layer") if layer_recorder else nullcontext():
+                                out = layer(
+                                    inps[j : j + args.bsz].to(dev),
+                                    attention_mask=batch_attention_mask,
+                                    position_ids=batch_position_ids,
+                                    position_embeddings=batch_position_embeddings,
                                 )
-                                layer_output_fisher_cache.append(grad_squared.mean(dim=-1).detach())
+                            with layer_recorder.section("layer.grad_hessian.forward.hidden_extract") if layer_recorder else nullcontext():
+                                out_hidden = out[0] if isinstance(out, (tuple, list)) else out
+                            with layer_recorder.section("layer.grad_hessian.forward.logits_quant") if layer_recorder else nullcontext():
+                                logits = hidden2logits(out, analyzer)
+                            with layer_recorder.section("layer.grad_hessian.forward.logits_fp") if layer_recorder else nullcontext():
+                                logits_fp = hidden2logits(fp_inps[j : j + args.bsz].to(dev), analyzer)
+                            grad_hessian_logits = logits
+                            grad_hessian_logits_fp = logits_fp
+                            grad_hessian_topk = args.grad_hessian_topk
+                            if grad_hessian_topk > 0:
+                                with layer_recorder.section("layer.grad_hessian.forward.topk_slice") if layer_recorder else nullcontext():
+                                    grad_hessian_logits_fp, grad_hessian_indices = logits_fp.topk(
+                                        grad_hessian_topk,
+                                        dim=-1,
+                                        sorted=False,
+                                    )
+                                    grad_hessian_logits = logits.gather(-1, grad_hessian_indices)
+                            with layer_recorder.section("layer.grad_hessian.forward.label_sample") if layer_recorder else nullcontext():
+                                labels = torch.distributions.Categorical(logits=grad_hessian_logits_fp).sample()
+                            with layer_recorder.section("layer.grad_hessian.forward.nll_build") if layer_recorder else nullcontext():
+                                nll_loss = F.cross_entropy(
+                                    grad_hessian_logits.view(-1, grad_hessian_logits.size(-1)),
+                                    labels.view(-1),
+                                    reduction="sum",
+                                )
 
-                            out_hidden.register_hook(layer_output_grad_hook)
+                        with layer_recorder.section("layer.grad_hessian.saliency_backward.total") if layer_recorder else nullcontext():
+                            saliency_cache.enable_hooks()
+                            with layer_recorder.section("layer.grad_hessian.saliency_backward.zero_grad") if layer_recorder else nullcontext():
+                                model.zero_grad()
+                            with layer_recorder.section("layer.grad_hessian.saliency_backward.backward") if layer_recorder else nullcontext():
+                                nll_loss.backward(retain_graph=True)
+                            saliency_cache.disable_hooks()
 
-                    gradients_cache.enable_hooks()
-                    with layer_recorder.section("layer.grad_hessian.gradient_backward") if layer_recorder else nullcontext():
-                        model.zero_grad()
-                        kl_loss.backward()
-                    gradients_cache.disable_hooks()
+                        with layer_recorder.section("layer.grad_hessian.kl_forward") if layer_recorder else nullcontext():
+                            kl_logits = grad_hessian_logits if args.grad_hessian_topk > 0 else logits
+                            kl_logits_fp = grad_hessian_logits_fp if args.grad_hessian_topk > 0 else logits_fp
+                            if args.grad_hessian_topk <= 0 and args.kl_topk > 0:
+                                with layer_recorder.section("layer.grad_hessian.kl_forward.topk") if layer_recorder else nullcontext():
+                                    kl_logits_fp, indices = logits_fp.topk(args.kl_topk, dim=-1, sorted=False)
+                                    kl_logits = logits.gather(-1, indices)
+                            with layer_recorder.section("layer.grad_hessian.kl_forward.loss_build") if layer_recorder else nullcontext():
+                                kl_loss = F.kl_div(
+                                    F.log_softmax(kl_logits, dim=-1),
+                                    F.softmax(kl_logits_fp, dim=-1),
+                                    reduction="none",
+                                )
+                                kl_loss = kl_loss.sum(dim=-1).mean()
+                            if layer_refresh_loss_type == "fisher_diag_mse":
+                                with layer_recorder.section("layer.grad_hessian.kl_forward.fisher_hook_register") if layer_recorder else nullcontext():
+                                    out_hidden.retain_grad()
 
-                    kl_losses.append(kl_loss.item())
-                    with layer_recorder.section("layer.grad_hessian.cleanup") if layer_recorder else nullcontext():
-                        memory_utils.cleanup_memory()
+                                    def layer_output_grad_hook(grad):
+                                        bsz_local, seq_len_local, hidden_dim = grad.shape
+                                        group_size = hidden_dim // args.num_groups
+                                        token_count = bsz_local * seq_len_local
+                                        grad_unmean = grad.float() * token_count
+                                        grad_squared = grad_unmean.pow(2).view(
+                                            bsz_local, seq_len_local, args.num_groups, group_size
+                                        )
+                                        layer_output_fisher_cache.append(grad_squared.mean(dim=-1).detach())
+
+                                    out_hidden.register_hook(layer_output_grad_hook)
+
+                        with layer_recorder.section("layer.grad_hessian.gradient_backward.total") if layer_recorder else nullcontext():
+                            gradients_cache.enable_hooks()
+                            with layer_recorder.section("layer.grad_hessian.gradient_backward.zero_grad") if layer_recorder else nullcontext():
+                                model.zero_grad()
+                            with layer_recorder.section("layer.grad_hessian.gradient_backward.backward") if layer_recorder else nullcontext():
+                                kl_loss.backward()
+                            gradients_cache.disable_hooks()
+
+                        with layer_recorder.section("layer.grad_hessian.metrics_record") if layer_recorder else nullcontext():
+                            kl_losses.append(kl_loss.item())
+                        with layer_recorder.section("layer.grad_hessian.cleanup") if layer_recorder else nullcontext():
+                            memory_utils.cleanup_memory()
 
                 mean_kl_loss = sum(kl_losses) / len(kl_losses)
 

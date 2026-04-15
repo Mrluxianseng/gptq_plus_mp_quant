@@ -47,6 +47,7 @@ GRAD_REG_LAMBDA=${GRAD_REG_LAMBDA:-0.0}
 GRAD_GATE_FLOOR=${GRAD_GATE_FLOOR:-0.01}
 GRAD_GATE_SHARPNESS=${GRAD_GATE_SHARPNESS:-5.0}
 GRAD_GATE_SINE_AMP=${GRAD_GATE_SINE_AMP:-0.0005}
+GRAD_HESSIAN_TOPK=${GRAD_HESSIAN_TOPK:-20}
 PROJ_LR_SCALE=${PROJ_LR_SCALE:-1.0}
 DOWN_PROJ_LR_SCALE=${DOWN_PROJ_LR_SCALE:-1.0}
 
@@ -77,6 +78,7 @@ python analyze_quant_profile.py \
     --grad_gate_floor "${GRAD_GATE_FLOOR}" \
     --grad_gate_sharpness "${GRAD_GATE_SHARPNESS}" \
     --grad_gate_sine_amp "${GRAD_GATE_SINE_AMP}" \
+    --grad_hessian_topk "${GRAD_HESSIAN_TOPK}" \
     --second_order_scale "${SECOND_ORDER_SCALE}" \
     --quant_profile_target_layers "${TARGET_LAYERS}" \
     --quant_profile_target_modules "${TARGET_MODULES}" \
