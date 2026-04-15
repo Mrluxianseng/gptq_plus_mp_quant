@@ -649,6 +649,8 @@ class GPTQPlus:
                 with profile_recorder.section("fasterquant.block.total") if profile_recorder else nullcontext():
                     i2 = min(i1 + blocksize, self.columns)
                     count = i2 - i1
+                    is_last_block = i2 >= self.columns
+                    use_atomic_quant = block_atomic_quant and not is_last_block
                     D = torch.arange(count - 1, -1, -1).to(W)
                     block_states = []
 
@@ -674,7 +676,7 @@ class GPTQPlus:
                                 inner_update_mode,
                             )
 
-                        if block_atomic_quant:
+                        if use_atomic_quant:
                             if groupsize == -1:
                                 # In per-row quantization each column uses the same row-wise scale,
                                 # so atomic block quantization can quantize the whole block at once
