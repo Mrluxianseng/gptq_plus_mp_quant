@@ -189,6 +189,10 @@ def parse_gen():
     parser.add_argument("--load_qmodel_path", type=str, default=None, help="The path to load quantized model ckpt")
     parser.add_argument("--save_qmodel_path", type=str, default=None, help="The path to save quantized model ckpt")
     parser.add_argument("--offload_inps", action="store_true", help="Offload inputs to CPU")
+    parser.add_argument("--enable_quant_profile", action="store_true", help="Emit NVTX ranges for Nsight profiling during GPTQ+ quantization.")
+    parser.add_argument("--quant_profile_target_layers", type=str, default="all", help="Layer ids to profile in detail when quant profiling is enabled.")
+    parser.add_argument("--quant_profile_target_modules", type=str, default="all", help="Comma-separated module names to profile in detail when quant profiling is enabled.")
+    parser.add_argument("--quant_stop_layer", type=str, default=None, help="Inclusive transformer layer index to stop after; intended for short profiling/debug runs.")
     # Eval
     parser.add_argument("--skip_eval", action="store_true", help="Skip KL/PPL and QA evaluation")
     parser.add_argument("--lm_eval", action="store_true", help="Enable QA eval")
