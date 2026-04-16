@@ -2866,6 +2866,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         if i == final_layer_idx and args.final_layer_grad_lr is not None
                         else args.grad_lr
                     )
+                    effective_grad_reg_strategy = "none" if i == final_layer_idx else args.grad_reg_strategy
                     effective_grad_lr = get_module_grad_lr(
                         name,
                         base_grad_lr,
@@ -2888,6 +2889,13 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             effective_grad_optimizer,
                             layer_refresh_loss_type,
                         )
+                    if i == final_layer_idx and args.grad_reg_strategy != "none":
+                        logging.info(
+                            "Disabling first-order regularization for final layer=%d module=%s: %s -> none",
+                            i,
+                            name,
+                            args.grad_reg_strategy,
+                        )
                     module_recorder = (
                         QuantProfileRecorder(dev, prefix=f"layers.{i}.{name}")
                         if should_profile_module(i, name) else None
@@ -2905,7 +2913,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         gradient_refresh_fn=make_gradient_refresh_fn(name) if args.g_update_mode in {"block_backward", "block_gd"} else None,
                         grad_lr=effective_grad_lr,
                         grad_optimizer=effective_grad_optimizer,
-                        grad_reg_strategy=args.grad_reg_strategy,
+                        grad_reg_strategy=effective_grad_reg_strategy,
                         grad_reg_lambda=args.grad_reg_lambda,
                         grad_gate_floor=args.grad_gate_floor,
                         grad_gate_sharpness=args.grad_gate_sharpness,
