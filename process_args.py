@@ -270,6 +270,12 @@ def parse_gen():
         help="Batch size used inside each block-backward refresh (-1 means reuse --bsz).",
     )
     parser.add_argument(
+        "--final_layer_backward_bsz",
+        type=int,
+        default=None,
+        help="Optional override for the refresh backward batch size used only in the final transformer layer.",
+    )
+    parser.add_argument(
         "--final_layer_full_backward",
         action="store_true",
         help="Use all calibration samples for every block refresh in the final transformer layer while keeping earlier layers on --backward_samples.",
@@ -322,6 +328,12 @@ def parse_gen():
         args.backward_bsz = args.bsz
     if args.backward_bsz <= 0:
         raise ValueError(f"`backward_bsz` must be positive or -1. Got {args.backward_bsz}.")
+    if args.final_layer_backward_bsz is None:
+        args.final_layer_backward_bsz = args.backward_bsz
+    if args.final_layer_backward_bsz <= 0:
+        raise ValueError(
+            f"`final_layer_backward_bsz` must be positive when provided. Got {args.final_layer_backward_bsz}."
+        )
     if args.global_loss_bsz is None:
         args.global_loss_bsz = args.bsz
     if args.global_loss_bsz <= 0:

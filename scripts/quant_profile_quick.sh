@@ -20,6 +20,7 @@ BLOCKSIZE=${BLOCKSIZE:-256}
 BLOCK_ATOMIC_QUANT=${BLOCK_ATOMIC_QUANT:-1}
 BACKWARD_SAMPLES=${BACKWARD_SAMPLES:-32}
 BACKWARD_BSZ=${BACKWARD_BSZ:-4}
+FINAL_LAYER_BACKWARD_BSZ=${FINAL_LAYER_BACKWARD_BSZ:-${BACKWARD_BSZ}}
 GRAD_LR=${GRAD_LR:-0.00005}
 SECOND_ORDER_SCALE=${SECOND_ORDER_SCALE:-1.0}
 G_UPDATE_MODE=${G_UPDATE_MODE:-block_gd}
@@ -69,6 +70,7 @@ python analyze_quant_profile.py \
     --blocksize "${BLOCKSIZE}" \
     --backward_samples "${BACKWARD_SAMPLES}" \
     --backward_bsz "${BACKWARD_BSZ}" \
+    --final_layer_backward_bsz "${FINAL_LAYER_BACKWARD_BSZ}" \
     --g_update_mode "${G_UPDATE_MODE}" \
     --grad_lr "${GRAD_LR}" \
     --grad_optimizer "${GRAD_OPT}" \

@@ -2597,6 +2597,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     args.grad_refresh_loss,
                     layer_refresh_loss_type,
                 )
+            layer_backward_bsz = args.final_layer_backward_bsz if i == final_layer_idx else args.backward_bsz
 
             with layer_recorder.section("layer.fp_reference_forward") if layer_recorder else nullcontext():
                 bits_config = quant_utils.disable_act_quant(layer)
@@ -2688,7 +2689,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             attention_mask=attention_mask,
                             position_ids=position_ids,
                             position_embeddings=position_embeddings,
-                            backward_bsz=args.backward_bsz,
+                            backward_bsz=layer_backward_bsz,
                             kl_topk=args.kl_topk,
                             dev=dev,
                             module_names=list(subset.keys()),
@@ -2802,7 +2803,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         attention_mask=attention_mask,
                         position_ids=position_ids,
                         position_embeddings=position_embeddings,
-                        bsz=args.backward_bsz,
+                        bsz=layer_backward_bsz,
                         kl_topk=args.kl_topk,
                         dev=dev,
                         weight_override=weight_snapshot,

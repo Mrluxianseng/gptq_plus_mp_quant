@@ -20,6 +20,7 @@ SEQ_LEN=${SEQ_LEN:-1024}
 BSZ=${BSZ:-4}
 BACKWARD_SAMPLES=${BACKWARD_SAMPLES:-32}
 BACKWARD_BSZ=${BACKWARD_BSZ:-4}
+FINAL_LAYER_BACKWARD_BSZ=${FINAL_LAYER_BACKWARD_BSZ:-${BACKWARD_BSZ}}
 FINAL_LAYER_FULL_BACKWARD=${FINAL_LAYER_FULL_BACKWARD:-0}
 BLOCKSIZE=${BLOCKSIZE:-256}
 BLOCK_ATOMIC_QUANT=${BLOCK_ATOMIC_QUANT:-0}
@@ -187,6 +188,7 @@ for grad_lr in "${GRAD_LRS[@]}"; do
     echo "  bsz    : ${BSZ}"
     echo "  bw_smp : ${BACKWARD_SAMPLES}"
     echo "  bw_bsz : ${BACKWARD_BSZ}"
+    echo "  fl_bwb : ${FINAL_LAYER_BACKWARD_BSZ}"
     echo "  exp    : ${exp_name}"
     echo "============================================================"
 
@@ -201,7 +203,7 @@ for grad_lr in "${GRAD_LRS[@]}"; do
         --dataset neuralmagic --nsamples "${N_SAMPLES}" --seq_len "${SEQ_LEN}" \
         --w_method gptq_plus --w_bits 4 --w_clip --num_groups "${NUM_GROUPS}" --fisher_num_groups "${FISHER_NUM_GROUPS}" --act_order \
         --kl_topk "${KL_TOPK}" --bsz "${BSZ}" --alpha "${ALPHA}" --blocksize "${BLOCKSIZE}" \
-        --backward_samples "${BACKWARD_SAMPLES}" --backward_bsz "${BACKWARD_BSZ}" \
+        --backward_samples "${BACKWARD_SAMPLES}" --backward_bsz "${BACKWARD_BSZ}" --final_layer_backward_bsz "${FINAL_LAYER_BACKWARD_BSZ}" \
         --g_update_mode block_gd --grad_lr "${grad_lr}" --grad_optimizer "${GRAD_OPTIMIZER}" --grad_refresh_loss "${GRAD_REFRESH_LOSS}" \
         "${GLOBAL_LOSS_ARGS[@]}" \
         --final_layer_grad_optimizer "${FINAL_LAYER_GRAD_OPTIMIZER}" \
