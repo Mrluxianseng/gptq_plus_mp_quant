@@ -2492,11 +2492,12 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     saliency_num_groups=args.num_groups,
                     fisher_num_groups=args.fisher_num_groups,
                     grad_hessian_topk=args.grad_hessian_topk,
-                    batch_size=args.bsz,
+                    batch_size=args.global_loss_bsz,
                 )
             logging.info(
-                "Collected frozen end-to-end saliency/Fisher caches before quantization. "
-                "These cached coefficients will be reused for Hessian estimation and fisher_diag_mse throughout quantization."
+                "Collected frozen end-to-end saliency/Fisher caches before quantization with global_loss_bsz=%d. "
+                "These cached coefficients will be reused for Hessian estimation and fisher_diag_mse throughout quantization.",
+                args.global_loss_bsz,
             )
         else:
             static_saliency_by_layer = [None] * len(layers)

@@ -139,6 +139,15 @@ def parse_gen():
     )
     parser.set_defaults(global_loss=False)
     parser.add_argument(
+        "--global_loss_bsz",
+        type=int,
+        default=None,
+        help=(
+            "Batch size used only for the frozen end-to-end global-loss backward pass that collects static "
+            "saliency/Fisher caches. Defaults to --bsz when not provided."
+        ),
+    )
+    parser.add_argument(
         "--pre_gd_steps",
         type=int,
         default=0,
@@ -313,6 +322,10 @@ def parse_gen():
         args.backward_bsz = args.bsz
     if args.backward_bsz <= 0:
         raise ValueError(f"`backward_bsz` must be positive or -1. Got {args.backward_bsz}.")
+    if args.global_loss_bsz is None:
+        args.global_loss_bsz = args.bsz
+    if args.global_loss_bsz <= 0:
+        raise ValueError(f"`global_loss_bsz` must be positive when provided. Got {args.global_loss_bsz}.")
     if args.nsamples % args.backward_samples != 0:
         raise ValueError(
             f"`nsamples` ({args.nsamples}) must be divisible by `backward_samples` ({args.backward_samples})."

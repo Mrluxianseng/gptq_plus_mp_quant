@@ -51,6 +51,7 @@ GRAD_HESSIAN_TOPK=${GRAD_HESSIAN_TOPK:-20}
 PROJ_LR_SCALE=${PROJ_LR_SCALE:-1.0}
 DOWN_PROJ_LR_SCALE=${DOWN_PROJ_LR_SCALE:-1.0}
 GLOBAL_LOSS=${GLOBAL_LOSS:-0}
+GLOBAL_LOSS_BSZ=${GLOBAL_LOSS_BSZ:-${BSZ}}
 
 export HF_DATASETS_CACHE=${HF_DATASETS_CACHE:-/tmp/hf_datasets}
 export HUGGINGFACE_HUB_CACHE=${HUGGINGFACE_HUB_CACHE:-/tmp/hf_hub}
@@ -89,7 +90,7 @@ python analyze_quant_profile.py \
 )
 
 if [[ "${GLOBAL_LOSS}" == "1" ]]; then
-    CMD+=(--global_loss)
+    CMD+=(--global_loss --global_loss_bsz "${GLOBAL_LOSS_BSZ}")
 fi
 
 if [[ "${BLOCK_ATOMIC_QUANT}" == "1" ]]; then
