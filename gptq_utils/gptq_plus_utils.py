@@ -196,7 +196,7 @@ class GPTQPlus:
         gradient: torch.Tensor, # shape (G, in_features)
         num_groups: int,
         alpha: float,
-        kl_loss: float,
+        reference_loss: float,
     ):
         self.layer = layer
         self.dev = self.layer.weight.device
@@ -209,7 +209,7 @@ class GPTQPlus:
         self.num_groups = num_groups
         assert self.num_groups == saliency.shape[2], "Number of groups for GuidedQuant must match saliency shape!"
         self.alpha = alpha
-        self.kl_loss = max(kl_loss, 0)
+        self.reference_loss = max(reference_loss, 0)
 
         self.saliencies = saliency.float()
         self.gradients = gradient.float()
@@ -243,8 +243,8 @@ class GPTQPlus:
             c = (gradients_sub * GHinv_init).sum(dim=1) - (
                 (GHinv_init ** 2) / torch.diagonal(Hinv_init).unsqueeze(0)
             ).mean(1)
-            c = torch.clamp(c, min=2 * alpha * self.kl_loss)
-            beta = 1 - torch.sqrt(torch.clamp(1 - (2 * alpha * self.kl_loss) / c, min=0.0))
+            c = torch.clamp(c, min=2 * alpha * self.reference_loss)
+            beta = 1 - torch.sqrt(torch.clamp(1 - (2 * alpha * self.reference_loss) / c, min=0.0))
         else:
             beta = torch.zeros([1]).to(gradients_sub)
         beta_view = beta.unsqueeze(1)
@@ -859,10 +859,10 @@ class GPTQPlus:
                                         "regularizer_update_mean_row_l2": None,
                                         "sine_regularizer_update_abs_mean": None,
                                         "sine_regularizer_update_mean_row_l2": None,
-                                        "mean_kl_loss": None if refresh_meta is None else refresh_meta.get("mean_kl_loss"),
-                                        "train_mean_kl_loss": None if refresh_meta is None else refresh_meta.get("train_mean_kl_loss"),
-                                        "val_mean_kl_loss": None if refresh_meta is None else refresh_meta.get("val_mean_kl_loss"),
-                                        "refresh_subset_mean_kl_loss": None if refresh_meta is None else refresh_meta.get("refresh_subset_mean_kl_loss"),
+                                        "mean_refresh_loss": None if refresh_meta is None else refresh_meta.get("mean_refresh_loss"),
+                                        "train_mean_refresh_loss": None if refresh_meta is None else refresh_meta.get("train_mean_refresh_loss"),
+                                        "val_mean_refresh_loss": None if refresh_meta is None else refresh_meta.get("val_mean_refresh_loss"),
+                                        "refresh_subset_mean_refresh_loss": None if refresh_meta is None else refresh_meta.get("refresh_subset_mean_refresh_loss"),
                                     }
                                 )
 
@@ -1035,10 +1035,10 @@ class GPTQPlus:
                                         "regularizer_update_mean_row_l2": regularizer_mean_row_l2,
                                         "sine_regularizer_update_abs_mean": sine_regularizer_abs_mean,
                                         "sine_regularizer_update_mean_row_l2": sine_regularizer_mean_row_l2,
-                                        "mean_kl_loss": None if refresh_meta is None else refresh_meta.get("mean_kl_loss"),
-                                        "train_mean_kl_loss": None if refresh_meta is None else refresh_meta.get("train_mean_kl_loss"),
-                                        "val_mean_kl_loss": None if refresh_meta is None else refresh_meta.get("val_mean_kl_loss"),
-                                        "refresh_subset_mean_kl_loss": None if refresh_meta is None else refresh_meta.get("refresh_subset_mean_kl_loss"),
+                                        "mean_refresh_loss": None if refresh_meta is None else refresh_meta.get("mean_refresh_loss"),
+                                        "train_mean_refresh_loss": None if refresh_meta is None else refresh_meta.get("train_mean_refresh_loss"),
+                                        "val_mean_refresh_loss": None if refresh_meta is None else refresh_meta.get("val_mean_refresh_loss"),
+                                        "refresh_subset_mean_refresh_loss": None if refresh_meta is None else refresh_meta.get("refresh_subset_mean_refresh_loss"),
                                     }
                                 )
 
@@ -1187,8 +1187,8 @@ class GPTQPlus:
                 c = (gradients_sub * GHinv_init).sum(dim=1) - (
                     (GHinv_init ** 2) / torch.diagonal(Hinv_init).unsqueeze(0)
                 ).mean(1)
-                c = torch.clamp(c, min=2 * alpha * self.kl_loss)
-                beta = 1 - torch.sqrt(torch.clamp(1 - (2 * alpha * self.kl_loss) / c, min=0.0))
+                c = torch.clamp(c, min=2 * alpha * self.reference_loss)
+                beta = 1 - torch.sqrt(torch.clamp(1 - (2 * alpha * self.reference_loss) / c, min=0.0))
             else:
                 beta = torch.zeros([1]).to(gradients_sub)
 
@@ -1379,7 +1379,7 @@ class GPTQPlus:
         actorder=False,
         enable_gradient_update=True,
         gradient_override=None,
-        kl_loss_override=None,
+        reference_loss_override=None,
         max_subgroups=None,
         max_blocks=None,
         return_tensors=False,
@@ -1407,7 +1407,11 @@ class GPTQPlus:
             }
 
         gradients = self.gradients if gradient_override is None else gradient_override.float()
-        effective_kl_loss = self.kl_loss if kl_loss_override is None else max(float(kl_loss_override), 0.0)
+        effective_reference_loss = (
+            self.reference_loss
+            if reference_loss_override is None
+            else max(float(reference_loss_override), 0.0)
+        )
         rows_per_sub = self.rows // self.num_groups
         results = {
             "rows": self.rows,
@@ -1460,8 +1464,8 @@ class GPTQPlus:
                 c = (gradients_sub * GHinv_init).sum(dim=1) - (
                     (GHinv_init ** 2) / torch.diagonal(Hinv_init).unsqueeze(0)
                 ).mean(1)
-                c = torch.clamp(c, min=2 * alpha * effective_kl_loss)
-                beta = 1 - torch.sqrt(torch.clamp(1 - (2 * alpha * effective_kl_loss) / c, min=0.0))
+                c = torch.clamp(c, min=2 * alpha * effective_reference_loss)
+                beta = 1 - torch.sqrt(torch.clamp(1 - (2 * alpha * effective_reference_loss) / c, min=0.0))
             else:
                 beta = torch.zeros([1]).to(gradients_sub)
             GHinv_raw = gradients_sub.matmul(Hinv_init)
@@ -2031,7 +2035,7 @@ def collect_true_weight_gradient(
     module = full.get(module_name, full.get(module_name + ".module", None))
     if module is None:
         raise ValueError(f"Unable to find module `{module_name}` in the provided layer.")
-    kl_losses = []
+    losses = []
     selected_indices = list(range(inps.shape[0])) if sample_indices is None else list(sample_indices)
     if len(selected_indices) == 0:
         raise ValueError("`sample_indices` must contain at least one sample.")
@@ -2043,11 +2047,14 @@ def collect_true_weight_gradient(
     override_weight.requires_grad_(True)
     grad = torch.zeros_like(override_weight, dtype=torch.float32)
     grad_count = 0
-    grad_modules = [
-        layer,
-        analyzer.get_layernorm_before_head(),
-        analyzer.get_lm_head(),
-    ]
+    grad_modules = [layer]
+    if refresh_loss_type == "kl":
+        grad_modules.extend(
+            [
+                analyzer.get_layernorm_before_head(),
+                analyzer.get_lm_head(),
+            ]
+        )
     with temporary_requires_grad(grad_modules, []):
         with torch.enable_grad():
             for start in range(0, len(selected_indices), bsz):
@@ -2086,11 +2093,11 @@ def collect_true_weight_gradient(
                 grad.mul_(grad_count / (grad_count + 1))
                 grad.add_(batch_grad.float(), alpha=1.0 / (grad_count + 1))
                 grad_count += 1
-                kl_losses.append(refresh_loss.item())
+                losses.append(refresh_loss.item())
                 memory_utils.cleanup_memory()
 
-    mean_kl_loss = sum(kl_losses) / len(kl_losses)
-    return grad, mean_kl_loss
+    mean_refresh_loss = sum(losses) / len(losses)
+    return grad, mean_refresh_loss
 
 
 def collect_layer_grad_hessian_stats(
@@ -2121,6 +2128,11 @@ def collect_layer_grad_hessian_stats(
     need_layer_output_fisher_collection = (
         layer_refresh_loss_type == "fisher_diag_mse" and precomputed_layer_output_fisher is None
     )
+    need_output_head = (
+        need_saliency_collection
+        or layer_refresh_loss_type == "kl"
+        or need_layer_output_fisher_collection
+    )
     with torch.enable_grad():
         saliency_cache = None
         if need_saliency_collection:
@@ -2129,7 +2141,7 @@ def collect_layer_grad_hessian_stats(
         gradients_cache = GradientCache(names, num_groups)
         gradients_cache.add_hook(full, enable=False)
         layer_output_fisher_cache = []
-        kl_losses = []
+        refresh_losses = []
 
         for j in tqdm(
             range(0, inps.shape[0], bsz),
@@ -2149,20 +2161,27 @@ def collect_layer_grad_hessian_stats(
                         )
                     with layer_recorder.section("layer.grad_hessian.forward.hidden_extract") if layer_recorder else nullcontext():
                         out_hidden = out[0] if isinstance(out, (tuple, list)) else out
-                    with layer_recorder.section("layer.grad_hessian.forward.logits_quant") if layer_recorder else nullcontext():
-                        logits = hidden2logits(out, analyzer)
-                    with layer_recorder.section("layer.grad_hessian.forward.logits_fp") if layer_recorder else nullcontext():
-                        logits_fp = hidden2logits(fp_inps[j : j + bsz].to(dev), analyzer)
-                    grad_hessian_logits = logits
-                    grad_hessian_logits_fp = logits_fp
-                    if grad_hessian_topk > 0:
-                        with layer_recorder.section("layer.grad_hessian.forward.topk_slice") if layer_recorder else nullcontext():
-                            grad_hessian_logits_fp, grad_hessian_indices = logits_fp.topk(
-                                grad_hessian_topk,
-                                dim=-1,
-                                sorted=False,
-                            )
-                            grad_hessian_logits = logits.gather(-1, grad_hessian_indices)
+                    with layer_recorder.section("layer.grad_hessian.forward.fp_hidden") if layer_recorder else nullcontext():
+                        fp_hidden = fp_inps[j : j + bsz].to(dev)
+                    logits = None
+                    logits_fp = None
+                    grad_hessian_logits = None
+                    grad_hessian_logits_fp = None
+                    if need_output_head:
+                        with layer_recorder.section("layer.grad_hessian.forward.logits_quant") if layer_recorder else nullcontext():
+                            logits = hidden2logits(out, analyzer)
+                        with layer_recorder.section("layer.grad_hessian.forward.logits_fp") if layer_recorder else nullcontext():
+                            logits_fp = hidden2logits(fp_hidden, analyzer)
+                        grad_hessian_logits = logits
+                        grad_hessian_logits_fp = logits_fp
+                        if grad_hessian_topk > 0:
+                            with layer_recorder.section("layer.grad_hessian.forward.topk_slice") if layer_recorder else nullcontext():
+                                grad_hessian_logits_fp, grad_hessian_indices = logits_fp.topk(
+                                    grad_hessian_topk,
+                                    dim=-1,
+                                    sorted=False,
+                                )
+                                grad_hessian_logits = logits.gather(-1, grad_hessian_indices)
                     if need_saliency_collection:
                         with layer_recorder.section("layer.grad_hessian.forward.label_sample") if layer_recorder else nullcontext():
                             labels = torch.distributions.Categorical(logits=grad_hessian_logits_fp).sample()
@@ -2182,22 +2201,26 @@ def collect_layer_grad_hessian_stats(
                             nll_loss.backward(retain_graph=True)
                         saliency_cache.disable_hooks()
 
-                with layer_recorder.section("layer.grad_hessian.kl_forward") if layer_recorder else nullcontext():
-                    kl_logits = grad_hessian_logits if grad_hessian_topk > 0 else logits
-                    kl_logits_fp = grad_hessian_logits_fp if grad_hessian_topk > 0 else logits_fp
-                    if grad_hessian_topk <= 0 and kl_topk > 0:
-                        with layer_recorder.section("layer.grad_hessian.kl_forward.topk") if layer_recorder else nullcontext():
-                            kl_logits_fp, indices = logits_fp.topk(kl_topk, dim=-1, sorted=False)
-                            kl_logits = logits.gather(-1, indices)
-                    with layer_recorder.section("layer.grad_hessian.kl_forward.loss_build") if layer_recorder else nullcontext():
-                        kl_loss = F.kl_div(
-                            F.log_softmax(kl_logits, dim=-1),
-                            F.softmax(kl_logits_fp, dim=-1),
-                            reduction="none",
-                        )
-                        kl_loss = kl_loss.sum(dim=-1).mean()
-                    if need_layer_output_fisher_collection:
-                        with layer_recorder.section("layer.grad_hessian.kl_forward.fisher_hook_register") if layer_recorder else nullcontext():
+                batch_layer_output_fisher = None
+                if layer_refresh_loss_type == "fisher_diag_mse" and precomputed_layer_output_fisher is not None:
+                    with layer_recorder.section("layer.grad_hessian.fisher_slice") if layer_recorder else nullcontext():
+                        batch_layer_output_fisher = precomputed_layer_output_fisher[j : j + bsz].to(dev)
+                elif need_layer_output_fisher_collection:
+                    with layer_recorder.section("layer.grad_hessian.fisher_collect") if layer_recorder else nullcontext():
+                        kl_logits = grad_hessian_logits if grad_hessian_topk > 0 else logits
+                        kl_logits_fp = grad_hessian_logits_fp if grad_hessian_topk > 0 else logits_fp
+                        if grad_hessian_topk <= 0 and kl_topk > 0:
+                            with layer_recorder.section("layer.grad_hessian.fisher_collect.topk") if layer_recorder else nullcontext():
+                                kl_logits_fp, indices = logits_fp.topk(kl_topk, dim=-1, sorted=False)
+                                kl_logits = logits.gather(-1, indices)
+                        with layer_recorder.section("layer.grad_hessian.fisher_collect.loss_build") if layer_recorder else nullcontext():
+                            fisher_kl_loss = F.kl_div(
+                                F.log_softmax(kl_logits, dim=-1),
+                                F.softmax(kl_logits_fp, dim=-1),
+                                reduction="none",
+                            )
+                            fisher_kl_loss = fisher_kl_loss.sum(dim=-1).mean()
+                        with layer_recorder.section("layer.grad_hessian.fisher_collect.hook_register") if layer_recorder else nullcontext():
                             out_hidden.retain_grad()
 
                             def layer_output_grad_hook(grad):
@@ -2215,21 +2238,49 @@ def collect_layer_grad_hessian_stats(
                                 layer_output_fisher_cache.append(grad_squared.mean(dim=-1).detach())
 
                             out_hidden.register_hook(layer_output_grad_hook)
+                        with layer_recorder.section("layer.grad_hessian.fisher_collect.backward") if layer_recorder else nullcontext():
+                            model.zero_grad()
+                            fisher_kl_loss.backward(retain_graph=True)
+                        batch_layer_output_fisher = layer_output_fisher_cache[-1]
+
+                with layer_recorder.section("layer.grad_hessian.gradient_loss_build") if layer_recorder else nullcontext():
+                    if layer_refresh_loss_type == "kl":
+                        kl_logits = grad_hessian_logits if grad_hessian_topk > 0 else logits
+                        kl_logits_fp = grad_hessian_logits_fp if grad_hessian_topk > 0 else logits_fp
+                        if grad_hessian_topk <= 0 and kl_topk > 0:
+                            with layer_recorder.section("layer.grad_hessian.gradient_loss_build.topk") if layer_recorder else nullcontext():
+                                kl_logits_fp, indices = logits_fp.topk(kl_topk, dim=-1, sorted=False)
+                                kl_logits = logits.gather(-1, indices)
+                        gradient_loss = F.kl_div(
+                            F.log_softmax(kl_logits, dim=-1),
+                            F.softmax(kl_logits_fp, dim=-1),
+                            reduction="none",
+                        )
+                        gradient_loss = gradient_loss.sum(dim=-1).mean()
+                    else:
+                        gradient_loss = compute_refresh_loss(
+                            layer_refresh_loss_type,
+                            out_hidden,
+                            fp_hidden,
+                            analyzer,
+                            kl_topk,
+                            layer_output_fisher=batch_layer_output_fisher,
+                        )
 
                 with layer_recorder.section("layer.grad_hessian.gradient_backward.total") if layer_recorder else nullcontext():
                     gradients_cache.enable_hooks()
                     with layer_recorder.section("layer.grad_hessian.gradient_backward.zero_grad") if layer_recorder else nullcontext():
                         model.zero_grad()
                     with layer_recorder.section("layer.grad_hessian.gradient_backward.backward") if layer_recorder else nullcontext():
-                        kl_loss.backward()
+                        gradient_loss.backward()
                     gradients_cache.disable_hooks()
 
                 with layer_recorder.section("layer.grad_hessian.metrics_record") if layer_recorder else nullcontext():
-                    kl_losses.append(kl_loss.item())
+                    refresh_losses.append(gradient_loss.item())
                 with layer_recorder.section("layer.grad_hessian.cleanup") if layer_recorder else nullcontext():
                     memory_utils.cleanup_memory()
 
-        mean_kl_loss = sum(kl_losses) / len(kl_losses)
+        mean_refresh_loss = sum(refresh_losses) / len(refresh_losses)
 
     if saliency_cache is not None:
         saliency_cache.clear_hook()
@@ -2247,7 +2298,7 @@ def collect_layer_grad_hessian_stats(
         saliency_dict = precomputed_saliency_dict if precomputed_saliency_dict is not None else saliency_cache.saliency_cache
         gradients_dict = gradients_cache.gradients_cache
 
-    return saliency_dict, gradients_dict, mean_kl_loss, layer_output_fisher
+    return saliency_dict, gradients_dict, mean_refresh_loss, layer_output_fisher
 
 
 def run_pre_quant_gd(
@@ -2271,7 +2322,6 @@ def run_pre_quant_gd(
     grad_optimizer,
     grad_clip,
     refresh_loss_type,
-    final_layer_idx,
     layer_output_fisher_by_module,
 ):
     if num_steps <= 0 or not module_names:
@@ -2298,7 +2348,6 @@ def run_pre_quant_gd(
         step_losses = []
         step_update_abs = []
         for module_name, module in modules:
-            module_refresh_loss_type = "kl" if layer_idx == final_layer_idx else refresh_loss_type
             fisher_tensor = layer_output_fisher_by_module.get(module_name)
             grad, mean_loss = collect_true_weight_gradient(
                 layer=layer,
@@ -2315,7 +2364,7 @@ def run_pre_quant_gd(
                 dev=dev,
                 weight_override=module.weight.data.float(),
                 sample_indices=sample_indices,
-                refresh_loss_type=module_refresh_loss_type,
+                refresh_loss_type=refresh_loss_type,
                 layer_output_fisher=fisher_tensor,
             )
             update, next_state = apply_dense_optimizer_step(
@@ -2410,11 +2459,16 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
             "These cached coefficients will be reused for Hessian estimation and fisher_diag_mse throughout quantization."
         )
 
+        per_layer_runtime_modules = list(analyzer.get_pre_block_modules())
+        if args.grad_refresh_loss == "kl":
+            per_layer_runtime_modules.extend(
+                [
+                    analyzer.get_layernorm_before_head(),
+                    analyzer.get_lm_head(),
+                ]
+            )
         with pipeline_recorder.section("pipeline.move_to_device") if pipeline_recorder else nullcontext():
-            for module in analyzer.get_pre_block_modules() + [
-                analyzer.get_layernorm_before_head(),
-                analyzer.get_lm_head(),
-            ]:
+            for module in per_layer_runtime_modules:
                 module.to(dev)
             layers[0] = layers[0].to(dev)
 
@@ -2480,12 +2534,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
             layer = layers[i].to(dev)
             full = analyzer.get_quantizable_modules(layer)
             layer_recorder = QuantProfileRecorder(dev, prefix=f"layers.{i}") if quant_profile_enabled else None
-            layer_refresh_loss_type = "kl" if i == final_layer_idx else args.grad_refresh_loss
-            if i == final_layer_idx and args.grad_refresh_loss != "kl":
-                logging.info(
-                    "Overriding final transformer layer refresh loss from %s to kl.",
-                    args.grad_refresh_loss,
-                )
+            layer_refresh_loss_type = args.grad_refresh_loss
 
             with layer_recorder.section("layer.fp_reference_forward") if layer_recorder else nullcontext():
                 bits_config = quant_utils.disable_act_quant(layer)
@@ -2520,7 +2569,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
             layer_output_fisher = None
             subset = {n: full.get(n, full.get(n + ".module", None)) for n in names}
             layer_output_fisher_by_module = {}
-            pre_gd_refresh_loss_type = "kl" if i == final_layer_idx else args.grad_refresh_loss
+            pre_gd_refresh_loss_type = args.grad_refresh_loss
             if effective_pre_gd_steps > 0 and pre_gd_refresh_loss_type == "fisher_diag_mse":
                 layer_output_fisher = static_fisher_by_layer[i]
                 if layer_output_fisher is None:
@@ -2565,7 +2614,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             effective_pre_gd_steps,
                             format_log_value(pre_grad_lr, digits=6),
                             pre_grad_optimizer,
-                            "kl" if i == final_layer_idx else layer_refresh_loss_type,
+                            layer_refresh_loss_type,
                         )
                         run_pre_quant_gd(
                             layer_idx=i,
@@ -2587,11 +2636,10 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             grad_optimizer=pre_grad_optimizer,
                             grad_clip=args.grad_clip,
                             refresh_loss_type=layer_refresh_loss_type,
-                            final_layer_idx=final_layer_idx,
                             layer_output_fisher_by_module=layer_output_fisher_by_module,
                         )
 
-            saliency_dict, gradients_dict, mean_kl_loss, layer_output_fisher = collect_layer_grad_hessian_stats(
+            saliency_dict, gradients_dict, mean_refresh_loss, layer_output_fisher = collect_layer_grad_hessian_stats(
                 model=model,
                 layer=layer,
                 analyzer=analyzer,
@@ -2639,7 +2687,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         gradient=gradients_dict[name],
                         num_groups=args.num_groups,
                         alpha=args.alpha,
-                        kl_loss=mean_kl_loss,
+                        reference_loss=mean_refresh_loss,
                     )
                     gptq[name].quantizer = quant_utils.WeightQuantizer()
                     gptq[name].quantizer.configure(
@@ -2681,7 +2729,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         sample_indices = full_refresh_sample_indices
                     else:
                         sample_indices = gradient_refresh_scheduler.next_indices()
-                    grad, mean_kl_loss = collect_true_weight_gradient(
+                    grad, mean_refresh_loss = collect_true_weight_gradient(
                         layer=layer,
                         analyzer=analyzer,
                         module_name=module_name,
@@ -2699,14 +2747,14 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         refresh_loss_type=layer_refresh_loss_type,
                         layer_output_fisher=layer_output_fisher,
                     )
-                    return grad, {"mean_kl_loss": mean_kl_loss, "sample_indices": sample_indices}
+                    return grad, {"mean_refresh_loss": mean_refresh_loss, "sample_indices": sample_indices}
 
                 return refresh_fn
 
             def make_block_observer(module_name, effective_grad_optimizer):
                 def observer(payload):
                     logging.info(
-                        "block-metrics layer=%d module=%s mode=%s grad_opt=%s block=%d cols=[%d,%d) remain=%d grad_abs_mean=%s grad_row_l2=%s kl=%s refresh_kl=%s train_kl=%s val_kl=%s second_abs=%s first_raw_abs=%s first_abs=%s reg_abs=%s sine_abs=%s",
+                        "block-metrics layer=%d module=%s mode=%s grad_opt=%s block=%d cols=[%d,%d) remain=%d grad_abs_mean=%s grad_row_l2=%s loss=%s refresh_loss=%s train_loss=%s val_loss=%s second_abs=%s first_raw_abs=%s first_abs=%s reg_abs=%s sine_abs=%s",
                         i,
                         module_name,
                         args.g_update_mode,
@@ -2717,10 +2765,10 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         payload["remaining_columns"],
                         format_log_value(payload["remaining_grad_abs_mean"], digits=4),
                         format_log_value(payload["remaining_grad_mean_row_l2"], digits=4),
-                        format_log_value(payload["mean_kl_loss"], digits=6),
-                        format_log_value(payload["refresh_subset_mean_kl_loss"], digits=6),
-                        format_log_value(payload["train_mean_kl_loss"], digits=6),
-                        format_log_value(payload["val_mean_kl_loss"], digits=6),
+                        format_log_value(payload["mean_refresh_loss"], digits=6),
+                        format_log_value(payload["refresh_subset_mean_refresh_loss"], digits=6),
+                        format_log_value(payload["train_mean_refresh_loss"], digits=6),
+                        format_log_value(payload["val_mean_refresh_loss"], digits=6),
                         format_log_value(payload["second_order_update_abs_mean"], digits=4),
                         format_log_value(payload["first_order_raw_abs_mean"], digits=4),
                         format_log_value(payload["first_order_update_abs_mean"], digits=4),
@@ -2734,7 +2782,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                 for name in subset:
                     if name not in gptq:
                         continue
-                    pbar.set_postfix(module=f"layers.{i}." + name, kl=f"{mean_kl_loss:.2e}")
+                    pbar.set_postfix(module=f"layers.{i}." + name, loss=f"{mean_refresh_loss:.2e}")
                     layer_w_groupsize = args.w_groupsize
                     effective_grad_optimizer = (
                         args.final_layer_grad_optimizer
@@ -2819,10 +2867,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                 break
 
         with pipeline_recorder.section("pipeline.restore_modules") if pipeline_recorder else nullcontext():
-            for module in analyzer.get_pre_block_modules() + [
-                analyzer.get_layernorm_before_head(),
-                analyzer.get_lm_head(),
-            ]:
+            for module in per_layer_runtime_modules:
                 module.to(orig_device)
             model.config.use_cache = use_cache
         memory_utils.cleanup_memory(verbos=True)
