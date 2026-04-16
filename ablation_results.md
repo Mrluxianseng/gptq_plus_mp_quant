@@ -291,14 +291,173 @@ $$
 | --- | --- | --- | --- | --- | --- |
 | 1.83e-01 | 24.80 | 7.55e-02 | 5.10 | 1.33e-01 | 8.94 |
 
+## quant params计算小优化
+
+提前用fp模型计算完整quant params，而不是量化到当前块用当前块的情况计算quant params。
+
+## loss优化后，数值较稳定，尝试加rotate：
+
+最后一层仍然有爆炸问题，使用sgd，学习率0.01
+
+- baseline:
+
+| KL-wikitext2 | PPL-wikitext2 | KL-ultrachat_2k | PPL-ultrachat_2k | KL-numinamath | PPL-numinamath |
+| --- | --- | --- | --- | --- | --- |
+| 1.48e-01 | 23.53 | 5.98e-02 | 5.04 | 1.11e-01 | 8.69 |
+
+- GRAD_LR=0.00001
+
+| KL-wikitext2 | PPL-wikitext2 | KL-ultrachat_2k | PPL-ultrachat_2k | KL-numinamath | PPL-numinamath |
+| --- | --- | --- | --- | --- | --- |
+| 1.48e-01 | 23.51 | 5.74e-02 | 5.06 | 1.09e-01 | 8.77 |
+
+- GRAD_LR=0.00002
+
+| KL-wikitext2 | PPL-wikitext2 | KL-ultrachat_2k | PPL-ultrachat_2k | KL-numinamath | PPL-numinamath |
+| --- | --- | --- | --- | --- | --- |
+| 1.47e-01 | 23.56 | 5.65e-02 | 5.01 | 1.10e-01 | 8.75 |
+
+- GRAD_LR=0.00003
+
+| KL-wikitext2 | PPL-wikitext2 | KL-ultrachat_2k | PPL-ultrachat_2k | KL-numinamath | PPL-numinamath |
+| --- | --- | --- | --- | --- | --- |
+| 1.46e-01 | 23.87 | 5.54e-02 | 5.05 | 1.09e-01 | 8.71 |
+
+- GRAD_LR=0.00005
+
+| KL-wikitext2 | PPL-wikitext2 | KL-ultrachat_2k | PPL-ultrachat_2k | KL-numinamath | PPL-numinamath |
+| --- | --- | --- | --- | --- | --- |
+| 1.43e-01 | 23.25 | 5.55e-02 | 5.03 | 1.07e-01 | 8.64 |
+
+- GRAD_LR=0.00007
+
+| KL-wikitext2 | PPL-wikitext2 | KL-ultrachat_2k | PPL-ultrachat_2k | KL-numinamath | PPL-numinamath |
+| --- | --- | --- | --- | --- | --- |
+| 1.44e-01 | 23.50 | 5.66e-02 | 5.11 | 1.07e-01 | 8.81 |
+
+- GRAD_LR=0.0001
+
+| KL-wikitext2 | PPL-wikitext2 | KL-ultrachat_2k | PPL-ultrachat_2k | KL-numinamath | PPL-numinamath |
+| --- | --- | --- | --- | --- | --- |
+| 1.42e-01 | 23.23 | 5.49e-02 | 5.02 | 1.06e-01 | 8.73 |
+
+- GRAD_LR=0.0002
+
+| KL-wikitext2 | PPL-wikitext2 | KL-ultrachat_2k | PPL-ultrachat_2k | KL-numinamath | PPL-numinamath |
+| --- | --- | --- | --- | --- | --- |
+| 1.42e-01 | 23.77 | 5.65e-02 | 5.01 | 1.06e-01 | 8.72 |
+
+- GRAD_LR=0.0003
+
+| KL-wikitext2 | PPL-wikitext2 | KL-ultrachat_2k | PPL-ultrachat_2k | KL-numinamath | PPL-numinamath |
+| --- | --- | --- | --- | --- | --- |
+| 1.43e-01 | 23.77 | 5.60e-02 | 5.03 | 1.06e-01 | 8.74 |
+
+- GRAD_LR=0.0004
+
+| KL-wikitext2 | PPL-wikitext2 | KL-ultrachat_2k | PPL-ultrachat_2k | KL-numinamath | PPL-numinamath |
+| --- | --- | --- | --- | --- | --- |
+| 1.48e-01 | 24.01 | 5.75e-02 | 5.04 | 1.08e-01 | 8.81 |
+
+- GRAD_LR=0.0005
+
+| KL-wikitext2 | PPL-wikitext2 | KL-ultrachat_2k | PPL-ultrachat_2k | KL-numinamath | PPL-numinamath |
+| --- | --- | --- | --- | --- | --- |
+| 1.50e-01 | 24.09 | 5.88e-02 | 5.08 | 1.07e-01 | 8.80 |
+
+- GRAD_LR=0.0007
+
+| KL-wikitext2 | PPL-wikitext2 | KL-ultrachat_2k | PPL-ultrachat_2k | KL-numinamath | PPL-numinamath |
+| --- | --- | --- | --- | --- | --- |
+| 1.54e-01 | 24.09 | 6.70e-02 | 5.12 | 1.12e-01 | 8.84 |
+
+- GRAD_LR=0.001
+
+| KL-wikitext2 | PPL-wikitext2 | KL-ultrachat_2k | PPL-ultrachat_2k | KL-numinamath | PPL-numinamath |
+| --- | --- | --- | --- | --- | --- |
+| 1.64e-01 | 24.10 | 7.59e-02 | 5.13 | 1.21e-01 | 8.81 |
+
+
 ## quant边界优化：
 
 （暂时没动groupsize！=-1的情况）
 
 在quant边界确定后先裁剪再算sg H g等，blockwise更新时顺序：先更新block外的gptq+二阶项，再裁剪，再反传梯度下降
 
-- GRAD_LR=0.0003 adam
+负提升，因为被裁剪的没法补偿
 
+## 增加一下fisher diag mse loss的fisher diag num group
 
+- GRAD_LR=0.0001 NUM_GROUP=512
+
+| KL-wikitext2 | PPL-wikitext2 | KL-ultrachat_2k | PPL-ultrachat_2k | KL-numinamath | PPL-numinamath |
+| --- | --- | --- | --- | --- | --- |
+| 1.43e-01 | 23.75 | 5.21e-02 | 5.00 | 1.05e-01 | 8.70 |
+
+## 全局loss
+
+将原本的layerwise kl loss换成了fisher diag mse loss。参数beta也是跟着同步变。并且fisher diag mse loss的加权系数（fisher diag）改成量化前端到端反传确定，并且缓存下来，后续不再更新。
+
+- GRAD_LR=0.0
+
+| KL-wikitext2 | PPL-wikitext2 | KL-ultrachat_2k | PPL-ultrachat_2k | KL-numinamath | PPL-numinamath |
+| --- | --- | --- | --- | --- | --- |
+| 1.57e-01 | 23.89 | 6.66e-02 | 5.08 | 1.13e-01 | 8.77 |
+
+- GRAD_LR=0.00001
+
+| KL-wikitext2 | PPL-wikitext2 | KL-ultrachat_2k | PPL-ultrachat_2k | KL-numinamath | PPL-numinamath |
+| --- | --- | --- | --- | --- | --- |
+| 1.57e-01 | 23.90 | 6.59e-02 | 5.13 | 1.11e-01 | 8.77 |
+
+- GRAD_LR=0.00002
+
+| KL-wikitext2 | PPL-wikitext2 | KL-ultrachat_2k | PPL-ultrachat_2k | KL-numinamath | PPL-numinamath |
+| --- | --- | --- | --- | --- | --- |
+| 1.54e-01 | 23.81 | 6.39e-02 | 5.10 | 1.10e-01 | 8.66 |
+
+- GRAD_LR=0.00003
+
+| KL-wikitext2 | PPL-wikitext2 | KL-ultrachat_2k | PPL-ultrachat_2k | KL-numinamath | PPL-numinamath |
+| --- | --- | --- | --- | --- | --- |
+| 1.53e-01 | 23.93 | 6.22e-02 | 5.10 | 1.08e-01 | 8.77 |
+
+- GRAD_LR=0.00004
+
+| KL-wikitext2 | PPL-wikitext2 | KL-ultrachat_2k | PPL-ultrachat_2k | KL-numinamath | PPL-numinamath |
+| --- | --- | --- | --- | --- | --- |
+| 1.50e-01 | 23.53 | 5.94e-02 | 5.09 | 1.05e-01 | 8.77 |
+
+- GRAD_LR=0.00005
+
+| KL-wikitext2 | PPL-wikitext2 | KL-ultrachat_2k | PPL-ultrachat_2k | KL-numinamath | PPL-numinamath |
+| --- | --- | --- | --- | --- | --- |
+| 1.46e-01 | 23.53 | 5.87e-02 | 5.11 | 1.03e-01 | 8.79 |
+
+- GRAD_LR=0.00007
+
+| KL-wikitext2 | PPL-wikitext2 | KL-ultrachat_2k | PPL-ultrachat_2k | KL-numinamath | PPL-numinamath |
+| --- | --- | --- | --- | --- | --- |
+| 1.41e-01 | 23.55 | 5.53e-02 | 5.09 | 9.85e-02 | 8.71 |
+
+- GRAD_LR=0.0001
+
+| KL-wikitext2 | PPL-wikitext2 | KL-ultrachat_2k | PPL-ultrachat_2k | KL-numinamath | PPL-numinamath |
+| --- | --- | --- | --- | --- | --- |
+| 1.39e-01 | 23.70 | 5.44e-02 | 5.08 | 9.76e-02 | 8.73 |
+
+- GRAD_LR=0.00015
+
+| KL-wikitext2 | PPL-wikitext2 | KL-ultrachat_2k | PPL-ultrachat_2k | KL-numinamath | PPL-numinamath |
+| --- | --- | --- | --- | --- | --- |
+| 1.37e-01 | 23.54 | 5.44e-02 | 5.07 | 9.72e-02 | 8.67 |
+
+- GRAD_LR=0.0002
+
+| KL-wikitext2 | PPL-wikitext2 | KL-ultrachat_2k | PPL-ultrachat_2k | KL-numinamath | PPL-numinamath |
+| --- | --- | --- | --- | --- | --- |
+| 1.43e-01 | 23.64 | 6.05e-02 | 5.06 | 1.02e-01 | 8.61 |
 
 ## 正弦周期正则化
+
+试了负提升，因为量化误差主要来源于截断
