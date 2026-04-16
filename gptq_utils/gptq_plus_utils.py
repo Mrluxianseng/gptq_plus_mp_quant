@@ -25,6 +25,10 @@ def format_log_value(value, digits=6):
     return f"{float(value):.{digits}g}"
 
 
+def normalize_quant_module_name(name: str) -> str:
+    return name[:-7] if name.endswith(".module") else name
+
+
 def compute_quant_clip_bounds(scale, zero, maxq, sym):
     scale = scale.clamp(min=1e-8)
     maxq_value = int(maxq.item()) if isinstance(maxq, torch.Tensor) else int(maxq)
@@ -1695,7 +1699,18 @@ def collect_static_end_to_end_saliency_and_fisher(
         "Using sampled end-to-end NLL / empirical Fisher because literal KL-to-self before quantization would be zero."
     )
     layers = analyzer.get_layers()
-    module_dicts = [analyzer.get_quantizable_modules(layer) for layer in layers]
+    module_dicts = []
+    for layer in layers:
+        raw_module_dict = analyzer.get_quantizable_modules(layer)
+        normalized_module_dict = {}
+        for module_name, module in raw_module_dict.items():
+            canonical_name = normalize_quant_module_name(module_name)
+            if canonical_name in normalized_module_dict and normalized_module_dict[canonical_name] is not module:
+                raise ValueError(
+                    f"Duplicate canonical quant module name `{canonical_name}` detected while collecting static saliency/Fisher."
+                )
+            normalized_module_dict[canonical_name] = module
+        module_dicts.append(normalized_module_dict)
     saliency_data = [
         {module_name: [] for module_name in module_dict.keys()}
         for module_dict in module_dicts
@@ -2611,10 +2626,16 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     layer_weight_sym = not args.w_asym
                     if "lm_head" in name:
                         continue
+                    saliency = saliency_dict.get(name, saliency_dict.get(name + ".module", None))
+                    if saliency is None:
+                        raise KeyError(
+                            f"Missing saliency cache for layer={i} module={name}. "
+                            f"Available keys: {sorted(saliency_dict.keys())}"
+                        )
 
                     gptq[name] = GPTQPlus(
                         subset[name],
-                        saliency=saliency_dict[name],
+                        saliency=saliency,
                         gradient=gradients_dict[name],
                         num_groups=args.num_groups,
                         alpha=args.alpha,
