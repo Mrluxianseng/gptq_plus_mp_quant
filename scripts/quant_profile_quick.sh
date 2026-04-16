@@ -50,6 +50,7 @@ GRAD_GATE_SINE_AMP=${GRAD_GATE_SINE_AMP:-0.0005}
 GRAD_HESSIAN_TOPK=${GRAD_HESSIAN_TOPK:-20}
 PROJ_LR_SCALE=${PROJ_LR_SCALE:-1.0}
 DOWN_PROJ_LR_SCALE=${DOWN_PROJ_LR_SCALE:-1.0}
+GLOBAL_LOSS=${GLOBAL_LOSS:-0}
 
 export HF_DATASETS_CACHE=${HF_DATASETS_CACHE:-/tmp/hf_datasets}
 export HUGGINGFACE_HUB_CACHE=${HUGGINGFACE_HUB_CACHE:-/tmp/hf_hub}
@@ -86,6 +87,10 @@ python analyze_quant_profile.py \
     --act_order \
     --w_clip \
 )
+
+if [[ "${GLOBAL_LOSS}" == "1" ]]; then
+    CMD+=(--global_loss)
+fi
 
 if [[ "${BLOCK_ATOMIC_QUANT}" == "1" ]]; then
     CMD+=(--block_atomic_quant)

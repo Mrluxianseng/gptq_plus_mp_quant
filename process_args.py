@@ -120,6 +120,25 @@ def parse_gen():
         help="Loss used to compute the true refresh gradient in block_backward/block_gd.",
     )
     parser.add_argument(
+        "--global_loss",
+        dest="global_loss",
+        action="store_true",
+        help=(
+            "Enable the frozen global-loss mode: run one end-to-end pre-quantization backward pass to cache "
+            "saliency/Fisher coefficients and align GPTQ+ second-order terms with the configured refresh loss."
+        ),
+    )
+    parser.add_argument(
+        "--no_global_loss",
+        dest="global_loss",
+        action="store_false",
+        help=(
+            "Disable frozen global-loss caches and fall back to layerwise output-head saliency/Fisher collection, "
+            "with GPTQ+ second-order terms using layerwise KL."
+        ),
+    )
+    parser.set_defaults(global_loss=False)
+    parser.add_argument(
         "--pre_gd_steps",
         type=int,
         default=0,

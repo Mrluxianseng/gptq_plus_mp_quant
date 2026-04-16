@@ -14,28 +14,28 @@ DEVICE=${3}
 shift 3
 
 # Sweep configuration. Override from the shell when needed.
-GRAD_LRS_STR=${GRAD_LRS:-"0.0003"}
+GRAD_LRS_STR=${GRAD_LRS:-"0.0001"}
 N_SAMPLES=${N_SAMPLES:-512}
 SEQ_LEN=${SEQ_LEN:-1024}
-BSZ=${BSZ:-4}
+BSZ=${BSZ:-16}
 BACKWARD_SAMPLES=${BACKWARD_SAMPLES:-32}
-BACKWARD_BSZ=${BACKWARD_BSZ:-4}
+BACKWARD_BSZ=${BACKWARD_BSZ:-16}
 FINAL_LAYER_FULL_BACKWARD=${FINAL_LAYER_FULL_BACKWARD:-0}
 BLOCKSIZE=${BLOCKSIZE:-256}
-BLOCK_ATOMIC_QUANT=${BLOCK_ATOMIC_QUANT:-1}
+BLOCK_ATOMIC_QUANT=${BLOCK_ATOMIC_QUANT:-0}
 GRAD_OPTIMIZER=${GRAD_OPTIMIZER:-adam}
 FINAL_LAYER_GRAD_OPTIMIZER=${FINAL_LAYER_GRAD_OPTIMIZER:-sgd}
 GRAD_CLIP=${GRAD_CLIP:-1.0}
 # --grad_refresh_loss {kl,hidden_mse,fisher_diag_mse}
 GRAD_REFRESH_LOSS=${GRAD_REFRESH_LOSS:-fisher_diag_mse}
-FINAL_LAYER_GRAD_LR=${FINAL_LAYER_GRAD_LR:-0.3}
+FINAL_LAYER_GRAD_LR=${FINAL_LAYER_GRAD_LR:-0.01}
 PRE_GD_STEPS=${PRE_GD_STEPS:-10}
 PRE_GRAD_LR=${PRE_GRAD_LR:-0.00003}
 PRE_FINAL_LAYER_GRAD_LR=${PRE_FINAL_LAYER_GRAD_LR:-0.3}
 PRE_GRAD_OPTIMIZER=${PRE_GRAD_OPTIMIZER:-adam}
 PRE_FINAL_LAYER_GRAD_OPTIMIZER=${PRE_FINAL_LAYER_GRAD_OPTIMIZER:-sgd}
 #--grad_reg_strategy {none,l2,hessian,quant_error_gate,quant_error_gate_optimized}
-GRAD_REG_STRATEGY=${GRAD_REG_STRATEGY:-quant_error_gate_optimized}
+GRAD_REG_STRATEGY=${GRAD_REG_STRATEGY:-none}
 GRAD_REG_LAMBDA=${GRAD_REG_LAMBDA:-0.01}
 GRAD_GATE_FLOOR=${GRAD_GATE_FLOOR:-0.01}
 GRAD_GATE_SHARPNESS=${GRAD_GATE_SHARPNESS:-5.0}
@@ -44,9 +44,10 @@ GRAD_HESSIAN_TOPK=${GRAD_HESSIAN_TOPK:-20}
 PROJ_LR_SCALE=${PROJ_LR_SCALE:-1.0}
 DOWN_PROJ_LR_SCALE=${DOWN_PROJ_LR_SCALE:-1.0}
 SECOND_ORDER_SCALE=${SECOND_ORDER_SCALE:-1.0}
-FISHER_NUM_GROUPS=${FISHER_NUM_GROUPS:-${NUM_GROUPS}}
-PRE_CLIP=${PRE_CLIP:-1}
-ALPHA=${ALPHA:-0.2}
+FISHER_NUM_GROUPS=${FISHER_NUM_GROUPS:-512}
+PRE_CLIP=${PRE_CLIP:-0}
+GLOBAL_LOSS=${GLOBAL_LOSS:-0}
+ALPHA=${ALPHA:-0.05}
 KL_TOPK=${KL_TOPK:-20}
 LM_EVAL_BATCH_SIZE=${LM_EVAL_BATCH_SIZE:-32}
 ENABLE_QA_EVAL=${ENABLE_QA_EVAL:-0}
@@ -103,6 +104,13 @@ if [[ -n "${PRE_FINAL_LAYER_GRAD_OPTIMIZER}" && "${PRE_FINAL_LAYER_GRAD_OPTIMIZE
     PRE_FINAL_LAYER_GRAD_OPTIMIZER_ARGS=(--pre_final_layer_grad_optimizer "${PRE_FINAL_LAYER_GRAD_OPTIMIZER}")
 fi
 
+GLOBAL_LOSS_ARGS=()
+GLOBAL_LOSS_TAG=""
+if [[ "${GLOBAL_LOSS}" == "1" ]]; then
+    GLOBAL_LOSS_ARGS=(--global_loss)
+    GLOBAL_LOSS_TAG="_globalloss"
+fi
+
 for grad_lr in "${GRAD_LRS[@]}"; do
     grad_lr_tag=$(sanitize_float "${grad_lr}")
     final_layer_grad_lr_tag=$(sanitize_float "${FINAL_LAYER_GRAD_LR}")
@@ -138,7 +146,7 @@ for grad_lr in "${GRAD_LRS[@]}"; do
             pre_gd_suffix="${pre_gd_suffix}_flopt${PRE_FINAL_LAYER_GRAD_OPTIMIZER}"
         fi
     fi
-    exp_name="${BASE_EXP}_block_gd_${GRAD_OPTIMIZER}${refresh_suffix}${reg_suffix}${grad_hessian_suffix}${fisher_groups_suffix}_lr${grad_lr_tag}_fllr${final_layer_grad_lr_tag}_s${second_order_tag}${pre_gd_suffix}${PRE_CLIP_TAG}${BLOCK_ATOMIC_TAG}${FINAL_LAYER_FULL_BACKWARD_TAG}"
+    exp_name="${BASE_EXP}_block_gd_${GRAD_OPTIMIZER}${refresh_suffix}${reg_suffix}${grad_hessian_suffix}${fisher_groups_suffix}_lr${grad_lr_tag}_fllr${final_layer_grad_lr_tag}_s${second_order_tag}${pre_gd_suffix}${PRE_CLIP_TAG}${BLOCK_ATOMIC_TAG}${FINAL_LAYER_FULL_BACKWARD_TAG}${GLOBAL_LOSS_TAG}"
 
     echo "============================================================"
     echo "Running GPTQ+ LR sweep"
@@ -161,6 +169,7 @@ for grad_lr in "${GRAD_LRS[@]}"; do
     echo "  proj_s : ${PROJ_LR_SCALE}"
     echo "  down_s : ${DOWN_PROJ_LR_SCALE}"
     echo "  preclip: ${PRE_CLIP}"
+    echo "  global : ${GLOBAL_LOSS}"
     echo "  pregd  : ${PRE_GD_STEPS}"
     echo "  prelr  : ${PRE_GRAD_LR}"
     echo "  preopt : ${PRE_GRAD_OPTIMIZER}"
@@ -189,6 +198,7 @@ for grad_lr in "${GRAD_LRS[@]}"; do
         --kl_topk "${KL_TOPK}" --bsz "${BSZ}" --alpha "${ALPHA}" --blocksize "${BLOCKSIZE}" \
         --backward_samples "${BACKWARD_SAMPLES}" --backward_bsz "${BACKWARD_BSZ}" \
         --g_update_mode block_gd --grad_lr "${grad_lr}" --grad_optimizer "${GRAD_OPTIMIZER}" --grad_refresh_loss "${GRAD_REFRESH_LOSS}" \
+        "${GLOBAL_LOSS_ARGS[@]}" \
         --final_layer_grad_optimizer "${FINAL_LAYER_GRAD_OPTIMIZER}" \
         --grad_clip "${GRAD_CLIP}" \
         --final_layer_grad_lr "${FINAL_LAYER_GRAD_LR}" \

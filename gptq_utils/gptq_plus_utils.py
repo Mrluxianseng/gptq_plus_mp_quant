@@ -35,6 +35,10 @@ def get_effective_refresh_loss_type(layer_idx: int, final_layer_idx: int, defaul
     return default_refresh_loss_type
 
 
+def get_effective_gptq_reference_loss_type(global_loss_enabled: bool, layer_refresh_loss_type: str) -> str:
+    return layer_refresh_loss_type if global_loss_enabled else "kl"
+
+
 def compute_safe_beta_from_reference_loss(
     gradients_sub: torch.Tensor,
     hinv_init: torch.Tensor,
@@ -2152,6 +2156,7 @@ def collect_layer_grad_hessian_stats(
     dev,
     layer_idx,
     layer_refresh_loss_type,
+    gptq_reference_loss_type,
     precomputed_saliency_dict=None,
     precomputed_layer_output_fisher=None,
     layer_recorder=None,
@@ -2163,6 +2168,7 @@ def collect_layer_grad_hessian_stats(
     need_output_head = (
         need_saliency_collection
         or layer_refresh_loss_type == "kl"
+        or gptq_reference_loss_type == "kl"
         or need_layer_output_fisher_collection
     )
     with torch.enable_grad():
@@ -2173,7 +2179,7 @@ def collect_layer_grad_hessian_stats(
         gradients_cache = GradientCache(names, num_groups)
         gradients_cache.add_hook(full, enable=False)
         layer_output_fisher_cache = []
-        refresh_losses = []
+        reference_losses = []
 
         for j in tqdm(
             range(0, inps.shape[0], bsz),
@@ -2276,7 +2282,7 @@ def collect_layer_grad_hessian_stats(
                         batch_layer_output_fisher = layer_output_fisher_cache[-1]
 
                 with layer_recorder.section("layer.grad_hessian.gradient_loss_build") if layer_recorder else nullcontext():
-                    if layer_refresh_loss_type == "kl":
+                    if gptq_reference_loss_type == "kl":
                         kl_logits = grad_hessian_logits if grad_hessian_topk > 0 else logits
                         kl_logits_fp = grad_hessian_logits_fp if grad_hessian_topk > 0 else logits_fp
                         if grad_hessian_topk <= 0 and kl_topk > 0:
@@ -2291,7 +2297,7 @@ def collect_layer_grad_hessian_stats(
                         gradient_loss = gradient_loss.sum(dim=-1).mean()
                     else:
                         gradient_loss = compute_refresh_loss(
-                            layer_refresh_loss_type,
+                            gptq_reference_loss_type,
                             out_hidden,
                             fp_hidden,
                             analyzer,
@@ -2308,11 +2314,11 @@ def collect_layer_grad_hessian_stats(
                     gradients_cache.disable_hooks()
 
                 with layer_recorder.section("layer.grad_hessian.metrics_record") if layer_recorder else nullcontext():
-                    refresh_losses.append(gradient_loss.item())
+                    reference_losses.append(gradient_loss.item())
                 with layer_recorder.section("layer.grad_hessian.cleanup") if layer_recorder else nullcontext():
                     memory_utils.cleanup_memory()
 
-        mean_refresh_loss = sum(refresh_losses) / len(refresh_losses)
+        mean_reference_loss = sum(reference_losses) / len(reference_losses)
 
     if saliency_cache is not None:
         saliency_cache.clear_hook()
@@ -2330,7 +2336,7 @@ def collect_layer_grad_hessian_stats(
         saliency_dict = precomputed_saliency_dict if precomputed_saliency_dict is not None else saliency_cache.saliency_cache
         gradients_dict = gradients_cache.gradients_cache
 
-    return saliency_dict, gradients_dict, mean_refresh_loss, layer_output_fisher
+    return saliency_dict, gradients_dict, mean_reference_loss, layer_output_fisher
 
 
 def run_pre_quant_gd(
@@ -2460,6 +2466,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
         logging.info("Quantization will stop after transformer layer %d.", quant_stop_layer)
     preclip_enabled = bool(args.w_clip and getattr(args, "pre_clip", True))
     effective_pre_gd_steps = args.pre_gd_steps if preclip_enabled else 0
+    global_loss_enabled = bool(getattr(args, "global_loss", False))
     if args.pre_gd_steps > 0 and not preclip_enabled:
         logging.info(
             "Pre-quantization GD is disabled because preclip is off (w_clip=%s, pre_clip=%s).",
@@ -2475,21 +2482,29 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
         return not target_modules or module_name in target_modules
 
     with run_recorder.section("run.total") if run_recorder else nullcontext():
-        with pipeline_recorder.section("pipeline.static_end_to_end_saliency_fisher") if pipeline_recorder else nullcontext():
-            static_saliency_by_layer, static_fisher_by_layer = collect_static_end_to_end_saliency_and_fisher(
-                model=model,
-                analyzer=analyzer,
-                dataloader=dataloader,
-                dev=dev,
-                saliency_num_groups=args.num_groups,
-                fisher_num_groups=args.fisher_num_groups,
-                grad_hessian_topk=args.grad_hessian_topk,
-                batch_size=args.bsz,
+        if global_loss_enabled:
+            with pipeline_recorder.section("pipeline.static_end_to_end_saliency_fisher") if pipeline_recorder else nullcontext():
+                static_saliency_by_layer, static_fisher_by_layer = collect_static_end_to_end_saliency_and_fisher(
+                    model=model,
+                    analyzer=analyzer,
+                    dataloader=dataloader,
+                    dev=dev,
+                    saliency_num_groups=args.num_groups,
+                    fisher_num_groups=args.fisher_num_groups,
+                    grad_hessian_topk=args.grad_hessian_topk,
+                    batch_size=args.bsz,
+                )
+            logging.info(
+                "Collected frozen end-to-end saliency/Fisher caches before quantization. "
+                "These cached coefficients will be reused for Hessian estimation and fisher_diag_mse throughout quantization."
             )
-        logging.info(
-            "Collected frozen end-to-end saliency/Fisher caches before quantization. "
-            "These cached coefficients will be reused for Hessian estimation and fisher_diag_mse throughout quantization."
-        )
+        else:
+            static_saliency_by_layer = [None] * len(layers)
+            static_fisher_by_layer = [None] * len(layers)
+            logging.info(
+                "Global loss mode is disabled. Saliency/Fisher caches will be collected layerwise with the output head, "
+                "and GPTQ+ second-order terms will use layerwise KL."
+            )
 
         per_layer_runtime_modules = list(analyzer.get_pre_block_modules())
         per_layer_runtime_modules.extend(
@@ -2569,6 +2584,10 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                 i,
                 final_layer_idx,
                 args.grad_refresh_loss,
+            )
+            gptq_reference_loss_type = get_effective_gptq_reference_loss_type(
+                global_loss_enabled,
+                layer_refresh_loss_type,
             )
             if i == final_layer_idx and layer_refresh_loss_type != args.grad_refresh_loss:
                 logging.info(
@@ -2681,7 +2700,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             layer_output_fisher_by_module=layer_output_fisher_by_module,
                         )
 
-            saliency_dict, gradients_dict, mean_refresh_loss, layer_output_fisher = collect_layer_grad_hessian_stats(
+            saliency_dict, gradients_dict, mean_reference_loss, layer_output_fisher = collect_layer_grad_hessian_stats(
                 model=model,
                 layer=layer,
                 analyzer=analyzer,
@@ -2700,6 +2719,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                 dev=dev,
                 layer_idx=i,
                 layer_refresh_loss_type=layer_refresh_loss_type,
+                gptq_reference_loss_type=gptq_reference_loss_type,
                 precomputed_saliency_dict=static_saliency_by_layer[i],
                 precomputed_layer_output_fisher=(
                     static_fisher_by_layer[i]
@@ -2729,7 +2749,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         gradient=gradients_dict[name],
                         num_groups=args.num_groups,
                         alpha=args.alpha,
-                        reference_loss=mean_refresh_loss,
+                        reference_loss=mean_reference_loss,
                     )
                     gptq[name].quantizer = quant_utils.WeightQuantizer()
                     gptq[name].quantizer.configure(
@@ -2824,7 +2844,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                 for name in subset:
                     if name not in gptq:
                         continue
-                    pbar.set_postfix(module=f"layers.{i}." + name, loss=f"{mean_refresh_loss:.2e}")
+                    pbar.set_postfix(module=f"layers.{i}." + name, loss=f"{mean_reference_loss:.2e}")
                     layer_w_groupsize = args.w_groupsize
                     effective_grad_optimizer = (
                         args.final_layer_grad_optimizer
