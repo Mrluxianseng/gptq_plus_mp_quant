@@ -1679,6 +1679,143 @@ def hidden2logits(hidden_states, analyzer: model_utils.ModelAnalyzer):
     return logits
 
 
+def collect_static_end_to_end_saliency_and_fisher(
+    *,
+    model,
+    analyzer,
+    dataloader,
+    dev,
+    saliency_num_groups,
+    fisher_num_groups,
+    grad_hessian_topk,
+    batch_size,
+):
+    logging.info(
+        "Collecting static end-to-end saliency/fisher caches from a single pre-quantization full-model backward pass. "
+        "Using sampled end-to-end NLL / empirical Fisher because literal KL-to-self before quantization would be zero."
+    )
+    layers = analyzer.get_layers()
+    module_dicts = [analyzer.get_quantizable_modules(layer) for layer in layers]
+    saliency_data = [
+        {module_name: [] for module_name in module_dict.keys()}
+        for module_dict in module_dicts
+    ]
+    fisher_data = [[] for _ in layers]
+    handles = []
+
+    def make_module_hook(layer_idx, module_name):
+        def forward_hook(module, inp, out):
+            out_tensor = out[0] if isinstance(out, (tuple, list)) else out
+            out_tensor.retain_grad()
+
+            def grad_hook(grad):
+                bsz_local, seq_len_local, hidden_dim = grad.shape
+                if hidden_dim % saliency_num_groups != 0:
+                    raise ValueError(
+                        f"Module output dim ({hidden_dim}) must be divisible by saliency num_groups ({saliency_num_groups})."
+                    )
+                group_size = hidden_dim // saliency_num_groups
+                grad_squared = grad.float().pow(2).view(
+                    bsz_local,
+                    seq_len_local,
+                    saliency_num_groups,
+                    group_size,
+                )
+                saliency_data[layer_idx][module_name].append(
+                    grad_squared.mean(dim=-1).detach().cpu()
+                )
+
+            out_tensor.register_hook(grad_hook)
+
+        return forward_hook
+
+    def make_layer_hook(layer_idx):
+        def forward_hook(module, inp, out):
+            out_tensor = out[0] if isinstance(out, (tuple, list)) else out
+            out_tensor.retain_grad()
+
+            def grad_hook(grad):
+                bsz_local, seq_len_local, hidden_dim = grad.shape
+                if hidden_dim % fisher_num_groups != 0:
+                    raise ValueError(
+                        f"Layer output dim ({hidden_dim}) must be divisible by fisher_num_groups ({fisher_num_groups})."
+                    )
+                group_size = hidden_dim // fisher_num_groups
+                grad_squared = grad.float().pow(2).view(
+                    bsz_local,
+                    seq_len_local,
+                    fisher_num_groups,
+                    group_size,
+                )
+                fisher_data[layer_idx].append(grad_squared.mean(dim=-1).detach().cpu())
+
+            out_tensor.register_hook(grad_hook)
+
+        return forward_hook
+
+    for layer_idx, (layer, module_dict) in enumerate(zip(layers, module_dicts)):
+        handles.append(layer.register_forward_hook(make_layer_hook(layer_idx)))
+        for module_name, module in module_dict.items():
+            handles.append(module.register_forward_hook(make_module_hook(layer_idx, module_name)))
+
+    token_batches = [batch[0] for batch in dataloader]
+    model = model.to(dev)
+    model.eval()
+    try:
+        with torch.enable_grad():
+            for start in tqdm(
+                range(0, len(token_batches), batch_size),
+                ncols=120,
+                desc="Static E2E Saliency/Fisher",
+                position=1,
+                leave=False,
+            ):
+                input_ids = torch.cat(token_batches[start:start + batch_size], dim=0).to(dev)
+                outputs = model(input_ids=input_ids)
+                logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
+                teacher_logits = logits.detach()
+                student_logits = logits
+                if grad_hessian_topk > 0:
+                    teacher_logits, indices = teacher_logits.topk(
+                        grad_hessian_topk,
+                        dim=-1,
+                        sorted=False,
+                    )
+                    student_logits = student_logits.gather(-1, indices)
+                labels = torch.distributions.Categorical(logits=teacher_logits).sample()
+                loss = F.cross_entropy(
+                    student_logits.view(-1, student_logits.size(-1)),
+                    labels.view(-1),
+                    reduction="sum",
+                )
+                model.zero_grad()
+                loss.backward()
+                del outputs, logits, teacher_logits, student_logits, labels, loss, input_ids
+    finally:
+        for handle in handles:
+            handle.remove()
+        model.zero_grad()
+        model.cpu()
+        memory_utils.cleanup_memory()
+
+    static_saliency = []
+    static_fisher = []
+    for layer_idx, module_dict in enumerate(module_dicts):
+        layer_saliency = {}
+        for module_name in module_dict.keys():
+            if not saliency_data[layer_idx][module_name]:
+                raise ValueError(
+                    f"Failed to collect static end-to-end saliency for layer={layer_idx} module={module_name}."
+                )
+            layer_saliency[module_name] = torch.cat(saliency_data[layer_idx][module_name], dim=0)
+        if not fisher_data[layer_idx]:
+            raise ValueError(f"Failed to collect static end-to-end Fisher for layer={layer_idx}.")
+        static_saliency.append(layer_saliency)
+        static_fisher.append(torch.cat(fisher_data[layer_idx], dim=0))
+
+    return static_saliency, static_fisher
+
+
 def compute_refresh_loss(
     refresh_loss_type,
     out_hidden,
@@ -1961,11 +2098,19 @@ def collect_layer_grad_hessian_stats(
     dev,
     layer_idx,
     layer_refresh_loss_type,
+    precomputed_saliency_dict=None,
+    precomputed_layer_output_fisher=None,
     layer_recorder=None,
 ):
+    need_saliency_collection = precomputed_saliency_dict is None
+    need_layer_output_fisher_collection = (
+        layer_refresh_loss_type == "fisher_diag_mse" and precomputed_layer_output_fisher is None
+    )
     with torch.enable_grad():
-        saliency_cache = SaliencyCache(names, num_groups)
-        saliency_cache.add_hook(full, enable=False)
+        saliency_cache = None
+        if need_saliency_collection:
+            saliency_cache = SaliencyCache(names, num_groups)
+            saliency_cache.add_hook(full, enable=False)
         gradients_cache = GradientCache(names, num_groups)
         gradients_cache.add_hook(full, enable=False)
         layer_output_fisher_cache = []
@@ -2003,22 +2148,24 @@ def collect_layer_grad_hessian_stats(
                                 sorted=False,
                             )
                             grad_hessian_logits = logits.gather(-1, grad_hessian_indices)
-                    with layer_recorder.section("layer.grad_hessian.forward.label_sample") if layer_recorder else nullcontext():
-                        labels = torch.distributions.Categorical(logits=grad_hessian_logits_fp).sample()
-                    with layer_recorder.section("layer.grad_hessian.forward.nll_build") if layer_recorder else nullcontext():
-                        nll_loss = F.cross_entropy(
-                            grad_hessian_logits.view(-1, grad_hessian_logits.size(-1)),
-                            labels.view(-1),
-                            reduction="sum",
-                        )
+                    if need_saliency_collection:
+                        with layer_recorder.section("layer.grad_hessian.forward.label_sample") if layer_recorder else nullcontext():
+                            labels = torch.distributions.Categorical(logits=grad_hessian_logits_fp).sample()
+                        with layer_recorder.section("layer.grad_hessian.forward.nll_build") if layer_recorder else nullcontext():
+                            nll_loss = F.cross_entropy(
+                                grad_hessian_logits.view(-1, grad_hessian_logits.size(-1)),
+                                labels.view(-1),
+                                reduction="sum",
+                            )
 
-                with layer_recorder.section("layer.grad_hessian.saliency_backward.total") if layer_recorder else nullcontext():
-                    saliency_cache.enable_hooks()
-                    with layer_recorder.section("layer.grad_hessian.saliency_backward.zero_grad") if layer_recorder else nullcontext():
-                        model.zero_grad()
-                    with layer_recorder.section("layer.grad_hessian.saliency_backward.backward") if layer_recorder else nullcontext():
-                        nll_loss.backward(retain_graph=True)
-                    saliency_cache.disable_hooks()
+                if need_saliency_collection:
+                    with layer_recorder.section("layer.grad_hessian.saliency_backward.total") if layer_recorder else nullcontext():
+                        saliency_cache.enable_hooks()
+                        with layer_recorder.section("layer.grad_hessian.saliency_backward.zero_grad") if layer_recorder else nullcontext():
+                            model.zero_grad()
+                        with layer_recorder.section("layer.grad_hessian.saliency_backward.backward") if layer_recorder else nullcontext():
+                            nll_loss.backward(retain_graph=True)
+                        saliency_cache.disable_hooks()
 
                 with layer_recorder.section("layer.grad_hessian.kl_forward") if layer_recorder else nullcontext():
                     kl_logits = grad_hessian_logits if grad_hessian_topk > 0 else logits
@@ -2034,7 +2181,7 @@ def collect_layer_grad_hessian_stats(
                             reduction="none",
                         )
                         kl_loss = kl_loss.sum(dim=-1).mean()
-                    if layer_refresh_loss_type == "fisher_diag_mse":
+                    if need_layer_output_fisher_collection:
                         with layer_recorder.section("layer.grad_hessian.kl_forward.fisher_hook_register") if layer_recorder else nullcontext():
                             out_hidden.retain_grad()
 
@@ -2069,17 +2216,20 @@ def collect_layer_grad_hessian_stats(
 
         mean_kl_loss = sum(kl_losses) / len(kl_losses)
 
-    saliency_cache.clear_hook()
+    if saliency_cache is not None:
+        saliency_cache.clear_hook()
     gradients_cache.clear_hook()
-    layer_output_fisher = None
-    if layer_refresh_loss_type == "fisher_diag_mse":
+    layer_output_fisher = precomputed_layer_output_fisher
+    if need_layer_output_fisher_collection:
         layer_output_fisher = torch.cat(layer_output_fisher_cache, dim=0)
 
     with layer_recorder.section("layer.cache_finalize") if layer_recorder else nullcontext():
-        for name in saliency_cache.names:
-            saliency_cache.saliency_cache[name] = torch.cat(saliency_cache.saliency_cache[name], dim=0)
+        if saliency_cache is not None:
+            for name in saliency_cache.names:
+                saliency_cache.saliency_cache[name] = torch.cat(saliency_cache.saliency_cache[name], dim=0)
+        for name in gradients_cache.names:
             gradients_cache.gradients_cache[name] = gradients_cache.gradients_cache[name]
-        saliency_dict = saliency_cache.saliency_cache
+        saliency_dict = precomputed_saliency_dict if precomputed_saliency_dict is not None else saliency_cache.saliency_cache
         gradients_dict = gradients_cache.gradients_cache
 
     return saliency_dict, gradients_dict, mean_kl_loss, layer_output_fisher
@@ -2212,6 +2362,14 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
     quant_stop_layer = parse_quant_stop_layer(getattr(args, "quant_stop_layer", None), len(layers))
     if quant_stop_layer is not None:
         logging.info("Quantization will stop after transformer layer %d.", quant_stop_layer)
+    preclip_enabled = bool(args.w_clip and getattr(args, "pre_clip", True))
+    effective_pre_gd_steps = args.pre_gd_steps if preclip_enabled else 0
+    if args.pre_gd_steps > 0 and not preclip_enabled:
+        logging.info(
+            "Pre-quantization GD is disabled because preclip is off (w_clip=%s, pre_clip=%s).",
+            args.w_clip,
+            getattr(args, "pre_clip", True),
+        )
 
     def should_profile_module(layer_idx, module_name):
         if not quant_profile_enabled:
@@ -2221,6 +2379,22 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
         return not target_modules or module_name in target_modules
 
     with run_recorder.section("run.total") if run_recorder else nullcontext():
+        with pipeline_recorder.section("pipeline.static_end_to_end_saliency_fisher") if pipeline_recorder else nullcontext():
+            static_saliency_by_layer, static_fisher_by_layer = collect_static_end_to_end_saliency_and_fisher(
+                model=model,
+                analyzer=analyzer,
+                dataloader=dataloader,
+                dev=dev,
+                saliency_num_groups=args.num_groups,
+                fisher_num_groups=args.fisher_num_groups,
+                grad_hessian_topk=args.grad_hessian_topk,
+                batch_size=args.bsz,
+            )
+        logging.info(
+            "Collected frozen end-to-end saliency/Fisher caches before quantization. "
+            "These cached coefficients will be reused for Hessian estimation and fisher_diag_mse throughout quantization."
+        )
+
         with pipeline_recorder.section("pipeline.move_to_device") if pipeline_recorder else nullcontext():
             for module in analyzer.get_pre_block_modules() + [
                 analyzer.get_layernorm_before_head(),
@@ -2276,14 +2450,6 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                 fp_inps = fp_inps.cpu()
 
         quantizers = {}
-        preclip_enabled = bool(args.w_clip and getattr(args, "pre_clip", True))
-        effective_pre_gd_steps = args.pre_gd_steps if preclip_enabled else 0
-        if args.pre_gd_steps > 0 and not preclip_enabled:
-            logging.info(
-                "Pre-quantization GD is disabled because preclip is off (w_clip=%s, pre_clip=%s).",
-                args.w_clip,
-                getattr(args, "pre_clip", True),
-            )
         gradient_refresh_scheduler = None
         if args.g_update_mode in {"block_backward", "block_gd"} or effective_pre_gd_steps > 0:
             gradient_refresh_scheduler = BackwardSampleScheduler(
@@ -2341,24 +2507,26 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
             layer_output_fisher_by_module = {}
             pre_gd_refresh_loss_type = "kl" if i == final_layer_idx else args.grad_refresh_loss
             if effective_pre_gd_steps > 0 and pre_gd_refresh_loss_type == "fisher_diag_mse":
-                with layer_recorder.section("layer.pre_quant_fisher_collect") if layer_recorder else nullcontext():
-                    layer_output_fisher = collect_layer_output_fisher_only(
-                        model=model,
-                        layer=layer,
-                        analyzer=analyzer,
-                        inps=inps,
-                        fp_inps=fp_inps,
-                        batch_attention_mask=batch_attention_mask,
-                        batch_position_ids=batch_position_ids,
-                        batch_position_embeddings=batch_position_embeddings,
-                        bsz=args.bsz,
-                        fisher_num_groups=args.fisher_num_groups,
-                        kl_topk=args.kl_topk,
-                        grad_hessian_topk=args.grad_hessian_topk,
-                        dev=dev,
-                        layer_idx=i,
-                        layer_recorder=layer_recorder,
-                    )
+                layer_output_fisher = static_fisher_by_layer[i]
+                if layer_output_fisher is None:
+                    with layer_recorder.section("layer.pre_quant_fisher_collect") if layer_recorder else nullcontext():
+                        layer_output_fisher = collect_layer_output_fisher_only(
+                            model=model,
+                            layer=layer,
+                            analyzer=analyzer,
+                            inps=inps,
+                            fp_inps=fp_inps,
+                            batch_attention_mask=batch_attention_mask,
+                            batch_position_ids=batch_position_ids,
+                            batch_position_embeddings=batch_position_embeddings,
+                            bsz=args.bsz,
+                            fisher_num_groups=args.fisher_num_groups,
+                            kl_topk=args.kl_topk,
+                            grad_hessian_topk=args.grad_hessian_topk,
+                            dev=dev,
+                            layer_idx=i,
+                            layer_recorder=layer_recorder,
+                        )
                 for name in subset:
                     if subset[name] is not None:
                         layer_output_fisher_by_module[name] = layer_output_fisher
@@ -2427,6 +2595,12 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                 dev=dev,
                 layer_idx=i,
                 layer_refresh_loss_type=layer_refresh_loss_type,
+                precomputed_saliency_dict=static_saliency_by_layer[i],
+                precomputed_layer_output_fisher=(
+                    static_fisher_by_layer[i]
+                    if layer_refresh_loss_type == "fisher_diag_mse"
+                    else None
+                ),
                 layer_recorder=layer_recorder,
             )
 
