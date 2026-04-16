@@ -29,6 +29,12 @@ def normalize_quant_module_name(name: str) -> str:
     return name[:-7] if name.endswith(".module") else name
 
 
+def get_effective_refresh_loss_type(layer_idx: int, final_layer_idx: int, default_refresh_loss_type: str) -> str:
+    if layer_idx == final_layer_idx:
+        return "kl"
+    return default_refresh_loss_type
+
+
 def compute_safe_beta_from_reference_loss(
     gradients_sub: torch.Tensor,
     hinv_init: torch.Tensor,
@@ -1207,14 +1213,15 @@ class GPTQPlus:
 
             if enable_gradient_update and self.alpha > 0:
                 alpha = self.alpha / (self.rows * self.columns)
-                GHinv_init = gradients_sub.matmul(Hinv_init)
-                c = (gradients_sub * GHinv_init).sum(dim=1) - (
-                    (GHinv_init ** 2) / torch.diagonal(Hinv_init).unsqueeze(0)
-                ).mean(1)
-                c = torch.clamp(c, min=2 * alpha * self.reference_loss)
-                beta = 1 - torch.sqrt(torch.clamp(1 - (2 * alpha * self.reference_loss) / c, min=0.0))
+                beta, GHinv_init = compute_safe_beta_from_reference_loss(
+                    gradients_sub,
+                    Hinv_init,
+                    self.reference_loss,
+                    alpha,
+                )
             else:
                 beta = torch.zeros([1]).to(gradients_sub)
+                GHinv_init = gradients_sub.matmul(Hinv_init)
 
             Z = gradients_sub.matmul(Hinv.T) * beta.unsqueeze(1)
             GHinv = Z.matmul(Hinv)
@@ -1484,14 +1491,15 @@ class GPTQPlus:
 
             if enable_gradient_update and self.alpha > 0:
                 alpha = self.alpha / (self.rows * self.columns)
-                GHinv_init = gradients_sub.matmul(Hinv_init)
-                c = (gradients_sub * GHinv_init).sum(dim=1) - (
-                    (GHinv_init ** 2) / torch.diagonal(Hinv_init).unsqueeze(0)
-                ).mean(1)
-                c = torch.clamp(c, min=2 * alpha * effective_reference_loss)
-                beta = 1 - torch.sqrt(torch.clamp(1 - (2 * alpha * effective_reference_loss) / c, min=0.0))
+                beta, GHinv_init = compute_safe_beta_from_reference_loss(
+                    gradients_sub,
+                    Hinv_init,
+                    effective_reference_loss,
+                    alpha,
+                )
             else:
                 beta = torch.zeros([1]).to(gradients_sub)
+                GHinv_init = gradients_sub.matmul(Hinv_init)
             GHinv_raw = gradients_sub.matmul(Hinv_init)
             GHinv = GHinv_raw * beta.unsqueeze(1) if enable_gradient_update and self.alpha > 0 else torch.zeros_like(GHinv_raw)
 
@@ -2484,13 +2492,12 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
         )
 
         per_layer_runtime_modules = list(analyzer.get_pre_block_modules())
-        if args.grad_refresh_loss == "kl":
-            per_layer_runtime_modules.extend(
-                [
-                    analyzer.get_layernorm_before_head(),
-                    analyzer.get_lm_head(),
-                ]
-            )
+        per_layer_runtime_modules.extend(
+            [
+                analyzer.get_layernorm_before_head(),
+                analyzer.get_lm_head(),
+            ]
+        )
         with pipeline_recorder.section("pipeline.move_to_device") if pipeline_recorder else nullcontext():
             for module in per_layer_runtime_modules:
                 module.to(dev)
@@ -2558,7 +2565,18 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
             layer = layers[i].to(dev)
             full = analyzer.get_quantizable_modules(layer)
             layer_recorder = QuantProfileRecorder(dev, prefix=f"layers.{i}") if quant_profile_enabled else None
-            layer_refresh_loss_type = args.grad_refresh_loss
+            layer_refresh_loss_type = get_effective_refresh_loss_type(
+                i,
+                final_layer_idx,
+                args.grad_refresh_loss,
+            )
+            if i == final_layer_idx and layer_refresh_loss_type != args.grad_refresh_loss:
+                logging.info(
+                    "Overriding refresh loss for final layer %d: %s -> %s",
+                    i,
+                    args.grad_refresh_loss,
+                    layer_refresh_loss_type,
+                )
 
             with layer_recorder.section("layer.fp_reference_forward") if layer_recorder else nullcontext():
                 bits_config = quant_utils.disable_act_quant(layer)
@@ -2593,7 +2611,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
             layer_output_fisher = None
             subset = {n: full.get(n, full.get(n + ".module", None)) for n in names}
             layer_output_fisher_by_module = {}
-            pre_gd_refresh_loss_type = args.grad_refresh_loss
+            pre_gd_refresh_loss_type = layer_refresh_loss_type
             if effective_pre_gd_steps > 0 and pre_gd_refresh_loss_type == "fisher_diag_mse":
                 layer_output_fisher = static_fisher_by_layer[i]
                 if layer_output_fisher is None:
