@@ -2145,9 +2145,9 @@ def collect_layer_grad_hessian_stats(
     names,
     inps,
     fp_inps,
-    batch_attention_mask,
-    batch_position_ids,
-    batch_position_embeddings,
+    attention_mask,
+    position_ids,
+    position_embeddings,
     bsz,
     num_groups,
     fisher_num_groups,
@@ -2188,6 +2188,13 @@ def collect_layer_grad_hessian_stats(
             position=1,
             leave=False,
         ):
+            batch_size = min(bsz, inps.shape[0] - j)
+            batch_attention_mask = attention_mask.expand(batch_size, -1, -1, -1)
+            batch_position_ids = position_ids.expand(batch_size, -1)
+            batch_position_embeddings = (
+                position_embeddings[0].expand(batch_size, -1, -1),
+                position_embeddings[1].expand(batch_size, -1, -1),
+            )
             with layer_recorder.section("layer.grad_hessian.batch.total") if layer_recorder else nullcontext():
                 with layer_recorder.section("layer.grad_hessian.forward") if layer_recorder else nullcontext():
                     with layer_recorder.section("layer.grad_hessian.forward.layer") if layer_recorder else nullcontext():
@@ -2598,6 +2605,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     layer_refresh_loss_type,
                 )
             layer_backward_bsz = args.final_layer_backward_bsz if i == final_layer_idx else args.backward_bsz
+            layer_stats_bsz = args.final_layer_stats_bsz if i == final_layer_idx else args.bsz
 
             with layer_recorder.section("layer.fp_reference_forward") if layer_recorder else nullcontext():
                 bits_config = quant_utils.disable_act_quant(layer)
@@ -2710,10 +2718,10 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                 names=names,
                 inps=inps,
                 fp_inps=fp_inps,
-                batch_attention_mask=batch_attention_mask,
-                batch_position_ids=batch_position_ids,
-                batch_position_embeddings=batch_position_embeddings,
-                bsz=args.bsz,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                position_embeddings=position_embeddings,
+                bsz=layer_stats_bsz,
                 num_groups=args.num_groups,
                 fisher_num_groups=args.fisher_num_groups,
                 kl_topk=args.kl_topk,

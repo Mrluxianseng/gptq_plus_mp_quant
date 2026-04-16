@@ -15,6 +15,7 @@ N_SAMPLES=${N_SAMPLES:-512}
 SEQ_LEN=${SEQ_LEN:-1024}
 NUM_GROUPS=${NUM_GROUPS:-4}
 BSZ=${BSZ:-4}
+FINAL_LAYER_STATS_BSZ=${FINAL_LAYER_STATS_BSZ:-${BSZ}}
 ALPHA=${ALPHA:-0.05}
 BLOCKSIZE=${BLOCKSIZE:-256}
 BLOCK_ATOMIC_QUANT=${BLOCK_ATOMIC_QUANT:-1}
@@ -66,6 +67,7 @@ python analyze_quant_profile.py \
     --seq_len "${SEQ_LEN}" \
     --num_groups "${NUM_GROUPS}" \
     --bsz "${BSZ}" \
+    --final_layer_stats_bsz "${FINAL_LAYER_STATS_BSZ}" \
     --alpha "${ALPHA}" \
     --blocksize "${BLOCKSIZE}" \
     --backward_samples "${BACKWARD_SAMPLES}" \

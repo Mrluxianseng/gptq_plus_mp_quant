@@ -258,6 +258,12 @@ def parse_gen():
     )
     parser.add_argument("--bsz", type=int, default=1, help="Batch size for computing hessians and gradients")
     parser.add_argument(
+        "--final_layer_stats_bsz",
+        type=int,
+        default=None,
+        help="Optional override for the statistics-collection batch size used only in the final transformer layer.",
+    )
+    parser.add_argument(
         "--backward_samples",
         type=int,
         default=-1,
@@ -324,6 +330,12 @@ def parse_gen():
         args.backward_samples = args.nsamples
     if args.backward_samples <= 0:
         raise ValueError(f"`backward_samples` must be positive or -1. Got {args.backward_samples}.")
+    if args.final_layer_stats_bsz is None:
+        args.final_layer_stats_bsz = args.bsz
+    if args.final_layer_stats_bsz <= 0:
+        raise ValueError(
+            f"`final_layer_stats_bsz` must be positive when provided. Got {args.final_layer_stats_bsz}."
+        )
     if args.backward_bsz == -1:
         args.backward_bsz = args.bsz
     if args.backward_bsz <= 0:
