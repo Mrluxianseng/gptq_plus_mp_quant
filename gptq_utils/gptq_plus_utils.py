@@ -29,6 +29,29 @@ def normalize_quant_module_name(name: str) -> str:
     return name[:-7] if name.endswith(".module") else name
 
 
+def compute_safe_beta_from_reference_loss(
+    gradients_sub: torch.Tensor,
+    hinv_init: torch.Tensor,
+    reference_loss: float,
+    alpha: float,
+):
+    ghinv_init = gradients_sub.matmul(hinv_init)
+    if reference_loss <= 0:
+        beta = torch.zeros(gradients_sub.shape[0], device=gradients_sub.device, dtype=gradients_sub.dtype)
+        return beta, ghinv_init
+
+    c = (gradients_sub * ghinv_init).sum(dim=1) - (
+        (ghinv_init ** 2) / torch.diagonal(hinv_init).unsqueeze(0)
+    ).mean(1)
+    target = 2 * alpha * reference_loss
+    c = torch.clamp(c, min=target)
+    ratio = torch.where(c > 0, target / c, torch.zeros_like(c))
+    ratio = torch.clamp(ratio, min=0.0, max=1.0)
+    beta = 1 - torch.sqrt(torch.clamp(1 - ratio, min=0.0))
+    beta = torch.nan_to_num(beta, nan=0.0, posinf=1.0, neginf=0.0)
+    return beta, ghinv_init
+
+
 def compute_quant_clip_bounds(scale, zero, maxq, sym):
     scale = scale.clamp(min=1e-8)
     maxq_value = int(maxq.item()) if isinstance(maxq, torch.Tensor) else int(maxq)
@@ -239,14 +262,15 @@ class GPTQPlus:
     def _compute_gradient_terms(self, gradients_sub, Hinv_init, Hinv, enable_gradient_update):
         if enable_gradient_update and self.alpha > 0:
             alpha = self.alpha / (self.rows * self.columns)
-            GHinv_init = gradients_sub.matmul(Hinv_init)
-            c = (gradients_sub * GHinv_init).sum(dim=1) - (
-                (GHinv_init ** 2) / torch.diagonal(Hinv_init).unsqueeze(0)
-            ).mean(1)
-            c = torch.clamp(c, min=2 * alpha * self.reference_loss)
-            beta = 1 - torch.sqrt(torch.clamp(1 - (2 * alpha * self.reference_loss) / c, min=0.0))
+            beta, GHinv_init = compute_safe_beta_from_reference_loss(
+                gradients_sub,
+                Hinv_init,
+                self.reference_loss,
+                alpha,
+            )
         else:
             beta = torch.zeros([1]).to(gradients_sub)
+            GHinv_init = gradients_sub.matmul(Hinv_init)
         beta_view = beta.unsqueeze(1)
         Z = gradients_sub.matmul(Hinv.T) * beta_view
         GHinv = Z.matmul(Hinv)
