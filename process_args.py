@@ -68,6 +68,12 @@ def parse_gen():
     parser.add_argument("--num_groups", type=int, default=4,
                         help="Number of groups $g$ to use for block-diagonal Hessian")
     parser.add_argument(
+        "--fisher_num_groups",
+        type=int,
+        default=None,
+        help="Optional number of groups used only for fisher_diag_mse layer-output Fisher weights. Defaults to --num_groups.",
+    )
+    parser.add_argument(
         "--percdamp",
         type=float,
         default=0.01,
@@ -277,6 +283,9 @@ def parse_gen():
 
     init_logging(args.log_dir)
 
+    if args.fisher_num_groups is None:
+        args.fisher_num_groups = args.num_groups
+
     if args.backward_samples == -1:
         args.backward_samples = args.nsamples
     if args.backward_samples <= 0:
@@ -321,6 +330,8 @@ def parse_gen():
         raise ValueError(f"`grad_gate_sine_amp` must be non-negative. Got {args.grad_gate_sine_amp}.")
     if args.grad_hessian_topk == 0:
         raise ValueError("`grad_hessian_topk` must be positive or negative to disable. Use -1 to disable.")
+    if args.fisher_num_groups <= 0:
+        raise ValueError(f"`fisher_num_groups` must be positive. Got {args.fisher_num_groups}.")
     logging.info(args)
 
     # Disable parallelism in tokenizers to prevent warnings when forking in the seed generation step

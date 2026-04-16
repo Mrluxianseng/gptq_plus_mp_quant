@@ -1776,7 +1776,7 @@ def collect_layer_output_fisher_only(
     batch_position_ids,
     batch_position_embeddings,
     bsz,
-    num_groups,
+    fisher_num_groups,
     kl_topk,
     grad_hessian_topk,
     dev,
@@ -1836,11 +1836,15 @@ def collect_layer_output_fisher_only(
 
                     def layer_output_grad_hook(grad):
                         bsz_local, seq_len_local, hidden_dim = grad.shape
-                        group_size = hidden_dim // num_groups
+                        if hidden_dim % fisher_num_groups != 0:
+                            raise ValueError(
+                                f"Output hidden dim ({hidden_dim}) must be divisible by fisher_num_groups ({fisher_num_groups})."
+                            )
+                        group_size = hidden_dim // fisher_num_groups
                         token_count = bsz_local * seq_len_local
                         grad_unmean = grad.float() * token_count
                         grad_squared = grad_unmean.pow(2).view(
-                            bsz_local, seq_len_local, num_groups, group_size
+                            bsz_local, seq_len_local, fisher_num_groups, group_size
                         )
                         layer_output_fisher_cache.append(grad_squared.mean(dim=-1).detach())
 
@@ -1951,6 +1955,7 @@ def collect_layer_grad_hessian_stats(
     batch_position_embeddings,
     bsz,
     num_groups,
+    fisher_num_groups,
     kl_topk,
     grad_hessian_topk,
     dev,
@@ -2035,11 +2040,15 @@ def collect_layer_grad_hessian_stats(
 
                             def layer_output_grad_hook(grad):
                                 bsz_local, seq_len_local, hidden_dim = grad.shape
-                                group_size = hidden_dim // num_groups
+                                if hidden_dim % fisher_num_groups != 0:
+                                    raise ValueError(
+                                        f"Output hidden dim ({hidden_dim}) must be divisible by fisher_num_groups ({fisher_num_groups})."
+                                    )
+                                group_size = hidden_dim // fisher_num_groups
                                 token_count = bsz_local * seq_len_local
                                 grad_unmean = grad.float() * token_count
                                 grad_squared = grad_unmean.pow(2).view(
-                                    bsz_local, seq_len_local, num_groups, group_size
+                                    bsz_local, seq_len_local, fisher_num_groups, group_size
                                 )
                                 layer_output_fisher_cache.append(grad_squared.mean(dim=-1).detach())
 
@@ -2343,7 +2352,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         batch_position_ids=batch_position_ids,
                         batch_position_embeddings=batch_position_embeddings,
                         bsz=args.bsz,
-                        num_groups=args.num_groups,
+                        fisher_num_groups=args.fisher_num_groups,
                         kl_topk=args.kl_topk,
                         grad_hessian_topk=args.grad_hessian_topk,
                         dev=dev,
@@ -2412,6 +2421,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                 batch_position_embeddings=batch_position_embeddings,
                 bsz=args.bsz,
                 num_groups=args.num_groups,
+                fisher_num_groups=args.fisher_num_groups,
                 kl_topk=args.kl_topk,
                 grad_hessian_topk=args.grad_hessian_topk,
                 dev=dev,

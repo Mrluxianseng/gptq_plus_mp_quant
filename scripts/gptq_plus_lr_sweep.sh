@@ -17,9 +17,9 @@ shift 3
 GRAD_LRS_STR=${GRAD_LRS:-"0.0003"}
 N_SAMPLES=${N_SAMPLES:-512}
 SEQ_LEN=${SEQ_LEN:-1024}
-BSZ=${BSZ:-16}
+BSZ=${BSZ:-4}
 BACKWARD_SAMPLES=${BACKWARD_SAMPLES:-32}
-BACKWARD_BSZ=${BACKWARD_BSZ:-16}
+BACKWARD_BSZ=${BACKWARD_BSZ:-4}
 FINAL_LAYER_FULL_BACKWARD=${FINAL_LAYER_FULL_BACKWARD:-0}
 BLOCKSIZE=${BLOCKSIZE:-256}
 BLOCK_ATOMIC_QUANT=${BLOCK_ATOMIC_QUANT:-1}
@@ -29,8 +29,8 @@ GRAD_CLIP=${GRAD_CLIP:-1.0}
 # --grad_refresh_loss {kl,hidden_mse,fisher_diag_mse}
 GRAD_REFRESH_LOSS=${GRAD_REFRESH_LOSS:-fisher_diag_mse}
 FINAL_LAYER_GRAD_LR=${FINAL_LAYER_GRAD_LR:-0.3}
-PRE_GD_STEPS=${PRE_GD_STEPS:-5}
-PRE_GRAD_LR=${PRE_GRAD_LR:-0.0003}
+PRE_GD_STEPS=${PRE_GD_STEPS:-10}
+PRE_GRAD_LR=${PRE_GRAD_LR:-0.00003}
 PRE_FINAL_LAYER_GRAD_LR=${PRE_FINAL_LAYER_GRAD_LR:-0.3}
 PRE_GRAD_OPTIMIZER=${PRE_GRAD_OPTIMIZER:-adam}
 PRE_FINAL_LAYER_GRAD_OPTIMIZER=${PRE_FINAL_LAYER_GRAD_OPTIMIZER:-sgd}
@@ -44,8 +44,9 @@ GRAD_HESSIAN_TOPK=${GRAD_HESSIAN_TOPK:-20}
 PROJ_LR_SCALE=${PROJ_LR_SCALE:-1.0}
 DOWN_PROJ_LR_SCALE=${DOWN_PROJ_LR_SCALE:-1.0}
 SECOND_ORDER_SCALE=${SECOND_ORDER_SCALE:-1.0}
+FISHER_NUM_GROUPS=${FISHER_NUM_GROUPS:-${NUM_GROUPS}}
 PRE_CLIP=${PRE_CLIP:-1}
-ALPHA=${ALPHA:-0.05}
+ALPHA=${ALPHA:-0.2}
 KL_TOPK=${KL_TOPK:-20}
 LM_EVAL_BATCH_SIZE=${LM_EVAL_BATCH_SIZE:-32}
 ENABLE_QA_EVAL=${ENABLE_QA_EVAL:-0}
@@ -123,6 +124,10 @@ for grad_lr in "${GRAD_LRS[@]}"; do
     if [[ "${GRAD_HESSIAN_TOPK}" != "-1" ]]; then
         grad_hessian_suffix="_ghtk${GRAD_HESSIAN_TOPK}"
     fi
+    fisher_groups_suffix=""
+    if [[ "${FISHER_NUM_GROUPS}" != "${NUM_GROUPS}" ]]; then
+        fisher_groups_suffix="_fng${FISHER_NUM_GROUPS}"
+    fi
     pre_gd_suffix=""
     if [[ "${PRE_GD_STEPS}" != "0" ]]; then
         pre_gd_suffix="_pregd${PRE_GD_STEPS}_lr$(sanitize_float "${PRE_GRAD_LR}")_opt${PRE_GRAD_OPTIMIZER}"
@@ -133,7 +138,7 @@ for grad_lr in "${GRAD_LRS[@]}"; do
             pre_gd_suffix="${pre_gd_suffix}_flopt${PRE_FINAL_LAYER_GRAD_OPTIMIZER}"
         fi
     fi
-    exp_name="${BASE_EXP}_block_gd_${GRAD_OPTIMIZER}${refresh_suffix}${reg_suffix}${grad_hessian_suffix}_lr${grad_lr_tag}_fllr${final_layer_grad_lr_tag}_s${second_order_tag}${pre_gd_suffix}${PRE_CLIP_TAG}${BLOCK_ATOMIC_TAG}${FINAL_LAYER_FULL_BACKWARD_TAG}"
+    exp_name="${BASE_EXP}_block_gd_${GRAD_OPTIMIZER}${refresh_suffix}${reg_suffix}${grad_hessian_suffix}${fisher_groups_suffix}_lr${grad_lr_tag}_fllr${final_layer_grad_lr_tag}_s${second_order_tag}${pre_gd_suffix}${PRE_CLIP_TAG}${BLOCK_ATOMIC_TAG}${FINAL_LAYER_FULL_BACKWARD_TAG}"
 
     echo "============================================================"
     echo "Running GPTQ+ LR sweep"
@@ -152,6 +157,7 @@ for grad_lr in "${GRAD_LRS[@]}"; do
     echo "  gate_k : ${GRAD_GATE_SHARPNESS}"
     echo "  gate_a : ${GRAD_GATE_SINE_AMP}"
     echo "  gh_topk: ${GRAD_HESSIAN_TOPK}"
+    echo "  fng    : ${FISHER_NUM_GROUPS}"
     echo "  proj_s : ${PROJ_LR_SCALE}"
     echo "  down_s : ${DOWN_PROJ_LR_SCALE}"
     echo "  preclip: ${PRE_CLIP}"
@@ -179,7 +185,7 @@ for grad_lr in "${GRAD_LRS[@]}"; do
         --model "${MODEL_PATH}" \
         --exp "${exp_name}" \
         --dataset neuralmagic --nsamples "${N_SAMPLES}" --seq_len "${SEQ_LEN}" \
-        --w_method gptq_plus --w_bits 4 --w_clip --num_groups "${NUM_GROUPS}" --act_order \
+        --w_method gptq_plus --w_bits 4 --w_clip --num_groups "${NUM_GROUPS}" --fisher_num_groups "${FISHER_NUM_GROUPS}" --act_order \
         --kl_topk "${KL_TOPK}" --bsz "${BSZ}" --alpha "${ALPHA}" --blocksize "${BLOCKSIZE}" \
         --backward_samples "${BACKWARD_SAMPLES}" --backward_bsz "${BACKWARD_BSZ}" \
         --g_update_mode block_gd --grad_lr "${grad_lr}" --grad_optimizer "${GRAD_OPTIMIZER}" --grad_refresh_loss "${GRAD_REFRESH_LOSS}" \
