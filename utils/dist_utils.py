@@ -11,7 +11,14 @@ from utils import memory_utils
 
 
 def init_process_group():
-    dist.init_process_group(backend="nccl", timeout=datetime.timedelta(hours=8))
+    # Tell NCCL exactly which GPU this rank owns so collectives don't "guess"
+    # the device from rank % device_count and hang when the mapping is not
+    # that simple (e.g. CUDA_VISIBLE_DEVICES listing multiple GPUs per rank).
+    # Caller must have already run torch.cuda.set_device(local_rank).
+    kwargs = dict(backend="nccl", timeout=datetime.timedelta(hours=8))
+    if torch.cuda.is_available():
+        kwargs["device_id"] = torch.device(f"cuda:{torch.cuda.current_device()}")
+    dist.init_process_group(**kwargs)
     dist.barrier()
 
 
