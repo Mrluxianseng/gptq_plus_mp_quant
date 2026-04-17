@@ -62,6 +62,12 @@ IFS=' ' read -r -a GRAD_LRS <<< "${GRAD_LRS_STR}"
 export CUDA_VISIBLE_DEVICES=${DEVICE}
 MODEL_NAME=$(basename "${MODEL_PATH}")
 
+# Infer number of ranks from DEVICE ("0" → 1, "0,1" → 2, "0,1,2,3" → 4).
+# RDZV port decouples from DEVICE so the commas don't end up in the endpoint.
+IFS=',' read -r -a _DEVICE_LIST <<< "${DEVICE}"
+N_GPUS=${N_GPUS:-${#_DEVICE_LIST[@]}}
+RDZV_PORT=${RDZV_PORT:-29400}
+
 sanitize_float() {
     local value="${1}"
     value="${value//./p}"
@@ -199,7 +205,7 @@ for grad_lr in "${GRAD_LRS[@]}"; do
     RUN_LOG_PATH="${RUN_LOG_DIR}/stdout.log"
 
     python -m torch.distributed.run \
-        --nnodes=1 --nproc_per_node=1 --rdzv_endpoint=localhost:2940${DEVICE} ./ptq.py \
+        --nnodes=1 --nproc_per_node=${N_GPUS} --rdzv_endpoint=localhost:${RDZV_PORT} ./ptq.py \
         --model "${MODEL_PATH}" \
         --exp "${exp_name}" \
         --dataset neuralmagic --nsamples "${N_SAMPLES}" --seq_len "${SEQ_LEN}" \

@@ -19,6 +19,12 @@ from utils import data_utils, dist_utils, eval_utils, model_utils, rotation_util
 
 
 def main(args):
+    # When launched via torchrun for DP, each rank must pin itself to its
+    # assigned GPU BEFORE any CUDA / NCCL op; otherwise rank 1 defaults to
+    # cuda:0 (same device as rank 0) and every downstream NCCL collective
+    # deadlocks because the ranks aren't on distinct devices.
+    if "LOCAL_RANK" in os.environ and torch.cuda.is_available():
+        torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     dist_utils.init_process_group()
 
     analyzer = model_utils.ModelAnalyzer(args.model, args.seq_len)
