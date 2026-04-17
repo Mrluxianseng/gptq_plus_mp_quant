@@ -42,16 +42,26 @@ def quantize_weights(args, analyzer: model_utils.ModelAnalyzer):
                 logging.info("Reformatting input tokens to tuple + Unsqueeze")
                 trainloader = [(x.unsqueeze(0), None) for x in trainloader]
 
+            # DP-aware device selection: with torchrun each rank calls
+            # `torch.cuda.set_device(LOCAL_RANK)` before entering this function,
+            # so `cuda:<current>` points at that rank's physical GPU. Hard-coding
+            # "cuda:0" here would send rank>0's tensors to physical GPU 0 while
+            # NCCL talks on the current device, which deadlocks the collective.
+            if torch.cuda.is_available():
+                dp_dev = f"cuda:{torch.cuda.current_device()}"
+            else:
+                dp_dev = "cpu"
+
             if args.w_method == "rtn":
-                quantizers = gptq_utils.rtn_fwrd(args, analyzer, "cuda:0")
+                quantizers = gptq_utils.rtn_fwrd(args, analyzer, dp_dev)
             elif args.w_method == "gptq":
-                quantizers = gptq_utils.gptq_fwrd(args, analyzer, trainloader, "cuda:0")
+                quantizers = gptq_utils.gptq_fwrd(args, analyzer, trainloader, dp_dev)
             elif args.w_method == "gptaq":
-                quantizers = gptaq_utils.gptq_fwrd(args, analyzer, trainloader, "cuda:0")
+                quantizers = gptaq_utils.gptq_fwrd(args, analyzer, trainloader, dp_dev)
             elif args.w_method == "gptq_guided":
-                quantizers = gptq_guided_utils.gptq_fwrd(args, analyzer, trainloader, "cuda:0")
+                quantizers = gptq_guided_utils.gptq_fwrd(args, analyzer, trainloader, dp_dev)
             elif args.w_method == "gptq_plus":
-                quantizers = gptq_plus_utils.gptq_fwrd(args, analyzer, trainloader, "cuda:0")
+                quantizers = gptq_plus_utils.gptq_fwrd(args, analyzer, trainloader, dp_dev)
             save_dict["w_quantizers"] = quantizers
 
         if args.save_qmodel_path:
