@@ -48,6 +48,16 @@ def main(args):
         rotation_utils.rotate_model(args, analyzer)
         memory_utils.cleanup_memory()
 
+        # DP hygiene: rotation's QR + per-layer W@R matmuls run on each rank
+        # independently. Random matrices are generated via CPU RNG so they
+        # agree, but cuSOLVER QR and cuBLAS GEMM can pick slightly different
+        # kernels per physical GPU → rotated weights may drift by ~1e-7.
+        # That drift would then be amplified through every downstream layer.
+        # Force bit-exact agreement by broadcasting all parameters from rank 0.
+        if dist_utils.get_world_size() > 1:
+            for p in model.parameters():
+                dist.broadcast(p.data, src=0)
+
         quant_utils.add_actquant(analyzer)  # Add Activation Wrapper to the model
         qlayers = quant_utils.find_qlayers(model)
         for name in qlayers:
