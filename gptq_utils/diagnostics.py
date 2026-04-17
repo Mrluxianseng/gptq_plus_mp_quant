@@ -151,10 +151,22 @@ class DiagnosticRecorder:
 
     def record_loss(self, sub_idx: int, block_idx: int, loss: float):
         self._block_losses[(sub_idx, block_idx)] = float(loss) if loss is not None else None
+        # Incrementally flush meta.json so partial runs / crashes still produce
+        # a readable summary. `finalize()` writes atomically enough for small
+        # JSON files on modern filesystems.
+        try:
+            self.finalize()
+        except Exception:
+            # Don't let a meta.json write error take down the quant run.
+            pass
 
     def record_block_meta(self, entry: dict):
         """Arbitrary small key/value info, lands in meta.json."""
         self._block_meta.append(entry)
+        try:
+            self.finalize()
+        except Exception:
+            pass
 
     # -- cleanup ---------------------------------------------------------
     def finalize(self):
