@@ -183,6 +183,14 @@ def main() -> None:
     parser.add_argument("--verify_tol_rel", type=float, default=0.0)
     parser.add_argument("--enable_debug", action="store_true",
                         help="Enable cross-rank bit-exact assertions after each layer's fasterquant.")
+    parser.add_argument(
+        "--diagnose_targets",
+        type=str,
+        default=None,
+        help="Comma-separated `<layer_idx>:<module_substring>` list (e.g. `2:mlp.down_proj,1:mlp.down_proj`).",
+    )
+    parser.add_argument("--diagnose_dir", type=str, default=None)
+    parser.add_argument("--diagnose_spike_ratio", type=float, default=3.0)
     args = parser.parse_args()
     finalize_args(args)
 

@@ -110,7 +110,7 @@ def parse_gen():
         "--grad_clip",
         type=float,
         default=1.0,
-        help="Elementwise clip threshold applied to the true refresh gradient before SGD updates. Set negative to disable clipping.",
+        help="Elementwise clip threshold applied to the true refresh gradient before optimizer updates. Set negative to disable clipping.",
     )
     parser.add_argument(
         "--grad_refresh_loss",
@@ -301,6 +301,33 @@ def parse_gen():
                         help="Datasets for PPL & KL eval")
     # Exp
     parser.add_argument("--enable_debug", action="store_true", help="Enable debugging")
+    # Diagnostic dump: saves raw matrices at every fasterquant checkpoint for
+    # selected (layer_idx, module_substring) pairs. Zero overhead when off.
+    parser.add_argument(
+        "--diagnose_targets",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated list of `<layer_idx>:<module_substring>` tuples; dumps "
+            "W/Q/Err/H/updates/refresh_grad/etc per block for each matching module. "
+            "Example: `2:mlp.down_proj,1:mlp.down_proj,2:self_attn.q_proj`."
+        ),
+    )
+    parser.add_argument(
+        "--diagnose_dir",
+        type=str,
+        default=None,
+        help=(
+            "Where to write diagnostic dumps. Defaults to `<output_dir>/diagnostics/` "
+            "when --diagnose_targets is set."
+        ),
+    )
+    parser.add_argument(
+        "--diagnose_spike_ratio",
+        type=float,
+        default=3.0,
+        help="Flag a block as `is_spike` in meta.json when loss[i]/loss[i-1] exceeds this.",
+    )
 
     args = parser.parse_args()
 

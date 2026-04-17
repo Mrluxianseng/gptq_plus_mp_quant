@@ -17,6 +17,7 @@ except ImportError:
     from torch.nn.utils.stateless import functional_call
 
 from utils import quant_utils, memory_utils, model_utils, dist_utils
+from gptq_utils.diagnostics import DiagnosticRegistry, parse_diagnose_targets
 
 
 # Single reusable no-op context. `nullcontext()` instances are stateless, so we
@@ -345,9 +346,9 @@ class GPTQPlus:
         grad_slice = grad_sub[:, col_start:]
         if grad_slice.numel() == 0:
             return grad_slice
+        if grad_clip is not None and grad_clip > 0:
+            grad_slice = grad_slice.clamp(min=-grad_clip, max=grad_clip)
         if opt_state["type"] == "sgd":
-            if grad_clip is not None and grad_clip > 0:
-                grad_slice = grad_slice.clamp(min=-grad_clip, max=grad_clip)
             return lr * grad_slice
 
         opt_state["step"] += 1
@@ -603,8 +604,11 @@ class GPTQPlus:
         block_atomic_quant=False,
         block_observer=None,
         grad_clip=1.0,
+        diagnostic_recorder=None,
     ):
         profile_recorder = profile_recorder or self.profile_recorder
+        # Alias the recorder so call sites can do `rec and rec.save_block(...)`.
+        rec = diagnostic_recorder
         self._validate_grad_regularizer(
             grad_reg_strategy,
             grad_reg_lambda=grad_reg_lambda,
@@ -616,6 +620,26 @@ class GPTQPlus:
             W = self.layer.weight.data.clone()
             W = W.float()
             block_gd_mode = g_update_mode == "block_gd"
+            # Diagnostic: dump the pre-quant (rotated, if applicable) module weight,
+            # plus the quantizer params, gradients and saliency that feed this
+            # fasterquant invocation. Everything under module_level/ is fixed for
+            # the duration of fasterquant; per-block stuff lands under subgroup_X/block_Y/.
+            if rec is not None:
+                rec.save_module_level("original_weight_rotated", W)
+                if self.quantizer.scale is not None:
+                    rec.save_module_level("quantizer_scale", self.quantizer.scale)
+                if hasattr(self.quantizer, "zero") and self.quantizer.zero is not None:
+                    rec.save_module_level("quantizer_zero", self.quantizer.zero)
+                if isinstance(self.quantizer.maxq, torch.Tensor):
+                    rec.save_module_level("quantizer_maxq", self.quantizer.maxq)
+                else:
+                    rec.save_module_level("quantizer_maxq", torch.tensor(float(self.quantizer.maxq)))
+                rec.save_module_level("H_after_accumulate", self.H)
+                rec.save_module_level("act_square", self.act_square)
+                rec.save_module_level("gradients", self.gradients)
+                rec.save_module_level("reference_loss", torch.tensor(self.reference_loss))
+                rec.save_module_level("saliencies", self.saliencies)
+                rec.save_module_level("alpha", torch.tensor(self.alpha))
             with profile_recorder.section("fasterquant.allocate_outputs") if profile_recorder else _NULL_CONTEXT:
                 Q_final = torch.zeros_like(W)
                 W_int_final = torch.zeros_like(W)
@@ -737,6 +761,24 @@ class GPTQPlus:
                             enable_gradient_update,
                         )
 
+                    # Diagnostic: per-subgroup snapshot of the Hessian inverse,
+                    # the permuted weight and gradient (post-actorder), and the
+                    # GPTQ+ state. Everything here is fixed for the duration of
+                    # the block loop for this subgroup.
+                    if rec is not None:
+                        rec.save_subgroup(sub_idx, "W_sub_initial", W_sub)
+                        rec.save_subgroup(sub_idx, "gradients_sub", gradients_sub)
+                        rec.save_subgroup(sub_idx, "H_sub_damped_but_original", None if hessian_reg is None else hessian_reg)
+                        rec.save_subgroup(sub_idx, "Hinv_init", Hinv_init)
+                        rec.save_subgroup(sub_idx, "Hinv_upper_cholesky", Hinv)
+                        rec.save_subgroup(sub_idx, "beta", beta)
+                        rec.save_subgroup(sub_idx, "Z_initial", Z)
+                        rec.save_subgroup(sub_idx, "GHinv_initial", GHinv)
+                        rec.save_subgroup(sub_idx, "row_slice", torch.tensor([row_start, row_end]))
+                        if perm is not None:
+                            rec.save_subgroup(sub_idx, "perm", perm)
+                            rec.save_subgroup(sub_idx, "invperm", invperm)
+
                     subgroup_states.append(
                         {
                             "sub_idx": sub_idx,
@@ -803,6 +845,26 @@ class GPTQPlus:
                                 inner_update_mode,
                             )
                             fast_quant_scale = state["fast_quant_scale"] if fast_quant_enabled else None
+                            # Diagnostic: snapshot state at the start of this block
+                            # BEFORE any inner quant updates. Captures the input to
+                            # the block loop: W1_start is what the inner loop will
+                            # quantize; W_trailing_start is what outer + adam will
+                            # later push. These reflect any previous blocks' effects.
+                            if rec is not None:
+                                block_idx = i1 // blocksize
+                                sub_idx = state["sub_idx"]
+                                rec.save_block(sub_idx, block_idx, "W1_start", W1)
+                                rec.save_block(
+                                    sub_idx, block_idx, "W_trailing_start",
+                                    state["W_sub"][:, i2:].clone(),
+                                )
+                                rec.save_block(sub_idx, block_idx, "Hinv1", Hinv1)
+                                rec.save_block(sub_idx, block_idx, "GHinv1_at_block_start", GHinv1)
+                                rec.save_block(sub_idx, block_idx, "Z1", Z1)
+                                rec.save_block(
+                                    sub_idx, block_idx, "block_column_range",
+                                    torch.tensor([i1, i2]),
+                                )
                             # With groupsize == -1 the per-row scale is shared by
                             # every column of the block, so we can fill Scale1
                             # once here instead of reassigning it in each column
@@ -933,6 +995,21 @@ class GPTQPlus:
                             state["W_int_sub"][:, i1:i2] = W_int1
                             state["Scale_sub"][:, i1:i2] = Scale1
 
+                        # Diagnostic: block inner-loop outputs. W1 here has
+                        # received the inner error propagation for columns
+                        # [i, count), but W_sub trailing hasn't been touched yet.
+                        if rec is not None:
+                            block_idx = i1 // blocksize
+                            sub_idx = state["sub_idx"]
+                            rec.save_block(sub_idx, block_idx, "Q1", Q1)
+                            rec.save_block(sub_idx, block_idx, "W_int1", W_int1)
+                            rec.save_block(sub_idx, block_idx, "Scale1", Scale1)
+                            rec.save_block(sub_idx, block_idx, "Err1", Err1)
+                            rec.save_block(sub_idx, block_idx, "W1_after_inner", W1)
+                            rec.save_block(
+                                sub_idx, block_idx, "GHinv1_after_inner", GHinv1,
+                            )
+
                         # `current_sub_weight` is only consumed by the block_backward
                         # refresh path below; skipping the clone for other modes
                         # avoids O(rows_per_sub × columns) copies per block.
@@ -1045,6 +1122,32 @@ class GPTQPlus:
                             )
                             second_order_update = block_state["Err1"].matmul(state["Hinv"][i1:i2, i2:])
                             total_outer_update = second_order_update + G_Update
+
+                            # Diagnostic: outer update components BEFORE they are
+                            # subtracted from W_sub[:, i2:]. We also dump
+                            # GHinv_rest and `count * GHinv_rest` separately so
+                            # the cancellation between the two G_Update terms
+                            # can be inspected directly.
+                            if rec is not None:
+                                block_idx = i1 // blocksize
+                                sub_idx = state["sub_idx"]
+                                einsum_term = torch.einsum(
+                                    "ij,j,jk->ik",
+                                    block_state["Z1"],
+                                    D,
+                                    state["Hinv"][i1:i2, i2:],
+                                )
+                                rec.save_block(sub_idx, block_idx, "GHinv_rest_at_outer", GHinv_rest)
+                                rec.save_block(sub_idx, block_idx, "count_times_GHinv_rest", count * GHinv_rest)
+                                rec.save_block(sub_idx, block_idx, "einsum_Z1_D_Hinv_term", einsum_term)
+                                rec.save_block(sub_idx, block_idx, "G_Update", G_Update)
+                                rec.save_block(sub_idx, block_idx, "second_order_update", second_order_update)
+                                rec.save_block(sub_idx, block_idx, "total_outer_update", total_outer_update)
+                                rec.save_block(
+                                    sub_idx, block_idx, "W_trailing_before_outer_update",
+                                    state["W_sub"][:, i2:].clone(),
+                                )
+
                             if block_gd_mode:
                                 applied_second_order_update = second_order_scale * second_order_update
                                 state["W_sub"][:, i2:] -= second_order_scale * total_outer_update
@@ -1053,6 +1156,18 @@ class GPTQPlus:
                                 state["W_sub"][:, i2:] -= total_outer_update
                             if block_gd_mode and second_order_update.numel() > 0:
                                 block_second_order_chunks.append(applied_second_order_update)
+
+                            # Diagnostic: W_sub trailing AFTER outer update.
+                            if rec is not None:
+                                rec.save_block(
+                                    state["sub_idx"], i1 // blocksize,
+                                    "W_trailing_after_outer_update",
+                                    state["W_sub"][:, i2:].clone(),
+                                )
+                                rec.save_block(
+                                    state["sub_idx"], i1 // blocksize,
+                                    "applied_second_order_update", applied_second_order_update,
+                                )
 
                         with profile_recorder.section("fasterquant.block.outer_update_ghinv") if profile_recorder else _NULL_CONTEXT:
                             state["GHinv"][:, i2:] -= state["Z"][:, i1:i2].matmul(state["Hinv"][i1:i2, i2:])
@@ -1140,6 +1255,51 @@ class GPTQPlus:
                                     grad_gate_sharpness,
                                     grad_gate_sine_amp,
                                 )
+                                # Diagnostic: block_gd refresh results PER SUBGROUP.
+                                # refreshed_grad_sub is the per-row gradient of the
+                                # refresh loss wrt this subgroup's weight; optimizer_update
+                                # is what Adam/SGD will push onto W_sub trailing AFTER
+                                # this loop finishes.
+                                if rec is not None:
+                                    block_idx = i1 // blocksize
+                                    sub_idx = state["sub_idx"]
+                                    rec.save_block(
+                                        sub_idx, block_idx, "refreshed_grad_subgroup", refreshed_grad_sub,
+                                    )
+                                    rec.save_block(
+                                        sub_idx, block_idx, "optimizer_update_raw", optimizer_update_raw,
+                                    )
+                                    rec.save_block(
+                                        sub_idx, block_idx, "optimizer_update", optimizer_update,
+                                    )
+                                    rec.save_block(
+                                        sub_idx, block_idx, "current_effective_weight_at_refresh",
+                                        current_effective_weight,
+                                    )
+                                    opt_state = state.get("grad_optimizer_state")
+                                    if opt_state is not None and opt_state.get("type") == "adam":
+                                        rec.save_block(
+                                            sub_idx, block_idx, "adam_exp_avg_after_update",
+                                            opt_state["exp_avg"],
+                                        )
+                                        rec.save_block(
+                                            sub_idx, block_idx, "adam_exp_avg_sq_after_update",
+                                            opt_state["exp_avg_sq"],
+                                        )
+                                        rec.save_block(
+                                            sub_idx, block_idx, "adam_step",
+                                            torch.tensor(opt_state["step"]),
+                                        )
+                                    # Record loss so finalize() can auto-detect spikes.
+                                    if refresh_meta is not None:
+                                        rec.record_loss(
+                                            sub_idx, block_idx,
+                                            refresh_meta.get("mean_refresh_loss"),
+                                        )
+                                        rec.save_block(
+                                            sub_idx, block_idx, "mean_refresh_loss",
+                                            torch.tensor(float(refresh_meta.get("mean_refresh_loss", 0.0))),
+                                        )
                                 state["pending_optimizer_update"] = optimizer_update
                                 if optimizer_update_raw.numel() > 0:
                                     optimizer_updates_raw.append(optimizer_update_raw)
@@ -1206,6 +1366,15 @@ class GPTQPlus:
                                 optimizer_update = state.pop("pending_optimizer_update")
                                 if optimizer_update.numel() > 0:
                                     state["W_sub"][:, i2:] -= optimizer_update
+                                # Diagnostic: W_sub trailing AFTER Adam apply —
+                                # i.e. the state that block i+1 will see as W1_start
+                                # for the columns [i2, i2+blocksize).
+                                if rec is not None:
+                                    rec.save_block(
+                                        state["sub_idx"], i1 // blocksize,
+                                        "W_trailing_after_adam",
+                                        state["W_sub"][:, i2:].clone(),
+                                    )
 
             for state in subgroup_states:
                 with profile_recorder.section("fasterquant.subgroup.total") if profile_recorder else _NULL_CONTEXT:
@@ -1233,6 +1402,12 @@ class GPTQPlus:
                 self.layer.weight.data = Q_final.reshape(self.layer.weight.shape).to(
                     self.layer.weight.data.dtype
                 )
+            # Diagnostic: final quantized weight (natural order, matches what gets
+            # written back to the model) and its int-code / scale equivalents.
+            if rec is not None:
+                rec.save_module_level("Q_final", Q_final)
+                rec.save_module_level("W_int_final", W_int_final)
+                rec.save_module_level("Scale_final", Scale_final)
             if torch.any(torch.isnan(self.layer.weight.data)):
                 logging.warning("NaN in weights")
 
@@ -2155,9 +2330,9 @@ def apply_dense_optimizer_step(
         return torch.zeros_like(grad), opt_state
 
     grad_step = grad
+    if grad_clip is not None and grad_clip > 0:
+        grad_step = grad_step.clamp(min=-grad_clip, max=grad_clip)
     if optimizer == "sgd":
-        if grad_clip is not None and grad_clip > 0:
-            grad_step = grad_step.clamp(min=-grad_clip, max=grad_clip)
         update = lr * grad_step
         param.sub_(update.to(param.dtype))
         return update, opt_state
@@ -2759,6 +2934,25 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
             return False
         return not target_modules or module_name in target_modules
 
+    # Diagnostic dumper: activates for (layer_idx, module_substring) pairs listed
+    # in `args.diagnose_targets` (e.g. "2:mlp.down_proj,1:mlp.down_proj"). No-op
+    # when the flag isn't set. Writes raw matrices under `args.diagnose_dir`.
+    _diag_targets = parse_diagnose_targets(getattr(args, "diagnose_targets", None))
+    _diag_root = getattr(args, "diagnose_dir", None)
+    if _diag_targets and not _diag_root:
+        _diag_root = os.path.join(args.output_dir, "diagnostics")
+    diagnostic_registry = DiagnosticRegistry(
+        root_dir=_diag_root if _diag_targets else None,
+        targets=_diag_targets,
+        spike_ratio=float(getattr(args, "diagnose_spike_ratio", 3.0)),
+    )
+    if _diag_targets:
+        logging.info(
+            "Diagnostic dump enabled for targets=%s under %s",
+            _diag_targets,
+            _diag_root,
+        )
+
     with run_recorder.section("run.total") if run_recorder else _NULL_CONTEXT:
         if global_loss_enabled:
             with pipeline_recorder.section("pipeline.static_end_to_end_saliency_fisher") if pipeline_recorder else _NULL_CONTEXT:
@@ -3248,6 +3442,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         block_atomic_quant=args.block_atomic_quant,
                         block_observer=make_block_observer(name, effective_grad_optimizer) if args.g_update_mode in {"block_backward", "block_gd"} else None,
                         grad_clip=args.grad_clip,
+                        diagnostic_recorder=diagnostic_registry.get_or_create(i, name),
                     )
                     # DP correctness check (debug only): fasterquant is meant
                     # to be deterministic given identical inputs, and since H /
@@ -3287,6 +3482,9 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                 module.to(orig_device)
             model.config.use_cache = use_cache
         memory_utils.cleanup_memory(verbos=True)
+
+    # Flush per-recorder meta.json files (loss trajectory + auto-detected spikes).
+    diagnostic_registry.finalize_all()
 
     if quant_profile_enabled:
         logging.info("Quant profile NVTX ranges emitted. Inspect them with Nsight Systems/Compute.")
