@@ -36,26 +36,49 @@ class ColoredFormatter(logging.Formatter):
 
 def init_logging(log_dir):
     """
-    Initializes logging to output colored prefixes to the console 
+    Initializes logging to output colored prefixes to the console
     and plain text to a timestamped file.
+
+    DP: when launched via torchrun, only LOCAL_RANK==0 gets the full logger.
+    Other ranks are silenced to CRITICAL level so we don't see every message
+    twice (and don't fight each other for the same log file). If a rank>0
+    actually raises an error it will still surface via stderr and
+    torchrun's aggregation.
     """
-    # 1. Create log directory
-    os.makedirs(log_dir, exist_ok=True)
+    # Detect torchrun rank. This env var is only set under distributed launch.
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    rank = int(os.environ.get("RANK", "0"))
+    is_main = (rank == 0)
+
+    # 1. Create log directory (only rank 0 writes to it).
+    if is_main:
+        os.makedirs(log_dir, exist_ok=True)
     timestamp = datetime.datetime.now().strftime("%y%m%d_%H%M%S")
-    
+
     # 2. Define formats
     log_format = '[%(asctime)s | %(levelname)s] %(message)s'
     date_format = '%Y-%m-%d %H:%M:%S'
-    
+
+    if not is_main:
+        # Non-main ranks: nuke existing handlers, suppress everything below CRITICAL.
+        # Keep CRITICAL so unrecoverable errors still reach stderr.
+        logging.basicConfig(
+            level=logging.CRITICAL,
+            handlers=[logging.NullHandler()],
+            force=True,
+        )
+        logging.disable(logging.ERROR)
+        return
+
     # 3. Configure Console Handler (WITH color prefix)
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(ColoredFormatter(log_format, datefmt=date_format))
-    
+
     # 4. Configure File Handler (WITHOUT color, plain text)
     log_file_path = os.path.join(log_dir, f"log_{timestamp}.txt")
     file_handler = logging.FileHandler(log_file_path)
     file_handler.setFormatter(logging.Formatter(log_format, datefmt=date_format))
-    
+
     # 5. Apply handlers
     logging.basicConfig(
         level=logging.INFO,
