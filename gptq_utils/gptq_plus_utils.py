@@ -666,7 +666,6 @@ class GPTQPlus:
                         gate_zero = None
 
                     with profile_recorder.section("fasterquant.subgroup.allocate_buffers") if profile_recorder else _NULL_CONTEXT:
-                        Losses = torch.zeros_like(W_sub)
                         Q = torch.zeros_like(W_sub)
                         W_int_sub = torch.zeros_like(W_sub)
                         Scale_sub = torch.zeros_like(W_sub)
@@ -710,7 +709,6 @@ class GPTQPlus:
                             "Hinv_init": Hinv_init,
                             "Hinv": Hinv,
                             "Q": Q,
-                            "Losses": Losses,
                             "W_int_sub": W_int_sub,
                             "Scale_sub": Scale_sub,
                             "beta": beta,
@@ -753,7 +751,6 @@ class GPTQPlus:
                             W_int1 = torch.zeros_like(W1)
                             Scale1 = torch.zeros_like(W1).to(state["Scale_sub"].dtype)
                             Err1 = torch.zeros_like(W1)
-                            Losses1 = torch.zeros_like(W1)
                             Hinv1 = state["Hinv"][i1:i2, i1:i2]
                             GHinv1 = state["GHinv"][:, i1:i2].clone()
                             Z1 = state["Z"][:, i1:i2]
@@ -768,6 +765,13 @@ class GPTQPlus:
                                 inner_update_mode,
                             )
                             fast_quant_scale = state["fast_quant_scale"] if fast_quant_enabled else None
+                            # With groupsize == -1 the per-row scale is shared by
+                            # every column of the block, so we can fill Scale1
+                            # once here instead of reassigning it in each column
+                            # iteration. Same dtype and values as the per-column
+                            # assignment, so bit-exactness is preserved.
+                            if fast_quant_scale is not None:
+                                Scale1.copy_(fast_quant_scale.expand_as(Scale1))
 
                         if use_atomic_quant:
                             if groupsize == -1:
@@ -807,8 +811,6 @@ class GPTQPlus:
 
                             with profile_recorder.section("fasterquant.block.atomic_err_solve") if profile_recorder else _NULL_CONTEXT:
                                 residual_block = W_block_start - Q1 - GHinv1_eff
-                                diag_view = torch.diagonal(Hinv1).unsqueeze(0)
-                                Losses1.copy_(residual_block.square() / diag_view.square())
                                 Err1.copy_(
                                     torch.linalg.solve_triangular(
                                         Hinv1.T,
@@ -852,9 +854,12 @@ class GPTQPlus:
                                     Q1[:, i] = q_flat
                                     q = q_flat
                                     W_int1[:, i] = int_weight.flatten()
-                                    Scale1[:, i] = scale.flatten()
-
-                                    Losses1[:, i] = (w - q - GHinv1_eff[:, i]) ** 2 / d**2
+                                    if fast_quant_scale is None:
+                                        # In the groupsize != -1 path scale varies per
+                                        # column group, so we still need the per-column
+                                        # write. With fast_quant_scale active the block
+                                        # setup pre-filled Scale1.
+                                        Scale1[:, i] = scale.flatten()
 
                                     with profile_recorder.section("fasterquant.column.inner_update_delta_w") if profile_recorder else _NULL_CONTEXT:
                                         err1 = (w - q - GHinv1_eff[:, i]) / d
@@ -889,7 +894,6 @@ class GPTQPlus:
                             state["Q"][:, i1:i2] = Q1
                             state["W_int_sub"][:, i1:i2] = W_int1
                             state["Scale_sub"][:, i1:i2] = Scale1
-                            state["Losses"][:, i1:i2] = Losses1 / 2
 
                         # `current_sub_weight` is only consumed by the block_backward
                         # refresh path below; skipping the clone for other modes
