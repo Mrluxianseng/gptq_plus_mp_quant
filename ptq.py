@@ -55,16 +55,24 @@ def main(args):
         # That drift would then be amplified through every downstream layer.
         # Force bit-exact agreement by broadcasting all parameters from rank 0.
         #
-        # NCCL only broadcasts CUDA tensors, and after rotate_model the params
-        # live on CPU. Move each param to GPU in-place (quantize_weights does
-        # model.cpu() at its own entry point, so the "cpu residency" gets
-        # restored right after this anyway — no need to copy back manually).
+        # NCCL requires CUDA + contiguous tensors, and after rotate_model many
+        # params are (a) still on CPU and (b) non-contiguous views produced by
+        # in-place reshape/transpose inside the rotation routines. Normalise
+        # both in-place before each broadcast. quantize_weights does a global
+        # model.cpu() right after this block, so we don't restore the CPU
+        # residency ourselves.
         if dist_utils.get_world_size() > 1:
             _cuda_dev = torch.device(f"cuda:{torch.cuda.current_device()}")
             for p in model.parameters():
-                if not p.is_cuda:
-                    p.data = p.data.to(_cuda_dev)
-                dist.broadcast(p.data, src=0)
+                data = p.data
+                if not data.is_contiguous():
+                    data = data.contiguous()
+                if not data.is_cuda:
+                    data = data.to(_cuda_dev)
+                dist.broadcast(data, src=0)
+                # If contiguous()/to() returned a fresh tensor, update p.data.
+                if data.data_ptr() != p.data.data_ptr():
+                    p.data = data
 
         quant_utils.add_actquant(analyzer)  # Add Activation Wrapper to the model
         qlayers = quant_utils.find_qlayers(model)
