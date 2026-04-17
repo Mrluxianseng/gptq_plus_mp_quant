@@ -2521,32 +2521,66 @@ def collect_true_weight_gradient(
     next_layer=None,
     fp_inps_next=None,
     next_layer_output_fisher=None,
+    global_shuffle=False,
+    dp_rank=0,
+    shard_size=None,
 ):
+    """Compute the refresh gradient as a per-rank partial sum + count.
+
+    Returns
+    -------
+    partial_grad_sum : torch.Tensor
+        Sum of per-sample gradients contributed by this rank's local slice of
+        `sample_indices` (unnormalised). Zeros if this rank owns 0 samples.
+    partial_count : int
+        Number of samples this rank actually processed.
+    loss_sum : float
+        Sum of per-sample losses over the processed samples (unnormalised).
+    extras : dict
+        Optional diagnostics (slide-window components, etc.), all in
+        "sum" form so callers can allreduce then divide.
+
+    When `global_shuffle=False` (default / stratified): `sample_indices` is
+    treated as rank-local indices into `inps`; no filtering. Each rank typically
+    gets an equal-sized chunk. Equivalent to the pre-global-shuffle pipeline.
+
+    When `global_shuffle=True`: `sample_indices` is a list of GLOBAL sample
+    ids; this function filters to the rank's contiguous shard
+    `[dp_rank * shard_size, (dp_rank + 1) * shard_size)` and only processes
+    those. Empty-shard runs still return a valid zero tensor + count=0 so the
+    caller's allreduce does the right thing.
+    """
     module = full.get(module_name, full.get(module_name + ".module", None))
     if module is None:
         raise ValueError(f"Unable to find module `{module_name}` in the provided layer.")
-    losses = []
-    losses_current = []
-    losses_next = []
-    selected_indices = list(range(inps.shape[0])) if sample_indices is None else list(sample_indices)
-    if len(selected_indices) == 0:
-        raise ValueError("`sample_indices` must contain at least one sample.")
+    if sample_indices is None:
+        raw_indices = list(range(inps.shape[0]))
+    else:
+        raw_indices = list(sample_indices)
+
+    if global_shuffle:
+        if shard_size is None:
+            shard_size = inps.shape[0]
+        rank_start = dp_rank * shard_size
+        rank_end = rank_start + shard_size
+        selected_indices = [
+            gi - rank_start for gi in raw_indices if rank_start <= gi < rank_end
+        ]
+    else:
+        selected_indices = raw_indices
+
     override_weight = (
         module.weight.detach().clone()
         if weight_override is None
         else weight_override.detach().to(module.weight.device, dtype=module.weight.data.dtype).clone()
     )
     override_weight.requires_grad_(True)
-    grad = torch.zeros_like(override_weight, dtype=torch.float32)
-    grad_count = 0
-    grad_modules = [layer]
-    if refresh_loss_type == "kl":
-        grad_modules.extend(
-            [
-                analyzer.get_layernorm_before_head(),
-                analyzer.get_lm_head(),
-            ]
-        )
+    partial_grad_sum = torch.zeros_like(override_weight, dtype=torch.float32)
+    partial_count = 0
+    loss_sum = 0.0
+    loss_sum_current = 0.0
+    loss_sum_next = 0.0
+
     slide_active = (
         slide_alpha < 1.0
         and next_layer is not None
@@ -2554,79 +2588,96 @@ def collect_true_weight_gradient(
         and next_layer_output_fisher is not None
         and refresh_loss_type == "fisher_diag_mse"
     )
-    if slide_active:
-        grad_modules.append(next_layer)
-    with temporary_requires_grad(grad_modules, []):
-        with torch.enable_grad():
-            for start in range(0, len(selected_indices), bsz):
-                batch_indices = selected_indices[start:start + bsz]
-                batch_size = len(batch_indices)
-                batch_attention_mask = attention_mask.expand(batch_size, -1, -1, -1)
-                batch_position_ids = position_ids.expand(batch_size, -1)
-                batch_position_embeddings = (
-                    position_embeddings[0].expand(batch_size, -1, -1),
-                    position_embeddings[1].expand(batch_size, -1, -1),
-                )
 
-                out = functional_call(
-                    layer,
-                    {f"{module_name}.weight": override_weight},
-                    (inps[batch_indices].to(dev),),
-                    {
-                        "attention_mask": batch_attention_mask,
-                        "position_ids": batch_position_ids,
-                        "position_embeddings": batch_position_embeddings,
-                    },
-                    strict=False,
-                )
-                out_hidden = out[0] if isinstance(out, (tuple, list)) else out
-                fp_hidden = fp_inps[batch_indices].to(dev)
-                fisher_batch = None if layer_output_fisher is None else layer_output_fisher[batch_indices].to(dev)
-                refresh_loss_current = compute_refresh_loss(
-                    refresh_loss_type,
-                    out_hidden,
-                    fp_hidden,
-                    analyzer,
-                    kl_topk,
-                    layer_output_fisher=fisher_batch,
-                )
-                if slide_active:
-                    next_out = next_layer(
-                        out_hidden,
-                        attention_mask=batch_attention_mask,
-                        position_ids=batch_position_ids,
-                        position_embeddings=batch_position_embeddings,
+    if len(selected_indices) > 0:
+        grad_modules = [layer]
+        if refresh_loss_type == "kl":
+            grad_modules.extend(
+                [analyzer.get_layernorm_before_head(), analyzer.get_lm_head()]
+            )
+        if slide_active:
+            grad_modules.append(next_layer)
+        with temporary_requires_grad(grad_modules, []):
+            with torch.enable_grad():
+                for start in range(0, len(selected_indices), bsz):
+                    batch_indices = selected_indices[start:start + bsz]
+                    batch_size = len(batch_indices)
+                    batch_attention_mask = attention_mask.expand(batch_size, -1, -1, -1)
+                    batch_position_ids = position_ids.expand(batch_size, -1)
+                    batch_position_embeddings = (
+                        position_embeddings[0].expand(batch_size, -1, -1),
+                        position_embeddings[1].expand(batch_size, -1, -1),
                     )
-                    next_out_hidden = next_out[0] if isinstance(next_out, (tuple, list)) else next_out
-                    fp_hidden_next = fp_inps_next[batch_indices].to(dev)
-                    fisher_batch_next = next_layer_output_fisher[batch_indices].to(dev)
-                    refresh_loss_next = compute_refresh_loss(
+
+                    out = functional_call(
+                        layer,
+                        {f"{module_name}.weight": override_weight},
+                        (inps[batch_indices].to(dev),),
+                        {
+                            "attention_mask": batch_attention_mask,
+                            "position_ids": batch_position_ids,
+                            "position_embeddings": batch_position_embeddings,
+                        },
+                        strict=False,
+                    )
+                    out_hidden = out[0] if isinstance(out, (tuple, list)) else out
+                    fp_hidden = fp_inps[batch_indices].to(dev)
+                    fisher_batch = (
+                        None if layer_output_fisher is None
+                        else layer_output_fisher[batch_indices].to(dev)
+                    )
+                    refresh_loss_current = compute_refresh_loss(
                         refresh_loss_type,
-                        next_out_hidden,
-                        fp_hidden_next,
+                        out_hidden,
+                        fp_hidden,
                         analyzer,
                         kl_topk,
-                        layer_output_fisher=fisher_batch_next,
+                        layer_output_fisher=fisher_batch,
                     )
-                    refresh_loss = slide_alpha * refresh_loss_current + (1.0 - slide_alpha) * refresh_loss_next
-                    losses_current.append(refresh_loss_current.item())
-                    losses_next.append(refresh_loss_next.item())
-                else:
-                    refresh_loss = refresh_loss_current
-                batch_grad = torch.autograd.grad(refresh_loss, override_weight, retain_graph=False)[0]
-                grad.mul_(grad_count / (grad_count + 1))
-                grad.add_(batch_grad.float(), alpha=1.0 / (grad_count + 1))
-                grad_count += 1
-                losses.append(refresh_loss.item())
-                memory_utils.cleanup_memory()
+                    if slide_active:
+                        next_out = next_layer(
+                            out_hidden,
+                            attention_mask=batch_attention_mask,
+                            position_ids=batch_position_ids,
+                            position_embeddings=batch_position_embeddings,
+                        )
+                        next_out_hidden = next_out[0] if isinstance(next_out, (tuple, list)) else next_out
+                        fp_hidden_next = fp_inps_next[batch_indices].to(dev)
+                        fisher_batch_next = next_layer_output_fisher[batch_indices].to(dev)
+                        refresh_loss_next = compute_refresh_loss(
+                            refresh_loss_type,
+                            next_out_hidden,
+                            fp_hidden_next,
+                            analyzer,
+                            kl_topk,
+                            layer_output_fisher=fisher_batch_next,
+                        )
+                        refresh_loss = (
+                            slide_alpha * refresh_loss_current
+                            + (1.0 - slide_alpha) * refresh_loss_next
+                        )
+                        loss_sum_current += refresh_loss_current.item() * batch_size
+                        loss_sum_next += refresh_loss_next.item() * batch_size
+                    else:
+                        refresh_loss = refresh_loss_current
 
-    mean_refresh_loss = sum(losses) / len(losses)
-    extras = {}
+                    batch_grad_mean = torch.autograd.grad(
+                        refresh_loss, override_weight, retain_graph=False
+                    )[0].float()
+                    # `autograd.grad` returns ∂(mean_loss)/∂W. Multiply by batch
+                    # size to recover a sum-over-samples gradient so per-rank
+                    # partials aggregate with a plain allreduce_sum.
+                    partial_grad_sum.add_(batch_grad_mean, alpha=float(batch_size))
+                    loss_sum += refresh_loss.item() * batch_size
+                    partial_count += batch_size
+                    memory_utils.cleanup_memory()
+
+    extras = {"loss_sum": loss_sum}
     if slide_active:
-        extras["mean_refresh_loss_current"] = sum(losses_current) / len(losses_current)
-        extras["mean_refresh_loss_next"] = sum(losses_next) / len(losses_next)
+        extras["loss_sum_current"] = loss_sum_current
+        extras["loss_sum_next"] = loss_sum_next
         extras["slide_alpha"] = slide_alpha
-    return grad, mean_refresh_loss, extras
+    return partial_grad_sum, partial_count, loss_sum, extras
 
 
 def collect_layer_grad_hessian_stats(
@@ -2892,6 +2943,9 @@ def run_pre_quant_gd(
     grad_clip,
     refresh_loss_type,
     layer_output_fisher_by_module,
+    global_shuffle=False,
+    dp_rank=0,
+    shard_size=None,
 ):
     if num_steps <= 0 or not module_names:
         return
@@ -2912,40 +2966,53 @@ def run_pre_quant_gd(
                 "exp_avg_sq": torch.zeros_like(module.weight.data, dtype=torch.float32),
             }
 
+    world = dist_utils.get_world_size()
     for step_idx in range(num_steps):
         sample_indices = scheduler.next_indices()
         step_losses = []
         step_update_abs = []
         for module_name, module in modules:
             fisher_tensor = layer_output_fisher_by_module.get(module_name)
-            grad, mean_loss, _grad_extras = collect_true_weight_gradient(
-                layer=layer,
-                analyzer=analyzer,
-                module_name=module_name,
-                full=full,
-                inps=inps,
-                fp_inps=fp_inps,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                position_embeddings=position_embeddings,
-                bsz=backward_bsz,
-                kl_topk=kl_topk,
-                dev=dev,
-                weight_override=module.weight.data.float(),
-                sample_indices=sample_indices,
-                refresh_loss_type=refresh_loss_type,
-                layer_output_fisher=fisher_tensor,
-            )
-            # DP aggregation: per-rank `grad` is the mean over `len(sample_indices)`
-            # local samples, and those shards are disjoint with equal size. The
-            # global mean across all ranks' samples = sum(grad_r) / world, which
-            # is what allreduce + divide gives us. Loss uses count-weighted mean.
-            if dist_utils.get_world_size() > 1:
-                dist_utils.allreduce_sum_(grad)
-                grad.div_(dist_utils.get_world_size())
-                mean_loss = dist_utils.allreduce_mean_scalar(
-                    mean_loss, count=len(sample_indices)
+            partial_grad_sum, partial_count, loss_sum, _extras = (
+                collect_true_weight_gradient(
+                    layer=layer,
+                    analyzer=analyzer,
+                    module_name=module_name,
+                    full=full,
+                    inps=inps,
+                    fp_inps=fp_inps,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    position_embeddings=position_embeddings,
+                    bsz=backward_bsz,
+                    kl_topk=kl_topk,
+                    dev=dev,
+                    weight_override=module.weight.data.float(),
+                    sample_indices=sample_indices,
+                    refresh_loss_type=refresh_loss_type,
+                    layer_output_fisher=fisher_tensor,
+                    global_shuffle=global_shuffle,
+                    dp_rank=dp_rank,
+                    shard_size=shard_size if shard_size is not None else inps.shape[0],
                 )
+            )
+            # DP aggregation via sum + count. The same code path handles both
+            # stratified (equal counts per rank) and global-shuffle (possibly
+            # uneven counts, even zero on some ranks).
+            if world > 1:
+                dist_utils.allreduce_sum_(partial_grad_sum)
+                global_count = dist_utils.allreduce_sum_scalar(partial_count)
+                global_loss_sum = dist_utils.allreduce_sum_scalar(loss_sum)
+            else:
+                global_count = partial_count
+                global_loss_sum = loss_sum
+            if global_count <= 0:
+                raise RuntimeError(
+                    f"pre-gd refresh produced zero samples across all ranks "
+                    f"(layer={layer_idx}, module={module_name})."
+                )
+            grad = partial_grad_sum / float(global_count)
+            mean_loss = global_loss_sum / float(global_count)
             update, next_state = apply_dense_optimizer_step(
                 module.weight.data,
                 grad,
@@ -3141,25 +3208,46 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
 
         quantizers = {}
         gradient_refresh_scheduler = None
+        dp_global_shuffle = bool(getattr(args, "dp_global_shuffle", False))
         if args.g_update_mode in {"block_backward", "block_gd"} or effective_pre_gd_steps > 0:
-            # Per-rank scheduler over the local shard. Each rank draws
-            # `backward_samples_local = backward_samples / world` indices per
-            # refresh; across ranks this realises stratified sampling over the
-            # full calibration set (variance ≤ global simple random sampling).
-            if args.backward_samples % dp_world != 0:
-                raise ValueError(
-                    f"backward_samples ({args.backward_samples}) must be divisible by world_size ({dp_world})."
+            if dp_global_shuffle:
+                # Single globally-shared shuffle. Every rank constructs the
+                # scheduler with the same seed + same total_samples, so
+                # `next_indices()` returns the identical global id list on
+                # every rank. Each rank then filters to its own shard inside
+                # `collect_true_weight_gradient`.
+                gradient_refresh_scheduler = BackwardSampleScheduler(
+                    args.nsamples,
+                    args.backward_samples,
+                    seed=args.seed,
                 )
-            backward_samples_local = args.backward_samples // dp_world
-            gradient_refresh_scheduler = BackwardSampleScheduler(
-                n_local,
-                backward_samples_local,
-                seed=args.seed + dp_rank,
-            )
+            else:
+                # Stratified: each rank owns a per-rank scheduler over its
+                # own shard. `backward_samples` must divide `dp_world` so the
+                # per-rank chunk is integral.
+                if args.backward_samples % dp_world != 0:
+                    raise ValueError(
+                        f"backward_samples ({args.backward_samples}) must be divisible by world_size ({dp_world})."
+                    )
+                backward_samples_local = args.backward_samples // dp_world
+                gradient_refresh_scheduler = BackwardSampleScheduler(
+                    n_local,
+                    backward_samples_local,
+                    seed=args.seed + dp_rank,
+                )
         final_layer_idx = len(layers) - 1
-        # In DP, "full backward" means every rank uses all of its local samples;
-        # together they still cover all `args.nsamples`.
-        full_refresh_sample_indices = list(range(n_local)) if args.final_layer_full_backward else None
+        if dp_global_shuffle:
+            # Every rank sees all global sample ids; `collect_true_weight_gradient`
+            # filters to the rank's shard.
+            full_refresh_sample_indices = (
+                list(range(args.nsamples)) if args.final_layer_full_backward else None
+            )
+        else:
+            # In the stratified path, each rank's full-backward equals using
+            # all of its local samples; together they cover all `args.nsamples`.
+            full_refresh_sample_indices = (
+                list(range(n_local)) if args.final_layer_full_backward else None
+            )
         layer_indices = range(quant_stop_layer + 1) if quant_stop_layer is not None else range(len(layers))
         pbar = tqdm(layer_indices, ncols=120, desc="Quantizing Layers", position=0)
         for i in pbar:
@@ -3336,6 +3424,9 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             grad_clip=args.grad_clip,
                             refresh_loss_type=layer_refresh_loss_type,
                             layer_output_fisher_by_module=layer_output_fisher_by_module,
+                            global_shuffle=dp_global_shuffle,
+                            dp_rank=dp_rank,
+                            shard_size=n_local,
                         )
 
             saliency_dict, gradients_dict, mean_reference_loss, layer_output_fisher = collect_layer_grad_hessian_stats(
@@ -3442,46 +3533,70 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         sample_indices = full_refresh_sample_indices
                     else:
                         sample_indices = gradient_refresh_scheduler.next_indices()
-                    grad, mean_refresh_loss, grad_extras = collect_true_weight_gradient(
-                        layer=layer,
-                        analyzer=analyzer,
-                        module_name=module_name,
-                        full=full,
-                        inps=inps,
-                        fp_inps=fp_inps,
-                        attention_mask=attention_mask,
-                        position_ids=position_ids,
-                        position_embeddings=position_embeddings,
-                        bsz=layer_backward_bsz,
-                        kl_topk=args.kl_topk,
-                        dev=dev,
-                        weight_override=weight_snapshot,
-                        sample_indices=sample_indices,
-                        refresh_loss_type=layer_refresh_loss_type,
-                        layer_output_fisher=layer_output_fisher,
-                        slide_alpha=slide_alpha,
-                        next_layer=slide_next_layer,
-                        fp_inps_next=slide_fp_inps_next,
-                        next_layer_output_fisher=slide_next_layer_output_fisher,
-                    )
-                    # DP aggregation: combine per-rank per-sample means into
-                    # the global mean. Equal shards → divide by world.
-                    if dp_world > 1:
-                        dist_utils.allreduce_sum_(grad)
-                        grad.div_(dp_world)
-                        mean_refresh_loss = dist_utils.allreduce_mean_scalar(
-                            mean_refresh_loss, count=len(sample_indices)
+                    partial_grad_sum, partial_count, loss_sum, grad_extras = (
+                        collect_true_weight_gradient(
+                            layer=layer,
+                            analyzer=analyzer,
+                            module_name=module_name,
+                            full=full,
+                            inps=inps,
+                            fp_inps=fp_inps,
+                            attention_mask=attention_mask,
+                            position_ids=position_ids,
+                            position_embeddings=position_embeddings,
+                            bsz=layer_backward_bsz,
+                            kl_topk=args.kl_topk,
+                            dev=dev,
+                            weight_override=weight_snapshot,
+                            sample_indices=sample_indices,
+                            refresh_loss_type=layer_refresh_loss_type,
+                            layer_output_fisher=layer_output_fisher,
+                            slide_alpha=slide_alpha,
+                            next_layer=slide_next_layer,
+                            fp_inps_next=slide_fp_inps_next,
+                            next_layer_output_fisher=slide_next_layer_output_fisher,
+                            global_shuffle=dp_global_shuffle,
+                            dp_rank=dp_rank,
+                            shard_size=n_local,
                         )
-                        for k in ("mean_refresh_loss_current", "mean_refresh_loss_next"):
+                    )
+                    # DP aggregation via sum + count. Works uniformly whether
+                    # each rank got exactly `backward_samples_local` (stratified)
+                    # or a binomial-distributed subset (global shuffle, and
+                    # occasionally zero).
+                    if dp_world > 1:
+                        dist_utils.allreduce_sum_(partial_grad_sum)
+                        global_count = dist_utils.allreduce_sum_scalar(partial_count)
+                        global_loss_sum = dist_utils.allreduce_sum_scalar(loss_sum)
+                        for k in ("loss_sum_current", "loss_sum_next"):
                             if k in grad_extras:
-                                grad_extras[k] = dist_utils.allreduce_mean_scalar(
-                                    grad_extras[k], count=len(sample_indices)
+                                grad_extras[k] = dist_utils.allreduce_sum_scalar(
+                                    grad_extras[k]
                                 )
+                    else:
+                        global_count = partial_count
+                        global_loss_sum = loss_sum
+                    if global_count <= 0:
+                        raise RuntimeError(
+                            f"refresh produced zero samples across all ranks; "
+                            f"sample_indices={sample_indices[:8]}..."
+                        )
+                    grad = partial_grad_sum / float(global_count)
+                    mean_refresh_loss = global_loss_sum / float(global_count)
                     meta = {
                         "mean_refresh_loss": mean_refresh_loss,
                         "sample_indices": sample_indices,
                     }
-                    meta.update(grad_extras)
+                    if "slide_alpha" in grad_extras:
+                        meta["slide_alpha"] = grad_extras["slide_alpha"]
+                    if "loss_sum_current" in grad_extras:
+                        meta["mean_refresh_loss_current"] = (
+                            grad_extras["loss_sum_current"] / float(global_count)
+                        )
+                    if "loss_sum_next" in grad_extras:
+                        meta["mean_refresh_loss_next"] = (
+                            grad_extras["loss_sum_next"] / float(global_count)
+                        )
                     return grad, meta
 
                 return refresh_fn

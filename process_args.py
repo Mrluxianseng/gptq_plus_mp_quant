@@ -149,6 +149,17 @@ def parse_gen():
         ),
     )
     parser.add_argument(
+        "--dp_global_shuffle",
+        action="store_true",
+        help=(
+            "Use a single globally-shared shuffle of all nsamples across ranks so every "
+            "rank selects the same global sample ids each refresh. Each rank filters to "
+            "its own shard and contributes a partial (sum, count). Makes DP results "
+            "numerically match a 1-GPU run with the same seed. Default (off) keeps the "
+            "per-rank stratified scheduler."
+        ),
+    )
+    parser.add_argument(
         "--global_loss_bsz",
         type=int,
         default=None,
