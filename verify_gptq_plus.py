@@ -6,14 +6,18 @@ analyze_quant_profile.build_parser) and either (a) saves the final quantized
 weights as a golden baseline, or (b) reloads a saved baseline and compares it
 to the current run.
 
+DP support: launch via `torchrun --nproc_per_node=N` to run multi-GPU DP.
+All ranks execute quantize_weights; only rank 0 handles the save/check I/O
+and the final pass/fail report.
+
 Usage:
-    # save baseline before optimizing
+    # save baseline before optimizing (single GPU)
     python verify_gptq_plus.py --verify_mode save \
         --verify_output ./outputs/verify/baseline.pt [<analyze args...>]
 
-    # re-check after optimizing
-    python verify_gptq_plus.py --verify_mode check \
-        --verify_output ./outputs/verify/baseline.pt [<analyze args...>]
+    # DP run (2 GPUs)
+    torchrun --nproc_per_node=2 verify_gptq_plus.py --verify_mode save \
+        --verify_output ./outputs/verify/baseline_2gpu.pt [<analyze args...>]
 """
 import os
 
@@ -28,7 +32,7 @@ import torch
 
 from analyze_quant_profile import build_parser
 from gptq_utils.main import quantize_weights
-from utils import memory_utils
+from utils import memory_utils, dist_utils
 from utils.log_utils import init_logging
 from utils.model_utils import ModelAnalyzer
 
@@ -150,7 +154,7 @@ def finalize_args(args) -> None:
     args.lm_eval = False
     args.lm_eval_batch_size = 32
     args.eval_datasets = ["wikitext2", "ultrachat_2k", "numinamath"]
-    args.enable_debug = False
+    args.enable_debug = getattr(args, "enable_debug", False)
 
     if args.fisher_num_groups is None:
         args.fisher_num_groups = args.num_groups
@@ -166,18 +170,35 @@ def finalize_args(args) -> None:
         args.global_loss_bsz = args.bsz
 
 
+def _is_torchrun_launched() -> bool:
+    """torchrun sets RANK/WORLD_SIZE/LOCAL_RANK env vars."""
+    return "RANK" in os.environ and "WORLD_SIZE" in os.environ
+
+
 def main() -> None:
     parser = build_parser()
     parser.add_argument("--verify_mode", required=True, choices=["save", "check"])
     parser.add_argument("--verify_output", required=True, type=str)
     parser.add_argument("--verify_tol_abs", type=float, default=0.0)
     parser.add_argument("--verify_tol_rel", type=float, default=0.0)
+    parser.add_argument("--enable_debug", action="store_true",
+                        help="Enable cross-rank bit-exact assertions after each layer's fasterquant.")
     args = parser.parse_args()
     finalize_args(args)
 
-    init_logging(args.log_dir)
-    logging.info("[verify] mode=%s output=%s", args.verify_mode, args.verify_output)
-    logging.info(args)
+    # DP init. When launched single-GPU without torchrun we skip init entirely
+    # so the code paths stay as before (world_size=1 everywhere).
+    if _is_torchrun_launched():
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+        dist_utils.init_process_group()
+
+    if dist_utils.is_main():
+        init_logging(args.log_dir)
+        logging.info("[verify] mode=%s output=%s world_size=%d",
+                     args.verify_mode, args.verify_output, dist_utils.get_world_size())
+        logging.info(args)
 
     seed_everything(args.seed)
 
@@ -185,27 +206,45 @@ def main() -> None:
     analyzer.model.cpu()
     quantize_weights(args, analyzer)
 
+    # After quantization all ranks' model.layer weights are identical (verified
+    # via assert_bit_exact when --enable_debug is set). Only rank 0 needs to
+    # do the save/check I/O.
     state = collect_quantized_tensors(analyzer.model)
     if not state:
-        sys.exit("[verify] no tensors collected — is quant_stop_layer set correctly?")
+        if dist_utils.is_main():
+            print("[verify] no tensors collected — is quant_stop_layer set correctly?")
+        dist_utils.barrier()
+        sys.exit(1)
 
-    if args.verify_mode == "save":
-        os.makedirs(os.path.dirname(args.verify_output) or ".", exist_ok=True)
-        torch.save(state, args.verify_output)
-        print(f"[verify] saved baseline: {args.verify_output} ({len(state)} tensors)")
-    else:
-        if not os.path.exists(args.verify_output):
-            sys.exit(f"[verify] golden file not found: {args.verify_output}")
-        golden = torch.load(args.verify_output, map_location="cpu")
-        if compare_tensors(golden, state, args.verify_tol_abs, args.verify_tol_rel):
-            print("[verify] PASS — all tensors match within tolerance")
+    if dist_utils.is_main():
+        if args.verify_mode == "save":
+            os.makedirs(os.path.dirname(args.verify_output) or ".", exist_ok=True)
+            torch.save(state, args.verify_output)
+            print(f"[verify] saved baseline: {args.verify_output} ({len(state)} tensors)")
+            exit_code = 0
         else:
-            print("[verify] FAIL — tensor mismatch detected")
-            sys.exit(1)
+            if not os.path.exists(args.verify_output):
+                print(f"[verify] golden file not found: {args.verify_output}")
+                exit_code = 1
+            else:
+                golden = torch.load(args.verify_output, map_location="cpu")
+                if compare_tensors(golden, state, args.verify_tol_abs, args.verify_tol_rel):
+                    print("[verify] PASS — all tensors match within tolerance")
+                    exit_code = 0
+                else:
+                    print("[verify] FAIL — tensor mismatch detected")
+                    exit_code = 1
+    else:
+        exit_code = 0
+
+    dist_utils.barrier()
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     memory_utils.cleanup_memory(False)
+
+    if exit_code != 0:
+        sys.exit(exit_code)
 
 
 if __name__ == "__main__":

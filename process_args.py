@@ -330,6 +330,29 @@ def parse_gen():
         args.backward_samples = args.nsamples
     if args.backward_samples <= 0:
         raise ValueError(f"`backward_samples` must be positive or -1. Got {args.backward_samples}.")
+
+    # DP divisibility constraints. When running under torchrun with N>1 ranks,
+    # sample counts and batch sizes must split evenly across ranks. We read
+    # WORLD_SIZE from the env so these checks fire at parse time — failing late
+    # inside gptq_fwrd after loading the model would waste a lot of startup.
+    _dp_world = int(os.environ.get("WORLD_SIZE", 1))
+    if _dp_world > 1:
+        if args.nsamples % _dp_world != 0:
+            raise ValueError(
+                f"DP requires nsamples ({args.nsamples}) divisible by WORLD_SIZE ({_dp_world})."
+            )
+        if args.backward_samples % _dp_world != 0:
+            raise ValueError(
+                f"DP requires backward_samples ({args.backward_samples}) divisible by WORLD_SIZE ({_dp_world})."
+            )
+        if args.bsz % _dp_world != 0:
+            raise ValueError(
+                f"DP requires bsz ({args.bsz}) divisible by WORLD_SIZE ({_dp_world})."
+            )
+        if args.global_loss_bsz is not None and args.global_loss_bsz > 0 and args.global_loss_bsz % _dp_world != 0:
+            raise ValueError(
+                f"DP requires global_loss_bsz ({args.global_loss_bsz}) divisible by WORLD_SIZE ({_dp_world})."
+            )
     if args.final_layer_stats_bsz is None:
         args.final_layer_stats_bsz = args.bsz
     if args.final_layer_stats_bsz <= 0:

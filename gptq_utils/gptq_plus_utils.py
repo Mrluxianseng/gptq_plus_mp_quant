@@ -16,7 +16,7 @@ try:
 except ImportError:
     from torch.nn.utils.stateless import functional_call
 
-from utils import quant_utils, memory_utils, model_utils
+from utils import quant_utils, memory_utils, model_utils, dist_utils
 
 
 # Single reusable no-op context. `nullcontext()` instances are stateless, so we
@@ -229,9 +229,9 @@ def get_module_grad_lr(
 
 
 class GPTQPlus:
-    def __init__(self, 
-        layer, 
-        saliency: torch.Tensor, # shape (N, seq_len, G)
+    def __init__(self,
+        layer,
+        saliency: torch.Tensor, # shape (N_local, seq_len, G) — rank-local shard in DP
         gradient: torch.Tensor, # shape (G, in_features)
         num_groups: int,
         alpha: float,
@@ -256,6 +256,12 @@ class GPTQPlus:
         # makes per-subgroup slices `self.H[g]` contiguous, so the bmm-based
         # accumulation in `add_batch` and the per-subgroup clone in
         # `fasterquant` get a fast contiguous read/write path.
+        #
+        # DP note: `H` / `act_square` hold an unnormalised SUM. `finalize_hessian`
+        # all-reduces across ranks and applies the single global division. This
+        # gives mathematically the same result as the old running-mean update
+        # but is invariant to sample-order / sample-shard, which is required
+        # once multiple ranks each see only part of `nsamples`.
         self.H = torch.zeros(
             (self.num_groups, self.columns, self.columns),
             device=self.dev
@@ -263,8 +269,13 @@ class GPTQPlus:
         self.act_square = torch.zeros(
             (self.columns), device=self.dev
         )
+        # Rank-local sample counter; `token_count` mirrors it in units of tokens
+        # (= index * seq_len) so we can recover seq_len at finalize time even
+        # if the caller never handed it to us directly.
         self.nsamples = saliency.shape[0]
         self.index = 0
+        self.token_count = 0
+        self._finalized = False
         self.profile_recorder = None
 
         # Assert row partition is valid:
@@ -497,13 +508,19 @@ class GPTQPlus:
         """
         inp: shape [batch_size, seq_len, in_features]
 
-        We'll slice self.saliencies[index: index + batch_size]
-        do the einsum => accumulate into self.H
-        then index += batch_size.
+        Accumulates an unnormalised per-rank sum into `self.H` / `self.act_square`.
+        `finalize_hessian()` later all-reduces across ranks and applies the single
+        global division.
+
+        This replaces the pre-DP running-mean update. Single-GPU no longer stays
+        bit-exact with the previous baseline because FP accumulation order changes,
+        but the mathematical result is the same and verification uses tolerant
+        allclose anyway (DP vs serial is never bit-exact).
         """
+        if self._finalized:
+            raise RuntimeError("add_batch called after finalize_hessian. Re-init GPTQPlus to reuse.")
         profile_recorder = self.profile_recorder
         with profile_recorder.section("add_batch.total") if profile_recorder else _NULL_CONTEXT:
-            # If input is 2D or 1D, reshape to [batch, seq_len, dim] for consistency
             if inp.dim() == 2:
                 inp = inp.unsqueeze(0)  # => [1, seq_len, dim]
             else:
@@ -511,9 +528,7 @@ class GPTQPlus:
 
             with profile_recorder.section("add_batch.slice_saliency") if profile_recorder else _NULL_CONTEXT:
                 bsz = inp.shape[0]
-                # slice out shape => (bsz, seq_len, G)
                 sal_batch = self.saliencies[self.index: self.index + bsz].to(self.dev)
-                self.H *= self.index / (self.index + bsz)
                 self.index += bsz
 
             with profile_recorder.section("add_batch.prepare_inputs") if profile_recorder else _NULL_CONTEXT:
@@ -525,22 +540,45 @@ class GPTQPlus:
                 n_tokens = inp.shape[0]
 
             with profile_recorder.section("add_batch.weighted_input") if profile_recorder else _NULL_CONTEXT:
-                # weighted[g, n, j] = inp[n, j] * sal[n, g]; equivalent to the
-                # original einsum "nj,ng->njg" but laid out so the subsequent
-                # bmm sees contiguous (G, n, d) batches.
                 weighted = inp.unsqueeze(0).mul(sal_batch.transpose(0, 1).unsqueeze(-1))
 
             with profile_recorder.section("add_batch.hessian_block") if profile_recorder else _NULL_CONTEXT:
-                # block[g, i, j] = sum_n inp[n, i] * inp[n, j] * sal[n, g]
-                #                = (inp.T @ (inp * sal[:, g:g+1]))_{i,j}
-                # cuBLAS batched GEMM is significantly faster than the 3-axis
-                # einsum kernel that PyTorch falls back to for "ni,njg->ijg".
                 inp_T_batched = inp.transpose(0, 1).unsqueeze(0).expand(self.num_groups, -1, -1)
                 block = torch.bmm(inp_T_batched, weighted)
 
             with profile_recorder.section("add_batch.accumulate") if profile_recorder else _NULL_CONTEXT:
-                self.H.add_(block, alpha=1 / (n_tokens * self.index))
-                self.act_square.add_((inp ** 2).sum(0), alpha=1 / n_tokens)
+                # Pure sum; normalisation deferred to `finalize_hessian`. Tracking
+                # `token_count` lets finalize recover seq_len = token_count / index.
+                self.H.add_(block)
+                self.act_square.add_((inp ** 2).sum(0))
+                self.token_count += n_tokens
+
+    @torch.no_grad()
+    def finalize_hessian(self):
+        """All-reduce the unnormalised sums across ranks (no-op at world_size=1),
+        then apply the single global division to produce the same H as the
+        pre-DP running-mean formula did:
+
+            H      = sum_tokens block / (total_samples * seq_len)
+            act_sq = sum_tokens (inp**2)_n / seq_len
+
+        Called exactly once per GPTQPlus instance, between the forward that
+        drives `add_batch` and `fasterquant`.
+        """
+        if self._finalized:
+            return
+        from utils import dist_utils as _dist  # local import to avoid cycles
+
+        _dist.allreduce_sum_(self.H)
+        _dist.allreduce_sum_(self.act_square)
+        total_samples = _dist.allreduce_sum_scalar(self.index)
+        total_tokens = _dist.allreduce_sum_scalar(self.token_count)
+        if total_samples <= 0 or total_tokens <= 0:
+            raise RuntimeError("finalize_hessian called before any add_batch ran.")
+        seq_len = total_tokens / total_samples
+        self.H.div_(total_samples * seq_len)
+        self.act_square.div_(seq_len)
+        self._finalized = True
 
     def fasterquant(
         self,
@@ -1753,24 +1791,61 @@ class SaliencyCache:
 class GradientCache:
     """
     class for saving the weight gradients in each layer.
+
+    DP note: `cache_gradient` accumulates an unnormalised rank-local SUM of
+    per-batch gradients; `finalize` all-reduces the sum and the batch count
+    across ranks, then produces the global mean. This matches the pre-DP
+    running-mean semantics: `mean_over_all_batches(batch_grad)` — as long as
+    batches across ranks have the same size, the global mean equals what the
+    single-GPU running-mean would produce.
     """
     def __init__(self, names, num_groups):
         self.num_groups = num_groups
+        # Public result field; populated by finalize().
         self.gradients_cache = {}
-        self.index = {}
+        # Internal rank-local accumulators.
+        self._gradients_sum = {}
+        self._count = {}
         self.names = names
         for name in self.names:
-            self.gradients_cache[name] = 0
-            self.index[name] = 0
+            self._gradients_sum[name] = None
+            self._count[name] = 0
         self.handles = []
         self.hooks_enabled = False
 
     def cache_gradient(self, grad, name):
         if not self.hooks_enabled:
             return
-        self.gradients_cache[name] *= self.index[name] / (self.index[name] + 1)
-        self.index[name] += 1
-        self.gradients_cache[name] += grad.float() / self.index[name]
+        grad_f = grad.float()
+        if self._gradients_sum[name] is None:
+            self._gradients_sum[name] = torch.zeros_like(grad_f)
+        self._gradients_sum[name].add_(grad_f)
+        self._count[name] += 1
+
+    def finalize(self):
+        """All-reduce per-module sums across ranks and divide by the global
+        batch count to produce the mean. Populates `self.gradients_cache`.
+        """
+        from utils import dist_utils as _dist
+
+        for name in self.names:
+            total = self._gradients_sum[name]
+            if total is None:
+                # Nothing accumulated on any rank: produce a zero tensor only
+                # after we know the shape. Defer: raise — this should not happen
+                # because we only register hooks for modules that will fire.
+                raise RuntimeError(
+                    f"GradientCache.finalize: no gradient accumulated for `{name}`. "
+                    f"Did a module silently skip its weight.grad hook?"
+                )
+            _dist.allreduce_sum_(total)
+            global_count = _dist.allreduce_sum_scalar(self._count[name])
+            if global_count <= 0:
+                raise RuntimeError(f"GradientCache.finalize: zero count for `{name}`.")
+            self.gradients_cache[name] = total / global_count
+        # Release the raw sums — downstream code only reads `gradients_cache`.
+        self._gradients_sum.clear()
+        self._count.clear()
 
     def add_hook(self, full, enable=True):
         for name in self.names:
@@ -1797,7 +1872,8 @@ class GradientCache:
     def clear_cache(self):
         for name in self.names:
             self.gradients_cache[name] = 0
-            self.index[name] = 0
+            self._gradients_sum[name] = None
+            self._count[name] = 0
         memory_utils.cleanup_memory()
 
 
@@ -1901,18 +1977,38 @@ def collect_static_end_to_end_saliency_and_fisher(
             handles.append(module.register_forward_hook(make_module_hook(layer_idx, module_name)))
 
     token_batches = [batch[0] for batch in dataloader]
+    nsamples_total = len(token_batches)
+    world = dist_utils.get_world_size()
+    rank = dist_utils.get_rank()
+    if nsamples_total % world != 0:
+        raise ValueError(
+            f"static saliency: nsamples ({nsamples_total}) must be divisible by world_size ({world})."
+        )
+    if batch_size % world != 0:
+        raise ValueError(
+            f"static saliency: global_loss_bsz ({batch_size}) must be divisible by world_size ({world})."
+        )
+    local_batch_size = batch_size // world
+    # Contiguous shard of sample ids; each rank only does forward/backward on
+    # its own slice and keeps the collected saliency/fisher rank-local. These
+    # tensors are later consumed directly by rank-local `add_batch` calls
+    # (sample index alignment is preserved because `inps` is sharded the same
+    # way) — no all-gather is needed.
+    shard = dist_utils.shard_slice(nsamples_total, rank, world)
+    local_batches = token_batches[shard]
     model = model.to(dev)
     model.eval()
     try:
         with torch.enable_grad():
-            for start in tqdm(
-                range(0, len(token_batches), batch_size),
+            for local_start in tqdm(
+                range(0, len(local_batches), local_batch_size),
                 ncols=120,
                 desc="Static E2E Saliency/Fisher",
                 position=1,
                 leave=False,
             ):
-                input_ids = torch.cat(token_batches[start:start + batch_size], dim=0).to(dev)
+                global_start = shard.start + local_start
+                input_ids = torch.cat(local_batches[local_start:local_start + local_batch_size], dim=0).to(dev)
                 outputs = model(input_ids=input_ids)
                 logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
                 teacher_logits = logits.detach()
@@ -1924,6 +2020,13 @@ def collect_static_end_to_end_saliency_and_fisher(
                         sorted=False,
                     )
                     student_logits = student_logits.gather(-1, indices)
+                # Per-batch deterministic label sampling: seed the CUDA RNG by
+                # the batch's global start index so the labels for each global
+                # sample id are identical no matter how nsamples is sharded
+                # across ranks. Categorical.sample does not take a generator
+                # kwarg uniformly across torch versions, so we reset the global
+                # RNG state (only affects this rank's visible GPU).
+                torch.cuda.manual_seed_all(1000003 * global_start + 17)
                 labels = torch.distributions.Categorical(logits=teacher_logits).sample()
                 loss = F.cross_entropy(
                     student_logits.view(-1, student_logits.size(-1)),
@@ -1949,6 +2052,7 @@ def collect_static_end_to_end_saliency_and_fisher(
                 raise ValueError(
                     f"Failed to collect static end-to-end saliency for layer={layer_idx} module={module_name}."
                 )
+            # Rank-local shard of shape (n_local, T, G). Not gathered.
             layer_saliency[module_name] = torch.cat(saliency_data[layer_idx][module_name], dim=0)
         if not fisher_data[layer_idx]:
             raise ValueError(f"Failed to collect static end-to-end Fisher for layer={layer_idx}.")
@@ -2316,6 +2420,15 @@ def collect_layer_grad_hessian_stats(
                                 grad_hessian_logits = logits.gather(-1, grad_hessian_indices)
                     if need_saliency_collection:
                         with layer_recorder.section("layer.grad_hessian.forward.label_sample") if layer_recorder else _NULL_CONTEXT:
+                            # Seed per-global-sample-index: with DP each rank
+                            # processes different `j`, so identical seeding
+                            # based on the global sample id keeps the label
+                            # distribution invariant to world_size.
+                            _dp_rank = dist_utils.get_rank()
+                            _dp_world = dist_utils.get_world_size()
+                            _n_local = inps.shape[0]
+                            _global_start = _dp_rank * _n_local + j
+                            torch.cuda.manual_seed_all(1000003 * (layer_idx * 131 + _global_start) + 17)
                             labels = torch.distributions.Categorical(logits=grad_hessian_logits_fp).sample()
                         with layer_recorder.section("layer.grad_hessian.forward.nll_build") if layer_recorder else _NULL_CONTEXT:
                             nll_loss = F.cross_entropy(
@@ -2412,21 +2525,36 @@ def collect_layer_grad_hessian_stats(
                 with layer_recorder.section("layer.grad_hessian.cleanup") if layer_recorder else _NULL_CONTEXT:
                     memory_utils.cleanup_memory()
 
-        mean_reference_loss = sum(reference_losses) / len(reference_losses)
+        # DP: rank-local running mean already covers per-sample contributions.
+        # We combine across ranks into the global mean via (sum, count)
+        # allreduce of the reference_losses vector below.
+        local_sum_ref_loss = sum(reference_losses)
+        local_count_ref_loss = len(reference_losses)
+        mean_reference_loss = dist_utils.allreduce_mean_scalar(
+            local_sum_ref_loss / max(local_count_ref_loss, 1),
+            count=local_count_ref_loss,
+        )
 
     if saliency_cache is not None:
         saliency_cache.clear_hook()
     gradients_cache.clear_hook()
+    # Finalise the per-module gradient sums: all-reduce across ranks and divide
+    # by the global batch count to realise the same mean as the pre-DP
+    # running-mean hook.
+    gradients_cache.finalize()
     layer_output_fisher = precomputed_layer_output_fisher
     if need_layer_output_fisher_collection:
+        # Keep the layer-output Fisher sharded across ranks — every consumer
+        # indexes it by rank-local sample ids (fp_inps local shard).
         layer_output_fisher = torch.cat(layer_output_fisher_cache, dim=0)
 
     with layer_recorder.section("layer.cache_finalize") if layer_recorder else _NULL_CONTEXT:
         if saliency_cache is not None:
             for name in saliency_cache.names:
+                # Saliency stays sharded (rank-local); GPTQPlus only needs its
+                # own rank's slice for add_batch, which also runs on the rank's
+                # inps shard.
                 saliency_cache.saliency_cache[name] = torch.cat(saliency_cache.saliency_cache[name], dim=0)
-        for name in gradients_cache.names:
-            gradients_cache.gradients_cache[name] = gradients_cache.gradients_cache[name]
         saliency_dict = precomputed_saliency_dict if precomputed_saliency_dict is not None else saliency_cache.saliency_cache
         gradients_dict = gradients_cache.gradients_cache
 
@@ -2499,6 +2627,16 @@ def run_pre_quant_gd(
                 refresh_loss_type=refresh_loss_type,
                 layer_output_fisher=fisher_tensor,
             )
+            # DP aggregation: per-rank `grad` is the mean over `len(sample_indices)`
+            # local samples, and those shards are disjoint with equal size. The
+            # global mean across all ranks' samples = sum(grad_r) / world, which
+            # is what allreduce + divide gives us. Loss uses count-weighted mean.
+            if dist_utils.get_world_size() > 1:
+                dist_utils.allreduce_sum_(grad)
+                grad.div_(dist_utils.get_world_size())
+                mean_loss = dist_utils.allreduce_mean_scalar(
+                    mean_loss, count=len(sample_indices)
+                )
             update, next_state = apply_dense_optimizer_step(
                 module.weight.data,
                 grad,
@@ -2614,10 +2752,21 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
             layers[0] = layers[0].to(dev)
 
         dtype = next(iter(model.parameters())).dtype
+        # DP: shard calibration samples contiguously by rank. Each rank only
+        # allocates / captures its own slice of inps; subsequent per-layer loops
+        # iterate over `inps.shape[0] == n_local`.
+        dp_world = dist_utils.get_world_size()
+        dp_rank = dist_utils.get_rank()
+        if args.nsamples % dp_world != 0:
+            raise ValueError(
+                f"nsamples ({args.nsamples}) must be divisible by world_size ({dp_world}) for DP."
+            )
+        n_local = args.nsamples // dp_world
+        dp_shard = slice(dp_rank * n_local, (dp_rank + 1) * n_local)
         inps = torch.zeros(
-            (args.nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device=dev
+            (n_local, model.seqlen, model.config.hidden_size), dtype=dtype, device=dev
         )
-        cache = {"i": 0, "attention_mask": None}
+        cache = {"global_i": 0, "attention_mask": None}
 
         class Catcher(nn.Module):
             def __init__(self, module):
@@ -2627,8 +2776,11 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     self.attention_type = module.attention_type
 
             def forward(self, inp, **kwargs):
-                inps[cache["i"]] = inp
-                cache["i"] += 1
+                # Only materialise this rank's shard; other ranks drop the sample.
+                global_i = cache["global_i"]
+                if dp_shard.start <= global_i < dp_shard.stop:
+                    inps[global_i - dp_shard.start] = inp
+                cache["global_i"] += 1
                 cache["attention_mask"] = kwargs["attention_mask"]
                 cache["position_ids"] = kwargs["position_ids"]
                 cache["position_embeddings"] = kwargs["position_embeddings"]
@@ -2662,13 +2814,24 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
         quantizers = {}
         gradient_refresh_scheduler = None
         if args.g_update_mode in {"block_backward", "block_gd"} or effective_pre_gd_steps > 0:
+            # Per-rank scheduler over the local shard. Each rank draws
+            # `backward_samples_local = backward_samples / world` indices per
+            # refresh; across ranks this realises stratified sampling over the
+            # full calibration set (variance ≤ global simple random sampling).
+            if args.backward_samples % dp_world != 0:
+                raise ValueError(
+                    f"backward_samples ({args.backward_samples}) must be divisible by world_size ({dp_world})."
+                )
+            backward_samples_local = args.backward_samples // dp_world
             gradient_refresh_scheduler = BackwardSampleScheduler(
-                args.nsamples,
-                args.backward_samples,
-                seed=args.seed,
+                n_local,
+                backward_samples_local,
+                seed=args.seed + dp_rank,
             )
         final_layer_idx = len(layers) - 1
-        full_refresh_sample_indices = list(range(args.nsamples)) if args.final_layer_full_backward else None
+        # In DP, "full backward" means every rank uses all of its local samples;
+        # together they still cover all `args.nsamples`.
+        full_refresh_sample_indices = list(range(n_local)) if args.final_layer_full_backward else None
         layer_indices = range(quant_stop_layer + 1) if quant_stop_layer is not None else range(len(layers))
         pbar = tqdm(layer_indices, ncols=120, desc="Quantizing Layers", position=0)
         for i in pbar:
@@ -2691,12 +2854,26 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     args.grad_refresh_loss,
                     layer_refresh_loss_type,
                 )
-            layer_backward_bsz = args.final_layer_backward_bsz if i == final_layer_idx else args.backward_bsz
-            layer_stats_bsz = args.final_layer_stats_bsz if i == final_layer_idx else args.bsz
+            # Interpret all *_bsz knobs as GLOBAL batch sizes and split per
+            # rank. With N=1 these reduce to their original values, so N=1
+            # behavior w.r.t. bsz is unchanged.
+            layer_backward_bsz_global = args.final_layer_backward_bsz if i == final_layer_idx else args.backward_bsz
+            layer_stats_bsz_global = args.final_layer_stats_bsz if i == final_layer_idx else args.bsz
+            if layer_backward_bsz_global % dp_world != 0:
+                raise ValueError(
+                    f"layer_backward_bsz ({layer_backward_bsz_global}) must be divisible by world_size ({dp_world})."
+                )
+            if layer_stats_bsz_global % dp_world != 0:
+                raise ValueError(
+                    f"layer_stats_bsz ({layer_stats_bsz_global}) must be divisible by world_size ({dp_world})."
+                )
+            layer_backward_bsz = layer_backward_bsz_global // dp_world
+            layer_stats_bsz = layer_stats_bsz_global // dp_world
 
             with layer_recorder.section("layer.fp_reference_forward") if layer_recorder else _NULL_CONTEXT:
                 bits_config = quant_utils.disable_act_quant(layer)
-                for j in range(args.nsamples):
+                # inps/fp_inps are rank-local shards of length n_local.
+                for j in range(inps.shape[0]):
                     fp_inps[j] = layer(
                         fp_inps[j].unsqueeze(0).to(dev),
                         attention_mask=attention_mask,
@@ -2870,7 +3047,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     gptq[name].profile_recorder = add_batch_recorders[name]
                 handles.append(subset[name].register_forward_hook(add_batch(name)))
             with layer_recorder.section("layer.hessian_accumulation_forward") if layer_recorder else _NULL_CONTEXT:
-                for j in range(args.nsamples):
+                for j in range(inps.shape[0]):
                     _ = layer(
                         inps[j].unsqueeze(0).to(dev),
                         attention_mask=attention_mask,
@@ -2881,6 +3058,14 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                 h.remove()
             for name in add_batch_recorders:
                 gptq[name].profile_recorder = None
+
+            # Close out the Hessian accumulation: all-reduce the per-rank sums
+            # and apply the global normalisation exactly once. After this call
+            # fasterquant sees a globally-averaged H that is bit-identical on
+            # every rank (NCCL all_reduce is deterministic for a given op+shape).
+            with layer_recorder.section("layer.hessian_finalize") if layer_recorder else _NULL_CONTEXT:
+                for name in gptq:
+                    gptq[name].finalize_hessian()
 
             def make_gradient_refresh_fn(module_name):
                 def refresh_fn(weight_snapshot):
@@ -2906,6 +3091,14 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         refresh_loss_type=layer_refresh_loss_type,
                         layer_output_fisher=layer_output_fisher,
                     )
+                    # DP aggregation: combine per-rank per-sample means into
+                    # the global mean. Equal shards → divide by world.
+                    if dp_world > 1:
+                        dist_utils.allreduce_sum_(grad)
+                        grad.div_(dp_world)
+                        mean_refresh_loss = dist_utils.allreduce_mean_scalar(
+                            mean_refresh_loss, count=len(sample_indices)
+                        )
                     return grad, {"mean_refresh_loss": mean_refresh_loss, "sample_indices": sample_indices}
 
                 return refresh_fn
@@ -3010,11 +3203,21 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         block_observer=make_block_observer(name, effective_grad_optimizer) if args.g_update_mode in {"block_backward", "block_gd"} else None,
                         grad_clip=args.grad_clip,
                     )
+                    # DP correctness check (debug only): fasterquant is meant
+                    # to be deterministic given identical inputs, and since H /
+                    # gradients / act_square are bit-identical across ranks after
+                    # all-reduce, the output weight must be bit-identical too.
+                    # Any drift here compounds across layers, so we fail fast.
+                    if getattr(args, "enable_debug", False):
+                        dist_utils.assert_bit_exact(
+                            subset[name].weight.data,
+                            tag=f"layer{i}.{name}.weight_after_fasterquant",
+                        )
                     quantizers["model.layers.%d.%s" % (i, name)] = gptq[name].quantizer
                     gptq[name].free()
 
             with layer_recorder.section("layer.quantized_replay_forward") if layer_recorder else _NULL_CONTEXT:
-                for j in range(args.nsamples):
+                for j in range(inps.shape[0]):
                     inps[j] = layer(
                         inps[j].unsqueeze(0).to(dev),
                         attention_mask=attention_mask,
