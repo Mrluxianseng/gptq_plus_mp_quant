@@ -3567,6 +3567,22 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         QuantProfileRecorder(dev, prefix=f"layers.{i}.{name}")
                         if should_profile_module(i, name) else None
                     )
+                    if dist_utils.is_main() and getattr(args, "enable_debug", False):
+                        _H = gptq[name].H
+                        _grad = gptq[name].gradients
+                        _sal = gptq[name].saliencies
+                        _act = gptq[name].act_square
+                        logging.info(
+                            "dp-probe layer=%d module=%s H_mean=%.6e H_absmax=%.6e grad_mean=%.6e grad_absmax=%.6e "
+                            "act_mean=%.6e sal_mean=%.6e sal_shape=%s refloss=%.6e tokens=%d idx=%d",
+                            i, name,
+                            _H.float().mean().item(), _H.float().abs().max().item(),
+                            _grad.float().mean().item(), _grad.float().abs().max().item(),
+                            _act.float().mean().item(),
+                            _sal.float().mean().item(), tuple(_sal.shape),
+                            gptq[name].reference_loss,
+                            gptq[name].token_count, gptq[name].index,
+                        )
                     gptq[name].fasterquant(
                         blocksize=args.blocksize,
                         percdamp=args.percdamp,

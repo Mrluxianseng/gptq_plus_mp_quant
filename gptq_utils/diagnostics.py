@@ -117,6 +117,8 @@ class DiagnosticRecorder:
     # -- internal --------------------------------------------------------
     def _save(self, path: str, tensor):
         """Save a tensor (or Python scalar) as a .pt file, always on CPU and fp32."""
+        if tensor is None:
+            return
         os.makedirs(os.path.dirname(path), exist_ok=True)
         if isinstance(tensor, torch.Tensor):
             t = tensor.detach().cpu()
