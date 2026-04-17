@@ -1886,6 +1886,42 @@ def hidden2logits(hidden_states, analyzer: model_utils.ModelAnalyzer):
     return logits
 
 
+def _deterministic_categorical_labels(logits: torch.Tensor, global_sample_indices,
+                                      base_seed: int) -> torch.Tensor:
+    """Per-sample deterministic `Categorical(logits).sample()`.
+
+    Each row's labels depend ONLY on that row's global sample index, not on
+    the batch shape or how samples are grouped. This makes static saliency /
+    per-layer grad-hessian stats reproducible across shardings (1-GPU vs
+    N-GPU DP): both paths produce the same labels for the same global sample
+    ids, so downstream Fisher / saliency / gradient statistics match up to
+    pure FP-order drift.
+
+    logits: (bsz, ..., V)
+    global_sample_indices: sequence of length bsz, each an int global sample id
+    base_seed: tag that namespaces this call site (e.g. hash of layer_idx)
+    """
+    bsz = logits.shape[0]
+    assert len(global_sample_indices) == bsz, (
+        f"expected {bsz} global indices, got {len(global_sample_indices)}"
+    )
+    trailing_shape = logits.shape[1:-1]
+    vocab = logits.shape[-1]
+    out = torch.empty(logits.shape[:-1], dtype=torch.long, device=logits.device)
+    for i in range(bsz):
+        # torch.Generator accepts any device torch supports; we match logits.device.
+        gen = torch.Generator(device=logits.device).manual_seed(
+            int(1000003 * (base_seed * 100000 + int(global_sample_indices[i])) + 17)
+        )
+        # multinomial takes (num_rows, vocab) and a `generator` kwarg, which
+        # `Categorical.sample` does not expose portably across torch versions.
+        probs = torch.softmax(logits[i].reshape(-1, vocab).float(), dim=-1)
+        sample = torch.multinomial(probs, 1, generator=gen).reshape(trailing_shape)
+        out[i] = sample
+    return out
+
+
+
 def collect_static_end_to_end_saliency_and_fisher(
     *,
     model,
@@ -2020,14 +2056,17 @@ def collect_static_end_to_end_saliency_and_fisher(
                         sorted=False,
                     )
                     student_logits = student_logits.gather(-1, indices)
-                # Per-batch deterministic label sampling: seed the CUDA RNG by
-                # the batch's global start index so the labels for each global
-                # sample id are identical no matter how nsamples is sharded
-                # across ranks. Categorical.sample does not take a generator
-                # kwarg uniformly across torch versions, so we reset the global
-                # RNG state (only affects this rank's visible GPU).
-                torch.cuda.manual_seed_all(1000003 * global_start + 17)
-                labels = torch.distributions.Categorical(logits=teacher_logits).sample()
+                # Per-sample deterministic label sampling: each sample's labels
+                # only depend on its global sample id, making the draw
+                # invariant to batching (1-GPU 16-per-batch vs 2-GPU 8-per-batch
+                # both produce the same labels for the same global sample id).
+                _batch_bsz = teacher_logits.shape[0]
+                _global_indices = [global_start + _i for _i in range(_batch_bsz)]
+                labels = _deterministic_categorical_labels(
+                    teacher_logits,
+                    _global_indices,
+                    base_seed=0,  # global static saliency uses its own namespace
+                )
                 loss = F.cross_entropy(
                     student_logits.view(-1, student_logits.size(-1)),
                     labels.view(-1),
@@ -2420,16 +2459,23 @@ def collect_layer_grad_hessian_stats(
                                 grad_hessian_logits = logits.gather(-1, grad_hessian_indices)
                     if need_saliency_collection:
                         with layer_recorder.section("layer.grad_hessian.forward.label_sample") if layer_recorder else _NULL_CONTEXT:
-                            # Seed per-global-sample-index: with DP each rank
-                            # processes different `j`, so identical seeding
-                            # based on the global sample id keeps the label
-                            # distribution invariant to world_size.
+                            # Per-sample deterministic labels: each sample's
+                            # label draw only depends on its global sample id,
+                            # so 1-GPU and N-GPU DP produce identical labels for
+                            # the same sample regardless of how samples are
+                            # grouped into batches across ranks.
                             _dp_rank = dist_utils.get_rank()
-                            _dp_world = dist_utils.get_world_size()
                             _n_local = inps.shape[0]
-                            _global_start = _dp_rank * _n_local + j
-                            torch.cuda.manual_seed_all(1000003 * (layer_idx * 131 + _global_start) + 17)
-                            labels = torch.distributions.Categorical(logits=grad_hessian_logits_fp).sample()
+                            _batch_bsz = grad_hessian_logits_fp.shape[0]
+                            _global_indices = [
+                                _dp_rank * _n_local + j + _i
+                                for _i in range(_batch_bsz)
+                            ]
+                            labels = _deterministic_categorical_labels(
+                                grad_hessian_logits_fp,
+                                _global_indices,
+                                base_seed=layer_idx * 131 + 7,
+                            )
                         with layer_recorder.section("layer.grad_hessian.forward.nll_build") if layer_recorder else _NULL_CONTEXT:
                             nll_loss = F.cross_entropy(
                                 grad_hessian_logits.view(-1, grad_hessian_logits.size(-1)),
