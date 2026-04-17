@@ -50,6 +50,7 @@ FISHER_NUM_GROUPS=${FISHER_NUM_GROUPS:-512}
 PRE_CLIP=${PRE_CLIP:-0}
 GLOBAL_LOSS=${GLOBAL_LOSS:-1}
 GLOBAL_LOSS_BSZ=${GLOBAL_LOSS_BSZ:-16}
+LOSS_SLIDE_WINDOW=${LOSS_SLIDE_WINDOW:-0}
 ALPHA=${ALPHA:-0.05}
 KL_TOPK=${KL_TOPK:-20}
 LM_EVAL_BATCH_SIZE=${LM_EVAL_BATCH_SIZE:-32}
@@ -123,6 +124,13 @@ if [[ "${GLOBAL_LOSS}" == "1" ]]; then
     fi
 fi
 
+LOSS_SLIDE_WINDOW_ARGS=()
+LOSS_SLIDE_WINDOW_TAG=""
+if [[ "${LOSS_SLIDE_WINDOW}" == "1" ]]; then
+    LOSS_SLIDE_WINDOW_ARGS=(--loss_slide_window)
+    LOSS_SLIDE_WINDOW_TAG="_slidewin"
+fi
+
 for grad_lr in "${GRAD_LRS[@]}"; do
     grad_lr_tag=$(sanitize_float "${grad_lr}")
     final_layer_grad_lr_tag=$(sanitize_float "${FINAL_LAYER_GRAD_LR}")
@@ -158,7 +166,7 @@ for grad_lr in "${GRAD_LRS[@]}"; do
             pre_gd_suffix="${pre_gd_suffix}_flopt${PRE_FINAL_LAYER_GRAD_OPTIMIZER}"
         fi
     fi
-    exp_name="${BASE_EXP}_block_gd_${GRAD_OPTIMIZER}${refresh_suffix}${reg_suffix}${grad_hessian_suffix}${fisher_groups_suffix}_lr${grad_lr_tag}_fllr${final_layer_grad_lr_tag}_s${second_order_tag}${pre_gd_suffix}${PRE_CLIP_TAG}${BLOCK_ATOMIC_TAG}${FINAL_LAYER_FULL_BACKWARD_TAG}${GLOBAL_LOSS_TAG}"
+    exp_name="${BASE_EXP}_block_gd_${GRAD_OPTIMIZER}${refresh_suffix}${reg_suffix}${grad_hessian_suffix}${fisher_groups_suffix}_lr${grad_lr_tag}_fllr${final_layer_grad_lr_tag}_s${second_order_tag}${pre_gd_suffix}${PRE_CLIP_TAG}${BLOCK_ATOMIC_TAG}${FINAL_LAYER_FULL_BACKWARD_TAG}${GLOBAL_LOSS_TAG}${LOSS_SLIDE_WINDOW_TAG}"
 
     echo "============================================================"
     echo "Running GPTQ+ LR sweep"
@@ -183,6 +191,7 @@ for grad_lr in "${GRAD_LRS[@]}"; do
     echo "  preclip: ${PRE_CLIP}"
     echo "  global : ${GLOBAL_LOSS}"
     echo "  gl_bsz : ${GLOBAL_LOSS_BSZ}"
+    echo "  slidew : ${LOSS_SLIDE_WINDOW}"
     echo "  pregd  : ${PRE_GD_STEPS}"
     echo "  prelr  : ${PRE_GRAD_LR}"
     echo "  preopt : ${PRE_GRAD_OPTIMIZER}"
@@ -214,6 +223,7 @@ for grad_lr in "${GRAD_LRS[@]}"; do
         --backward_samples "${BACKWARD_SAMPLES}" --backward_bsz "${BACKWARD_BSZ}" --final_layer_backward_bsz "${FINAL_LAYER_BACKWARD_BSZ}" \
         --g_update_mode block_gd --grad_lr "${grad_lr}" --grad_optimizer "${GRAD_OPTIMIZER}" --grad_refresh_loss "${GRAD_REFRESH_LOSS}" \
         "${GLOBAL_LOSS_ARGS[@]}" \
+        "${LOSS_SLIDE_WINDOW_ARGS[@]}" \
         --final_layer_grad_optimizer "${FINAL_LAYER_GRAD_OPTIMIZER}" \
         --grad_clip "${GRAD_CLIP}" \
         --final_layer_grad_lr "${FINAL_LAYER_GRAD_LR}" \

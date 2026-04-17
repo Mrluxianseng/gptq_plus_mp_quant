@@ -813,6 +813,11 @@ class GPTQPlus:
                         }
                     )
 
+            # Number of blocks + refreshes, for the loss-slide-window schedule.
+            # Refresh fires after every block except the last, so n_refresh = n_blocks - 1.
+            n_blocks_total = (self.columns + blocksize - 1) // blocksize
+            n_refresh_total = max(n_blocks_total - 1, 0)
+
             for i1 in range(0, self.columns, blocksize):
                 with profile_recorder.section("fasterquant.block.total") if profile_recorder else _NULL_CONTEXT:
                     i2 = min(i1 + blocksize, self.columns)
@@ -1201,7 +1206,20 @@ class GPTQPlus:
                                 )
                                 weight_snapshot[state["row_start"]:state["row_end"], :] = current_sub_weight_orig
 
-                            refreshed_grad, refresh_meta = gradient_refresh_fn(weight_snapshot)
+                            # Loss-slide-window schedule: α=1 at the first
+                            # refresh, α=0 at the last. refresh_idx = i1 /
+                            # blocksize, and n_refresh_total refreshes fire
+                            # per module. When only one refresh fires we keep
+                            # α=1 (pure current-layer loss).
+                            refresh_idx = i1 // blocksize
+                            slide_alpha = (
+                                1.0 - refresh_idx / max(n_refresh_total - 1, 1)
+                                if n_refresh_total > 1 else 1.0
+                            )
+                            refreshed_grad, refresh_meta = gradient_refresh_fn(
+                                weight_snapshot,
+                                slide_alpha=slide_alpha,
+                            )
                             refreshed_grad = refreshed_grad.to(self.dev).float()
                             trailing_grad_chunks = []
                             for state in subgroup_states:
@@ -1382,6 +1400,9 @@ class GPTQPlus:
                                         "train_mean_refresh_loss": None if refresh_meta is None else refresh_meta.get("train_mean_refresh_loss"),
                                         "val_mean_refresh_loss": None if refresh_meta is None else refresh_meta.get("val_mean_refresh_loss"),
                                         "refresh_subset_mean_refresh_loss": None if refresh_meta is None else refresh_meta.get("refresh_subset_mean_refresh_loss"),
+                                        "slide_alpha": None if refresh_meta is None else refresh_meta.get("slide_alpha"),
+                                        "mean_refresh_loss_current": None if refresh_meta is None else refresh_meta.get("mean_refresh_loss_current"),
+                                        "mean_refresh_loss_next": None if refresh_meta is None else refresh_meta.get("mean_refresh_loss_next"),
                                     }
                                 )
 
@@ -2496,11 +2517,17 @@ def collect_true_weight_gradient(
     sample_indices=None,
     refresh_loss_type="kl",
     layer_output_fisher=None,
+    slide_alpha=1.0,
+    next_layer=None,
+    fp_inps_next=None,
+    next_layer_output_fisher=None,
 ):
     module = full.get(module_name, full.get(module_name + ".module", None))
     if module is None:
         raise ValueError(f"Unable to find module `{module_name}` in the provided layer.")
     losses = []
+    losses_current = []
+    losses_next = []
     selected_indices = list(range(inps.shape[0])) if sample_indices is None else list(sample_indices)
     if len(selected_indices) == 0:
         raise ValueError("`sample_indices` must contain at least one sample.")
@@ -2520,6 +2547,15 @@ def collect_true_weight_gradient(
                 analyzer.get_lm_head(),
             ]
         )
+    slide_active = (
+        slide_alpha < 1.0
+        and next_layer is not None
+        and fp_inps_next is not None
+        and next_layer_output_fisher is not None
+        and refresh_loss_type == "fisher_diag_mse"
+    )
+    if slide_active:
+        grad_modules.append(next_layer)
     with temporary_requires_grad(grad_modules, []):
         with torch.enable_grad():
             for start in range(0, len(selected_indices), bsz):
@@ -2546,7 +2582,7 @@ def collect_true_weight_gradient(
                 out_hidden = out[0] if isinstance(out, (tuple, list)) else out
                 fp_hidden = fp_inps[batch_indices].to(dev)
                 fisher_batch = None if layer_output_fisher is None else layer_output_fisher[batch_indices].to(dev)
-                refresh_loss = compute_refresh_loss(
+                refresh_loss_current = compute_refresh_loss(
                     refresh_loss_type,
                     out_hidden,
                     fp_hidden,
@@ -2554,6 +2590,29 @@ def collect_true_weight_gradient(
                     kl_topk,
                     layer_output_fisher=fisher_batch,
                 )
+                if slide_active:
+                    next_out = next_layer(
+                        out_hidden,
+                        attention_mask=batch_attention_mask,
+                        position_ids=batch_position_ids,
+                        position_embeddings=batch_position_embeddings,
+                    )
+                    next_out_hidden = next_out[0] if isinstance(next_out, (tuple, list)) else next_out
+                    fp_hidden_next = fp_inps_next[batch_indices].to(dev)
+                    fisher_batch_next = next_layer_output_fisher[batch_indices].to(dev)
+                    refresh_loss_next = compute_refresh_loss(
+                        refresh_loss_type,
+                        next_out_hidden,
+                        fp_hidden_next,
+                        analyzer,
+                        kl_topk,
+                        layer_output_fisher=fisher_batch_next,
+                    )
+                    refresh_loss = slide_alpha * refresh_loss_current + (1.0 - slide_alpha) * refresh_loss_next
+                    losses_current.append(refresh_loss_current.item())
+                    losses_next.append(refresh_loss_next.item())
+                else:
+                    refresh_loss = refresh_loss_current
                 batch_grad = torch.autograd.grad(refresh_loss, override_weight, retain_graph=False)[0]
                 grad.mul_(grad_count / (grad_count + 1))
                 grad.add_(batch_grad.float(), alpha=1.0 / (grad_count + 1))
@@ -2562,7 +2621,12 @@ def collect_true_weight_gradient(
                 memory_utils.cleanup_memory()
 
     mean_refresh_loss = sum(losses) / len(losses)
-    return grad, mean_refresh_loss
+    extras = {}
+    if slide_active:
+        extras["mean_refresh_loss_current"] = sum(losses_current) / len(losses_current)
+        extras["mean_refresh_loss_next"] = sum(losses_next) / len(losses_next)
+        extras["slide_alpha"] = slide_alpha
+    return grad, mean_refresh_loss, extras
 
 
 def collect_layer_grad_hessian_stats(
@@ -2854,7 +2918,7 @@ def run_pre_quant_gd(
         step_update_abs = []
         for module_name, module in modules:
             fisher_tensor = layer_output_fisher_by_module.get(module_name)
-            grad, mean_loss = collect_true_weight_gradient(
+            grad, mean_loss, _grad_extras = collect_true_weight_gradient(
                 layer=layer,
                 analyzer=analyzer,
                 module_name=module_name,
@@ -3146,6 +3210,42 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     )[0].to(fp_inps.device)
                 quant_utils.enable_act_quant(layer, bits_config)
 
+            # --- Loss-slide-window setup: precompute reference output of the
+            # next FP transformer block, so the per-block refresh can blend the
+            # current-layer fisher_diag_mse with the next-layer one. Skipped at
+            # and past the second-to-last layer per the spec.
+            slide_active_layer = False
+            if (
+                getattr(args, "loss_slide_window", False)
+                and args.g_update_mode == "block_gd"
+                and layer_refresh_loss_type == "fisher_diag_mse"
+                and global_loss_enabled
+                and i <= final_layer_idx - 2
+            ):
+                slide_active_layer = static_fisher_by_layer[i + 1] is not None
+            slide_next_layer = None
+            slide_fp_inps_next = None
+            slide_next_layer_output_fisher = None
+            slide_next_bits_config = None
+            if slide_active_layer:
+                with layer_recorder.section("layer.slide_window.next_fp_reference") if layer_recorder else _NULL_CONTEXT:
+                    slide_next_layer = layers[i + 1].to(dev)
+                    slide_next_bits_config = quant_utils.disable_act_quant(slide_next_layer)
+                    slide_next_layer_output_fisher = static_fisher_by_layer[i + 1]
+                    slide_fp_inps_next = torch.empty_like(fp_inps)
+                    for j in range(fp_inps.shape[0]):
+                        slide_fp_inps_next[j] = slide_next_layer(
+                            fp_inps[j].unsqueeze(0).to(dev),
+                            attention_mask=attention_mask,
+                            position_ids=position_ids,
+                            position_embeddings=position_embeddings,
+                        )[0].to(slide_fp_inps_next.device)
+                    logging.info(
+                        "Loss-slide-window active for layer %d (next=%d); next-layer fisher cached.",
+                        i,
+                        i + 1,
+                    )
+
             if preclip_enabled:
                 with layer_recorder.section("layer.weight_preclip") if layer_recorder else _NULL_CONTEXT:
                     for name, module in full.items():
@@ -3331,13 +3431,18 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                 for name in gptq:
                     gptq[name].finalize_hessian()
 
-            def make_gradient_refresh_fn(module_name):
-                def refresh_fn(weight_snapshot):
+            def make_gradient_refresh_fn(
+                module_name,
+                slide_next_layer=None,
+                slide_fp_inps_next=None,
+                slide_next_layer_output_fisher=None,
+            ):
+                def refresh_fn(weight_snapshot, slide_alpha=1.0):
                     if args.final_layer_full_backward and i == final_layer_idx:
                         sample_indices = full_refresh_sample_indices
                     else:
                         sample_indices = gradient_refresh_scheduler.next_indices()
-                    grad, mean_refresh_loss = collect_true_weight_gradient(
+                    grad, mean_refresh_loss, grad_extras = collect_true_weight_gradient(
                         layer=layer,
                         analyzer=analyzer,
                         module_name=module_name,
@@ -3354,6 +3459,10 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         sample_indices=sample_indices,
                         refresh_loss_type=layer_refresh_loss_type,
                         layer_output_fisher=layer_output_fisher,
+                        slide_alpha=slide_alpha,
+                        next_layer=slide_next_layer,
+                        fp_inps_next=slide_fp_inps_next,
+                        next_layer_output_fisher=slide_next_layer_output_fisher,
                     )
                     # DP aggregation: combine per-rank per-sample means into
                     # the global mean. Equal shards → divide by world.
@@ -3363,14 +3472,24 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         mean_refresh_loss = dist_utils.allreduce_mean_scalar(
                             mean_refresh_loss, count=len(sample_indices)
                         )
-                    return grad, {"mean_refresh_loss": mean_refresh_loss, "sample_indices": sample_indices}
+                        for k in ("mean_refresh_loss_current", "mean_refresh_loss_next"):
+                            if k in grad_extras:
+                                grad_extras[k] = dist_utils.allreduce_mean_scalar(
+                                    grad_extras[k], count=len(sample_indices)
+                                )
+                    meta = {
+                        "mean_refresh_loss": mean_refresh_loss,
+                        "sample_indices": sample_indices,
+                    }
+                    meta.update(grad_extras)
+                    return grad, meta
 
                 return refresh_fn
 
             def make_block_observer(module_name, effective_grad_optimizer):
                 def observer(payload):
                     logging.info(
-                        "block-metrics layer=%d module=%s mode=%s grad_opt=%s block=%d cols=[%d,%d) remain=%d grad_abs_mean=%s grad_clipped_abs_mean=%s grad_row_l2=%s loss=%s refresh_loss=%s train_loss=%s val_loss=%s second_abs=%s first_raw_abs=%s first_abs=%s reg_abs=%s sine_abs=%s",
+                        "block-metrics layer=%d module=%s mode=%s grad_opt=%s block=%d cols=[%d,%d) remain=%d grad_abs_mean=%s grad_clipped_abs_mean=%s grad_row_l2=%s loss=%s refresh_loss=%s train_loss=%s val_loss=%s second_abs=%s first_raw_abs=%s first_abs=%s reg_abs=%s sine_abs=%s slide_alpha=%s loss_cur=%s loss_next=%s",
                         i,
                         module_name,
                         args.g_update_mode,
@@ -3391,6 +3510,9 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         format_log_value(payload["first_order_update_abs_mean"], digits=4),
                         format_log_value(payload["regularizer_update_abs_mean"], digits=4),
                         format_log_value(payload["sine_regularizer_update_abs_mean"], digits=4),
+                        format_log_value(payload.get("slide_alpha"), digits=3),
+                        format_log_value(payload.get("mean_refresh_loss_current"), digits=6),
+                        format_log_value(payload.get("mean_refresh_loss_next"), digits=6),
                     )
 
                 return observer
@@ -3455,7 +3577,12 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         g_update_mode=args.g_update_mode,
                         export_to_et=args.export_to_et,
                         profile_recorder=module_recorder,
-                        gradient_refresh_fn=make_gradient_refresh_fn(name) if args.g_update_mode in {"block_backward", "block_gd"} else None,
+                        gradient_refresh_fn=make_gradient_refresh_fn(
+                            name,
+                            slide_next_layer=slide_next_layer,
+                            slide_fp_inps_next=slide_fp_inps_next,
+                            slide_next_layer_output_fisher=slide_next_layer_output_fisher,
+                        ) if args.g_update_mode in {"block_backward", "block_gd"} else None,
                         grad_lr=effective_grad_lr,
                         grad_optimizer=effective_grad_optimizer,
                         grad_reg_strategy=effective_grad_reg_strategy,
@@ -3492,6 +3619,15 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     )[0].squeeze(0).to(inps.device)
 
             with layer_recorder.section("layer.cleanup") if layer_recorder else _NULL_CONTEXT:
+                if slide_active_layer and slide_next_layer is not None:
+                    # Restore next-layer bit widths so iter i+1 sees a clean
+                    # act-quant state when it calls disable_act_quant again.
+                    quant_utils.enable_act_quant(slide_next_layer, slide_next_bits_config)
+                    del slide_fp_inps_next
+                    slide_next_layer = None
+                    slide_fp_inps_next = None
+                    slide_next_layer_output_fisher = None
+                    slide_next_bits_config = None
                 layers[i] = layer.to(orig_device)
                 del layer
                 del gptq

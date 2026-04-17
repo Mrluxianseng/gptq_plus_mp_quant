@@ -139,6 +139,16 @@ def parse_gen():
     )
     parser.set_defaults(global_loss=False)
     parser.add_argument(
+        "--loss_slide_window",
+        action="store_true",
+        help=(
+            "In block_gd, linearly blend the current-layer fisher_diag_mse loss with the "
+            "next-layer fisher_diag_mse (weights α=1→0 across per-block refreshes). "
+            "Requires --grad_refresh_loss=fisher_diag_mse and --global_loss. Skipped for the "
+            "last layer and the second-to-last layer."
+        ),
+    )
+    parser.add_argument(
         "--global_loss_bsz",
         type=int,
         default=None,
@@ -400,6 +410,13 @@ def parse_gen():
         args.global_loss_bsz = args.bsz
     if args.global_loss_bsz <= 0:
         raise ValueError(f"`global_loss_bsz` must be positive when provided. Got {args.global_loss_bsz}.")
+    if getattr(args, "loss_slide_window", False):
+        if args.g_update_mode != "block_gd":
+            raise ValueError("--loss_slide_window requires --g_update_mode=block_gd.")
+        if args.grad_refresh_loss != "fisher_diag_mse":
+            raise ValueError("--loss_slide_window requires --grad_refresh_loss=fisher_diag_mse.")
+        if not args.global_loss:
+            raise ValueError("--loss_slide_window requires --global_loss (so next-layer fisher is cached).")
     if args.nsamples % args.backward_samples != 0:
         raise ValueError(
             f"`nsamples` ({args.nsamples}) must be divisible by `backward_samples` ({args.backward_samples})."
