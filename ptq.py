@@ -54,8 +54,16 @@ def main(args):
         # kernels per physical GPU → rotated weights may drift by ~1e-7.
         # That drift would then be amplified through every downstream layer.
         # Force bit-exact agreement by broadcasting all parameters from rank 0.
+        #
+        # NCCL only broadcasts CUDA tensors, and after rotate_model the params
+        # live on CPU. Move each param to GPU in-place (quantize_weights does
+        # model.cpu() at its own entry point, so the "cpu residency" gets
+        # restored right after this anyway — no need to copy back manually).
         if dist_utils.get_world_size() > 1:
+            _cuda_dev = torch.device(f"cuda:{torch.cuda.current_device()}")
             for p in model.parameters():
+                if not p.is_cuda:
+                    p.data = p.data.to(_cuda_dev)
                 dist.broadcast(p.data, src=0)
 
         quant_utils.add_actquant(analyzer)  # Add Activation Wrapper to the model
