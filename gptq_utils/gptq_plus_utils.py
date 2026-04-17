@@ -1069,6 +1069,7 @@ class GPTQPlus:
                                 block_state["Z1"] = Z[:, i1:i2]
                             trailing_grad_abs_mean = None
                             trailing_grad_mean_row_l2 = None
+                            trailing_grad_clipped_abs_mean = None
                             if trailing_grad_chunks:
                                 trailing_grad_cat = torch.cat(trailing_grad_chunks, dim=0).float()
                                 trailing_grad_abs_mean = trailing_grad_cat.abs().mean().item()
@@ -1076,6 +1077,16 @@ class GPTQPlus:
                                     trailing_grad_cat,
                                     dim=1,
                                 ).mean().item()
+                                # Post-clip abs mean — for verifying `grad_clip` takes effect.
+                                # Adam normalises |grad|, so a small grad_clip only shows up
+                                # here, not in `first_raw_abs` / the applied step size.
+                                if grad_clip is not None and grad_clip > 0:
+                                    trailing_grad_clipped_abs_mean = (
+                                        trailing_grad_cat.clamp(min=-grad_clip, max=grad_clip)
+                                        .abs().mean().item()
+                                    )
+                                else:
+                                    trailing_grad_clipped_abs_mean = trailing_grad_abs_mean
                             if block_observer is not None:
                                 block_observer(
                                     {
@@ -1084,6 +1095,7 @@ class GPTQPlus:
                                         "col_end": i2,
                                         "remaining_columns": self.columns - i2,
                                         "remaining_grad_abs_mean": trailing_grad_abs_mean,
+                                        "remaining_grad_clipped_abs_mean": trailing_grad_clipped_abs_mean,
                                         "remaining_grad_mean_row_l2": trailing_grad_mean_row_l2,
                                         "second_order_update_abs_mean": None,
                                         "second_order_update_mean_row_l2": None,
@@ -1202,6 +1214,7 @@ class GPTQPlus:
 
                             trailing_grad_abs_mean = None
                             trailing_grad_mean_row_l2 = None
+                            trailing_grad_clipped_abs_mean = None
                             second_order_abs_mean = None
                             second_order_mean_row_l2 = None
                             first_order_raw_abs_mean = None
@@ -1230,6 +1243,16 @@ class GPTQPlus:
                                     trailing_grad_cat,
                                     dim=1,
                                 ).mean().item()
+                                # Post-clip abs mean — for verifying `grad_clip` takes effect.
+                                # Adam normalises |grad|, so a small grad_clip only shows up
+                                # here, not in `first_raw_abs` / the applied step size.
+                                if grad_clip is not None and grad_clip > 0:
+                                    trailing_grad_clipped_abs_mean = (
+                                        trailing_grad_cat.clamp(min=-grad_clip, max=grad_clip)
+                                        .abs().mean().item()
+                                    )
+                                else:
+                                    trailing_grad_clipped_abs_mean = trailing_grad_abs_mean
                             for state in subgroup_states:
                                 refreshed_grad_sub = refreshed_grad[state["row_start"]:state["row_end"], :]
                                 if actorder:
@@ -1343,6 +1366,7 @@ class GPTQPlus:
                                         "col_end": i2,
                                         "remaining_columns": self.columns - i2,
                                         "remaining_grad_abs_mean": trailing_grad_abs_mean,
+                                        "remaining_grad_clipped_abs_mean": trailing_grad_clipped_abs_mean,
                                         "remaining_grad_mean_row_l2": trailing_grad_mean_row_l2,
                                         "second_order_update_abs_mean": second_order_abs_mean,
                                         "second_order_update_mean_row_l2": second_order_mean_row_l2,
@@ -3346,7 +3370,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
             def make_block_observer(module_name, effective_grad_optimizer):
                 def observer(payload):
                     logging.info(
-                        "block-metrics layer=%d module=%s mode=%s grad_opt=%s block=%d cols=[%d,%d) remain=%d grad_abs_mean=%s grad_row_l2=%s loss=%s refresh_loss=%s train_loss=%s val_loss=%s second_abs=%s first_raw_abs=%s first_abs=%s reg_abs=%s sine_abs=%s",
+                        "block-metrics layer=%d module=%s mode=%s grad_opt=%s block=%d cols=[%d,%d) remain=%d grad_abs_mean=%s grad_clipped_abs_mean=%s grad_row_l2=%s loss=%s refresh_loss=%s train_loss=%s val_loss=%s second_abs=%s first_raw_abs=%s first_abs=%s reg_abs=%s sine_abs=%s",
                         i,
                         module_name,
                         args.g_update_mode,
@@ -3356,6 +3380,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         payload["col_end"],
                         payload["remaining_columns"],
                         format_log_value(payload["remaining_grad_abs_mean"], digits=4),
+                        format_log_value(payload.get("remaining_grad_clipped_abs_mean"), digits=4),
                         format_log_value(payload["remaining_grad_mean_row_l2"], digits=4),
                         format_log_value(payload["mean_refresh_loss"], digits=6),
                         format_log_value(payload["refresh_subset_mean_refresh_loss"], digits=6),
