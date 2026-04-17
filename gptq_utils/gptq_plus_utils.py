@@ -19,6 +19,12 @@ except ImportError:
 from utils import quant_utils, memory_utils, model_utils
 
 
+# Single reusable no-op context. `nullcontext()` instances are stateless, so we
+# avoid allocating a new one at every `with ... if profile_recorder else
+# nullcontext():` site inside the fasterquant/add_batch hot loops.
+_NULL_CONTEXT = nullcontext()
+
+
 def format_log_value(value, digits=6):
     if value is None:
         return "None"
@@ -246,8 +252,12 @@ class GPTQPlus:
 
         self.saliencies = saliency.float()
         self.gradients = gradient.float()
+        # Layout: (num_groups, columns, columns). Storing the group axis first
+        # makes per-subgroup slices `self.H[g]` contiguous, so the bmm-based
+        # accumulation in `add_batch` and the per-subgroup clone in
+        # `fasterquant` get a fast contiguous read/write path.
         self.H = torch.zeros(
-            (self.columns, self.columns, self.num_groups),
+            (self.num_groups, self.columns, self.columns),
             device=self.dev
         )
         self.act_square = torch.zeros(
@@ -492,21 +502,21 @@ class GPTQPlus:
         then index += batch_size.
         """
         profile_recorder = self.profile_recorder
-        with profile_recorder.section("add_batch.total") if profile_recorder else nullcontext():
+        with profile_recorder.section("add_batch.total") if profile_recorder else _NULL_CONTEXT:
             # If input is 2D or 1D, reshape to [batch, seq_len, dim] for consistency
             if inp.dim() == 2:
                 inp = inp.unsqueeze(0)  # => [1, seq_len, dim]
             else:
                 assert inp.dim() == 3, "Input must be 2D or 3D. Got %dD." % inp.dim()
 
-            with profile_recorder.section("add_batch.slice_saliency") if profile_recorder else nullcontext():
+            with profile_recorder.section("add_batch.slice_saliency") if profile_recorder else _NULL_CONTEXT:
                 bsz = inp.shape[0]
                 # slice out shape => (bsz, seq_len, G)
                 sal_batch = self.saliencies[self.index: self.index + bsz].to(self.dev)
                 self.H *= self.index / (self.index + bsz)
                 self.index += bsz
 
-            with profile_recorder.section("add_batch.prepare_inputs") if profile_recorder else nullcontext():
+            with profile_recorder.section("add_batch.prepare_inputs") if profile_recorder else _NULL_CONTEXT:
                 if inp.dim() == 3:
                     inp = inp.reshape(-1, inp.shape[-1])
                     sal_batch = sal_batch.reshape(-1, sal_batch.shape[-1])
@@ -514,13 +524,21 @@ class GPTQPlus:
                 sal_batch = sal_batch.float()
                 n_tokens = inp.shape[0]
 
-            with profile_recorder.section("add_batch.weighted_input") if profile_recorder else nullcontext():
-                sal_weighted_inp = torch.einsum("nj,ng->njg", inp, sal_batch)
+            with profile_recorder.section("add_batch.weighted_input") if profile_recorder else _NULL_CONTEXT:
+                # weighted[g, n, j] = inp[n, j] * sal[n, g]; equivalent to the
+                # original einsum "nj,ng->njg" but laid out so the subsequent
+                # bmm sees contiguous (G, n, d) batches.
+                weighted = inp.unsqueeze(0).mul(sal_batch.transpose(0, 1).unsqueeze(-1))
 
-            with profile_recorder.section("add_batch.hessian_block") if profile_recorder else nullcontext():
-                block = torch.einsum("ni,njg->ijg", inp, sal_weighted_inp)
+            with profile_recorder.section("add_batch.hessian_block") if profile_recorder else _NULL_CONTEXT:
+                # block[g, i, j] = sum_n inp[n, i] * inp[n, j] * sal[n, g]
+                #                = (inp.T @ (inp * sal[:, g:g+1]))_{i,j}
+                # cuBLAS batched GEMM is significantly faster than the 3-axis
+                # einsum kernel that PyTorch falls back to for "ni,njg->ijg".
+                inp_T_batched = inp.transpose(0, 1).unsqueeze(0).expand(self.num_groups, -1, -1)
+                block = torch.bmm(inp_T_batched, weighted)
 
-            with profile_recorder.section("add_batch.accumulate") if profile_recorder else nullcontext():
+            with profile_recorder.section("add_batch.accumulate") if profile_recorder else _NULL_CONTEXT:
                 self.H.add_(block, alpha=1 / (n_tokens * self.index))
                 self.act_square.add_((inp ** 2).sum(0), alpha=1 / n_tokens)
 
@@ -556,22 +574,22 @@ class GPTQPlus:
             grad_gate_sharpness=grad_gate_sharpness,
             grad_gate_sine_amp=grad_gate_sine_amp,
         )
-        with profile_recorder.section("fasterquant.total") if profile_recorder else nullcontext():
+        with profile_recorder.section("fasterquant.total") if profile_recorder else _NULL_CONTEXT:
             W = self.layer.weight.data.clone()
             W = W.float()
             block_gd_mode = g_update_mode == "block_gd"
-            with profile_recorder.section("fasterquant.allocate_outputs") if profile_recorder else nullcontext():
+            with profile_recorder.section("fasterquant.allocate_outputs") if profile_recorder else _NULL_CONTEXT:
                 Q_final = torch.zeros_like(W)
                 W_int_final = torch.zeros_like(W)
                 Scale_final = torch.zeros_like(W)
 
             if not self.quantizer.ready():
-                with profile_recorder.section("fasterquant.quantizer_find_params_initial") if profile_recorder else nullcontext():
+                with profile_recorder.section("fasterquant.quantizer_find_params_initial") if profile_recorder else _NULL_CONTEXT:
                     self.quantizer.find_params(W)
 
             shared_groups = None
             if groupsize != -1:
-                with profile_recorder.section("fasterquant.quantizer_build_groups") if profile_recorder else nullcontext():
+                with profile_recorder.section("fasterquant.quantizer_build_groups") if profile_recorder else _NULL_CONTEXT:
                     shared_groups = []
                     for col_start in range(0, self.columns, groupsize):
                         col_end = min(col_start + groupsize, self.columns)
@@ -579,16 +597,37 @@ class GPTQPlus:
                         quantizer.find_params(W[:, col_start:col_end])
                         shared_groups.append(quantizer)
 
+            # Fast path for per-row symmetric quantization with groupsize == -1.
+            # Hoists scale materialisation and `quantizer.ready()` (a GPU reduction)
+            # out of the per-column inner loop. When unavailable we fall back to
+            # calling `quantizer.fake_quantize(...)` per column as before.
+            fast_quant_enabled = (
+                groupsize == -1
+                and self.quantizer.bits < 16
+                and self.quantizer.ready()
+            )
+            if fast_quant_enabled:
+                fast_quant_scale_full = self.quantizer.scale.to(self.dev)
+                fast_quant_maxq = int(self.quantizer.maxq.item())
+                fast_quant_lo = -(fast_quant_maxq + 1)
+            else:
+                fast_quant_scale_full = None
+                fast_quant_maxq = None
+                fast_quant_lo = None
+
             rows_per_sub = self.rows // self.num_groups
             subgroup_states = []
+            need_hessian_reg = grad_reg_strategy == "hessian"
+            need_full_precision_weight = grad_reg_strategy in {"l2", "hessian"}
+            need_gate_quant_maps = grad_reg_strategy in {"quant_error_gate", "quant_error_gate_optimized"}
             for sub_idx in range(self.num_groups):
-                with profile_recorder.section("fasterquant.subgroup.total") if profile_recorder else nullcontext():
+                with profile_recorder.section("fasterquant.subgroup.total") if profile_recorder else _NULL_CONTEXT:
                     row_start = sub_idx * rows_per_sub
                     row_end = (sub_idx + 1) * rows_per_sub
 
-                    with profile_recorder.section("fasterquant.subgroup.slice_inputs") if profile_recorder else nullcontext():
+                    with profile_recorder.section("fasterquant.subgroup.slice_inputs") if profile_recorder else _NULL_CONTEXT:
                         W_sub = W[row_start:row_end, :].clone()
-                        H_sub = self.H[:, :, sub_idx].clone()
+                        H_sub = self.H[sub_idx].clone()
                         gradients_sub = self.gradients[row_start: row_end, :].to(self.dev).float().clone()
                         dead = torch.diag(H_sub) == 0
                         H_sub[dead, dead] = 1
@@ -599,27 +638,34 @@ class GPTQPlus:
                     perm = None
                     invperm = None
                     if actorder:
-                        with profile_recorder.section("fasterquant.subgroup.actorder_permute") if profile_recorder else nullcontext():
+                        with profile_recorder.section("fasterquant.subgroup.actorder_permute") if profile_recorder else _NULL_CONTEXT:
                             perm = torch.argsort(self.act_square, descending=True)
                             W_sub = W_sub[:, perm]
                             H_sub = H_sub[perm][:, perm]
                             gradients_sub = gradients_sub[:, perm]
                             invperm = torch.argsort(perm)
-                    
-                    with profile_recorder.section("fasterquant.subgroup.H_sub_clone") if profile_recorder else nullcontext():
-                        hessian_reg = H_sub.clone()
-                    with profile_recorder.section("fasterquant.subgroup.build_gate_quant_maps") if profile_recorder else nullcontext():
-                        gate_scale, gate_zero = self._build_gate_quant_maps(
-                            self.quantizer,
-                            W_sub,
-                            groupsize,
-                            row_start=row_start,
-                            row_end=row_end,
-                            groups=groups,
-                            perm=perm,
-                        )
 
-                    with profile_recorder.section("fasterquant.subgroup.allocate_buffers") if profile_recorder else nullcontext():
+                    if need_hessian_reg:
+                        with profile_recorder.section("fasterquant.subgroup.H_sub_clone") if profile_recorder else _NULL_CONTEXT:
+                            hessian_reg = H_sub.clone()
+                    else:
+                        hessian_reg = None
+                    if need_gate_quant_maps:
+                        with profile_recorder.section("fasterquant.subgroup.build_gate_quant_maps") if profile_recorder else _NULL_CONTEXT:
+                            gate_scale, gate_zero = self._build_gate_quant_maps(
+                                self.quantizer,
+                                W_sub,
+                                groupsize,
+                                row_start=row_start,
+                                row_end=row_end,
+                                groups=groups,
+                                perm=perm,
+                            )
+                    else:
+                        gate_scale = None
+                        gate_zero = None
+
+                    with profile_recorder.section("fasterquant.subgroup.allocate_buffers") if profile_recorder else _NULL_CONTEXT:
                         Losses = torch.zeros_like(W_sub)
                         Q = torch.zeros_like(W_sub)
                         W_int_sub = torch.zeros_like(W_sub)
@@ -629,7 +675,7 @@ class GPTQPlus:
                     damp_auto_increment = 0.0015
                     while 1 > damp_percent > 0:
                         try:
-                            with profile_recorder.section("fasterquant.subgroup.compute_hinv") if profile_recorder else nullcontext():
+                            with profile_recorder.section("fasterquant.subgroup.compute_hinv") if profile_recorder else _NULL_CONTEXT:
                                 damp = damp_percent * torch.mean(torch.diag(H_sub))
                                 diag = torch.arange(self.columns, device=self.dev)
                                 H_sub[diag, diag] += damp
@@ -646,7 +692,7 @@ class GPTQPlus:
                     if not (0 < damp_percent < 1):
                         raise ValueError(f"Quantization: `damp_percent` must between 0 and 1. current is {damp_percent}")
 
-                    with profile_recorder.section("fasterquant.subgroup.init_ghinv") if profile_recorder else nullcontext():
+                    with profile_recorder.section("fasterquant.subgroup.init_ghinv") if profile_recorder else _NULL_CONTEXT:
                         beta, beta_view, Z, GHinv = self._compute_gradient_terms(
                             gradients_sub,
                             Hinv_init,
@@ -672,7 +718,7 @@ class GPTQPlus:
                             "Z": Z,
                             "GHinv": GHinv,
                             "anchor_weight": W_sub.clone(),
-                            "full_precision_weight": W_sub.clone(),
+                            "full_precision_weight": W_sub.clone() if need_full_precision_weight else None,
                             "hessian_reg": hessian_reg,
                             "gate_scale": gate_scale,
                             "gate_zero": gate_zero,
@@ -680,11 +726,17 @@ class GPTQPlus:
                             "groups": groups,
                             "perm": perm,
                             "invperm": invperm,
+                            # Cached per-subgroup scale slice for the fast quant
+                            # path; None when the fast path is disabled.
+                            "fast_quant_scale": (
+                                fast_quant_scale_full[row_start:row_end]
+                                if fast_quant_enabled else None
+                            ),
                         }
                     )
 
             for i1 in range(0, self.columns, blocksize):
-                with profile_recorder.section("fasterquant.block.total") if profile_recorder else nullcontext():
+                with profile_recorder.section("fasterquant.block.total") if profile_recorder else _NULL_CONTEXT:
                     i2 = min(i1 + blocksize, self.columns)
                     count = i2 - i1
                     is_last_block = i2 >= self.columns
@@ -693,7 +745,7 @@ class GPTQPlus:
                     block_states = []
 
                     for state in subgroup_states:
-                        with profile_recorder.section("fasterquant.block.setup") if profile_recorder else nullcontext():
+                        with profile_recorder.section("fasterquant.block.setup") if profile_recorder else _NULL_CONTEXT:
                             W1 = state["W_sub"][:, i1:i2].clone()
                             W_ref1 = state["anchor_weight"][:, i1:i2]
                             W_block_start = W1.clone()
@@ -706,20 +758,23 @@ class GPTQPlus:
                             GHinv1 = state["GHinv"][:, i1:i2].clone()
                             Z1 = state["Z"][:, i1:i2]
                             inner_update_mode = "surrogate_online" if g_update_mode == "block_backward" else "frozen" if block_gd_mode else g_update_mode
+                            is_frozen_inner = inner_update_mode == "frozen"
+                            is_surrogate_online = inner_update_mode == "surrogate_online"
                             GHinv1_eff = self._current_ghinv(
                                 GHinv1,
-                                W1 if inner_update_mode == "surrogate_online" else W_block_start,
+                                W1 if is_surrogate_online else W_block_start,
                                 W_ref1,
                                 state["beta_view"],
                                 inner_update_mode,
                             )
+                            fast_quant_scale = state["fast_quant_scale"] if fast_quant_enabled else None
 
                         if use_atomic_quant:
                             if groupsize == -1:
                                 # In per-row quantization each column uses the same row-wise scale,
                                 # so atomic block quantization can quantize the whole block at once
                                 # without changing the final quantized result.
-                                with profile_recorder.section("fasterquant.block.atomic_quantize_full") if profile_recorder else nullcontext():
+                                with profile_recorder.section("fasterquant.block.atomic_quantize_full") if profile_recorder else _NULL_CONTEXT:
                                     q, int_weight, scale = self.quantizer.fake_quantize(
                                         W_block_start,
                                         st_idx=state["row_start"],
@@ -730,7 +785,7 @@ class GPTQPlus:
                                     Scale1.copy_(scale.expand_as(W_block_start))
                             else:
                                 for i in range(count):
-                                    with profile_recorder.section("fasterquant.column.total") if profile_recorder else nullcontext():
+                                    with profile_recorder.section("fasterquant.column.total") if profile_recorder else _NULL_CONTEXT:
                                         w = W_block_start[:, i]
 
                                         quantizer = self.quantizer
@@ -740,7 +795,7 @@ class GPTQPlus:
                                                 idx = state["perm"][idx]
                                             quantizer = state["groups"][idx // groupsize]
 
-                                        with profile_recorder.section("fasterquant.column.quantize") if profile_recorder else nullcontext():
+                                        with profile_recorder.section("fasterquant.column.quantize") if profile_recorder else _NULL_CONTEXT:
                                             q, int_weight, scale = quantizer.fake_quantize(
                                                 w.unsqueeze(1),
                                                 st_idx=state["row_start"],
@@ -750,7 +805,7 @@ class GPTQPlus:
                                         W_int1[:, i] = int_weight.flatten()
                                         Scale1[:, i] = scale.flatten()
 
-                            with profile_recorder.section("fasterquant.block.atomic_err_solve") if profile_recorder else nullcontext():
+                            with profile_recorder.section("fasterquant.block.atomic_err_solve") if profile_recorder else _NULL_CONTEXT:
                                 residual_block = W_block_start - Q1 - GHinv1_eff
                                 diag_view = torch.diagonal(Hinv1).unsqueeze(0)
                                 Losses1.copy_(residual_block.square() / diag_view.square())
@@ -763,31 +818,45 @@ class GPTQPlus:
                                 )
                         else:
                             for i in range(count):
-                                with profile_recorder.section("fasterquant.column.total") if profile_recorder else nullcontext():
+                                with profile_recorder.section("fasterquant.column.total") if profile_recorder else _NULL_CONTEXT:
                                     w = W1[:, i]
                                     d = Hinv1[i, i]
 
-                                    quantizer = self.quantizer
-                                    if groupsize != -1:
-                                        idx = i1 + i
-                                        if actorder:
-                                            idx = state["perm"][idx]
-                                        quantizer = state["groups"][idx // groupsize]
-
-                                    with profile_recorder.section("fasterquant.column.quantize") if profile_recorder else nullcontext():
-                                        q, int_weight, scale = quantizer.fake_quantize(
-                                            w.unsqueeze(1),
-                                            st_idx=state["row_start"],
-                                            end_idx=state["row_end"],
-                                        )
-                                    Q1[:, i] = q.flatten()
-                                    q = q.flatten()
+                                    with profile_recorder.section("fasterquant.column.quantize") if profile_recorder else _NULL_CONTEXT:
+                                        w_col = w.unsqueeze(1)
+                                        if fast_quant_scale is not None:
+                                            # Inline of WeightQuantizer.fake_quantize for the
+                                            # symmetric per-row, groupsize == -1 case. Same
+                                            # operations and dtypes as the original call, so
+                                            # the output is bit-identical.
+                                            int_weight = torch.clamp(
+                                                torch.round(w_col / fast_quant_scale),
+                                                fast_quant_lo,
+                                                fast_quant_maxq,
+                                            )
+                                            q_fake = (fast_quant_scale * int_weight).to(w_col.dtype)
+                                            scale = fast_quant_scale
+                                        else:
+                                            quantizer = self.quantizer
+                                            if groupsize != -1:
+                                                idx = i1 + i
+                                                if actorder:
+                                                    idx = state["perm"][idx]
+                                                quantizer = state["groups"][idx // groupsize]
+                                            q_fake, int_weight, scale = quantizer.fake_quantize(
+                                                w_col,
+                                                st_idx=state["row_start"],
+                                                end_idx=state["row_end"],
+                                            )
+                                    q_flat = q_fake.flatten()
+                                    Q1[:, i] = q_flat
+                                    q = q_flat
                                     W_int1[:, i] = int_weight.flatten()
                                     Scale1[:, i] = scale.flatten()
 
                                     Losses1[:, i] = (w - q - GHinv1_eff[:, i]) ** 2 / d**2
 
-                                    with profile_recorder.section("fasterquant.column.inner_update_delta_w") if profile_recorder else nullcontext():
+                                    with profile_recorder.section("fasterquant.column.inner_update_delta_w") if profile_recorder else _NULL_CONTEXT:
                                         err1 = (w - q - GHinv1_eff[:, i]) / d
                                         second_order_inner_update = err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
                                         if block_gd_mode:
@@ -798,26 +867,40 @@ class GPTQPlus:
                                             W1[:, i:] -= second_order_inner_update + GHinv1_eff[:, i:]
                                         Err1[:, i] = err1
 
-                                    with profile_recorder.section("fasterquant.column.inner_update_ghinv") if profile_recorder else nullcontext():
-                                        GHinv1[:, i:] = GHinv1[:, i:] - Z1[:, i].unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
-                                        GHinv1_eff = self._current_ghinv(
-                                            GHinv1,
-                                            W1 if inner_update_mode == "surrogate_online" else W_block_start,
-                                            W_ref1,
-                                            state["beta_view"],
-                                            inner_update_mode,
+                                    with profile_recorder.section("fasterquant.column.inner_update_ghinv") if profile_recorder else _NULL_CONTEXT:
+                                        # In-place subtract avoids one tensor allocation
+                                        # per column compared to `GHinv1[:, i:] = GHinv1[:, i:] - ...`.
+                                        GHinv1[:, i:].sub_(
+                                            Z1[:, i].unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
                                         )
+                                        # For frozen inner mode `_current_ghinv` just returns
+                                        # `GHinv1`, so `GHinv1_eff` aliases it already and
+                                        # sees the in-place mutation automatically.
+                                        if not is_frozen_inner:
+                                            GHinv1_eff = self._current_ghinv(
+                                                GHinv1,
+                                                W1 if is_surrogate_online else W_block_start,
+                                                W_ref1,
+                                                state["beta_view"],
+                                                inner_update_mode,
+                                            )
 
-                        with profile_recorder.section("fasterquant.block.writeback_inner") if profile_recorder else nullcontext():
+                        with profile_recorder.section("fasterquant.block.writeback_inner") if profile_recorder else _NULL_CONTEXT:
                             state["Q"][:, i1:i2] = Q1
                             state["W_int_sub"][:, i1:i2] = W_int1
                             state["Scale_sub"][:, i1:i2] = Scale1
                             state["Losses"][:, i1:i2] = Losses1 / 2
 
-                        current_sub_weight = state["W_sub"].clone()
-                        if i1 > 0:
-                            current_sub_weight[:, :i1] = state["Q"][:, :i1]
-                        current_sub_weight[:, i1:i2] = Q1
+                        # `current_sub_weight` is only consumed by the block_backward
+                        # refresh path below; skipping the clone for other modes
+                        # avoids O(rows_per_sub × columns) copies per block.
+                        if g_update_mode == "block_backward":
+                            current_sub_weight = state["W_sub"].clone()
+                            if i1 > 0:
+                                current_sub_weight[:, :i1] = state["Q"][:, :i1]
+                            current_sub_weight[:, i1:i2] = Q1
+                        else:
+                            current_sub_weight = None
                         block_states.append(
                             {
                                 "state": state,
@@ -830,7 +913,7 @@ class GPTQPlus:
                     if g_update_mode == "block_backward" and enable_gradient_update:
                         if gradient_refresh_fn is None:
                             raise ValueError("`gradient_refresh_fn` must be provided for g_update_mode='block_backward'.")
-                        with profile_recorder.section("fasterquant.block.true_gradient_refresh") if profile_recorder else nullcontext():
+                        with profile_recorder.section("fasterquant.block.true_gradient_refresh") if profile_recorder else _NULL_CONTEXT:
                             weight_snapshot = self.layer.weight.data.clone().float()
                             for block_state in block_states:
                                 state = block_state["state"]
@@ -904,7 +987,7 @@ class GPTQPlus:
                     block_second_order_chunks = []
                     for block_state in block_states:
                         state = block_state["state"]
-                        with profile_recorder.section("fasterquant.block.outer_update_delta_w") if profile_recorder else nullcontext():
+                        with profile_recorder.section("fasterquant.block.outer_update_delta_w") if profile_recorder else _NULL_CONTEXT:
                             GHinv_rest = self._current_ghinv(
                                 state["GHinv"][:, i2:],
                                 state["W_sub"][:, i2:],
@@ -929,7 +1012,7 @@ class GPTQPlus:
                             if block_gd_mode and second_order_update.numel() > 0:
                                 block_second_order_chunks.append(applied_second_order_update)
 
-                        with profile_recorder.section("fasterquant.block.outer_update_ghinv") if profile_recorder else nullcontext():
+                        with profile_recorder.section("fasterquant.block.outer_update_ghinv") if profile_recorder else _NULL_CONTEXT:
                             state["GHinv"][:, i2:] -= state["Z"][:, i1:i2].matmul(state["Hinv"][i1:i2, i2:])
                             if block_gd_mode:
                                 self._clear_grad_optimizer_state(state["grad_optimizer_state"], i1, i2)
@@ -938,7 +1021,7 @@ class GPTQPlus:
                         if gradient_refresh_fn is None:
                             raise ValueError("`gradient_refresh_fn` must be provided for g_update_mode='block_gd'.")
 
-                        with profile_recorder.section("fasterquant.block.true_gradient_refresh") if profile_recorder else nullcontext():
+                        with profile_recorder.section("fasterquant.block.true_gradient_refresh") if profile_recorder else _NULL_CONTEXT:
                             weight_snapshot = self.layer.weight.data.clone().float()
                             for state in subgroup_states:
                                 current_sub_weight = state["W_sub"].clone()
@@ -1077,34 +1160,34 @@ class GPTQPlus:
                                 )
 
                         for state in subgroup_states:
-                            with profile_recorder.section("fasterquant.block.outer_update_grad_descent") if profile_recorder else nullcontext():
+                            with profile_recorder.section("fasterquant.block.outer_update_grad_descent") if profile_recorder else _NULL_CONTEXT:
                                 optimizer_update = state.pop("pending_optimizer_update")
                                 if optimizer_update.numel() > 0:
                                     state["W_sub"][:, i2:] -= optimizer_update
 
             for state in subgroup_states:
-                with profile_recorder.section("fasterquant.subgroup.total") if profile_recorder else nullcontext():
+                with profile_recorder.section("fasterquant.subgroup.total") if profile_recorder else _NULL_CONTEXT:
                     Q = state["Q"]
                     W_int_sub = state["W_int_sub"]
                     Scale_sub = state["Scale_sub"]
                     if actorder:
-                        with profile_recorder.section("fasterquant.subgroup.actorder_unpermute") if profile_recorder else nullcontext():
+                        with profile_recorder.section("fasterquant.subgroup.actorder_unpermute") if profile_recorder else _NULL_CONTEXT:
                             Q = Q[:, state["invperm"]]
                             W_int_sub = W_int_sub[:, state["invperm"]]
                             Scale_sub = Scale_sub[:, state["invperm"]]
 
-                    with profile_recorder.section("fasterquant.subgroup.writeback_outputs") if profile_recorder else nullcontext():
+                    with profile_recorder.section("fasterquant.subgroup.writeback_outputs") if profile_recorder else _NULL_CONTEXT:
                         Q_final[state["row_start"]:state["row_end"], :] = Q
                         W_int_final[state["row_start"]:state["row_end"], :] = W_int_sub
                         Scale_final[state["row_start"]:state["row_end"], :] = Scale_sub
 
             if export_to_et:
-                with profile_recorder.section("fasterquant.export_buffers") if profile_recorder else nullcontext():
+                with profile_recorder.section("fasterquant.export_buffers") if profile_recorder else _NULL_CONTEXT:
                     self.layer.register_buffer(
                         "int_weight", W_int_final.reshape(self.layer.weight.shape)
                     )
                     self.layer.register_buffer("scale", Scale_final)
-            with profile_recorder.section("fasterquant.write_layer_weight") if profile_recorder else nullcontext():
+            with profile_recorder.section("fasterquant.write_layer_weight") if profile_recorder else _NULL_CONTEXT:
                 self.layer.weight.data = Q_final.reshape(self.layer.weight.shape).to(
                     self.layer.weight.data.dtype
                 )
@@ -1175,7 +1258,7 @@ class GPTQPlus:
             row_end = (sub_idx + 1) * rows_per_sub
 
             W_sub = W[row_start:row_end, :].clone()
-            H_sub = self.H[:, :, sub_idx].clone()
+            H_sub = self.H[sub_idx].clone()
             gradients_sub = self.gradients[row_start:row_end, :].to(self.dev).clone()
 
             dead = torch.diag(H_sub) == 0
@@ -1463,7 +1546,7 @@ class GPTQPlus:
 
             row_start = sub_idx * rows_per_sub
             row_end = (sub_idx + 1) * rows_per_sub
-            H_sub = self.H[:, :, sub_idx].clone()
+            H_sub = self.H[sub_idx].clone()
             gradients_sub = gradients[row_start: row_end, :].to(self.dev).clone()
 
             dead = torch.diag(H_sub) == 0
@@ -1984,25 +2067,25 @@ def collect_layer_output_fisher_only(
             position=1,
             leave=False,
         ):
-            with layer_recorder.section("layer.pre_quant_fisher.batch.total") if layer_recorder else nullcontext():
-                with layer_recorder.section("layer.pre_quant_fisher.forward.layer") if layer_recorder else nullcontext():
+            with layer_recorder.section("layer.pre_quant_fisher.batch.total") if layer_recorder else _NULL_CONTEXT:
+                with layer_recorder.section("layer.pre_quant_fisher.forward.layer") if layer_recorder else _NULL_CONTEXT:
                     out = layer(
                         inps[j : j + bsz].to(dev),
                         attention_mask=batch_attention_mask,
                         position_ids=batch_position_ids,
                         position_embeddings=batch_position_embeddings,
                     )
-                with layer_recorder.section("layer.pre_quant_fisher.forward.hidden_extract") if layer_recorder else nullcontext():
+                with layer_recorder.section("layer.pre_quant_fisher.forward.hidden_extract") if layer_recorder else _NULL_CONTEXT:
                     out_hidden = out[0] if isinstance(out, (tuple, list)) else out
-                with layer_recorder.section("layer.pre_quant_fisher.forward.logits_quant") if layer_recorder else nullcontext():
+                with layer_recorder.section("layer.pre_quant_fisher.forward.logits_quant") if layer_recorder else _NULL_CONTEXT:
                     logits = hidden2logits(out, analyzer)
-                with layer_recorder.section("layer.pre_quant_fisher.forward.logits_fp") if layer_recorder else nullcontext():
+                with layer_recorder.section("layer.pre_quant_fisher.forward.logits_fp") if layer_recorder else _NULL_CONTEXT:
                     logits_fp = hidden2logits(fp_inps[j : j + bsz].to(dev), analyzer)
 
                 grad_hessian_logits = logits
                 grad_hessian_logits_fp = logits_fp
                 if grad_hessian_topk > 0:
-                    with layer_recorder.section("layer.pre_quant_fisher.forward.topk_slice") if layer_recorder else nullcontext():
+                    with layer_recorder.section("layer.pre_quant_fisher.forward.topk_slice") if layer_recorder else _NULL_CONTEXT:
                         grad_hessian_logits_fp, grad_hessian_indices = logits_fp.topk(
                             grad_hessian_topk,
                             dim=-1,
@@ -2010,7 +2093,7 @@ def collect_layer_output_fisher_only(
                         )
                         grad_hessian_logits = logits.gather(-1, grad_hessian_indices)
 
-                with layer_recorder.section("layer.pre_quant_fisher.loss_build") if layer_recorder else nullcontext():
+                with layer_recorder.section("layer.pre_quant_fisher.loss_build") if layer_recorder else _NULL_CONTEXT:
                     kl_logits = grad_hessian_logits if grad_hessian_topk > 0 else logits
                     kl_logits_fp = grad_hessian_logits_fp if grad_hessian_topk > 0 else logits_fp
                     if grad_hessian_topk <= 0 and kl_topk > 0:
@@ -2023,7 +2106,7 @@ def collect_layer_output_fisher_only(
                     )
                     kl_loss = kl_loss.sum(dim=-1).mean()
 
-                with layer_recorder.section("layer.pre_quant_fisher.backward") if layer_recorder else nullcontext():
+                with layer_recorder.section("layer.pre_quant_fisher.backward") if layer_recorder else _NULL_CONTEXT:
                     out_hidden.retain_grad()
 
                     def layer_output_grad_hook(grad):
@@ -2044,7 +2127,7 @@ def collect_layer_output_fisher_only(
                     model.zero_grad()
                     kl_loss.backward()
 
-                with layer_recorder.section("layer.pre_quant_fisher.cleanup") if layer_recorder else nullcontext():
+                with layer_recorder.section("layer.pre_quant_fisher.cleanup") if layer_recorder else _NULL_CONTEXT:
                     memory_utils.cleanup_memory()
 
     return torch.cat(layer_output_fisher_cache, dim=0) if layer_output_fisher_cache else None
@@ -2195,32 +2278,32 @@ def collect_layer_grad_hessian_stats(
                 position_embeddings[0].expand(batch_size, -1, -1),
                 position_embeddings[1].expand(batch_size, -1, -1),
             )
-            with layer_recorder.section("layer.grad_hessian.batch.total") if layer_recorder else nullcontext():
-                with layer_recorder.section("layer.grad_hessian.forward") if layer_recorder else nullcontext():
-                    with layer_recorder.section("layer.grad_hessian.forward.layer") if layer_recorder else nullcontext():
+            with layer_recorder.section("layer.grad_hessian.batch.total") if layer_recorder else _NULL_CONTEXT:
+                with layer_recorder.section("layer.grad_hessian.forward") if layer_recorder else _NULL_CONTEXT:
+                    with layer_recorder.section("layer.grad_hessian.forward.layer") if layer_recorder else _NULL_CONTEXT:
                         out = layer(
                             inps[j : j + bsz].to(dev),
                             attention_mask=batch_attention_mask,
                             position_ids=batch_position_ids,
                             position_embeddings=batch_position_embeddings,
                         )
-                    with layer_recorder.section("layer.grad_hessian.forward.hidden_extract") if layer_recorder else nullcontext():
+                    with layer_recorder.section("layer.grad_hessian.forward.hidden_extract") if layer_recorder else _NULL_CONTEXT:
                         out_hidden = out[0] if isinstance(out, (tuple, list)) else out
-                    with layer_recorder.section("layer.grad_hessian.forward.fp_hidden") if layer_recorder else nullcontext():
+                    with layer_recorder.section("layer.grad_hessian.forward.fp_hidden") if layer_recorder else _NULL_CONTEXT:
                         fp_hidden = fp_inps[j : j + bsz].to(dev)
                     logits = None
                     logits_fp = None
                     grad_hessian_logits = None
                     grad_hessian_logits_fp = None
                     if need_output_head:
-                        with layer_recorder.section("layer.grad_hessian.forward.logits_quant") if layer_recorder else nullcontext():
+                        with layer_recorder.section("layer.grad_hessian.forward.logits_quant") if layer_recorder else _NULL_CONTEXT:
                             logits = hidden2logits(out, analyzer)
-                        with layer_recorder.section("layer.grad_hessian.forward.logits_fp") if layer_recorder else nullcontext():
+                        with layer_recorder.section("layer.grad_hessian.forward.logits_fp") if layer_recorder else _NULL_CONTEXT:
                             logits_fp = hidden2logits(fp_hidden, analyzer)
                         grad_hessian_logits = logits
                         grad_hessian_logits_fp = logits_fp
                         if grad_hessian_topk > 0:
-                            with layer_recorder.section("layer.grad_hessian.forward.topk_slice") if layer_recorder else nullcontext():
+                            with layer_recorder.section("layer.grad_hessian.forward.topk_slice") if layer_recorder else _NULL_CONTEXT:
                                 grad_hessian_logits_fp, grad_hessian_indices = logits_fp.topk(
                                     grad_hessian_topk,
                                     dim=-1,
@@ -2228,9 +2311,9 @@ def collect_layer_grad_hessian_stats(
                                 )
                                 grad_hessian_logits = logits.gather(-1, grad_hessian_indices)
                     if need_saliency_collection:
-                        with layer_recorder.section("layer.grad_hessian.forward.label_sample") if layer_recorder else nullcontext():
+                        with layer_recorder.section("layer.grad_hessian.forward.label_sample") if layer_recorder else _NULL_CONTEXT:
                             labels = torch.distributions.Categorical(logits=grad_hessian_logits_fp).sample()
-                        with layer_recorder.section("layer.grad_hessian.forward.nll_build") if layer_recorder else nullcontext():
+                        with layer_recorder.section("layer.grad_hessian.forward.nll_build") if layer_recorder else _NULL_CONTEXT:
                             nll_loss = F.cross_entropy(
                                 grad_hessian_logits.view(-1, grad_hessian_logits.size(-1)),
                                 labels.view(-1),
@@ -2238,34 +2321,34 @@ def collect_layer_grad_hessian_stats(
                             )
 
                 if need_saliency_collection:
-                    with layer_recorder.section("layer.grad_hessian.saliency_backward.total") if layer_recorder else nullcontext():
+                    with layer_recorder.section("layer.grad_hessian.saliency_backward.total") if layer_recorder else _NULL_CONTEXT:
                         saliency_cache.enable_hooks()
-                        with layer_recorder.section("layer.grad_hessian.saliency_backward.zero_grad") if layer_recorder else nullcontext():
+                        with layer_recorder.section("layer.grad_hessian.saliency_backward.zero_grad") if layer_recorder else _NULL_CONTEXT:
                             model.zero_grad()
-                        with layer_recorder.section("layer.grad_hessian.saliency_backward.backward") if layer_recorder else nullcontext():
+                        with layer_recorder.section("layer.grad_hessian.saliency_backward.backward") if layer_recorder else _NULL_CONTEXT:
                             nll_loss.backward(retain_graph=True)
                         saliency_cache.disable_hooks()
 
                 batch_layer_output_fisher = None
                 if layer_refresh_loss_type == "fisher_diag_mse" and precomputed_layer_output_fisher is not None:
-                    with layer_recorder.section("layer.grad_hessian.fisher_slice") if layer_recorder else nullcontext():
+                    with layer_recorder.section("layer.grad_hessian.fisher_slice") if layer_recorder else _NULL_CONTEXT:
                         batch_layer_output_fisher = precomputed_layer_output_fisher[j : j + bsz].to(dev)
                 elif need_layer_output_fisher_collection:
-                    with layer_recorder.section("layer.grad_hessian.fisher_collect") if layer_recorder else nullcontext():
+                    with layer_recorder.section("layer.grad_hessian.fisher_collect") if layer_recorder else _NULL_CONTEXT:
                         kl_logits = grad_hessian_logits if grad_hessian_topk > 0 else logits
                         kl_logits_fp = grad_hessian_logits_fp if grad_hessian_topk > 0 else logits_fp
                         if grad_hessian_topk <= 0 and kl_topk > 0:
-                            with layer_recorder.section("layer.grad_hessian.fisher_collect.topk") if layer_recorder else nullcontext():
+                            with layer_recorder.section("layer.grad_hessian.fisher_collect.topk") if layer_recorder else _NULL_CONTEXT:
                                 kl_logits_fp, indices = logits_fp.topk(kl_topk, dim=-1, sorted=False)
                                 kl_logits = logits.gather(-1, indices)
-                        with layer_recorder.section("layer.grad_hessian.fisher_collect.loss_build") if layer_recorder else nullcontext():
+                        with layer_recorder.section("layer.grad_hessian.fisher_collect.loss_build") if layer_recorder else _NULL_CONTEXT:
                             fisher_kl_loss = F.kl_div(
                                 F.log_softmax(kl_logits, dim=-1),
                                 F.softmax(kl_logits_fp, dim=-1),
                                 reduction="none",
                             )
                             fisher_kl_loss = fisher_kl_loss.sum(dim=-1).mean()
-                        with layer_recorder.section("layer.grad_hessian.fisher_collect.hook_register") if layer_recorder else nullcontext():
+                        with layer_recorder.section("layer.grad_hessian.fisher_collect.hook_register") if layer_recorder else _NULL_CONTEXT:
                             out_hidden.retain_grad()
 
                             def layer_output_grad_hook(grad):
@@ -2283,17 +2366,17 @@ def collect_layer_grad_hessian_stats(
                                 layer_output_fisher_cache.append(grad_squared.mean(dim=-1).detach())
 
                             out_hidden.register_hook(layer_output_grad_hook)
-                        with layer_recorder.section("layer.grad_hessian.fisher_collect.backward") if layer_recorder else nullcontext():
+                        with layer_recorder.section("layer.grad_hessian.fisher_collect.backward") if layer_recorder else _NULL_CONTEXT:
                             model.zero_grad()
                             fisher_kl_loss.backward(retain_graph=True)
                         batch_layer_output_fisher = layer_output_fisher_cache[-1]
 
-                with layer_recorder.section("layer.grad_hessian.gradient_loss_build") if layer_recorder else nullcontext():
+                with layer_recorder.section("layer.grad_hessian.gradient_loss_build") if layer_recorder else _NULL_CONTEXT:
                     if gptq_reference_loss_type == "kl":
                         kl_logits = grad_hessian_logits if grad_hessian_topk > 0 else logits
                         kl_logits_fp = grad_hessian_logits_fp if grad_hessian_topk > 0 else logits_fp
                         if grad_hessian_topk <= 0 and kl_topk > 0:
-                            with layer_recorder.section("layer.grad_hessian.gradient_loss_build.topk") if layer_recorder else nullcontext():
+                            with layer_recorder.section("layer.grad_hessian.gradient_loss_build.topk") if layer_recorder else _NULL_CONTEXT:
                                 kl_logits_fp, indices = logits_fp.topk(kl_topk, dim=-1, sorted=False)
                                 kl_logits = logits.gather(-1, indices)
                         gradient_loss = F.kl_div(
@@ -2312,17 +2395,17 @@ def collect_layer_grad_hessian_stats(
                             layer_output_fisher=batch_layer_output_fisher,
                         )
 
-                with layer_recorder.section("layer.grad_hessian.gradient_backward.total") if layer_recorder else nullcontext():
+                with layer_recorder.section("layer.grad_hessian.gradient_backward.total") if layer_recorder else _NULL_CONTEXT:
                     gradients_cache.enable_hooks()
-                    with layer_recorder.section("layer.grad_hessian.gradient_backward.zero_grad") if layer_recorder else nullcontext():
+                    with layer_recorder.section("layer.grad_hessian.gradient_backward.zero_grad") if layer_recorder else _NULL_CONTEXT:
                         model.zero_grad()
-                    with layer_recorder.section("layer.grad_hessian.gradient_backward.backward") if layer_recorder else nullcontext():
+                    with layer_recorder.section("layer.grad_hessian.gradient_backward.backward") if layer_recorder else _NULL_CONTEXT:
                         gradient_loss.backward()
                     gradients_cache.disable_hooks()
 
-                with layer_recorder.section("layer.grad_hessian.metrics_record") if layer_recorder else nullcontext():
+                with layer_recorder.section("layer.grad_hessian.metrics_record") if layer_recorder else _NULL_CONTEXT:
                     reference_losses.append(gradient_loss.item())
-                with layer_recorder.section("layer.grad_hessian.cleanup") if layer_recorder else nullcontext():
+                with layer_recorder.section("layer.grad_hessian.cleanup") if layer_recorder else _NULL_CONTEXT:
                     memory_utils.cleanup_memory()
 
         mean_reference_loss = sum(reference_losses) / len(reference_losses)
@@ -2334,7 +2417,7 @@ def collect_layer_grad_hessian_stats(
     if need_layer_output_fisher_collection:
         layer_output_fisher = torch.cat(layer_output_fisher_cache, dim=0)
 
-    with layer_recorder.section("layer.cache_finalize") if layer_recorder else nullcontext():
+    with layer_recorder.section("layer.cache_finalize") if layer_recorder else _NULL_CONTEXT:
         if saliency_cache is not None:
             for name in saliency_cache.names:
                 saliency_cache.saliency_cache[name] = torch.cat(saliency_cache.saliency_cache[name], dim=0)
@@ -2488,9 +2571,9 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
             return False
         return not target_modules or module_name in target_modules
 
-    with run_recorder.section("run.total") if run_recorder else nullcontext():
+    with run_recorder.section("run.total") if run_recorder else _NULL_CONTEXT:
         if global_loss_enabled:
-            with pipeline_recorder.section("pipeline.static_end_to_end_saliency_fisher") if pipeline_recorder else nullcontext():
+            with pipeline_recorder.section("pipeline.static_end_to_end_saliency_fisher") if pipeline_recorder else _NULL_CONTEXT:
                 static_saliency_by_layer, static_fisher_by_layer = collect_static_end_to_end_saliency_and_fisher(
                     model=model,
                     analyzer=analyzer,
@@ -2521,7 +2604,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                 analyzer.get_lm_head(),
             ]
         )
-        with pipeline_recorder.section("pipeline.move_to_device") if pipeline_recorder else nullcontext():
+        with pipeline_recorder.section("pipeline.move_to_device") if pipeline_recorder else _NULL_CONTEXT:
             for module in per_layer_runtime_modules:
                 module.to(dev)
             layers[0] = layers[0].to(dev)
@@ -2548,7 +2631,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                 raise ValueError
 
         layers[0] = Catcher(layers[0])
-        with pipeline_recorder.section("pipeline.capture_inputs") if pipeline_recorder else nullcontext():
+        with pipeline_recorder.section("pipeline.capture_inputs") if pipeline_recorder else _NULL_CONTEXT:
             for batch in dataloader:
                 try:
                     model(batch[0].to(dev))
@@ -2568,7 +2651,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
         fp_inps = inps.clone()
 
         if args.offload_inps:
-            with pipeline_recorder.section("pipeline.offload_inputs") if pipeline_recorder else nullcontext():
+            with pipeline_recorder.section("pipeline.offload_inputs") if pipeline_recorder else _NULL_CONTEXT:
                 inps = inps.cpu()
                 fp_inps = fp_inps.cpu()
 
@@ -2607,7 +2690,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
             layer_backward_bsz = args.final_layer_backward_bsz if i == final_layer_idx else args.backward_bsz
             layer_stats_bsz = args.final_layer_stats_bsz if i == final_layer_idx else args.bsz
 
-            with layer_recorder.section("layer.fp_reference_forward") if layer_recorder else nullcontext():
+            with layer_recorder.section("layer.fp_reference_forward") if layer_recorder else _NULL_CONTEXT:
                 bits_config = quant_utils.disable_act_quant(layer)
                 for j in range(args.nsamples):
                     fp_inps[j] = layer(
@@ -2619,7 +2702,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                 quant_utils.enable_act_quant(layer, bits_config)
 
             if preclip_enabled:
-                with layer_recorder.section("layer.weight_preclip") if layer_recorder else nullcontext():
+                with layer_recorder.section("layer.weight_preclip") if layer_recorder else _NULL_CONTEXT:
                     for name, module in full.items():
                         if module is None or "lm_head" in name:
                             continue
@@ -2644,7 +2727,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
             if effective_pre_gd_steps > 0 and pre_gd_refresh_loss_type == "fisher_diag_mse":
                 layer_output_fisher = static_fisher_by_layer[i]
                 if layer_output_fisher is None:
-                    with layer_recorder.section("layer.pre_quant_fisher_collect") if layer_recorder else nullcontext():
+                    with layer_recorder.section("layer.pre_quant_fisher_collect") if layer_recorder else _NULL_CONTEXT:
                         layer_output_fisher = collect_layer_output_fisher_only(
                             model=model,
                             layer=layer,
@@ -2678,7 +2761,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     else args.pre_grad_lr
                 )
                 if pre_grad_lr > 0:
-                    with layer_recorder.section("layer.pre_quant_gd") if layer_recorder else nullcontext():
+                    with layer_recorder.section("layer.pre_quant_gd") if layer_recorder else _NULL_CONTEXT:
                         logging.info(
                             "Running pre-quantization GD for layer=%d steps=%d lr=%s optimizer=%s refresh_loss=%s",
                             i,
@@ -2740,7 +2823,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
             )
 
             gptq = {}
-            with layer_recorder.section("layer.gptq_setup") if layer_recorder else nullcontext():
+            with layer_recorder.section("layer.gptq_setup") if layer_recorder else _NULL_CONTEXT:
                 for name in subset:
                     layer_weight_bits = args.w_bits
                     layer_weight_sym = not args.w_asym
@@ -2782,7 +2865,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     add_batch_recorders[name] = QuantProfileRecorder(dev, prefix=f"layers.{i}.{name}")
                     gptq[name].profile_recorder = add_batch_recorders[name]
                 handles.append(subset[name].register_forward_hook(add_batch(name)))
-            with layer_recorder.section("layer.hessian_accumulation_forward") if layer_recorder else nullcontext():
+            with layer_recorder.section("layer.hessian_accumulation_forward") if layer_recorder else _NULL_CONTEXT:
                 for j in range(args.nsamples):
                     _ = layer(
                         inps[j].unsqueeze(0).to(dev),
@@ -2850,7 +2933,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
 
                 return observer
 
-            with layer_recorder.section("layer.module_quantization") if layer_recorder else nullcontext():
+            with layer_recorder.section("layer.module_quantization") if layer_recorder else _NULL_CONTEXT:
                 for name in subset:
                     if name not in gptq:
                         continue
@@ -2926,7 +3009,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     quantizers["model.layers.%d.%s" % (i, name)] = gptq[name].quantizer
                     gptq[name].free()
 
-            with layer_recorder.section("layer.quantized_replay_forward") if layer_recorder else nullcontext():
+            with layer_recorder.section("layer.quantized_replay_forward") if layer_recorder else _NULL_CONTEXT:
                 for j in range(args.nsamples):
                     inps[j] = layer(
                         inps[j].unsqueeze(0).to(dev),
@@ -2935,7 +3018,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         position_embeddings=position_embeddings,
                     )[0].squeeze(0).to(inps.device)
 
-            with layer_recorder.section("layer.cleanup") if layer_recorder else nullcontext():
+            with layer_recorder.section("layer.cleanup") if layer_recorder else _NULL_CONTEXT:
                 layers[i] = layer.to(orig_device)
                 del layer
                 del gptq
@@ -2946,7 +3029,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                 logging.info("Stopping quantization after transformer layer %d due to --quant_stop_layer.", i)
                 break
 
-        with pipeline_recorder.section("pipeline.restore_modules") if pipeline_recorder else nullcontext():
+        with pipeline_recorder.section("pipeline.restore_modules") if pipeline_recorder else _NULL_CONTEXT:
             for module in per_layer_runtime_modules:
                 module.to(orig_device)
             model.config.use_cache = use_cache
