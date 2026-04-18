@@ -213,6 +213,21 @@ def parse_gen():
         help="Multiplier applied to block_gd lr for MLP down projections.",
     )
     parser.add_argument(
+        "--grad_lr_layer_schedule",
+        type=str,
+        default="none",
+        choices=["none", "cosine", "linear", "sqrt"],
+        help=(
+            "Per-layer ramp for --grad_lr and --pre_grad_lr. "
+            "'none' keeps grad_lr constant across layers (default). "
+            "The ramp goes 0 → 1 from layer 0 to the last layer: "
+            "'cosine' = 0.5*(1-cos(π·x)), 'linear' = x, 'sqrt' = √x, "
+            "where x = layer_idx / (num_layers - 1). "
+            "Does NOT scale --final_layer_grad_lr / --pre_final_layer_grad_lr "
+            "(the final layer keeps its dedicated LR)."
+        ),
+    )
+    parser.add_argument(
         "--grad_reg_strategy",
         type=str,
         default="none",

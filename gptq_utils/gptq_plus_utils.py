@@ -270,6 +270,32 @@ def get_module_grad_lr(
     return base_grad_lr
 
 
+def compute_layer_lr_scale(layer_idx: int, num_layers: int, schedule: str) -> float:
+    """Layer-wise LR ramp. Returns a multiplier in [0, 1].
+
+    x = layer_idx / max(num_layers - 1, 1) ∈ [0, 1]. Mapping:
+        "none"   -> 1.0  (no ramp)
+        "linear" -> x
+        "cosine" -> 0.5 * (1 - cos(pi * x))   (smooth S-curve from 0 to 1)
+        "sqrt"   -> sqrt(x)                   (rises fast early)
+
+    Degenerate single-layer models (num_layers <= 1) get scale = 1.0.
+    """
+    if schedule in (None, "", "none"):
+        return 1.0
+    if num_layers <= 1:
+        return 1.0
+    x = float(layer_idx) / float(num_layers - 1)
+    x = min(max(x, 0.0), 1.0)
+    if schedule == "linear":
+        return x
+    if schedule == "cosine":
+        return 0.5 * (1.0 - math.cos(math.pi * x))
+    if schedule == "sqrt":
+        return math.sqrt(x)
+    raise ValueError(f"Unknown grad_lr_layer_schedule={schedule!r}")
+
+
 class GPTQPlus:
     def __init__(self,
         layer,
@@ -3318,6 +3344,18 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
             layer = layers[i].to(dev)
             full = analyzer.get_quantizable_modules(layer)
             layer_recorder = QuantProfileRecorder(dev, prefix=f"layers.{i}") if quant_profile_enabled else None
+            # Per-layer LR ramp. scale==1.0 when schedule="none", so this is
+            # a no-op for the default config.
+            grad_lr_layer_scale = compute_layer_lr_scale(
+                layer_idx=i,
+                num_layers=len(layers),
+                schedule=getattr(args, "grad_lr_layer_schedule", "none"),
+            )
+            if getattr(args, "grad_lr_layer_schedule", "none") != "none":
+                logging.info(
+                    "Layer %d grad_lr schedule scale=%.4f (schedule=%s)",
+                    i, grad_lr_layer_scale, args.grad_lr_layer_schedule,
+                )
             layer_refresh_loss_type = get_effective_refresh_loss_type(
                 i,
                 final_layer_idx,
@@ -3455,7 +3493,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                 pre_grad_lr = (
                     args.pre_final_layer_grad_lr
                     if i == final_layer_idx and args.pre_final_layer_grad_lr is not None
-                    else args.pre_grad_lr
+                    else args.pre_grad_lr * grad_lr_layer_scale
                 )
                 if pre_grad_lr > 0:
                     with layer_recorder.section("layer.pre_quant_gd") if layer_recorder else _NULL_CONTEXT:
@@ -3710,7 +3748,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     base_grad_lr = (
                         args.final_layer_grad_lr
                         if i == final_layer_idx and args.final_layer_grad_lr is not None
-                        else args.grad_lr
+                        else args.grad_lr * grad_lr_layer_scale
                     )
                     effective_grad_reg_strategy = "none" if i == final_layer_idx else args.grad_reg_strategy
                     effective_grad_lr = get_module_grad_lr(

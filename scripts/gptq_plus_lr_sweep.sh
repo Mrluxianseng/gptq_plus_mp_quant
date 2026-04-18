@@ -17,20 +17,20 @@ shift 3
 GRAD_LRS_STR=${GRAD_LRS:-"0.0001"}
 N_SAMPLES=${N_SAMPLES:-512}
 SEQ_LEN=${SEQ_LEN:-1024}
-BSZ=${BSZ:-128}
-FINAL_LAYER_STATS_BSZ=${FINAL_LAYER_STATS_BSZ:-16}
+BSZ=${BSZ:-16}
+FINAL_LAYER_STATS_BSZ=${FINAL_LAYER_STATS_BSZ:-4}
 BACKWARD_SAMPLES=${BACKWARD_SAMPLES:-32}
-BACKWARD_BSZ=${BACKWARD_BSZ:-32}
-FINAL_LAYER_BACKWARD_BSZ=${FINAL_LAYER_BACKWARD_BSZ:-16}
+BACKWARD_BSZ=${BACKWARD_BSZ:-16}
+FINAL_LAYER_BACKWARD_BSZ=${FINAL_LAYER_BACKWARD_BSZ:-4}
 FINAL_LAYER_FULL_BACKWARD=${FINAL_LAYER_FULL_BACKWARD:-0}
 BLOCKSIZE=${BLOCKSIZE:-256}
 BLOCK_ATOMIC_QUANT=${BLOCK_ATOMIC_QUANT:-0}
 GRAD_OPTIMIZER=${GRAD_OPTIMIZER:-adam}
-FINAL_LAYER_GRAD_OPTIMIZER=${FINAL_LAYER_GRAD_OPTIMIZER:-sgd}
+FINAL_LAYER_GRAD_OPTIMIZER=${FINAL_LAYER_GRAD_OPTIMIZER:-adam}
 GRAD_CLIP=${GRAD_CLIP:-1.0}
 # --grad_refresh_loss {kl,hidden_mse,fisher_diag_mse}
 GRAD_REFRESH_LOSS=${GRAD_REFRESH_LOSS:-fisher_diag_mse}
-FINAL_LAYER_GRAD_LR=${FINAL_LAYER_GRAD_LR:-0.01}
+FINAL_LAYER_GRAD_LR=${FINAL_LAYER_GRAD_LR:-0.0001}
 PRE_GD_STEPS=${PRE_GD_STEPS:-10}
 PRE_GRAD_LR=${PRE_GRAD_LR:-0.00003}
 PRE_FINAL_LAYER_GRAD_LR=${PRE_FINAL_LAYER_GRAD_LR:-0.3}
@@ -49,10 +49,11 @@ SECOND_ORDER_SCALE=${SECOND_ORDER_SCALE:-1.0}
 FISHER_NUM_GROUPS=${FISHER_NUM_GROUPS:-512}
 PRE_CLIP=${PRE_CLIP:-0}
 GLOBAL_LOSS=${GLOBAL_LOSS:-1}
-GLOBAL_LOSS_BSZ=${GLOBAL_LOSS_BSZ:-16}
+GLOBAL_LOSS_BSZ=${GLOBAL_LOSS_BSZ:-4}
 LOSS_SLIDE_WINDOW=${LOSS_SLIDE_WINDOW:-0}
-DP_GLOBAL_SHUFFLE=${DP_GLOBAL_SHUFFLE:-0}
-ALPHA=${ALPHA:-0.05}
+DP_GLOBAL_SHUFFLE=${DP_GLOBAL_SHUFFLE:-1}
+GRAD_LR_LAYER_SCHEDULE=${GRAD_LR_LAYER_SCHEDULE:-none}
+ALPHA=${ALPHA:-0.03}
 KL_TOPK=${KL_TOPK:-20}
 LM_EVAL_BATCH_SIZE=${LM_EVAL_BATCH_SIZE:-32}
 ENABLE_QA_EVAL=${ENABLE_QA_EVAL:-0}
@@ -68,7 +69,7 @@ MODEL_NAME=$(basename "${MODEL_PATH}")
 # RDZV port decouples from DEVICE so the commas don't end up in the endpoint.
 IFS=',' read -r -a _DEVICE_LIST <<< "${DEVICE}"
 N_GPUS=${N_GPUS:-${#_DEVICE_LIST[@]}}
-RDZV_PORT=${RDZV_PORT:-29400}
+RDZV_PORT=${RDZV_PORT:-29600}
 
 sanitize_float() {
     local value="${1}"
@@ -139,6 +140,13 @@ if [[ "${DP_GLOBAL_SHUFFLE}" == "1" ]]; then
     DP_GLOBAL_SHUFFLE_TAG="_gshuf"
 fi
 
+GRAD_LR_LAYER_SCHEDULE_ARGS=()
+GRAD_LR_LAYER_SCHEDULE_TAG=""
+if [[ "${GRAD_LR_LAYER_SCHEDULE}" != "none" ]]; then
+    GRAD_LR_LAYER_SCHEDULE_ARGS=(--grad_lr_layer_schedule "${GRAD_LR_LAYER_SCHEDULE}")
+    GRAD_LR_LAYER_SCHEDULE_TAG="_lrsched${GRAD_LR_LAYER_SCHEDULE}"
+fi
+
 for grad_lr in "${GRAD_LRS[@]}"; do
     grad_lr_tag=$(sanitize_float "${grad_lr}")
     final_layer_grad_lr_tag=$(sanitize_float "${FINAL_LAYER_GRAD_LR}")
@@ -174,7 +182,7 @@ for grad_lr in "${GRAD_LRS[@]}"; do
             pre_gd_suffix="${pre_gd_suffix}_flopt${PRE_FINAL_LAYER_GRAD_OPTIMIZER}"
         fi
     fi
-    exp_name="${BASE_EXP}_block_gd_${GRAD_OPTIMIZER}${refresh_suffix}${reg_suffix}${grad_hessian_suffix}${fisher_groups_suffix}_lr${grad_lr_tag}_fllr${final_layer_grad_lr_tag}_s${second_order_tag}${pre_gd_suffix}${PRE_CLIP_TAG}${BLOCK_ATOMIC_TAG}${FINAL_LAYER_FULL_BACKWARD_TAG}${GLOBAL_LOSS_TAG}${LOSS_SLIDE_WINDOW_TAG}${DP_GLOBAL_SHUFFLE_TAG}"
+    exp_name="${BASE_EXP}_block_gd_${GRAD_OPTIMIZER}${refresh_suffix}${reg_suffix}${grad_hessian_suffix}${fisher_groups_suffix}_lr${grad_lr_tag}_fllr${final_layer_grad_lr_tag}_s${second_order_tag}${pre_gd_suffix}${PRE_CLIP_TAG}${BLOCK_ATOMIC_TAG}${FINAL_LAYER_FULL_BACKWARD_TAG}${GLOBAL_LOSS_TAG}${LOSS_SLIDE_WINDOW_TAG}${DP_GLOBAL_SHUFFLE_TAG}${GRAD_LR_LAYER_SCHEDULE_TAG}"
 
     echo "============================================================"
     echo "Running GPTQ+ LR sweep"
@@ -231,12 +239,14 @@ for grad_lr in "${GRAD_LRS[@]}"; do
         --kl_topk "${KL_TOPK}" --bsz "${BSZ}" --final_layer_stats_bsz "${FINAL_LAYER_STATS_BSZ}" --alpha "${ALPHA}" --blocksize "${BLOCKSIZE}" \
         --backward_samples "${BACKWARD_SAMPLES}" --backward_bsz "${BACKWARD_BSZ}" --final_layer_backward_bsz "${FINAL_LAYER_BACKWARD_BSZ}" \
         --g_update_mode block_gd --grad_lr "${grad_lr}" --grad_optimizer "${GRAD_OPTIMIZER}" --grad_refresh_loss "${GRAD_REFRESH_LOSS}" \
+        --rotate \
         "${GLOBAL_LOSS_ARGS[@]}" \
         "${LOSS_SLIDE_WINDOW_ARGS[@]}" \
         "${DP_GLOBAL_SHUFFLE_ARGS[@]}" \
+        "${GRAD_LR_LAYER_SCHEDULE_ARGS[@]}" \
         --final_layer_grad_optimizer "${FINAL_LAYER_GRAD_OPTIMIZER}" \
         --grad_clip "${GRAD_CLIP}" \
-        --final_layer_grad_lr "${FINAL_LAYER_GRAD_LR}" \
+        --final_layer_grad_lr "${grad_lr}" \
         --grad_hessian_topk "${GRAD_HESSIAN_TOPK}" \
         --pre_gd_steps "${PRE_GD_STEPS}" \
         --pre_grad_lr "${PRE_GRAD_LR}" \
