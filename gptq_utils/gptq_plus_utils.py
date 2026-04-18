@@ -2693,12 +2693,18 @@ def collect_true_weight_gradient(
     loss_sum_current = 0.0
     loss_sum_next = 0.0
 
+    # Slide-window mixes in a "next-layer" version of the same loss.
+    #   fisher_diag_mse path: needs the next-layer fisher tensor.
+    #   residual_kl    path: reuses fp_inps_final (same final-head target for
+    #                         both current- and next-layer deltas).
     slide_active = (
         slide_alpha < 1.0
         and next_layer is not None
         and fp_inps_next is not None
-        and next_layer_output_fisher is not None
-        and refresh_loss_type == "fisher_diag_mse"
+        and (
+            (refresh_loss_type == "fisher_diag_mse" and next_layer_output_fisher is not None)
+            or (refresh_loss_type == "residual_kl" and fp_inps_final is not None)
+        )
     )
 
     if len(selected_indices) > 0:
@@ -2764,7 +2770,13 @@ def collect_true_weight_gradient(
                         )
                         next_out_hidden = next_out[0] if isinstance(next_out, (tuple, list)) else next_out
                         fp_hidden_next = fp_inps_next[batch_indices].to(dev)
-                        fisher_batch_next = next_layer_output_fisher[batch_indices].to(dev)
+                        # For fisher_diag_mse the next-layer loss needs the
+                        # next-layer fisher diagonal; for residual_kl it reuses
+                        # the same fp_inps_final as the current-layer loss.
+                        fisher_batch_next = (
+                            None if next_layer_output_fisher is None
+                            else next_layer_output_fisher[batch_indices].to(dev)
+                        )
                         refresh_loss_next = compute_refresh_loss(
                             refresh_loss_type,
                             next_out_hidden,
@@ -2772,6 +2784,7 @@ def collect_true_weight_gradient(
                             analyzer,
                             kl_topk,
                             layer_output_fisher=fisher_batch_next,
+                            fp_final_hidden=fp_final_batch,
                         )
                         refresh_loss = (
                             slide_alpha * refresh_loss_current
@@ -3492,17 +3505,30 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
 
             # --- Loss-slide-window setup: precompute reference output of the
             # next FP transformer block, so the per-block refresh can blend the
-            # current-layer fisher_diag_mse with the next-layer one. Skipped at
-            # and past the second-to-last layer per the spec.
+            # current-layer loss with the next-layer loss. Supported under two
+            # refresh types:
+            #   * fisher_diag_mse — needs `static_fisher_by_layer[i+1]` (so
+            #     global_loss must be on).
+            #   * residual_kl    — reuses the already-precomputed fp_inps_final
+            #     (no next-layer fisher needed).
+            # Skipped at and past the second-to-last layer per the spec.
             slide_active_layer = False
             if (
                 getattr(args, "loss_slide_window", False)
                 and args.g_update_mode == "block_gd"
-                and layer_refresh_loss_type == "fisher_diag_mse"
-                and global_loss_enabled
                 and i <= final_layer_idx - 2
             ):
-                slide_active_layer = static_fisher_by_layer[i + 1] is not None
+                if (
+                    layer_refresh_loss_type == "fisher_diag_mse"
+                    and global_loss_enabled
+                    and static_fisher_by_layer[i + 1] is not None
+                ):
+                    slide_active_layer = True
+                elif (
+                    layer_refresh_loss_type == "residual_kl"
+                    and fp_inps_final is not None
+                ):
+                    slide_active_layer = True
             slide_next_layer = None
             slide_fp_inps_next = None
             slide_next_layer_output_fisher = None
@@ -3511,7 +3537,12 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                 with layer_recorder.section("layer.slide_window.next_fp_reference") if layer_recorder else _NULL_CONTEXT:
                     slide_next_layer = layers[i + 1].to(dev)
                     slide_next_bits_config = quant_utils.disable_act_quant(slide_next_layer)
-                    slide_next_layer_output_fisher = static_fisher_by_layer[i + 1]
+                    # Only fisher_diag_mse needs the next-layer fisher. For
+                    # residual_kl we leave this None and the loss computation
+                    # in collect_true_weight_gradient routes through
+                    # fp_inps_final instead.
+                    if layer_refresh_loss_type == "fisher_diag_mse":
+                        slide_next_layer_output_fisher = static_fisher_by_layer[i + 1]
                     slide_fp_inps_next = torch.empty_like(fp_inps)
                     for j in range(fp_inps.shape[0]):
                         slide_fp_inps_next[j] = slide_next_layer(
@@ -3521,9 +3552,10 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             position_embeddings=position_embeddings,
                         )[0].to(slide_fp_inps_next.device)
                     logging.info(
-                        "Loss-slide-window active for layer %d (next=%d); next-layer fisher cached.",
+                        "Loss-slide-window active for layer %d (next=%d, mode=%s).",
                         i,
                         i + 1,
+                        layer_refresh_loss_type,
                     )
 
             if preclip_enabled:

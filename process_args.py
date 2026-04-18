@@ -444,16 +444,19 @@ def parse_gen():
     if getattr(args, "loss_slide_window", False):
         if args.g_update_mode != "block_gd":
             raise ValueError("--loss_slide_window requires --g_update_mode=block_gd.")
-        if args.grad_refresh_loss != "fisher_diag_mse":
-            raise ValueError("--loss_slide_window requires --grad_refresh_loss=fisher_diag_mse.")
-        if not args.global_loss:
-            raise ValueError("--loss_slide_window requires --global_loss (so next-layer fisher is cached).")
-    if args.grad_refresh_loss == "residual_kl":
-        if getattr(args, "loss_slide_window", False):
+        if args.grad_refresh_loss not in ("fisher_diag_mse", "residual_kl"):
             raise ValueError(
-                "--grad_refresh_loss=residual_kl is incompatible with --loss_slide_window "
-                "(residual_kl already captures downstream effect to the final head)."
+                "--loss_slide_window requires --grad_refresh_loss in "
+                "{fisher_diag_mse, residual_kl}."
             )
+        if args.grad_refresh_loss == "fisher_diag_mse" and not args.global_loss:
+            raise ValueError(
+                "--loss_slide_window + fisher_diag_mse requires --global_loss "
+                "(so next-layer fisher is cached)."
+            )
+    # residual_kl + slide_window is supported: the next-layer loss computes
+    # δ_next = next_layer(out_hidden) - fp_inps_next, then runs the same
+    # residual-stream shortcut using fp_inps_final. No incompatibility.
     if args.nsamples % args.backward_samples != 0:
         raise ValueError(
             f"`nsamples` ({args.nsamples}) must be divisible by `backward_samples` ({args.backward_samples})."

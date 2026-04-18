@@ -247,7 +247,7 @@ for grad_lr in "${GRAD_LRS[@]}"; do
         "${GRAD_LR_LAYER_SCHEDULE_ARGS[@]}" \
         --final_layer_grad_optimizer "${FINAL_LAYER_GRAD_OPTIMIZER}" \
         --grad_clip "${GRAD_CLIP}" \
-        --final_layer_grad_lr "${grad_lr}" \
+        --final_layer_grad_lr "${FINAL_LAYER_GRAD_LR}" \
         --grad_hessian_topk "${GRAD_HESSIAN_TOPK}" \
         --pre_gd_steps "${PRE_GD_STEPS}" \
         --pre_grad_lr "${PRE_GRAD_LR}" \
