@@ -259,7 +259,7 @@ $$
 
 - 假设输出的kl loss为这一层输出的变化的二阶项： $loss = \frac{1}{2} \Delta y ^T H \Delta y$ ，这里的H可以用fisher矩阵估算对角项，也就是逐元素的梯度平方的均值，这个可以在预处理的时候得到。
 
-直接这样取loss数值会爆炸，因为不同线性层的loss尺度不一样且hessian数值波动。改成加权系数归一化。后面可以试试给H加一个λI稳定数值。
+直接这样取loss数值会爆炸，因为不同线性层的loss尺度不一样且hessian数值波动。改成加权系数归一化(整体对batch token num_groups三个维度求均值除掉)。后面可以试试给H加一个λI稳定数值。
 
 - GRAD_LR=0.00007 adam
 
@@ -461,3 +461,18 @@ $$
 ## 正弦周期正则化
 
 试了负提升，因为量化误差主要来源于截断
+
+## loss slide window + fisher逐group分别标准化
+
+- alpha=0 grad_lr=0.0001
+
+| KL-wikitext2 | PPL-wikitext2 | KL-ultrachat_2k | PPL-ultrachat_2k | KL-numinamath | PPL-numinamath |
+| --- | --- | --- | --- | --- | --- |
+| 1.38e-01 | 23.10 | 5.09e-02 | 5.04 | 9.89e-02 | 8.66 |
+
+## 逆cos调度loss
+
+没用
+
+## res kl loss
+
