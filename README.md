@@ -26,6 +26,7 @@
 - SEQ_LEN：校准集样本长度
 - BSZ：每层计算saliency/hessian/gradient等用的batch_size
 - FINAL_LAYER_STATS_BSZ：最后一层单独设置计算saliency/hessian/gradient等用的batch_size，因为最后一层有输出头比较重
+- HESSIAN_ACCUM_BSZ：stats阶段跑完之后，还要再挂`add_batch` hook把inps过一遍layer累hessian，这个就是那个forward循环的batch_size。和BSZ解耦（stats阶段吃logits反传显存，这个阶段吃`add_batch`里`weighted`张量的显存），留空则复用BSZ。默认128。OOM时单独调小。
 - BACKWARD_SAMPLES：每block后用来计算loss的样本条数
 - BACKWARD_BSZ：每block后用来反传的batchsize
 - FINAL_LAYER_BACKWARD_BSZ：最后一层反传的batchsize
@@ -63,6 +64,7 @@
 - ENABLE_QA_EVAL：开启qa_eval打分，慢
 - BASE_EXP：实验名
 - OUTPUT_ROOT：实验日志输出
+- ENABLE_GPTQ_PLUS：总开关，0=走纯GPTQ基线，1=开启所有GPTQ+扩展（默认1）。设0后会自动旁路以下计算：stats阶段的reference loss反传（省一次backward）、fisher预计算（省CPU RAM和时间）、residual_kl的fp_inps_final预计算、pre-quantization GD（`run_pre_quant_gd`）、block间的gradient refresh（`gradient_refresh_fn`）、fasterquant逐列内循环的GHinv/Z一阶项（`enable_gradient_update=False`+`alpha=0`使`beta=0`）、loss slide window。等价于把`g_update_mode`强制成`frozen`、`pre_gd_steps=0`、`alpha=0`、`loss_slide_window=0`。适合用来跑时间/精度的GPTQ基线做ablation。
 
 # 核心的消融/创新点
 
