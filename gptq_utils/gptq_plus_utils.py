@@ -2221,6 +2221,7 @@ def collect_static_end_to_end_saliency_and_fisher(
     fisher_num_groups,
     grad_hessian_topk,
     batch_size,
+    collect_fisher=True,
 ):
     logging.info(
         "Collecting static end-to-end saliency/fisher caches from a single pre-quantization full-model backward pass. "
@@ -2290,14 +2291,17 @@ def collect_static_end_to_end_saliency_and_fisher(
                     fisher_num_groups,
                     group_size,
                 )
-                fisher_data[layer_idx].append(grad_squared.mean(dim=-1).detach().cpu())
+                # Cache as bf16 on CPU to halve RAM footprint. Consumers .float()
+                # on `.to(dev)` so compute stays fp32 and numerics are unchanged.
+                fisher_data[layer_idx].append(grad_squared.mean(dim=-1).detach().to(torch.bfloat16).cpu())
 
             out_tensor.register_hook(grad_hook)
 
         return forward_hook
 
     for layer_idx, (layer, module_dict) in enumerate(zip(layers, module_dicts)):
-        handles.append(layer.register_forward_hook(make_layer_hook(layer_idx)))
+        if collect_fisher:
+            handles.append(layer.register_forward_hook(make_layer_hook(layer_idx)))
         for module_name, module in module_dict.items():
             handles.append(module.register_forward_hook(make_module_hook(layer_idx, module_name)))
 
@@ -2382,10 +2386,13 @@ def collect_static_end_to_end_saliency_and_fisher(
                 )
             # Rank-local shard of shape (n_local, T, G). Not gathered.
             layer_saliency[module_name] = torch.cat(saliency_data[layer_idx][module_name], dim=0)
-        if not fisher_data[layer_idx]:
-            raise ValueError(f"Failed to collect static end-to-end Fisher for layer={layer_idx}.")
         static_saliency.append(layer_saliency)
-        static_fisher.append(torch.cat(fisher_data[layer_idx], dim=0))
+        if collect_fisher:
+            if not fisher_data[layer_idx]:
+                raise ValueError(f"Failed to collect static end-to-end Fisher for layer={layer_idx}.")
+            static_fisher.append(torch.cat(fisher_data[layer_idx], dim=0))
+        else:
+            static_fisher.append(None)
 
     return static_saliency, static_fisher
 
@@ -2746,7 +2753,7 @@ def collect_true_weight_gradient(
                     fp_hidden = fp_inps[batch_indices].to(dev)
                     fisher_batch = (
                         None if layer_output_fisher is None
-                        else layer_output_fisher[batch_indices].to(dev)
+                        else layer_output_fisher[batch_indices].to(dev).float()
                     )
                     fp_final_batch = (
                         None if fp_inps_final is None
@@ -2775,7 +2782,7 @@ def collect_true_weight_gradient(
                         # the same fp_inps_final as the current-layer loss.
                         fisher_batch_next = (
                             None if next_layer_output_fisher is None
-                            else next_layer_output_fisher[batch_indices].to(dev)
+                            else next_layer_output_fisher[batch_indices].to(dev).float()
                         )
                         refresh_loss_next = compute_refresh_loss(
                             refresh_loss_type,
@@ -2844,15 +2851,24 @@ def collect_layer_grad_hessian_stats(
     precomputed_layer_output_fisher=None,
     fp_inps_final=None,
     layer_recorder=None,
+    skip_gradient_backward=False,
 ):
     need_saliency_collection = precomputed_saliency_dict is None
+    # When the caller sets skip_gradient_backward, we're running pure GPTQ with
+    # enable_gptq_plus=0: no gradient reference loss, no fisher collection on
+    # this path (fisher only feeds fisher_diag_mse refresh, which is also off).
     need_layer_output_fisher_collection = (
-        layer_refresh_loss_type == "fisher_diag_mse" and precomputed_layer_output_fisher is None
+        not skip_gradient_backward
+        and layer_refresh_loss_type == "fisher_diag_mse"
+        and precomputed_layer_output_fisher is None
     )
+    need_gradient_backward = not skip_gradient_backward
     need_output_head = (
         need_saliency_collection
-        or layer_refresh_loss_type == "kl"
-        or gptq_reference_loss_type == "kl"
+        or (need_gradient_backward and (
+            layer_refresh_loss_type == "kl"
+            or gptq_reference_loss_type == "kl"
+        ))
         or need_layer_output_fisher_collection
     )
     with torch.enable_grad():
@@ -2949,7 +2965,7 @@ def collect_layer_grad_hessian_stats(
                 batch_layer_output_fisher = None
                 if layer_refresh_loss_type == "fisher_diag_mse" and precomputed_layer_output_fisher is not None:
                     with layer_recorder.section("layer.grad_hessian.fisher_slice") if layer_recorder else _NULL_CONTEXT:
-                        batch_layer_output_fisher = precomputed_layer_output_fisher[j : j + bsz].to(dev)
+                        batch_layer_output_fisher = precomputed_layer_output_fisher[j : j + bsz].to(dev).float()
                 elif need_layer_output_fisher_collection:
                     with layer_recorder.section("layer.grad_hessian.fisher_collect") if layer_recorder else _NULL_CONTEXT:
                         kl_logits = grad_hessian_logits if grad_hessian_topk > 0 else logits
@@ -2988,45 +3004,46 @@ def collect_layer_grad_hessian_stats(
                             fisher_kl_loss.backward(retain_graph=True)
                         batch_layer_output_fisher = layer_output_fisher_cache[-1]
 
-                with layer_recorder.section("layer.grad_hessian.gradient_loss_build") if layer_recorder else _NULL_CONTEXT:
-                    if gptq_reference_loss_type == "kl":
-                        kl_logits = grad_hessian_logits if grad_hessian_topk > 0 else logits
-                        kl_logits_fp = grad_hessian_logits_fp if grad_hessian_topk > 0 else logits_fp
-                        if grad_hessian_topk <= 0 and kl_topk > 0:
-                            with layer_recorder.section("layer.grad_hessian.gradient_loss_build.topk") if layer_recorder else _NULL_CONTEXT:
-                                kl_logits_fp, indices = logits_fp.topk(kl_topk, dim=-1, sorted=False)
-                                kl_logits = logits.gather(-1, indices)
-                        gradient_loss = F.kl_div(
-                            F.log_softmax(kl_logits, dim=-1),
-                            F.softmax(kl_logits_fp, dim=-1),
-                            reduction="none",
-                        )
-                        gradient_loss = gradient_loss.sum(dim=-1).mean()
-                    else:
-                        fp_final_batch = (
-                            None if fp_inps_final is None
-                            else fp_inps_final[j : j + bsz].to(dev)
-                        )
-                        gradient_loss = compute_refresh_loss(
-                            gptq_reference_loss_type,
-                            out_hidden,
-                            fp_hidden,
-                            analyzer,
-                            kl_topk,
-                            layer_output_fisher=batch_layer_output_fisher,
-                            fp_final_hidden=fp_final_batch,
-                        )
+                if need_gradient_backward:
+                    with layer_recorder.section("layer.grad_hessian.gradient_loss_build") if layer_recorder else _NULL_CONTEXT:
+                        if gptq_reference_loss_type == "kl":
+                            kl_logits = grad_hessian_logits if grad_hessian_topk > 0 else logits
+                            kl_logits_fp = grad_hessian_logits_fp if grad_hessian_topk > 0 else logits_fp
+                            if grad_hessian_topk <= 0 and kl_topk > 0:
+                                with layer_recorder.section("layer.grad_hessian.gradient_loss_build.topk") if layer_recorder else _NULL_CONTEXT:
+                                    kl_logits_fp, indices = logits_fp.topk(kl_topk, dim=-1, sorted=False)
+                                    kl_logits = logits.gather(-1, indices)
+                            gradient_loss = F.kl_div(
+                                F.log_softmax(kl_logits, dim=-1),
+                                F.softmax(kl_logits_fp, dim=-1),
+                                reduction="none",
+                            )
+                            gradient_loss = gradient_loss.sum(dim=-1).mean()
+                        else:
+                            fp_final_batch = (
+                                None if fp_inps_final is None
+                                else fp_inps_final[j : j + bsz].to(dev)
+                            )
+                            gradient_loss = compute_refresh_loss(
+                                gptq_reference_loss_type,
+                                out_hidden,
+                                fp_hidden,
+                                analyzer,
+                                kl_topk,
+                                layer_output_fisher=batch_layer_output_fisher,
+                                fp_final_hidden=fp_final_batch,
+                            )
 
-                with layer_recorder.section("layer.grad_hessian.gradient_backward.total") if layer_recorder else _NULL_CONTEXT:
-                    gradients_cache.enable_hooks()
-                    with layer_recorder.section("layer.grad_hessian.gradient_backward.zero_grad") if layer_recorder else _NULL_CONTEXT:
-                        model.zero_grad()
-                    with layer_recorder.section("layer.grad_hessian.gradient_backward.backward") if layer_recorder else _NULL_CONTEXT:
-                        gradient_loss.backward()
-                    gradients_cache.disable_hooks()
+                    with layer_recorder.section("layer.grad_hessian.gradient_backward.total") if layer_recorder else _NULL_CONTEXT:
+                        gradients_cache.enable_hooks()
+                        with layer_recorder.section("layer.grad_hessian.gradient_backward.zero_grad") if layer_recorder else _NULL_CONTEXT:
+                            model.zero_grad()
+                        with layer_recorder.section("layer.grad_hessian.gradient_backward.backward") if layer_recorder else _NULL_CONTEXT:
+                            gradient_loss.backward()
+                        gradients_cache.disable_hooks()
 
-                with layer_recorder.section("layer.grad_hessian.metrics_record") if layer_recorder else _NULL_CONTEXT:
-                    reference_losses.append(gradient_loss.item())
+                    with layer_recorder.section("layer.grad_hessian.metrics_record") if layer_recorder else _NULL_CONTEXT:
+                        reference_losses.append(gradient_loss.item())
                 # Per-batch cleanup_memory() used to run here. Removed: PyTorch
                 # frees autograd state automatically after gradient_loss.backward()
                 # and the heavy gc+synchronize+empty_cache was a significant
@@ -3047,8 +3064,16 @@ def collect_layer_grad_hessian_stats(
     gradients_cache.clear_hook()
     # Finalise the per-module gradient sums: all-reduce across ranks and divide
     # by the global batch count to realise the same mean as the pre-DP
-    # running-mean hook.
-    gradients_cache.finalize()
+    # running-mean hook. Skipped when the GPTQ+ one-order term is bypassed —
+    # downstream consumers get zero-shaped gradients instead.
+    if need_gradient_backward:
+        gradients_cache.finalize()
+    else:
+        for name in gradients_cache.names:
+            module = full.get(name, full.get(name + ".module", None))
+            gradients_cache.gradients_cache[name] = torch.zeros_like(
+                module.weight.data, dtype=torch.float32
+            )
     layer_output_fisher = precomputed_layer_output_fisher
     if need_layer_output_fisher_collection:
         # Keep the layer-output Fisher sharded across ranks — every consumer
@@ -3222,6 +3247,30 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
     if quant_stop_layer is not None:
         logging.info("Quantization will stop after transformer layer %d.", quant_stop_layer)
     preclip_enabled = bool(args.w_clip and getattr(args, "pre_clip", True))
+    enable_gptq_plus = bool(getattr(args, "enable_gptq_plus", 1))
+    if not enable_gptq_plus:
+        # Pure-GPTQ mode: force every first-order / refresh path off. We mutate
+        # the local args namespace instead of threading a flag through every
+        # call site — the overrides here cover:
+        #   * pre-quantization GD (set pre_gd_steps to 0)
+        #   * block refresh / gradient descent (force g_update_mode=frozen)
+        #   * GHinv / Z / beta in fasterquant (alpha=0 + enable_gradient_update=False)
+        #   * fisher precompute + reference loss backward (see guards below)
+        if args.g_update_mode != "frozen":
+            logging.info(
+                "enable_gptq_plus=0 → overriding g_update_mode '%s' -> 'frozen'",
+                args.g_update_mode,
+            )
+            args.g_update_mode = "frozen"
+        if args.pre_gd_steps > 0:
+            logging.info("enable_gptq_plus=0 → overriding pre_gd_steps %d -> 0", args.pre_gd_steps)
+            args.pre_gd_steps = 0
+        if getattr(args, "loss_slide_window", False):
+            logging.info("enable_gptq_plus=0 → disabling loss_slide_window")
+            args.loss_slide_window = False
+        if args.alpha != 0:
+            logging.info("enable_gptq_plus=0 → overriding alpha %s -> 0", args.alpha)
+            args.alpha = 0
     effective_pre_gd_steps = args.pre_gd_steps if preclip_enabled else 0
     global_loss_enabled = bool(getattr(args, "global_loss", False))
     if args.pre_gd_steps > 0 and not preclip_enabled:
@@ -3269,6 +3318,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     fisher_num_groups=args.fisher_num_groups,
                     grad_hessian_topk=args.grad_hessian_topk,
                     batch_size=args.global_loss_bsz,
+                    collect_fisher=enable_gptq_plus,
                 )
             logging.info(
                 "Collected frozen end-to-end saliency/Fisher caches before quantization with global_loss_bsz=%d. "
@@ -3392,7 +3442,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
         # `fp_inps_final` with the same (n_local, seq, hidden) shape as fp_inps.
         # Any other refresh loss keeps `fp_inps_final = None` and pays nothing.
         fp_inps_final = None
-        if args.grad_refresh_loss == "residual_kl":
+        if args.grad_refresh_loss == "residual_kl" and enable_gptq_plus:
             with pipeline_recorder.section("pipeline.fp_final_precompute") if pipeline_recorder else _NULL_CONTEXT:
                 logging.info(
                     "Precomputing FP final-layer hidden states for residual_kl "
@@ -3682,6 +3732,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                 ),
                 fp_inps_final=fp_inps_final,
                 layer_recorder=layer_recorder,
+                skip_gradient_backward=not enable_gptq_plus,
             )
 
             gptq = {}
@@ -3728,12 +3779,28 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     gptq[name].profile_recorder = add_batch_recorders[name]
                 handles.append(subset[name].register_forward_hook(add_batch(name)))
             with layer_recorder.section("layer.hessian_accumulation_forward") if layer_recorder else _NULL_CONTEXT:
-                for j in range(inps.shape[0]):
+                # Batch the accumulation forward so we don't pay a per-sample
+                # kernel-launch tax. `add_batch` already handles arbitrary
+                # batch sizes (it reshapes to [bsz*seq, dim] internally), so
+                # the math is bit-exact regardless of bsz.
+                hessian_accum_bsz = args.hessian_accum_bsz if args.hessian_accum_bsz is not None else args.bsz
+                hessian_accum_bsz = max(1, min(hessian_accum_bsz, inps.shape[0]))
+                for j in tqdm(
+                    range(0, inps.shape[0], hessian_accum_bsz),
+                    ncols=120,
+                    desc=f"Layer {i} Hessian accumulation",
+                    position=1,
+                    leave=False,
+                ):
+                    batch_bsz = min(hessian_accum_bsz, inps.shape[0] - j)
                     _ = layer(
-                        inps[j].unsqueeze(0).to(dev),
-                        attention_mask=attention_mask,
-                        position_ids=position_ids,
-                        position_embeddings=position_embeddings,
+                        inps[j : j + batch_bsz].to(dev),
+                        attention_mask=attention_mask.expand(batch_bsz, -1, -1, -1),
+                        position_ids=position_ids.expand(batch_bsz, -1),
+                        position_embeddings=(
+                            position_embeddings[0].expand(batch_bsz, -1, -1),
+                            position_embeddings[1].expand(batch_bsz, -1, -1),
+                        ),
                     )[0]
             for h in handles:
                 h.remove()
@@ -3931,7 +3998,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         groupsize=layer_w_groupsize,
                         actorder=args.act_order,
                         static_groups=args.act_order,
-                        enable_gradient_update=True,
+                        enable_gradient_update=enable_gptq_plus,
                         g_update_mode=args.g_update_mode,
                         export_to_et=args.export_to_et,
                         profile_recorder=module_recorder,

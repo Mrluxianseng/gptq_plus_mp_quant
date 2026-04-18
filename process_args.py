@@ -305,6 +305,28 @@ def parse_gen():
         help="Optional override for the statistics-collection batch size used only in the final transformer layer.",
     )
     parser.add_argument(
+        "--hessian_accum_bsz",
+        type=int,
+        default=None,
+        help=(
+            "Batch size for the Hessian accumulation forward loop (add_batch). "
+            "Defaults to --bsz when unset. Independent of stats collection bsz "
+            "so you can lower this if add_batch's `weighted` tensor spikes memory."
+        ),
+    )
+    parser.add_argument(
+        "--enable_gptq_plus",
+        type=int,
+        default=1,
+        choices=[0, 1],
+        help=(
+            "When 0, bypass all GPTQ+ first-order extensions and run pure GPTQ: "
+            "no pre-quant GD, no block refresh / gradient descent, no GHinv / Z "
+            "term in the per-column inner loop, no fisher precompute, no gradient "
+            "reference-loss backward during stats collection."
+        ),
+    )
+    parser.add_argument(
         "--backward_samples",
         type=int,
         default=-1,

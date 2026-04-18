@@ -29,6 +29,8 @@ N_SAMPLES=${N_SAMPLES:-768}
 SEQ_LEN=${SEQ_LEN:-2048}
 BSZ=${BSZ:-32}
 FINAL_LAYER_STATS_BSZ=${FINAL_LAYER_STATS_BSZ:-4}
+HESSIAN_ACCUM_BSZ=${HESSIAN_ACCUM_BSZ:-}
+ENABLE_GPTQ_PLUS=${ENABLE_GPTQ_PLUS:-1}
 BACKWARD_SAMPLES=${BACKWARD_SAMPLES:-32}
 BACKWARD_BSZ=${BACKWARD_BSZ:-32}
 FINAL_LAYER_BACKWARD_BSZ=${FINAL_LAYER_BACKWARD_BSZ:-4}
@@ -258,6 +260,8 @@ for grad_lr in "${GRAD_LRS[@]}"; do
         --dataset neuralmagic --nsamples "${N_SAMPLES}" --seq_len "${SEQ_LEN}" \
         --w_method gptq_plus --w_bits 4 --w_clip --num_groups "${NUM_GROUPS}" --fisher_num_groups "${FISHER_NUM_GROUPS}" --act_order \
         --kl_topk "${KL_TOPK}" --bsz "${BSZ}" --final_layer_stats_bsz "${FINAL_LAYER_STATS_BSZ}" --alpha "${ALPHA}" --blocksize "${BLOCKSIZE}" \
+        --enable_gptq_plus "${ENABLE_GPTQ_PLUS}" \
+        ${HESSIAN_ACCUM_BSZ:+--hessian_accum_bsz "${HESSIAN_ACCUM_BSZ}"} \
         --backward_samples "${BACKWARD_SAMPLES}" --backward_bsz "${BACKWARD_BSZ}" --final_layer_backward_bsz "${FINAL_LAYER_BACKWARD_BSZ}" \
         --g_update_mode block_gd --grad_lr "${grad_lr}" --grad_optimizer "${GRAD_OPTIMIZER}" --grad_refresh_loss "${GRAD_REFRESH_LOSS}" \
         --rotate \
