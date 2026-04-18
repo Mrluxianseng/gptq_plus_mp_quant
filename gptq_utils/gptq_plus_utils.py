@@ -101,6 +101,9 @@ def clip_module_weight_to_quant_bounds_(module, bits, sym, mse):
 
 
 class QuantProfileRecorder:
+    _WALL_ENABLED = os.environ.get("GPTQ_PLUS_WALL_PROFILE", "0") == "1"
+    _WALL_STATS: "dict[str, list[tuple]]" = {}
+
     def __init__(self, device, prefix=None):
         self.device = torch.device(device) if not isinstance(device, torch.device) else device
         self.enabled = self.device.type == "cuda" and torch.cuda.is_available()
@@ -114,13 +117,51 @@ class QuantProfileRecorder:
 
         range_name = f"{self.prefix}.{name}" if self.prefix else name
         torch.cuda.nvtx.range_push(range_name)
+        start_evt = None
+        end_evt = None
+        if QuantProfileRecorder._WALL_ENABLED:
+            start_evt = torch.cuda.Event(enable_timing=True)
+            end_evt = torch.cuda.Event(enable_timing=True)
+            start_evt.record()
         try:
             yield
         finally:
+            if start_evt is not None:
+                end_evt.record()
+                QuantProfileRecorder._WALL_STATS.setdefault(range_name, []).append(
+                    (start_evt, end_evt)
+                )
             torch.cuda.nvtx.range_pop()
 
     def summary(self):
         return {}
+
+    @classmethod
+    def dump_wall_summary(cls, top_k: int = 60):
+        if not cls._WALL_ENABLED:
+            return
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        rows = []
+        for name, events in cls._WALL_STATS.items():
+            elapsed_ms = 0.0
+            for s, e in events:
+                elapsed_ms += s.elapsed_time(e)
+            rows.append((name, elapsed_ms, len(events)))
+        rows.sort(key=lambda r: -r[1])
+        total = sum(r[1] for r in rows) or 1.0
+        lines = ["", "=" * 80, f"Wall-clock section summary (top {top_k} by total ms)", "=" * 80]
+        header = f"{'section':<70} {'calls':>6} {'total_ms':>12} {'pct':>6} {'mean_ms':>10}"
+        lines.append(header)
+        lines.append("-" * len(header))
+        for name, ms, n in rows[:top_k]:
+            pct = 100.0 * ms / total
+            mean = ms / max(n, 1)
+            lines.append(f"{name[:70]:<70} {n:>6d} {ms:>12.2f} {pct:>5.1f}% {mean:>10.3f}")
+        lines.append("=" * 80)
+        out = "\n".join(lines)
+        logging.info(out)
+        print(out)
 
 
 def parse_quant_profile_target_layers(spec: str, num_layers: int):
@@ -924,76 +965,78 @@ class GPTQPlus:
                                     ).T
                                 )
                         else:
+                            # Per-column `with profile_recorder.section(...)` wrappers were
+                            # removed from the inner loop — evaluating the ternary plus
+                            # entering/exiting a `nullcontext` 4x per column adds a few ms
+                            # per block at zero benefit when profiling is disabled (the
+                            # block-level `fasterquant.block.total` range already bounds
+                            # the inner loop for Nsight).
                             for i in range(count):
-                                with profile_recorder.section("fasterquant.column.total") if profile_recorder else _NULL_CONTEXT:
-                                    w = W1[:, i]
-                                    d = Hinv1[i, i]
+                                w = W1[:, i]
+                                d = Hinv1[i, i]
 
-                                    with profile_recorder.section("fasterquant.column.quantize") if profile_recorder else _NULL_CONTEXT:
-                                        w_col = w.unsqueeze(1)
-                                        if fast_quant_scale is not None:
-                                            # Inline of WeightQuantizer.fake_quantize for the
-                                            # symmetric per-row, groupsize == -1 case. Same
-                                            # operations and dtypes as the original call, so
-                                            # the output is bit-identical.
-                                            int_weight = torch.clamp(
-                                                torch.round(w_col / fast_quant_scale),
-                                                fast_quant_lo,
-                                                fast_quant_maxq,
-                                            )
-                                            q_fake = (fast_quant_scale * int_weight).to(w_col.dtype)
-                                            scale = fast_quant_scale
-                                        else:
-                                            quantizer = self.quantizer
-                                            if groupsize != -1:
-                                                idx = i1 + i
-                                                if actorder:
-                                                    idx = state["perm"][idx]
-                                                quantizer = state["groups"][idx // groupsize]
-                                            q_fake, int_weight, scale = quantizer.fake_quantize(
-                                                w_col,
-                                                st_idx=state["row_start"],
-                                                end_idx=state["row_end"],
-                                            )
-                                    q_flat = q_fake.flatten()
-                                    Q1[:, i] = q_flat
-                                    q = q_flat
-                                    W_int1[:, i] = int_weight.flatten()
-                                    if fast_quant_scale is None:
-                                        # In the groupsize != -1 path scale varies per
-                                        # column group, so we still need the per-column
-                                        # write. With fast_quant_scale active the block
-                                        # setup pre-filled Scale1.
-                                        Scale1[:, i] = scale.flatten()
+                                w_col = w.unsqueeze(1)
+                                if fast_quant_scale is not None:
+                                    # Inline of WeightQuantizer.fake_quantize for the
+                                    # symmetric per-row, groupsize == -1 case. Same
+                                    # operations and dtypes as the original call, so
+                                    # the output is bit-identical.
+                                    int_weight = torch.clamp(
+                                        torch.round(w_col / fast_quant_scale),
+                                        fast_quant_lo,
+                                        fast_quant_maxq,
+                                    )
+                                    q_fake = (fast_quant_scale * int_weight).to(w_col.dtype)
+                                    scale = fast_quant_scale
+                                else:
+                                    quantizer = self.quantizer
+                                    if groupsize != -1:
+                                        idx = i1 + i
+                                        if actorder:
+                                            idx = state["perm"][idx]
+                                        quantizer = state["groups"][idx // groupsize]
+                                    q_fake, int_weight, scale = quantizer.fake_quantize(
+                                        w_col,
+                                        st_idx=state["row_start"],
+                                        end_idx=state["row_end"],
+                                    )
+                                q_flat = q_fake.flatten()
+                                Q1[:, i] = q_flat
+                                q = q_flat
+                                W_int1[:, i] = int_weight.flatten()
+                                if fast_quant_scale is None:
+                                    # In the groupsize != -1 path scale varies per
+                                    # column group, so we still need the per-column
+                                    # write. With fast_quant_scale active the block
+                                    # setup pre-filled Scale1.
+                                    Scale1[:, i] = scale.flatten()
 
-                                    with profile_recorder.section("fasterquant.column.inner_update_delta_w") if profile_recorder else _NULL_CONTEXT:
-                                        err1 = (w - q - GHinv1_eff[:, i]) / d
-                                        second_order_inner_update = err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
-                                        if block_gd_mode:
-                                            W1[:, i:] -= second_order_scale * (
-                                                second_order_inner_update + GHinv1_eff[:, i:]
-                                            )
-                                        else:
-                                            W1[:, i:] -= second_order_inner_update + GHinv1_eff[:, i:]
-                                        Err1[:, i] = err1
+                                err1 = (w - q - GHinv1_eff[:, i]) / d
+                                second_order_inner_update = err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
+                                if block_gd_mode:
+                                    W1[:, i:] -= second_order_scale * (
+                                        second_order_inner_update + GHinv1_eff[:, i:]
+                                    )
+                                else:
+                                    W1[:, i:] -= second_order_inner_update + GHinv1_eff[:, i:]
+                                Err1[:, i] = err1
 
-                                    with profile_recorder.section("fasterquant.column.inner_update_ghinv") if profile_recorder else _NULL_CONTEXT:
-                                        # In-place subtract avoids one tensor allocation
-                                        # per column compared to `GHinv1[:, i:] = GHinv1[:, i:] - ...`.
-                                        GHinv1[:, i:].sub_(
-                                            Z1[:, i].unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
-                                        )
-                                        # For frozen inner mode `_current_ghinv` just returns
-                                        # `GHinv1`, so `GHinv1_eff` aliases it already and
-                                        # sees the in-place mutation automatically.
-                                        if not is_frozen_inner:
-                                            GHinv1_eff = self._current_ghinv(
-                                                GHinv1,
-                                                W1 if is_surrogate_online else W_block_start,
-                                                W_ref1,
-                                                state["beta_view"],
-                                                inner_update_mode,
-                                            )
+                                # In-place subtract avoids one tensor allocation
+                                # per column compared to `GHinv1[:, i:] = GHinv1[:, i:] - ...`.
+                                GHinv1[:, i:].sub_(
+                                    Z1[:, i].unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
+                                )
+                                # For frozen inner mode `_current_ghinv` just returns
+                                # `GHinv1`, so `GHinv1_eff` aliases it already and
+                                # sees the in-place mutation automatically.
+                                if not is_frozen_inner:
+                                    GHinv1_eff = self._current_ghinv(
+                                        GHinv1,
+                                        W1 if is_surrogate_online else W_block_start,
+                                        W_ref1,
+                                        state["beta_view"],
+                                        inner_update_mode,
+                                    )
 
                         with profile_recorder.section("fasterquant.block.writeback_inner") if profile_recorder else _NULL_CONTEXT:
                             state["Q"][:, i1:i2] = Q1
@@ -2353,11 +2396,16 @@ def compute_refresh_loss(
         raise ValueError(
             f"Output hidden dim ({delta.shape[-1]}) must be divisible by layer-output Fisher groups ({num_groups})."
         )
-    group_size = delta.shape[-1] // num_groups
+    hidden_size = delta.shape[-1]
+    group_size = hidden_size // num_groups
     delta_grouped = delta.view(delta.shape[0], delta.shape[1], num_groups, group_size)
-    fisher_norm = layer_output_fisher / (layer_output_fisher.mean() + 1e-12)
+    # Normalize Fisher weights independently for each (batch, token) across the
+    # group axis so the weighting reflects only relative saliency structure for
+    # that token, not the absolute Fisher magnitude of the current batch slice.
+    fisher_l2 = torch.linalg.vector_norm(layer_output_fisher, ord=2, dim=-1, keepdim=True)
+    fisher_norm = layer_output_fisher / (fisher_l2 + 1e-12)
     weighted_sq = fisher_norm.unsqueeze(-1) * delta_grouped.square()
-    return 0.5 * weighted_sq.sum(dim=(-1, -2)).mean()
+    return 0.5 * weighted_sq.sum(dim=(-1, -2)).mean() / hidden_size
 
 
 def apply_dense_optimizer_step(
@@ -2494,8 +2542,8 @@ def collect_layer_output_fisher_only(
                     model.zero_grad()
                     kl_loss.backward()
 
-                with layer_recorder.section("layer.pre_quant_fisher.cleanup") if layer_recorder else _NULL_CONTEXT:
-                    memory_utils.cleanup_memory()
+                # Per-batch cleanup_memory() was here. Removed for the same
+                # reason as above — autograd state is released automatically.
 
     return torch.cat(layer_output_fisher_cache, dim=0) if layer_output_fisher_cache else None
 
@@ -2569,11 +2617,20 @@ def collect_true_weight_gradient(
     else:
         selected_indices = raw_indices
 
-    override_weight = (
-        module.weight.detach().clone()
-        if weight_override is None
-        else weight_override.detach().to(module.weight.device, dtype=module.weight.data.dtype).clone()
-    )
+    if weight_override is None:
+        override_weight = module.weight.detach().clone()
+    else:
+        # Previously this did .detach().to(dev, dtype=...).clone() — two copies
+        # when the cast actually ran (which is the common case: weight_snapshot
+        # is fp32, module.weight is bf16). `.to(...)` already produces a fresh
+        # tensor when dtype/device differ, so one clone is enough.
+        src = weight_override.detach()
+        target_dev = module.weight.device
+        target_dtype = module.weight.data.dtype
+        if src.device == target_dev and src.dtype == target_dtype:
+            override_weight = src.clone()
+        else:
+            override_weight = src.to(target_dev, dtype=target_dtype)
     override_weight.requires_grad_(True)
     partial_grad_sum = torch.zeros_like(override_weight, dtype=torch.float32)
     partial_count = 0
@@ -2670,7 +2727,12 @@ def collect_true_weight_gradient(
                     partial_grad_sum.add_(batch_grad_mean, alpha=float(batch_size))
                     loss_sum += refresh_loss.item() * batch_size
                     partial_count += batch_size
-                    memory_utils.cleanup_memory()
+                    # Per-batch `cleanup_memory()` used to run here; removing
+                    # it trades a small increase in peak transient memory for
+                    # dropping ~5-20 ms/call of gc.collect + synchronize +
+                    # empty_cache on thousands of refreshes. PyTorch reuses
+                    # cached blocks, so this is safe as long as no outer
+                    # autograd graph leaks across the loop.
 
     extras = {"loss_sum": loss_sum}
     if slide_active:
@@ -2882,8 +2944,10 @@ def collect_layer_grad_hessian_stats(
 
                 with layer_recorder.section("layer.grad_hessian.metrics_record") if layer_recorder else _NULL_CONTEXT:
                     reference_losses.append(gradient_loss.item())
-                with layer_recorder.section("layer.grad_hessian.cleanup") if layer_recorder else _NULL_CONTEXT:
-                    memory_utils.cleanup_memory()
+                # Per-batch cleanup_memory() used to run here. Removed: PyTorch
+                # frees autograd state automatically after gradient_loss.backward()
+                # and the heavy gc+synchronize+empty_cache was a significant
+                # fraction of the loop time.
 
         # DP: rank-local running mean already covers per-sample contributions.
         # We combine across ranks into the global mean via (sum, count)
@@ -3780,5 +3844,6 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
 
     if quant_profile_enabled:
         logging.info("Quant profile NVTX ranges emitted. Inspect them with Nsight Systems/Compute.")
+        QuantProfileRecorder.dump_wall_summary()
     logging.info("-----GPTQPlus Quantization Done-----\n")
     return quantizers
