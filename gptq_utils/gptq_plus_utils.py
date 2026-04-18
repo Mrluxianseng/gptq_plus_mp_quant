@@ -2397,6 +2397,7 @@ def compute_refresh_loss(
     analyzer,
     kl_topk,
     layer_output_fisher=None,
+    fp_final_hidden=None,
 ):
     if refresh_loss_type == "kl":
         logits = hidden2logits(out_hidden, analyzer)
@@ -2414,6 +2415,33 @@ def compute_refresh_loss(
     delta = out_hidden - fp_hidden
     if refresh_loss_type == "hidden_mse":
         return 0.5 * delta.square().sum(dim=-1).mean()
+
+    if refresh_loss_type == "residual_kl":
+        # Residual-stream shortcut: assume (layers i+1 .. N-1) act as identity on
+        # the perturbation δ = out_hidden - fp_hidden. Then the final-layer
+        # hidden under the perturbed path equals fp_final_hidden + δ. We only
+        # run the lm_head + final norm exactly.
+        #
+        # Gradient only flows through `delta` (fp_final_hidden is a detached
+        # reference). Both lm_head and final norm participate in the backward,
+        # but `temporary_requires_grad` in the caller freezes their params so
+        # nothing outside `override_weight` accumulates grad.
+        if fp_final_hidden is None:
+            raise ValueError(
+                "`fp_final_hidden` must be provided for refresh_loss_type='residual_kl'."
+            )
+        final_with_delta = fp_final_hidden + delta
+        logits_perturbed = hidden2logits(final_with_delta, analyzer)
+        logits_fp = hidden2logits(fp_final_hidden, analyzer)
+        if kl_topk > 0:
+            logits_fp, indices = logits_fp.topk(kl_topk, dim=-1, sorted=False)
+            logits_perturbed = logits_perturbed.gather(-1, indices)
+        kl_loss = F.kl_div(
+            F.log_softmax(logits_perturbed, dim=-1),
+            F.softmax(logits_fp, dim=-1),
+            reduction="none",
+        )
+        return kl_loss.sum(dim=-1).mean()
 
     if layer_output_fisher is None:
         raise ValueError("`layer_output_fisher` must be provided for refresh_loss_type='fisher_diag_mse'.")
@@ -2595,6 +2623,7 @@ def collect_true_weight_gradient(
     next_layer=None,
     fp_inps_next=None,
     next_layer_output_fisher=None,
+    fp_inps_final=None,
     global_shuffle=False,
     dp_rank=0,
     shard_size=None,
@@ -2674,7 +2703,11 @@ def collect_true_weight_gradient(
 
     if len(selected_indices) > 0:
         grad_modules = [layer]
-        if refresh_loss_type == "kl":
+        if refresh_loss_type in ("kl", "residual_kl"):
+            # `residual_kl` also sends grad through the final norm + lm_head,
+            # so we must include them in `temporary_requires_grad` so their
+            # param.requires_grad is forced to False for the duration of the
+            # refresh (only `override_weight` should accumulate grad).
             grad_modules.extend(
                 [analyzer.get_layernorm_before_head(), analyzer.get_lm_head()]
             )
@@ -2709,6 +2742,10 @@ def collect_true_weight_gradient(
                         None if layer_output_fisher is None
                         else layer_output_fisher[batch_indices].to(dev)
                     )
+                    fp_final_batch = (
+                        None if fp_inps_final is None
+                        else fp_inps_final[batch_indices].to(dev)
+                    )
                     refresh_loss_current = compute_refresh_loss(
                         refresh_loss_type,
                         out_hidden,
@@ -2716,6 +2753,7 @@ def collect_true_weight_gradient(
                         analyzer,
                         kl_topk,
                         layer_output_fisher=fisher_batch,
+                        fp_final_hidden=fp_final_batch,
                     )
                     if slide_active:
                         next_out = next_layer(
@@ -2791,6 +2829,7 @@ def collect_layer_grad_hessian_stats(
     gptq_reference_loss_type,
     precomputed_saliency_dict=None,
     precomputed_layer_output_fisher=None,
+    fp_inps_final=None,
     layer_recorder=None,
 ):
     need_saliency_collection = precomputed_saliency_dict is None
@@ -2951,6 +2990,10 @@ def collect_layer_grad_hessian_stats(
                         )
                         gradient_loss = gradient_loss.sum(dim=-1).mean()
                     else:
+                        fp_final_batch = (
+                            None if fp_inps_final is None
+                            else fp_inps_final[j : j + bsz].to(dev)
+                        )
                         gradient_loss = compute_refresh_loss(
                             gptq_reference_loss_type,
                             out_hidden,
@@ -2958,6 +3001,7 @@ def collect_layer_grad_hessian_stats(
                             analyzer,
                             kl_topk,
                             layer_output_fisher=batch_layer_output_fisher,
+                            fp_final_hidden=fp_final_batch,
                         )
 
                 with layer_recorder.section("layer.grad_hessian.gradient_backward.total") if layer_recorder else _NULL_CONTEXT:
@@ -3033,6 +3077,7 @@ def run_pre_quant_gd(
     grad_clip,
     refresh_loss_type,
     layer_output_fisher_by_module,
+    fp_inps_final=None,
     global_shuffle=False,
     dp_rank=0,
     shard_size=None,
@@ -3081,6 +3126,7 @@ def run_pre_quant_gd(
                     sample_indices=sample_indices,
                     refresh_loss_type=refresh_loss_type,
                     layer_output_fisher=fisher_tensor,
+                    fp_inps_final=fp_inps_final,
                     global_shuffle=global_shuffle,
                     dp_rank=dp_rank,
                     shard_size=shard_size if shard_size is not None else inps.shape[0],
@@ -3326,6 +3372,50 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     seed=args.seed + dp_rank,
                 )
         final_layer_idx = len(layers) - 1
+
+        # residual_kl refresh loss needs the FP output of the last transformer
+        # block per sample (input to final norm + lm_head). We compute it once
+        # here with a full FP forward over all layers and store a buffer
+        # `fp_inps_final` with the same (n_local, seq, hidden) shape as fp_inps.
+        # Any other refresh loss keeps `fp_inps_final = None` and pays nothing.
+        fp_inps_final = None
+        if args.grad_refresh_loss == "residual_kl":
+            with pipeline_recorder.section("pipeline.fp_final_precompute") if pipeline_recorder else _NULL_CONTEXT:
+                logging.info(
+                    "Precomputing FP final-layer hidden states for residual_kl "
+                    "(nsamples_local=%d, layers=%d).",
+                    inps.shape[0], len(layers),
+                )
+                # Work on a scratch copy so we don't disturb the main `fp_inps`
+                # buffer (which is still at the layer-0 input stage).
+                scratch = inps.detach().clone().to(dev)
+                for idx in range(len(layers)):
+                    lay = layers[idx].to(dev)
+                    bits_cfg = quant_utils.disable_act_quant(lay)
+                    # Per-sample forward matches the per-layer fp_reference_forward
+                    # pattern; batching here would change numerics (cuBLAS kernel
+                    # selection) and has been shown to cause drift.
+                    for j in range(scratch.shape[0]):
+                        scratch[j] = lay(
+                            scratch[j].unsqueeze(0),
+                            attention_mask=attention_mask,
+                            position_ids=position_ids,
+                            position_embeddings=position_embeddings,
+                        )[0].squeeze(0)
+                    quant_utils.enable_act_quant(lay, bits_cfg)
+                    # Return each layer to its original (CPU) residency so the
+                    # main quant loop's `layers[i].to(dev)` starts from the same
+                    # state as if this precompute never happened.
+                    layers[idx] = lay.to(orig_device)
+                # Match the storage convention of `fp_inps` so downstream index
+                # expressions behave identically (`fp_inps_final[batch]` / CPU-
+                # to-GPU handoff inside collect_true_weight_gradient).
+                if fp_inps.device != scratch.device:
+                    fp_inps_final = scratch.to(fp_inps.device)
+                else:
+                    fp_inps_final = scratch
+                del scratch
+
         if dp_global_shuffle:
             # Every rank sees all global sample ids; `collect_true_weight_gradient`
             # filters to the rank's shard.
@@ -3526,6 +3616,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             grad_clip=args.grad_clip,
                             refresh_loss_type=layer_refresh_loss_type,
                             layer_output_fisher_by_module=layer_output_fisher_by_module,
+                            fp_inps_final=fp_inps_final,
                             global_shuffle=dp_global_shuffle,
                             dp_rank=dp_rank,
                             shard_size=n_local,
@@ -3557,6 +3648,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     if layer_refresh_loss_type == "fisher_diag_mse"
                     else None
                 ),
+                fp_inps_final=fp_inps_final,
                 layer_recorder=layer_recorder,
             )
 
@@ -3657,6 +3749,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             next_layer=slide_next_layer,
                             fp_inps_next=slide_fp_inps_next,
                             next_layer_output_fisher=slide_next_layer_output_fisher,
+                            fp_inps_final=fp_inps_final,
                             global_shuffle=dp_global_shuffle,
                             dp_rank=dp_rank,
                             shard_size=n_local,

@@ -116,8 +116,13 @@ def parse_gen():
         "--grad_refresh_loss",
         type=str,
         default="kl",
-        choices=["kl", "hidden_mse", "fisher_diag_mse"],
-        help="Loss used to compute the true refresh gradient in block_backward/block_gd.",
+        choices=["kl", "hidden_mse", "fisher_diag_mse", "residual_kl"],
+        help=(
+            "Loss used to compute the true refresh gradient in block_backward/block_gd. "
+            "'residual_kl' assumes the current-layer output delta flows through the "
+            "remaining residual stream unchanged and only measures its effect after the "
+            "final norm + lm_head (cheap approximation of end-to-end KL)."
+        ),
     )
     parser.add_argument(
         "--global_loss",
@@ -443,6 +448,12 @@ def parse_gen():
             raise ValueError("--loss_slide_window requires --grad_refresh_loss=fisher_diag_mse.")
         if not args.global_loss:
             raise ValueError("--loss_slide_window requires --global_loss (so next-layer fisher is cached).")
+    if args.grad_refresh_loss == "residual_kl":
+        if getattr(args, "loss_slide_window", False):
+            raise ValueError(
+                "--grad_refresh_loss=residual_kl is incompatible with --loss_slide_window "
+                "(residual_kl already captures downstream effect to the final head)."
+            )
     if args.nsamples % args.backward_samples != 0:
         raise ValueError(
             f"`nsamples` ({args.nsamples}) must be divisible by `backward_samples` ({args.backward_samples})."
