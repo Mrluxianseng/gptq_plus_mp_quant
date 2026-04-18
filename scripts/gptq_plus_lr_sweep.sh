@@ -66,6 +66,16 @@ IFS=' ' read -r -a GRAD_LRS <<< "${GRAD_LRS_STR}"
 export CUDA_VISIBLE_DEVICES=${DEVICE}
 MODEL_NAME=$(basename "${MODEL_PATH}")
 
+# HuggingFace datasets / hub configuration — lm_eval pulls benchmark datasets
+# (arc, hellaswag, ...) from the Hub at eval time. On china-region hosts the
+# default `huggingface.co` endpoint usually times out; fall back to the mirror.
+# Override from the shell with your own endpoint / cache dirs if needed.
+export HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}
+export HF_DATASETS_CACHE=${HF_DATASETS_CACHE:-${HOME}/.cache/huggingface/datasets}
+export HUGGINGFACE_HUB_CACHE=${HUGGINGFACE_HUB_CACHE:-${HOME}/.cache/huggingface/hub}
+# Prefer cached copies whenever available (avoid the online freshness check).
+export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-0}
+
 # Infer number of ranks from DEVICE ("0" → 1, "0,1" → 2, "0,1,2,3" → 4).
 # RDZV port decouples from DEVICE so the commas don't end up in the endpoint.
 IFS=',' read -r -a _DEVICE_LIST <<< "${DEVICE}"
