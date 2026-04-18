@@ -186,8 +186,24 @@ def qa_eval(model, tokenizer, lm_eval_batch_size=32):
     hflm = HFLM(pretrained=model, tokenizer=tokenizer, batch_size=lm_eval_batch_size)
 
     tasks = ["piqa", "hellaswag", "arc_easy", "arc_challenge", "winogrande", "lambada_openai", "ceval-valid"]
-    task_manager = lm_eval.tasks.TaskManager(include_path="./datasets/lm_eval_configs/tasks", include_defaults=False)
+    # Pick up the project's custom task YAMLs only if that directory exists.
+    # Without this guard, `include_defaults=False` + a missing include_path
+    # leaves `all_tasks` empty → `pattern_match` returns [] → later division
+    # by zero. Always enabling defaults lets us fall back to lm_eval's built-in
+    # task library when the custom dir isn't shipped with the checkout.
+    custom_task_dir = "./datasets/lm_eval_configs/tasks"
+    if os.path.isdir(custom_task_dir):
+        task_manager = lm_eval.tasks.TaskManager(include_path=custom_task_dir, include_defaults=True)
+    else:
+        task_manager = lm_eval.tasks.TaskManager(include_defaults=True)
     task_names = lm_eval_utils.pattern_match(tasks, task_manager.all_tasks)
+    if not task_names:
+        raise RuntimeError(
+            "qa_eval: no matching tasks found. Requested {tasks!r} but "
+            "`task_manager.all_tasks` resolved nothing. Install lm_eval with task "
+            "configs (`pip install lm-eval`) or populate ./datasets/lm_eval_configs/tasks."
+            .format(tasks=tasks)
+        )
     results, results_str = {}, {}
     for task_name in task_names:
         logging.info(f"Evaluating {task_name}...")
