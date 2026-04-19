@@ -25,6 +25,7 @@ shift 3
 
 # Sweep configuration. Override from the shell when needed.
 GRAD_LRS_STR=${GRAD_LRS:-"0.00001"}
+DATASET=${DATASET:-neuralmagic} # wikitext2 / neuralmagic / ultrachat_2k / numinamath
 N_SAMPLES=${N_SAMPLES:-128}
 SEQ_LEN=${SEQ_LEN:-2048}
 BSZ=${BSZ:-32}
@@ -227,7 +228,7 @@ if [[ "${FSDP_PRECOMPUTE}" == "1" && "${EXIT_AFTER_PRECOMPUTE}" != "1" ]]; then
         --nnodes=1 --nproc_per_node=${N_GPUS} --rdzv_endpoint=localhost:${RDZV_PORT} ./ptq.py \
         --model "${MODEL_PATH}" \
         --exp "precompute_fsdp" \
-        --dataset neuralmagic --nsamples "${N_SAMPLES}" --seq_len "${SEQ_LEN}" \
+        --dataset "${DATASET}" --nsamples "${N_SAMPLES}" --seq_len "${SEQ_LEN}" \
         --w_method gptq_plus --w_bits 4 --w_clip --num_groups "${NUM_GROUPS}" --fisher_num_groups "${FISHER_NUM_GROUPS}" --act_order \
         --kl_topk "${KL_TOPK}" --bsz "${BSZ}" --final_layer_stats_bsz "${FINAL_LAYER_STATS_BSZ}" --alpha "${ALPHA}" \
         --grad_hessian_topk "${GRAD_HESSIAN_TOPK}" \
@@ -333,7 +334,7 @@ for grad_lr in "${GRAD_LRS[@]}"; do
         --nnodes=1 --nproc_per_node=${N_GPUS} --rdzv_endpoint=localhost:${RDZV_PORT} ./ptq.py \
         --model "${MODEL_PATH}" \
         --exp "${exp_name}" \
-        --dataset neuralmagic --nsamples "${N_SAMPLES}" --seq_len "${SEQ_LEN}" \
+        --dataset "${DATASET}" --nsamples "${N_SAMPLES}" --seq_len "${SEQ_LEN}" \
         --w_method gptq_plus --w_bits 4 --w_clip --num_groups "${NUM_GROUPS}" --fisher_num_groups "${FISHER_NUM_GROUPS}" --act_order \
         --kl_topk "${KL_TOPK}" --bsz "${BSZ}" --final_layer_stats_bsz "${FINAL_LAYER_STATS_BSZ}" --alpha "${ALPHA}" --blocksize "${BLOCKSIZE}" \
         --enable_gptq_plus "${ENABLE_GPTQ_PLUS}" \
