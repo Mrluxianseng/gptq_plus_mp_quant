@@ -48,6 +48,7 @@
 - GRAD_GATE_SHARPNESS：quant_error_gate和quant_error_gate_optimized用的系数
 - GRAD_GATE_SINE_AMP：quant_error_gate_optimized用的系数
 - GRAD_HESSIAN_TOPK：计算saliency和fisher用的logits topk（如果用的不是端到端的kl(global_loss=0)，一定要设成-1，因为逐层的输出头的topk不一定是一样的）
+- SALIENCY_CLIP_PERCENTILE：在precompute阶段把每个token的saliency（`grad²(NLL_loss, module_output).mean(group)`）裁到这个分位数，默认0.99。用来压掉深层（layer 24+）NLL backward产生的极端gradient outlier（有几个token的saliency可以比中位数大10-12个数量级）。不裁的话这些outlier会让后续的`inp.T @ diag(s) @ inp`变成近rank-1的病态矩阵，Cholesky即使damp涨到0.5+还是失败。设成1.0可以关掉裁剪。改了这个值会让static_cache_path的cache key变（key里带`salclip{value}`），重新预计算。
 - PROJ_LR_SCALE：调整o_proj层用的学习率
 - DOWN_PROJ_LR_SCALE：调整down_proj层用的学习率（这个层一般比较爆炸）
 - SECOND_ORDER_SCALE：调整gptq式二阶更新的scale，固定为1就行
@@ -64,7 +65,57 @@
 - ENABLE_QA_EVAL：开启qa_eval打分，慢
 - BASE_EXP：实验名
 - OUTPUT_ROOT：实验日志输出
-- ENABLE_GPTQ_PLUS：总开关，0=走纯GPTQ基线，1=开启所有GPTQ+扩展（默认1）。设0后会自动旁路以下计算：stats阶段的reference loss反传（省一次backward）、fisher预计算（省CPU RAM和时间）、residual_kl的fp_inps_final预计算、pre-quantization GD（`run_pre_quant_gd`）、block间的gradient refresh（`gradient_refresh_fn`）、fasterquant逐列内循环的GHinv/Z一阶项（`enable_gradient_update=False`+`alpha=0`使`beta=0`）、loss slide window。等价于把`g_update_mode`强制成`frozen`、`pre_gd_steps=0`、`alpha=0`、`loss_slide_window=0`。适合用来跑时间/精度的GPTQ基线做ablation。
+- ENABLE_GPTQ_PLUS：GPTQ+一阶项开关，完全等价于把alpha调成0。设0时只关掉fasterquant内循环/外更新里的GHinv一阶项（GHinv/Z/beta全部变0），其他所有机制（block_gd梯度下降、loss_slide_window、pre_gd_steps、fisher预计算、residual_kl的fp_inps_final预计算）照常运行，与alpha的语义解耦。作为性能优化，stats阶段会跳过reference loss的backward（因为它算出来的权重梯度会被beta=0乘掉，无用）。做纯GPTQ一阶/二阶对照实验时设为0即可。
+- FSDP_PRECOMPUTE：在`collect_static_end_to_end_saliency_and_fisher`里用FSDP2把模型权重+梯度分片到各个rank上，给单卡放不下整模型backward的大模型用。权重dtype保持不变，grad dtype fp32；因为precompute里所有param都会被冻结（`requires_grad=False`），所以FSDP的reduce_scatter路径不触发，只走param的all_gather。**precompute结束后会自动unwrap FSDP**（用进FSDP前的CPU快照把DTensor param复原成普通Tensor，并摘掉forward/backward hooks），所以同一个run可以直接接着跑正常的per-layer量化，不需要分两阶段跑。但unwrap靠的是CPU snapshot，需要一份完整模型大小的额外CPU RAM：4B≈+8GB、7B≈+14GB、13B≈+26GB可以直接跑；**70B需要+140GB CPU RAM，大概率爆cgroup，这种情况必须走两阶段**（`EXIT_AFTER_PRECOMPUTE=1 STATIC_CACHE_PATH=...`先存盘退出，再换一次run读盘量化）。
+- FSDP_CPU_OFFLOAD：开了FSDP后，把param的shard放在pinned CPU内存里，每次forward前all_gather到GPU、forward后释放。进一步省GPU显存，代价是多一轮CPU↔GPU带宽。
+- STATIC_CACHE_PATH：precompute结果的磁盘缓存目录。key绑定`model/dataset/nsamples/seq_len/rotate/num_groups/fisher_num_groups/grad_hessian_topk/global_loss_bsz/seed/world_size/rank`，每rank存自己的分片（`_world{W}_rank{R}.pt`）。cache命中时跳过precompute直接读盘，在sweep不同lr之间复用同一份saliency/fisher、或者70B走两阶段工作流时用。要复用cache必须用相同的world_size和rank分配，否则cache miss重算。
+- EXIT_AFTER_PRECOMPUTE：precompute完成+结果存盘后直接退出（跳过量化和eval），专门给70B的两阶段流程用。默认0。
+- BASE_EXP：实验名
+- OUTPUT_ROOT：实验日志输出
+
+## FSDP使用说明
+
+### 何时开启
+
+FSDP只在有帮助的时候开。它**只shard参数+梯度，不shard激活值**，所以对激活主导的小模型收益很小：
+
+| 模型规模 | 建议 |
+|---------|-----|
+| ≤13B | 不开FSDP。小模型激活占显存大头，参数分片省不了多少。直接跑就行，甚至降`GLOBAL_LOSS_BSZ=1`更有效 |
+| 30B左右 | 可开可不开。A100-80G够用时不开；更小卡用FSDP会有帮助 |
+| **≥70B** | **必须开FSDP**。单机单卡放不下140GB权重+280GB fp32梯度。**且必须走两阶段**，否则in-process unwrap的CPU快照会爆内存 |
+
+### 一阶段用法（4B / 7B / 13B，默认）
+
+直接开`FSDP_PRECOMPUTE=1`跑就行，precompute完会自动unwrap：
+```bash
+FSDP_PRECOMPUTE=1 bash scripts/gptq_plus_lr_sweep.sh <model_path> 4 0,1
+```
+
+不过这个规模**开FSDP通常不会让你更快或更省**，因为激活内存才是瓶颈。真想压显存优先考虑`GLOBAL_LOSS_BSZ=1`。
+
+### 两阶段用法（70B必用）
+
+70B整模型放GPU做backward需要超过400GB显存，单卡搞不定；而in-process unwrap又需要140GB CPU RAM做快照，也会爆。解决办法：**第一个run用FSDP跑precompute、存盘、退出；第二个run不用FSDP、读盘、跑量化**。
+
+**Stage 1：FSDP下precompute + 存盘 + 退出**
+```bash
+# 8×80G跑precompute，按rank分片存到./cache/static_stats
+FSDP_PRECOMPUTE=1 FSDP_CPU_OFFLOAD=1 \
+  EXIT_AFTER_PRECOMPUTE=1 \
+  STATIC_CACHE_PATH=./cache/static_stats \
+  GLOBAL_LOSS_BSZ=1 \
+  bash scripts/gptq_plus_lr_sweep.sh /path/to/Llama-2-70b-hf 4 0,1,2,3,4,5,6,7
+```
+
+**Stage 2：关FSDP，读盘接着量化**
+```bash
+FSDP_PRECOMPUTE=0 \
+  STATIC_CACHE_PATH=./cache/static_stats \
+  bash scripts/gptq_plus_lr_sweep.sh /path/to/Llama-2-70b-hf 4 0,1,2,3,4,5,6,7
+```
+
+两阶段必须用相同的`N_SAMPLES / SEQ_LEN / NUM_GROUPS / FISHER_NUM_GROUPS / GRAD_HESSIAN_TOPK / SALIENCY_CLIP_PERCENTILE / GLOBAL_LOSS_BSZ / 种子 / rotate开关 / world_size`，否则cache key对不上会重算precompute。
 
 # 核心的消融/创新点
 

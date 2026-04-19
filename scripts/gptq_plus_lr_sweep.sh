@@ -55,6 +55,7 @@ GRAD_GATE_FLOOR=${GRAD_GATE_FLOOR:-0.01}
 GRAD_GATE_SHARPNESS=${GRAD_GATE_SHARPNESS:-5.0}
 GRAD_GATE_SINE_AMP=${GRAD_GATE_SINE_AMP:-0.0005}
 GRAD_HESSIAN_TOPK=${GRAD_HESSIAN_TOPK:-20}
+SALIENCY_CLIP_PERCENTILE=${SALIENCY_CLIP_PERCENTILE:-0.99}
 PROJ_LR_SCALE=${PROJ_LR_SCALE:-1.0}
 DOWN_PROJ_LR_SCALE=${DOWN_PROJ_LR_SCALE:-1.0}
 SECOND_ORDER_SCALE=${SECOND_ORDER_SCALE:-1.0}
@@ -230,6 +231,7 @@ if [[ "${FSDP_PRECOMPUTE}" == "1" && "${EXIT_AFTER_PRECOMPUTE}" != "1" ]]; then
         --w_method gptq_plus --w_bits 4 --w_clip --num_groups "${NUM_GROUPS}" --fisher_num_groups "${FISHER_NUM_GROUPS}" --act_order \
         --kl_topk "${KL_TOPK}" --bsz "${BSZ}" --final_layer_stats_bsz "${FINAL_LAYER_STATS_BSZ}" --alpha "${ALPHA}" \
         --grad_hessian_topk "${GRAD_HESSIAN_TOPK}" \
+        --saliency_clip_percentile "${SALIENCY_CLIP_PERCENTILE}" \
         "${GLOBAL_LOSS_ARGS[@]}" \
         "${DP_GLOBAL_SHUFFLE_ARGS[@]}" \
         --rotate \
@@ -348,6 +350,7 @@ for grad_lr in "${GRAD_LRS[@]}"; do
         --grad_clip "${GRAD_CLIP}" \
         --final_layer_grad_lr "${FINAL_LAYER_GRAD_LR}" \
         --grad_hessian_topk "${GRAD_HESSIAN_TOPK}" \
+        --saliency_clip_percentile "${SALIENCY_CLIP_PERCENTILE}" \
         --pre_gd_steps "${PRE_GD_STEPS}" \
         --pre_grad_lr "${PRE_GRAD_LR}" \
         --pre_grad_optimizer "${PRE_GRAD_OPTIMIZER}" \

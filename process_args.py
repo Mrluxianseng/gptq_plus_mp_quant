@@ -333,6 +333,18 @@ def parse_gen():
             "to the full-precision top-k logits support. Disabled when <= 0."
         ),
     )
+    parser.add_argument(
+        "--saliency_clip_percentile",
+        type=float,
+        default=0.99,
+        help=(
+            "In `collect_static_end_to_end_saliency_and_fisher`, clip per-token saliency "
+            "(grad² of end-to-end NLL wrt module output) to this percentile before caching. "
+            "Prevents a handful of extreme-gradient tokens in deep layers from collapsing "
+            "the downstream weighted Hessian `inp.T @ diag(s) @ inp` to near rank-1, which "
+            "makes Cholesky fail even with large damp. Set to 1.0 to disable clipping."
+        ),
+    )
     parser.add_argument("--bsz", type=int, default=1, help="Batch size for computing hessians and gradients")
     parser.add_argument(
         "--final_layer_stats_bsz",

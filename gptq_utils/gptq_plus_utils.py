@@ -2264,6 +2264,7 @@ def collect_static_end_to_end_saliency_and_fisher(
     collect_fisher=True,
     use_fsdp=False,
     fsdp_cpu_offload=False,
+    saliency_clip_percentile=0.99,
 ):
     logging.info(
         "Collecting static end-to-end saliency/fisher caches from a single pre-quantization full-model backward pass. "
@@ -2347,8 +2348,23 @@ def collect_static_end_to_end_saliency_and_fisher(
                     saliency_num_groups,
                     group_size,
                 )
+                sal_per_group = grad_squared.mean(dim=-1)
+                # Clip saliency outliers at a configurable percentile. For
+                # deep layers the NLL backward amplifies a handful of tokens
+                # by 10-12 orders of magnitude, which makes the downstream
+                # weighted Hessian (`inp.T @ diag(s) @ inp`) effectively
+                # rank-1 and Cholesky fails (even with big damp). Capping
+                # the top fraction keeps the "which tokens matter" ordering
+                # while bounding dynamic range; default 0.99 keeps 99% of
+                # tokens' saliency untouched.
+                if saliency_clip_percentile is not None and 0 < saliency_clip_percentile < 1:
+                    flat = sal_per_group.detach().flatten()
+                    # torch.quantile is O(n log n) but this tensor is small
+                    # (batch * seq * NG elements per hook call), so negligible.
+                    cap = torch.quantile(flat, saliency_clip_percentile)
+                    sal_per_group = torch.clamp(sal_per_group, max=cap)
                 saliency_data[layer_idx][module_name].append(
-                    grad_squared.mean(dim=-1).detach().cpu()
+                    sal_per_group.detach().cpu()
                 )
 
             out_tensor.register_hook(grad_hook)
@@ -3445,11 +3461,14 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
             if static_cache_dir is not None:
                 dataset_id = getattr(args, "dataset", "unknown")
                 rotate_flag = int(bool(getattr(args, "rotate", False)))
+                sal_clip_pct = getattr(args, "saliency_clip_percentile", 0.99)
+                sal_clip_tag = f"{sal_clip_pct:.4f}".rstrip("0").rstrip(".")
                 static_cache_key = (
                     f"{args.model_name}_{dataset_id}_s{args.nsamples}_"
                     f"blk{args.seq_len}_rot{rotate_flag}_g{args.num_groups}_"
                     f"fng{args.fisher_num_groups}_ghtk{args.grad_hessian_topk}_"
-                    f"glbsz{args.global_loss_bsz}_seed{args.seed}"
+                    f"glbsz{args.global_loss_bsz}_seed{args.seed}_"
+                    f"salclip{sal_clip_tag}"
                 )
                 static_cache_key += f"_world{dist_utils.get_world_size()}_rank{dist_utils.get_rank()}"
                 os.makedirs(static_cache_dir, exist_ok=True)
@@ -3476,6 +3495,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         batch_size=args.global_loss_bsz,
                         use_fsdp=bool(getattr(args, "fsdp_precompute", False)),
                         fsdp_cpu_offload=bool(getattr(args, "fsdp_cpu_offload", False)),
+                        saliency_clip_percentile=getattr(args, "saliency_clip_percentile", 0.99),
                     )
                 if static_cache_file is not None:
                     logging.info("Saving static saliency/fisher cache to %s", static_cache_file)
