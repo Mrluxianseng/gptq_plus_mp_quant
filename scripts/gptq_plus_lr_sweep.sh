@@ -25,7 +25,7 @@ shift 3
 
 # Sweep configuration. Override from the shell when needed.
 GRAD_LRS_STR=${GRAD_LRS:-"0.00001"}
-DATASET=${DATASET:-neuralmagic} # wikitext2 / neuralmagic / ultrachat_2k / numinamath
+DATASET=${DATASET:-wikitext2} # wikitext2 / neuralmagic / ultrachat_2k / numinamath
 N_SAMPLES=${N_SAMPLES:-128}
 SEQ_LEN=${SEQ_LEN:-2048}
 BSZ=${BSZ:-32}
