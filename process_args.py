@@ -174,6 +174,42 @@ def parse_gen():
         ),
     )
     parser.add_argument(
+        "--fsdp_precompute",
+        action="store_true",
+        help=(
+            "Wrap the model with FSDP2 during `collect_static_end_to_end_saliency_and_fisher` so the "
+            "end-to-end backward fits on multi-GPU setups where the full model + grads don't fit on a "
+            "single card (Llama-2-70B, Llama-3-70B, etc). Requires torchrun launch. Combine with "
+            "`--fsdp_cpu_offload` to spill param shards to CPU between layers."
+        ),
+    )
+    parser.add_argument(
+        "--fsdp_cpu_offload",
+        action="store_true",
+        help="When --fsdp_precompute is set, offload param shards to CPU (pinned) between layer forwards.",
+    )
+    parser.add_argument(
+        "--static_cache_path",
+        type=str,
+        default=None,
+        help=(
+            "Optional directory to persist the static end-to-end saliency/fisher caches. "
+            "If set and the cache exists (keyed by model/dataset/nsamples/seq_len/num_groups/fisher_num_groups/"
+            "grad_hessian_topk/global_loss_bsz/seed/rotate), the precompute is skipped and the saved "
+            "tensors are loaded per rank. First run writes, subsequent runs read."
+        ),
+    )
+    parser.add_argument(
+        "--exit_after_precompute",
+        action="store_true",
+        help=(
+            "Exit right after `collect_static_end_to_end_saliency_and_fisher` finishes and the results "
+            "are saved to `--static_cache_path`. Useful for the FSDP two-stage workflow: run precompute "
+            "under a torchrun that wraps the model with FSDP, then run the quantization pass separately "
+            "(which just reads the cache)."
+        ),
+    )
+    parser.add_argument(
         "--pre_gd_steps",
         type=int,
         default=0,

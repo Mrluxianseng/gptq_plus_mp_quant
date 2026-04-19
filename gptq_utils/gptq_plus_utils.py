@@ -1,6 +1,7 @@
 import copy
 import logging
 import os
+import sys
 import math
 import pprint
 import functools
@@ -11,6 +12,7 @@ from tqdm import tqdm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
 try:
     from torch.func import functional_call
 except ImportError:
@@ -646,6 +648,28 @@ class GPTQPlus:
         seq_len = total_tokens / total_samples
         self.H.div_(total_samples * seq_len)
         self.act_square.div_(seq_len)
+        # Symmetrise H to wipe out residual asymmetry from tensor-core bmm
+        # round-off (tf32 / bf16 outputs can lose exact H[i,j] == H[j,i]).
+        # Without this the per-subgroup Cholesky in fasterquant silently trips
+        # on deep / ill-conditioned layers (e.g. Qwen3-4B layer 24 attention)
+        # and `damp_percent` has to auto-increment. Mathematically a no-op on
+        # an exactly-symmetric H.
+        self.H = 0.5 * (self.H + self.H.transpose(-1, -2))
+        # NaN/Inf sanitisation. Once NaN leaks into H it's terminal — no damp
+        # can recover Cholesky and the retry loop runs until damp exceeds 1
+        # and crashes. Replace with zeros so the `dead channel` check in
+        # fasterquant handles the affected columns. Logs loudly so we can
+        # spot an upstream corruption (saliency/fisher produced by an NLL
+        # backward with log(0) / overflow, etc).
+        if not torch.isfinite(self.H).all():
+            n_nan = int(torch.isnan(self.H).sum().item())
+            n_inf = int(torch.isinf(self.H).sum().item())
+            logging.warning(
+                "finalize_hessian: non-finite in H (nan=%d, inf=%d, total=%d, module=%s); "
+                "sanitising to 0 — fasterquant's dead-channel check will take over.",
+                n_nan, n_inf, self.H.numel(), self.layer.__class__.__name__,
+            )
+            self.H = torch.nan_to_num(self.H, nan=0.0, posinf=0.0, neginf=0.0)
         self._finalized = True
 
     def fasterquant(
@@ -812,6 +836,14 @@ class GPTQPlus:
                                 Hinv_init = H_sub
                                 H_sub = torch.linalg.cholesky(H_sub, upper=True)
                                 Hinv = H_sub
+                            if not torch.isfinite(Hinv).all():
+                                # Cholesky succeeded but Hinv has NaN/Inf —
+                                # H was close enough to singular that the
+                                # inverse overflowed. Route back into the
+                                # damp-autoincrement path.
+                                raise torch._C._LinAlgError(
+                                    "Hinv contains non-finite values despite successful Cholesky"
+                                )
                             break
                         except torch._C._LinAlgError as e:
                             logging.warning(f"Quantization: Current `damp_percent = {damp_percent:.5f}` is too low, auto-incrementing by `{damp_auto_increment:.5f}`")
@@ -1524,9 +1556,17 @@ class GPTQPlus:
                 rec.save_module_level("Scale_final", Scale_final)
             if torch.any(torch.isnan(self.layer.weight.data)):
                 logging.warning("NaN in weights")
-
-                pprint.pprint(
-                    self.quantizer.bits, self.quantizer.scale, self.quantizer.zero_point
+                logging.warning(
+                    "bits=%s scale_stats=(min=%s max=%s any_nan=%s any_zero=%s) "
+                    "zero_stats=(min=%s max=%s any_nan=%s)",
+                    self.quantizer.bits,
+                    self.quantizer.scale.float().min().item() if self.quantizer.scale is not None else None,
+                    self.quantizer.scale.float().max().item() if self.quantizer.scale is not None else None,
+                    torch.isnan(self.quantizer.scale).any().item() if self.quantizer.scale is not None else None,
+                    (self.quantizer.scale == 0).any().item() if self.quantizer.scale is not None else None,
+                    self.quantizer.zero.float().min().item() if self.quantizer.zero is not None else None,
+                    self.quantizer.zero.float().max().item() if self.quantizer.zero is not None else None,
+                    torch.isnan(self.quantizer.zero).any().item() if self.quantizer.zero is not None else None,
                 )
                 raise ValueError("NaN in weights")
 
@@ -2222,12 +2262,45 @@ def collect_static_end_to_end_saliency_and_fisher(
     grad_hessian_topk,
     batch_size,
     collect_fisher=True,
+    use_fsdp=False,
+    fsdp_cpu_offload=False,
 ):
     logging.info(
         "Collecting static end-to-end saliency/fisher caches from a single pre-quantization full-model backward pass. "
         "Using sampled end-to-end NLL / empirical Fisher because literal KL-to-self before quantization would be zero."
     )
     layers = analyzer.get_layers()
+    # Wrap model with FSDP2 so the full-model backward fits on many small GPUs.
+    # Params + grads are sharded across the current default process group; each
+    # layer all-gathers on forward and reshards afterwards. Since all params
+    # are frozen below (requires_grad=False), no reduce_scatter happens on
+    # backward — FSDP becomes a pure param all-gather mechanism.
+    if use_fsdp:
+        from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy, CPUOffloadPolicy
+        from torch.distributed.device_mesh import init_device_mesh
+        world = dist_utils.get_world_size()
+        mesh = init_device_mesh("cuda", (world,))
+        mp_policy = MixedPrecisionPolicy(
+            param_dtype=next(iter(model.parameters())).dtype,
+            reduce_dtype=torch.float32,
+        )
+        offload_policy = CPUOffloadPolicy(pin_memory=True) if fsdp_cpu_offload else None
+        logging.info(
+            "FSDP2 precompute: sharding %d layers across world=%d, cpu_offload=%s",
+            len(layers), world, fsdp_cpu_offload,
+        )
+        # Shard each transformer block first (inner-most), then the outer
+        # module so embed/norm/lm_head also get sharded.
+        for layer in layers:
+            kwargs = {"mesh": mesh, "mp_policy": mp_policy}
+            if offload_policy is not None:
+                kwargs["offload_policy"] = offload_policy
+            fully_shard(layer, **kwargs)
+        kwargs = {"mesh": mesh, "mp_policy": mp_policy}
+        if offload_policy is not None:
+            kwargs["offload_policy"] = offload_policy
+        fully_shard(model, **kwargs)
+        # FSDP-managed params live on-rank already; don't model.to(dev).
     module_dicts = []
     for layer in layers:
         raw_module_dict = analyzer.get_quantizable_modules(layer)
@@ -2325,7 +2398,10 @@ def collect_static_end_to_end_saliency_and_fisher(
     # way) — no all-gather is needed.
     shard = dist_utils.shard_slice(nsamples_total, rank, world)
     local_batches = token_batches[shard]
-    model = model.to(dev)
+    if not use_fsdp:
+        # FSDP2 already placed the shards on each rank's GPU; don't try to
+        # move the whole model to one device.
+        model = model.to(dev)
     model.eval()
     # The precompute only reads **activation gradients** via hooks (saliency /
     # fisher = mean of grad².pow). Weight gradients are never consumed here, so
@@ -2392,7 +2468,12 @@ def collect_static_end_to_end_saliency_and_fisher(
         for p, flag in prev_requires_grad:
             p.requires_grad_(flag)
         model.zero_grad()
-        model.cpu()
+        if not use_fsdp:
+            # Non-FSDP path: push the model back to CPU so the per-layer quant
+            # phase can reload layers on demand. Under FSDP2 the shards are
+            # already spread across ranks (and may be CPU-offloaded); calling
+            # `.cpu()` on the wrapped module isn't meaningful — leave as is.
+            model.cpu()
         memory_utils.cleanup_memory()
 
     static_saliency = []
@@ -3322,22 +3403,73 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
 
     with run_recorder.section("run.total") if run_recorder else _NULL_CONTEXT:
         if global_loss_enabled:
-            with pipeline_recorder.section("pipeline.static_end_to_end_saliency_fisher") if pipeline_recorder else _NULL_CONTEXT:
-                static_saliency_by_layer, static_fisher_by_layer = collect_static_end_to_end_saliency_and_fisher(
-                    model=model,
-                    analyzer=analyzer,
-                    dataloader=dataloader,
-                    dev=dev,
-                    saliency_num_groups=args.num_groups,
-                    fisher_num_groups=args.fisher_num_groups,
-                    grad_hessian_topk=args.grad_hessian_topk,
-                    batch_size=args.global_loss_bsz,
+            # Optional disk cache. The precompute result depends only on:
+            #   model / dataset / nsamples / seq_len / rotate setting /
+            #   num_groups / fisher_num_groups / grad_hessian_topk /
+            #   global_loss_bsz / seed.
+            # Use `--static_cache_path DIR` to persist. Each rank writes/reads
+            # its own shard file since saliency/fisher are rank-local.
+            static_cache_dir = getattr(args, "static_cache_path", None)
+            static_cache_key = None
+            if static_cache_dir is not None:
+                dataset_id = getattr(args, "dataset", "unknown")
+                rotate_flag = int(bool(getattr(args, "rotate", False)))
+                static_cache_key = (
+                    f"{args.model_name}_{dataset_id}_s{args.nsamples}_"
+                    f"blk{args.seq_len}_rot{rotate_flag}_g{args.num_groups}_"
+                    f"fng{args.fisher_num_groups}_ghtk{args.grad_hessian_topk}_"
+                    f"glbsz{args.global_loss_bsz}_seed{args.seed}"
                 )
+                static_cache_key += f"_world{dist_utils.get_world_size()}_rank{dp_rank}"
+                os.makedirs(static_cache_dir, exist_ok=True)
+            static_cache_file = (
+                os.path.join(static_cache_dir, f"{static_cache_key}.pt")
+                if static_cache_key is not None else None
+            )
+
+            if static_cache_file is not None and os.path.exists(static_cache_file):
+                logging.info("Loading static saliency/fisher cache from %s", static_cache_file)
+                _loaded = torch.load(static_cache_file, map_location="cpu", weights_only=True)
+                static_saliency_by_layer = _loaded["saliency"]
+                static_fisher_by_layer = _loaded["fisher"]
+            else:
+                with pipeline_recorder.section("pipeline.static_end_to_end_saliency_fisher") if pipeline_recorder else _NULL_CONTEXT:
+                    static_saliency_by_layer, static_fisher_by_layer = collect_static_end_to_end_saliency_and_fisher(
+                        model=model,
+                        analyzer=analyzer,
+                        dataloader=dataloader,
+                        dev=dev,
+                        saliency_num_groups=args.num_groups,
+                        fisher_num_groups=args.fisher_num_groups,
+                        grad_hessian_topk=args.grad_hessian_topk,
+                        batch_size=args.global_loss_bsz,
+                        use_fsdp=bool(getattr(args, "fsdp_precompute", False)),
+                        fsdp_cpu_offload=bool(getattr(args, "fsdp_cpu_offload", False)),
+                    )
+                if static_cache_file is not None:
+                    logging.info("Saving static saliency/fisher cache to %s", static_cache_file)
+                    torch.save(
+                        {"saliency": static_saliency_by_layer, "fisher": static_fisher_by_layer},
+                        static_cache_file,
+                    )
             logging.info(
                 "Collected frozen end-to-end saliency/Fisher caches before quantization with global_loss_bsz=%d. "
                 "These cached coefficients will be reused for Hessian estimation and fisher_diag_mse throughout quantization.",
                 args.global_loss_bsz,
             )
+            # Exit right after persisting the cache — the FSDP-wrapped model
+            # can't gracefully drop into the per-layer quant phase, so the
+            # intended workflow is: (1) torchrun precompute with FSDP, (2)
+            # separately run the quant pass without FSDP which reads the cache.
+            if bool(getattr(args, "exit_after_precompute", False)):
+                logging.info(
+                    "exit_after_precompute=1 → finished static saliency/fisher stage, exiting. "
+                    "Rerun without --exit_after_precompute to perform quantization."
+                )
+                if dist.is_initialized():
+                    dist.barrier()
+                    dist.destroy_process_group()
+                sys.exit(0)
         else:
             static_saliency_by_layer = [None] * len(layers)
             static_fisher_by_layer = [None] * len(layers)
