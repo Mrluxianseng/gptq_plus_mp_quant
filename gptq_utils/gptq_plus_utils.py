@@ -2327,6 +2327,22 @@ def collect_static_end_to_end_saliency_and_fisher(
     local_batches = token_batches[shard]
     model = model.to(dev)
     model.eval()
+    # The precompute only reads **activation gradients** via hooks (saliency /
+    # fisher = mean of grad².pow). Weight gradients are never consumed here, so
+    # freeze all parameters to skip populating `param.grad` — saves a fp32 grad
+    # buffer the size of the entire model (280 GB for Llama2-70B, 8 GB for 4B).
+    # Restored in the finally clause below.
+    prev_requires_grad = [(p, p.requires_grad) for p in model.parameters()]
+    for p in model.parameters():
+        p.requires_grad_(False)
+    # With all params frozen the embedding output has requires_grad=False, so
+    # autograd wouldn't build any graph. Re-enter the graph at the first
+    # transformer layer's input by flipping it to requires_grad=True via a
+    # forward pre-hook.
+    def _kick_off_grad_hook(module, inputs):
+        if isinstance(inputs, tuple) and len(inputs) > 0 and torch.is_tensor(inputs[0]):
+            inputs[0].requires_grad_(True)
+    _kick_off_handle = analyzer.get_layers()[0].register_forward_pre_hook(_kick_off_grad_hook)
     try:
         with torch.enable_grad():
             for local_start in tqdm(
@@ -2365,12 +2381,16 @@ def collect_static_end_to_end_saliency_and_fisher(
                     labels.view(-1),
                     reduction="sum",
                 )
-                model.zero_grad()
                 loss.backward()
                 del outputs, logits, teacher_logits, student_logits, labels, loss, input_ids
     finally:
         for handle in handles:
             handle.remove()
+        _kick_off_handle.remove()
+        # Restore `requires_grad` so downstream phases (quantization, eval) see
+        # the model in its original training-like state.
+        for p, flag in prev_requires_grad:
+            p.requires_grad_(flag)
         model.zero_grad()
         model.cpu()
         memory_utils.cleanup_memory()
@@ -3249,28 +3269,22 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
     preclip_enabled = bool(args.w_clip and getattr(args, "pre_clip", True))
     enable_gptq_plus = bool(getattr(args, "enable_gptq_plus", 1))
     if not enable_gptq_plus:
-        # Pure-GPTQ mode: force every first-order / refresh path off. We mutate
-        # the local args namespace instead of threading a flag through every
-        # call site — the overrides here cover:
-        #   * pre-quantization GD (set pre_gd_steps to 0)
-        #   * block refresh / gradient descent (force g_update_mode=frozen)
-        #   * GHinv / Z / beta in fasterquant (alpha=0 + enable_gradient_update=False)
-        #   * fisher precompute + reference loss backward (see guards below)
-        if args.g_update_mode != "frozen":
-            logging.info(
-                "enable_gptq_plus=0 → overriding g_update_mode '%s' -> 'frozen'",
-                args.g_update_mode,
-            )
-            args.g_update_mode = "frozen"
-        if args.pre_gd_steps > 0:
-            logging.info("enable_gptq_plus=0 → overriding pre_gd_steps %d -> 0", args.pre_gd_steps)
-            args.pre_gd_steps = 0
-        if getattr(args, "loss_slide_window", False):
-            logging.info("enable_gptq_plus=0 → disabling loss_slide_window")
-            args.loss_slide_window = False
+        # Semantic of enable_gptq_plus=0: fully equivalent to setting alpha=0.
+        # Only the GPTQ+ first-order term (GHinv / Z / beta inside fasterquant's
+        # inner + outer updates) is switched off — everything else (block_gd
+        # refresh, loss_slide_window, pre_gd_steps, fisher precompute,
+        # fp_inps_final) keeps running as the user configured.
         if args.alpha != 0:
-            logging.info("enable_gptq_plus=0 → overriding alpha %s -> 0", args.alpha)
+            logging.info(
+                "enable_gptq_plus=0 → overriding alpha %s -> 0 (GPTQ+ first-order disabled)",
+                args.alpha,
+            )
             args.alpha = 0
+    # When alpha=0 (set either directly or via enable_gptq_plus=0) the reference
+    # loss gradient collected in stats never survives `beta=0` in fasterquant,
+    # so we can skip that second backward entirely. Pure optimisation — no
+    # numerical change.
+    skip_ref_backward = args.alpha == 0
     effective_pre_gd_steps = args.pre_gd_steps if preclip_enabled else 0
     global_loss_enabled = bool(getattr(args, "global_loss", False))
     if args.pre_gd_steps > 0 and not preclip_enabled:
@@ -3318,7 +3332,6 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     fisher_num_groups=args.fisher_num_groups,
                     grad_hessian_topk=args.grad_hessian_topk,
                     batch_size=args.global_loss_bsz,
-                    collect_fisher=enable_gptq_plus,
                 )
             logging.info(
                 "Collected frozen end-to-end saliency/Fisher caches before quantization with global_loss_bsz=%d. "
@@ -3442,7 +3455,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
         # `fp_inps_final` with the same (n_local, seq, hidden) shape as fp_inps.
         # Any other refresh loss keeps `fp_inps_final = None` and pays nothing.
         fp_inps_final = None
-        if args.grad_refresh_loss == "residual_kl" and enable_gptq_plus:
+        if args.grad_refresh_loss == "residual_kl":
             with pipeline_recorder.section("pipeline.fp_final_precompute") if pipeline_recorder else _NULL_CONTEXT:
                 logging.info(
                     "Precomputing FP final-layer hidden states for residual_kl "
@@ -3732,7 +3745,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                 ),
                 fp_inps_final=fp_inps_final,
                 layer_recorder=layer_recorder,
-                skip_gradient_backward=not enable_gptq_plus,
+                skip_gradient_backward=skip_ref_backward,
             )
 
             gptq = {}
@@ -3998,7 +4011,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         groupsize=layer_w_groupsize,
                         actorder=args.act_order,
                         static_groups=args.act_order,
-                        enable_gradient_update=enable_gptq_plus,
+                        enable_gradient_update=True,
                         g_update_mode=args.g_update_mode,
                         export_to_et=args.export_to_et,
                         profile_recorder=module_recorder,

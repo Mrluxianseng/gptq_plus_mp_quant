@@ -24,7 +24,7 @@ DEVICE=${3}
 shift 3
 
 # Sweep configuration. Override from the shell when needed.
-GRAD_LRS_STR=${GRAD_LRS:-"0.00003"}
+GRAD_LRS_STR=${GRAD_LRS:-"0.0"}
 N_SAMPLES=${N_SAMPLES:-768}
 SEQ_LEN=${SEQ_LEN:-2048}
 BSZ=${BSZ:-32}
