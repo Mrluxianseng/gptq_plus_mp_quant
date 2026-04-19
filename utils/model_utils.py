@@ -28,7 +28,7 @@ def load_model(model_str_or_model):
             model_str_or_model,
             config=config,
             trust_remote_code=True,
-            torch_dtype='auto',
+            torch_dtype=torch.bfloat16,
             device_map='cpu',
             # attn_implementation='eager',
         )
