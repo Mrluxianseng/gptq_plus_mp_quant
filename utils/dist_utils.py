@@ -66,7 +66,11 @@ def print_on_main(*args, **kwargs):
 
 
 def distribute_model(model) -> None:
-    no_split_module_classes = ["Qwen3DecoderLayer", "Qwen3MoeForCausalLM"]
+    no_split_module_classes = [
+        "Qwen3DecoderLayer",
+        "Qwen3MoeForCausalLM",
+        "LlamaDecoderLayer",
+    ]
     max_memory = get_balanced_memory(
         model,
         no_split_module_classes=no_split_module_classes,

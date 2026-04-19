@@ -24,8 +24,8 @@ DEVICE=${3}
 shift 3
 
 # Sweep configuration. Override from the shell when needed.
-GRAD_LRS_STR=${GRAD_LRS:-"0.0"}
-N_SAMPLES=${N_SAMPLES:-768}
+GRAD_LRS_STR=${GRAD_LRS:-"0.00001"}
+N_SAMPLES=${N_SAMPLES:-128}
 SEQ_LEN=${SEQ_LEN:-2048}
 BSZ=${BSZ:-32}
 FINAL_LAYER_STATS_BSZ=${FINAL_LAYER_STATS_BSZ:-4}
@@ -72,6 +72,15 @@ LM_EVAL_BATCH_SIZE=${LM_EVAL_BATCH_SIZE:-32}
 ENABLE_QA_EVAL=${ENABLE_QA_EVAL:-1}
 BASE_EXP=${BASE_EXP:-gptq_plus_lr_sweep}
 OUTPUT_ROOT=${OUTPUT_ROOT:-./outputs}
+# FSDP2 precompute: shard params + grads across ranks during
+# `collect_static_end_to_end_saliency_and_fisher`. Needed for 70B where full
+# model + grads won't fit on a single card. Two-stage workflow:
+#   Stage 1: FSDP_PRECOMPUTE=1 EXIT_AFTER_PRECOMPUTE=1 STATIC_CACHE_PATH=...
+#   Stage 2: STATIC_CACHE_PATH=<same>  (no FSDP, reads cache)
+FSDP_PRECOMPUTE=${FSDP_PRECOMPUTE:-1}
+FSDP_CPU_OFFLOAD=${FSDP_CPU_OFFLOAD:-0}
+STATIC_CACHE_PATH=${STATIC_CACHE_PATH:-}
+EXIT_AFTER_PRECOMPUTE=${EXIT_AFTER_PRECOMPUTE:-0}
 
 IFS=' ' read -r -a GRAD_LRS <<< "${GRAD_LRS_STR}"
 
@@ -168,6 +177,71 @@ GRAD_LR_LAYER_SCHEDULE_TAG=""
 if [[ "${GRAD_LR_LAYER_SCHEDULE}" != "none" ]]; then
     GRAD_LR_LAYER_SCHEDULE_ARGS=(--grad_lr_layer_schedule "${GRAD_LR_LAYER_SCHEDULE}")
     GRAD_LR_LAYER_SCHEDULE_TAG="_lrsched${GRAD_LR_LAYER_SCHEDULE}"
+fi
+
+FSDP_ARGS=()
+if [[ "${FSDP_PRECOMPUTE}" == "1" ]]; then
+    FSDP_ARGS+=(--fsdp_precompute)
+fi
+if [[ "${FSDP_CPU_OFFLOAD}" == "1" ]]; then
+    FSDP_ARGS+=(--fsdp_cpu_offload)
+fi
+if [[ "${EXIT_AFTER_PRECOMPUTE}" == "1" ]]; then
+    FSDP_ARGS+=(--exit_after_precompute)
+fi
+if [[ -n "${STATIC_CACHE_PATH}" ]]; then
+    FSDP_ARGS+=(--static_cache_path "${STATIC_CACHE_PATH}")
+fi
+
+# ---------------------------------------------------------------
+# Auto two-stage when FSDP_PRECOMPUTE=1:
+#   Stage 1 — FSDP precompute only (write saliency/fisher cache, exit).
+#   Stage 2 — normal quantisation loop reads the cache; no FSDP.
+# We split like this because in-process FSDP2 unwrap is fragile — a fresh
+# process is the most reliable way to drop DTensor state cleanly.
+# User can still manually control this by setting FSDP_PRECOMPUTE=0 and
+# pointing STATIC_CACHE_PATH at a cache populated elsewhere.
+# ---------------------------------------------------------------
+if [[ "${FSDP_PRECOMPUTE}" == "1" && "${EXIT_AFTER_PRECOMPUTE}" != "1" ]]; then
+    if [[ -z "${STATIC_CACHE_PATH}" ]]; then
+        STATIC_CACHE_PATH="./cache/static_stats/${MODEL_NAME}_fsdp_auto"
+        echo "[sweep] FSDP_PRECOMPUTE=1: auto-setting STATIC_CACHE_PATH=${STATIC_CACHE_PATH}"
+    fi
+    mkdir -p "${STATIC_CACHE_PATH}"
+
+    PRECOMPUTE_CPU_OFFLOAD_ARG=()
+    if [[ "${FSDP_CPU_OFFLOAD}" == "1" ]]; then
+        PRECOMPUTE_CPU_OFFLOAD_ARG=(--fsdp_cpu_offload)
+    fi
+
+    echo "============================================================"
+    echo "[sweep] Stage 1/2: FSDP precompute → ${STATIC_CACHE_PATH}"
+    echo "  Passes that affect the cache key must match Stage 2:"
+    echo "    model, nsamples=${N_SAMPLES}, seq_len=${SEQ_LEN},"
+    echo "    num_groups=${NUM_GROUPS}, fisher_num_groups=${FISHER_NUM_GROUPS},"
+    echo "    grad_hessian_topk=${GRAD_HESSIAN_TOPK}, global_loss_bsz=${GLOBAL_LOSS_BSZ},"
+    echo "    world_size=${N_GPUS}, rotate=1"
+    echo "============================================================"
+    python -m torch.distributed.run \
+        --nnodes=1 --nproc_per_node=${N_GPUS} --rdzv_endpoint=localhost:${RDZV_PORT} ./ptq.py \
+        --model "${MODEL_PATH}" \
+        --exp "precompute_fsdp" \
+        --dataset neuralmagic --nsamples "${N_SAMPLES}" --seq_len "${SEQ_LEN}" \
+        --w_method gptq_plus --w_bits 4 --w_clip --num_groups "${NUM_GROUPS}" --fisher_num_groups "${FISHER_NUM_GROUPS}" --act_order \
+        --kl_topk "${KL_TOPK}" --bsz "${BSZ}" --final_layer_stats_bsz "${FINAL_LAYER_STATS_BSZ}" --alpha "${ALPHA}" \
+        --grad_hessian_topk "${GRAD_HESSIAN_TOPK}" \
+        "${GLOBAL_LOSS_ARGS[@]}" \
+        "${DP_GLOBAL_SHUFFLE_ARGS[@]}" \
+        --rotate \
+        --skip_eval \
+        --fsdp_precompute --exit_after_precompute --static_cache_path "${STATIC_CACHE_PATH}" \
+        "${PRECOMPUTE_CPU_OFFLOAD_ARG[@]}"
+
+    # For the sweep loop below, drop FSDP flags (model is fresh each run) and
+    # just point at the cache so each quantisation pass reads precomputed
+    # saliency/fisher from disk.
+    FSDP_ARGS=(--static_cache_path "${STATIC_CACHE_PATH}")
+    echo "[sweep] Stage 2/2: sweeping quantisation LRs (FSDP off, reading cache)"
 fi
 
 for grad_lr in "${GRAD_LRS[@]}"; do
@@ -269,6 +343,7 @@ for grad_lr in "${GRAD_LRS[@]}"; do
         "${LOSS_SLIDE_WINDOW_ARGS[@]}" \
         "${DP_GLOBAL_SHUFFLE_ARGS[@]}" \
         "${GRAD_LR_LAYER_SCHEDULE_ARGS[@]}" \
+        "${FSDP_ARGS[@]}" \
         --final_layer_grad_optimizer "${FINAL_LAYER_GRAD_OPTIMIZER}" \
         --grad_clip "${GRAD_CLIP}" \
         --final_layer_grad_lr "${FINAL_LAYER_GRAD_LR}" \

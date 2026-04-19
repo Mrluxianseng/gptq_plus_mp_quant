@@ -2275,6 +2275,15 @@ def collect_static_end_to_end_saliency_and_fisher(
     # layer all-gathers on forward and reshards afterwards. Since all params
     # are frozen below (requires_grad=False), no reduce_scatter happens on
     # backward — FSDP becomes a pure param all-gather mechanism.
+    #
+    # Important: when `use_fsdp` is on, the model ends up with DTensor-wrapped
+    # parameters. In-process "unwrap" attempts have proven fragile — the
+    # residual DTensor state leaks into downstream `find_params` / backward
+    # gradients. The supported workflow is **two-stage**: the caller must
+    # combine `--fsdp_precompute` with `--exit_after_precompute` and
+    # `--static_cache_path` so precompute exits immediately after saving to
+    # disk; a subsequent run without `--fsdp_precompute` reads the cache and
+    # performs quantisation. The sweep script wires this up automatically.
     if use_fsdp:
         from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy, CPUOffloadPolicy
         from torch.distributed.device_mesh import init_device_mesh
@@ -2468,11 +2477,19 @@ def collect_static_end_to_end_saliency_and_fisher(
         for p, flag in prev_requires_grad:
             p.requires_grad_(flag)
         model.zero_grad()
-        if not use_fsdp:
+        if use_fsdp:
+            # In-process FSDP unwrap has been removed — it was too fragile in
+            # PyTorch 2.9 FSDP2. When `use_fsdp=True`, the sweep/driver MUST
+            # set `--exit_after_precompute` and `--static_cache_path`; the
+            # parent stage writes the saliency/fisher cache to disk and exits,
+            # then the caller re-runs without `--fsdp_precompute` to do the
+            # quantisation from the cached stats. See README two-stage
+            # workflow. We leave the model in its FSDP-wrapped state here
+            # (don't `.cpu()` because FSDP's `_apply` override would crash).
+            pass
+        else:
             # Non-FSDP path: push the model back to CPU so the per-layer quant
-            # phase can reload layers on demand. Under FSDP2 the shards are
-            # already spread across ranks (and may be CPU-offloaded); calling
-            # `.cpu()` on the wrapped module isn't meaningful — leave as is.
+            # phase can reload layers on demand.
             model.cpu()
         memory_utils.cleanup_memory()
 
@@ -3326,6 +3343,20 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
     """
     logging.info("-----GPTQPlus Quantization-----")
 
+    # Guard: `--fsdp_precompute` leaves the model with DTensor-wrapped params
+    # after precompute (in-process unwrap was too fragile). The supported
+    # workflow is two-stage. Fail fast if the caller forgot to set
+    # `--exit_after_precompute` (the sweep script auto-wires both).
+    if bool(getattr(args, "fsdp_precompute", False)) and not bool(getattr(args, "exit_after_precompute", False)):
+        raise RuntimeError(
+            "--fsdp_precompute requires --exit_after_precompute. Two-stage workflow: "
+            "(1) run precompute under FSDP with --fsdp_precompute --exit_after_precompute "
+            "--static_cache_path <DIR> (writes cache, exits); "
+            "(2) rerun without --fsdp_precompute but with the same --static_cache_path "
+            "(reads cache, quantises). The sweep script automates this when "
+            "FSDP_PRECOMPUTE=1."
+        )
+
     model = analyzer.model
     use_cache = model.config.use_cache
     model.config.use_cache = False
@@ -3420,7 +3451,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     f"fng{args.fisher_num_groups}_ghtk{args.grad_hessian_topk}_"
                     f"glbsz{args.global_loss_bsz}_seed{args.seed}"
                 )
-                static_cache_key += f"_world{dist_utils.get_world_size()}_rank{dp_rank}"
+                static_cache_key += f"_world{dist_utils.get_world_size()}_rank{dist_utils.get_rank()}"
                 os.makedirs(static_cache_dir, exist_ok=True)
             static_cache_file = (
                 os.path.join(static_cache_dir, f"{static_cache_key}.pt")

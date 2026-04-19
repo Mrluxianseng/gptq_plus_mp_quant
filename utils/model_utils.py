@@ -99,33 +99,33 @@ class ModelAnalyzer:
         self.tie_word_embeddings = self.model.tie_word_embeddings
 
     def get_lm_head(self):
-        if self.model_arch in ["Qwen3ForCausalLM", "Qwen3MoeForCausalLM"]:
+        if self.model_arch in ["Qwen3ForCausalLM", "Qwen3MoeForCausalLM", "LlamaForCausalLM"]:
             return self.get_model_attribute("lm_head", self.model)
         else:
             raise NotImplementedError
 
     def get_embed_layer(self):
-        if self.model_arch in ["Qwen3ForCausalLM", "Qwen3MoeForCausalLM"]:
+        if self.model_arch in ["Qwen3ForCausalLM", "Qwen3MoeForCausalLM", "LlamaForCausalLM"]:
             return self.get_model_attribute("model.embed_tokens", self.model)
         else:
             raise NotImplementedError
 
     def get_layernorm_before_head(self):
-        if self.model_arch in ["Qwen3ForCausalLM", "Qwen3MoeForCausalLM"]:
+        if self.model_arch in ["Qwen3ForCausalLM", "Qwen3MoeForCausalLM", "LlamaForCausalLM"]:
             return self.get_model_attribute("model.norm", self.model)
         else:
             raise NotImplementedError
 
     def get_layers(self):
         """Return the layers of the model."""
-        if self.model_arch in ["Qwen3ForCausalLM", "Qwen3MoeForCausalLM"]:
+        if self.model_arch in ["Qwen3ForCausalLM", "Qwen3MoeForCausalLM", "LlamaForCausalLM"]:
             return self.get_model_attribute("model.layers", self.model)
         else:
             raise NotImplementedError
 
     def get_pre_block_modules(self):
         """Return pre-block modules of the model."""
-        if self.model_arch in ["Qwen3ForCausalLM", "Qwen3MoeForCausalLM"]:
+        if self.model_arch in ["Qwen3ForCausalLM", "Qwen3MoeForCausalLM", "LlamaForCausalLM"]:
             return [
                 self.get_model_attribute(name, self.model) for name in [
                     "model.embed_tokens",
@@ -137,14 +137,14 @@ class ModelAnalyzer:
 
     def get_quantizable_modules(self, layer):
         """Return the quantizable modules of the layer."""
-        if self.model_arch in ["Qwen3ForCausalLM", "Qwen3MoeForCausalLM"]:
+        if self.model_arch in ["Qwen3ForCausalLM", "Qwen3MoeForCausalLM", "LlamaForCausalLM"]:
             return select_layers(layer, "", ".*((q|k|v|o|gate|up|down)_proj)", LINEAR_LAYERS)
         else:
             raise NotImplementedError
 
     def get_sequential_quantizable_module_names(self):
         """Return the quantizable module names of the layer in sequential order."""
-        if self.model_arch in ["Qwen3ForCausalLM"]:
+        if self.model_arch in ["Qwen3ForCausalLM", "LlamaForCausalLM"]:
             return [
                 [
                     "self_attn.q_proj",
@@ -171,7 +171,7 @@ class ModelAnalyzer:
             raise NotImplementedError
 
     def get_layernorms(self, layer):
-        if self.model_arch in ["Qwen3ForCausalLM", "Qwen3MoeForCausalLM"]:
+        if self.model_arch in ["Qwen3ForCausalLM", "Qwen3MoeForCausalLM", "LlamaForCausalLM"]:
             return [
                 self.get_model_attribute(name, layer) for name in [
                     "input_layernorm",
@@ -182,18 +182,18 @@ class ModelAnalyzer:
             raise NotImplementedError
 
     def get_perlayer_input_modules(self, layer):
-        if self.model_arch in ["Qwen3ForCausalLM"]:
+        if self.model_arch in ["Qwen3ForCausalLM", "LlamaForCausalLM"]:
             return [
                 [
                     self.get_model_attribute(name, layer) for name in [
-                        "self_attn.q_proj", 
-                        "self_attn.k_proj", 
+                        "self_attn.q_proj",
+                        "self_attn.k_proj",
                         "self_attn.v_proj"
                     ]
                 ],
                 [
                     self.get_model_attribute(name, layer) for name in [
-                        "mlp.up_proj", 
+                        "mlp.up_proj",
                         "mlp.gate_proj"
                     ]
                 ],
@@ -202,8 +202,8 @@ class ModelAnalyzer:
             return [
                 [
                     self.get_model_attribute(name, layer) for name in [
-                        "self_attn.q_proj", 
-                        "self_attn.k_proj", 
+                        "self_attn.q_proj",
+                        "self_attn.k_proj",
                         "self_attn.v_proj"
                     ]
                 ],
@@ -215,7 +215,7 @@ class ModelAnalyzer:
             raise NotImplementedError
 
     def get_perlayer_output_modules(self, layer):
-        if self.model_arch in ["Qwen3ForCausalLM"]:
+        if self.model_arch in ["Qwen3ForCausalLM", "LlamaForCausalLM"]:
             return [
                 [self.get_model_attribute("self_attn.o_proj", layer)],
                 [self.get_model_attribute("mlp.down_proj", layer)],
@@ -229,7 +229,7 @@ class ModelAnalyzer:
             raise NotImplementedError
 
     def get_perlayer_down_proj(self, layer):
-        if self.model_arch in ["Qwen3ForCausalLM"]:
+        if self.model_arch in ["Qwen3ForCausalLM", "LlamaForCausalLM"]:
             return [self.get_model_attribute("mlp.down_proj", layer)]
         elif self.model_arch in ["Qwen3MoeForCausalLM"]:
             return [self.get_model_attribute(f"mlp.experts.{i}.down_proj", layer) for i in range(layer.mlp.num_experts)]
@@ -237,13 +237,13 @@ class ModelAnalyzer:
             raise NotImplementedError
 
     def get_perlayer_o_proj(self, layer):
-        if self.model_arch in ["Qwen3ForCausalLM", "Qwen3MoeForCausalLM"]:
+        if self.model_arch in ["Qwen3ForCausalLM", "Qwen3MoeForCausalLM", "LlamaForCausalLM"]:
             return self.get_model_attribute("self_attn.o_proj", layer)
         else:
             raise NotImplementedError
 
     def get_perlayer_v_proj(self, layer):
-        if self.model_arch in ["Qwen3ForCausalLM", "Qwen3MoeForCausalLM"]:
+        if self.model_arch in ["Qwen3ForCausalLM", "Qwen3MoeForCausalLM", "LlamaForCausalLM"]:
             return self.get_model_attribute("self_attn.v_proj", layer)
         else:
             raise NotImplementedError
