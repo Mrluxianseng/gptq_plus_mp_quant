@@ -2282,6 +2282,8 @@ def collect_static_end_to_end_saliency_and_fisher(
     refined_rkl_damp=0.01,
     refined_rkl_num_A=1,
     refined_rkl_store_dtype=torch.bfloat16,
+    collect_refined_diag_rkl=False,
+    refined_diag_rkl_store_dtype=torch.bfloat16,
     use_fsdp=False,
     fsdp_cpu_offload=False,
     saliency_clip_percentile=0.99,
@@ -2296,6 +2298,14 @@ def collect_static_end_to_end_saliency_and_fisher(
             "on (dy, dx-dy) pairs collected during the same backward pass. "
             "num_A=%d sub-matrices per layer, store_dtype=%s.",
             refined_rkl_num_A, str(refined_rkl_store_dtype).replace("torch.", ""),
+        )
+    if collect_refined_diag_rkl:
+        logging.info(
+            "Also fitting refined_diag_residual_kl per-(token, channel) diagonal J "
+            "via LS on (dy, dx-dy) pairs aggregated across samples in each sub-A. "
+            "num_A=%d, store_dtype=%s. Memory per layer per sub-A: (seq_len, H) bf16 "
+            "≈ H×-smaller than full refined_residual_kl per sub-A when H>>seq_len.",
+            refined_rkl_num_A, str(refined_diag_rkl_store_dtype).replace("torch.", ""),
         )
     layers = analyzer.get_layers()
     # Wrap model with FSDP2 so the full-model backward fits on many small GPUs.
@@ -2355,6 +2365,9 @@ def collect_static_end_to_end_saliency_and_fisher(
         for module_dict in module_dicts
     ]
     fisher_data = [[] for _ in layers]
+    # Any refined-rkl variant reuses the same num_A / samples_per_A partitioning
+    # and the shared dy capture at the last transformer block's output.
+    _collect_any_refined = collect_refined_rkl or collect_refined_diag_rkl
     # Refined residual_kl least-squares accumulators, one per (layer, sub-A)
     # pair. We fit A_{l,a} (H×H) such that f_l(x+Δx) ≈ f_l(x) + A_{l,a}·Δx,
     # where a is the sub-A index. When num_A>1, samples are split into num_A
@@ -2384,6 +2397,24 @@ def collect_static_end_to_end_saliency_and_fisher(
     static_refined_A = (
         [[None] * refined_rkl_num_A for _ in layers]
         if collect_refined_rkl else None
+    )
+    # refined_diag_residual_kl variant: ignore cross-channel coupling, fit a
+    # per-(token, channel) diagonal of J by LS over samples within each sub-A.
+    # Per-layer per-sub-A storage is (seq_len, H) in bf16, which shrinks the
+    # footprint by roughly H/seq vs the full H×H per sub-A — close to an
+    # order-of-magnitude saving for 70B (H=8192, seq=2048 → 4× smaller).
+    # Accumulators (seq, H) fp32 stream-freed alongside the full version.
+    refined_diag_C = (
+        [[None] * refined_rkl_num_A for _ in layers]
+        if collect_refined_diag_rkl else None
+    )
+    refined_diag_H = (
+        [[None] * refined_rkl_num_A for _ in layers]
+        if collect_refined_diag_rkl else None
+    )
+    static_refined_diag_A = (
+        [[None] * refined_rkl_num_A for _ in layers]
+        if collect_refined_diag_rkl else None
     )
     # Counter (list so inner closure can mutate) + remembered shape for the log.
     refined_fit_counter = [0]
@@ -2473,8 +2504,10 @@ def collect_static_end_to_end_saliency_and_fisher(
             out_tensor.retain_grad()
 
             def grad_hook(grad):
-                # grad shape (bsz, seq, H) → flatten to (N=bsz*seq, H) fp32.
-                refined_dy_buffer["dy"] = grad.detach().float().reshape(-1, grad.shape[-1])
+                # Keep 3D fp32 on dev. The full-RKL flat view is produced on the
+                # fly by the per-layer hook (reshape is a view — no copy). Diag
+                # mode also needs the 3D structure so we cache once here.
+                refined_dy_buffer["dy_3d"] = grad.detach().float()
 
             out_tensor.register_hook(grad_hook)
 
@@ -2483,34 +2516,59 @@ def collect_static_end_to_end_saliency_and_fisher(
     def make_refined_rkl_layer_hook(layer_idx):
         """For layer_idx < N-1: capture dx_i, combine with dy from buffer, accumulate
         C_{l,a} = Σ dyᵀ·(dx_i - dy)  and  H_{l,a} = Σ dyᵀ·dy (both H×H fp32),
-        where a = refined_current_a_idx["a"] (sub-A bucket for the current batch)."""
+        where a = refined_current_a_idx["a"] (sub-A bucket for the current batch).
+
+        Also accumulates per-(token, channel) diag sums when
+        `collect_refined_diag_rkl=True`:
+          C_diag_{l,a}[t, i] = Σ_s dy[s,t,i] · delta[s,t,i]      (seq, H)
+          H_diag_{l,a}[t, i] = Σ_s dy[s,t,i]²                    (seq, H)
+        Solve at sub-A flush time → A_diag_{l,a} shape (seq, H)."""
         def forward_hook(module, inp, out):
             out_tensor = out[0] if isinstance(out, (tuple, list)) else out
             out_tensor.retain_grad()
 
             def grad_hook(grad):
-                if "dy" not in refined_dy_buffer:
+                if "dy_3d" not in refined_dy_buffer:
                     # Last-layer hook hasn't fired yet — shouldn't happen because
                     # backward flows last→first, but guard anyway to fail loudly.
                     raise RuntimeError(
                         f"refined_rkl layer {layer_idx}: dy not captured before "
                         "this hook. Check hook registration order."
                     )
-                dy = refined_dy_buffer["dy"]  # (N, H) fp32 on dev
-                dx = grad.detach().float().reshape(-1, grad.shape[-1])
-                delta = dx - dy
-                # dy.t() @ delta → (H, H); dy.t() @ dy → (H, H). Compute on dev
-                # then transfer to CPU fp32 for accumulation (avoid bf16
-                # cancellation in the sum even when A itself is stored bf16).
-                inc_C = (dy.t() @ delta).cpu()
-                inc_H = (dy.t() @ dy).cpu()
+                dy_3d = refined_dy_buffer["dy_3d"]  # (B, seq, H) fp32 on dev
+                dx_3d = grad.detach().float()
                 a = refined_current_a_idx["a"]
-                if refined_C[layer_idx][a] is None:
-                    refined_C[layer_idx][a] = inc_C
-                    refined_H[layer_idx][a] = inc_H
-                else:
-                    refined_C[layer_idx][a] += inc_C
-                    refined_H[layer_idx][a] += inc_H
+
+                if collect_refined_rkl:
+                    dy = dy_3d.reshape(-1, dy_3d.shape[-1])
+                    dx = dx_3d.reshape(-1, dx_3d.shape[-1])
+                    delta = dx - dy
+                    # dy.t() @ delta → (H, H); dy.t() @ dy → (H, H). Compute on dev
+                    # then transfer to CPU fp32 for accumulation (avoid bf16
+                    # cancellation in the sum even when A itself is stored bf16).
+                    inc_C = (dy.t() @ delta).cpu()
+                    inc_H = (dy.t() @ dy).cpu()
+                    if refined_C[layer_idx][a] is None:
+                        refined_C[layer_idx][a] = inc_C
+                        refined_H[layer_idx][a] = inc_H
+                    else:
+                        refined_C[layer_idx][a] += inc_C
+                        refined_H[layer_idx][a] += inc_H
+
+                if collect_refined_diag_rkl:
+                    # Per-(token, channel) LS across samples in the batch:
+                    # accumulate Σ_s dy*delta and Σ_s dy² of shape (seq, H).
+                    # Aggregation across batches within a sub-A happens via the
+                    # running sum below; solve happens at sub-A flush.
+                    delta_3d = dx_3d - dy_3d
+                    inc_Cd = (dy_3d * delta_3d).sum(dim=0).cpu()
+                    inc_Hd = dy_3d.pow(2).sum(dim=0).cpu()
+                    if refined_diag_C[layer_idx][a] is None:
+                        refined_diag_C[layer_idx][a] = inc_Cd
+                        refined_diag_H[layer_idx][a] = inc_Hd
+                    else:
+                        refined_diag_C[layer_idx][a] += inc_Cd
+                        refined_diag_H[layer_idx][a] += inc_Hd
 
             out_tensor.register_hook(grad_hook)
 
@@ -2521,7 +2579,7 @@ def collect_static_end_to_end_saliency_and_fisher(
             handles.append(layer.register_forward_hook(make_layer_hook(layer_idx)))
         for module_name, module in module_dict.items():
             handles.append(module.register_forward_hook(make_module_hook(layer_idx, module_name)))
-    if collect_refined_rkl:
+    if _collect_any_refined:
         # Register the last-layer "dy capture" hook FIRST in the hook list so
         # it runs first in the forward pass; that way `register_hook` attaches
         # the grad-hook before any earlier-layer grad-hook fires during
@@ -2554,7 +2612,7 @@ def collect_static_end_to_end_saliency_and_fisher(
     # (layer, a) bucket. Enforce divisibility here rather than silently
     # dropping/merging samples across sub-A boundaries.
     refined_rkl_samples_per_A = 0
-    if collect_refined_rkl:
+    if _collect_any_refined:
         if nsamples_total % refined_rkl_num_A != 0:
             raise ValueError(
                 f"refined_rkl: nsamples_total ({nsamples_total}) must be divisible by "
@@ -2599,46 +2657,67 @@ def collect_static_end_to_end_saliency_and_fisher(
         """Solve A_{l, a_idx} for all layers and free the (l, a) C/H slots.
         Called when a batch transition signals that the sub-A has finished
         accumulating (or at the end of the backward pass). Writes into the
-        pre-allocated `static_refined_A[l][a_idx]` slot."""
+        pre-allocated `static_refined_A[l][a_idx]` slot. Also solves the
+        diagonal-variant slot when `collect_refined_diag_rkl=True`."""
         for layer_idx in range(len(layers)):
-            if refined_C[layer_idx] is None:
-                continue
-            slot_C = refined_C[layer_idx][a_idx]
-            if slot_C is None:
-                # Last layer (no hook registered) or empty sub-A (shouldn't
-                # happen given samples_per_A alignment). Leave slot None.
-                continue
-            C_i = slot_C.to(torch.float64)
-            H_i = refined_H[layer_idx][a_idx].to(torch.float64)
-            H_dim = H_i.shape[0]
-            trace = torch.trace(H_i).item() / H_dim
-            if not (trace > 0):
-                logging.warning(
-                    "refined_rkl layer %d a=%d: trace(H)/H=%.3e <= 0, setting A to zero.",
-                    layer_idx, a_idx, trace,
-                )
-                A_i = torch.zeros(H_dim, H_dim, dtype=torch.float32)
-            else:
-                damp = refined_rkl_damp * trace
-                H_damped = H_i + damp * torch.eye(H_dim, dtype=H_i.dtype)
-                try:
-                    L = torch.linalg.cholesky(H_damped)
-                    A_i = torch.cholesky_solve(C_i, L)
-                except torch._C._LinAlgError:
-                    logging.warning(
-                        "refined_rkl layer %d a=%d: Cholesky failed even with "
-                        "damp=%.3e; falling back to direct inverse.",
-                        layer_idx, a_idx, damp,
+            if refined_C is not None:
+                slot_C = refined_C[layer_idx][a_idx]
+                if slot_C is not None:
+                    C_i = slot_C.to(torch.float64)
+                    H_i = refined_H[layer_idx][a_idx].to(torch.float64)
+                    H_dim = H_i.shape[0]
+                    trace = torch.trace(H_i).item() / H_dim
+                    if not (trace > 0):
+                        logging.warning(
+                            "refined_rkl layer %d a=%d: trace(H)/H=%.3e <= 0, setting A to zero.",
+                            layer_idx, a_idx, trace,
+                        )
+                        A_i = torch.zeros(H_dim, H_dim, dtype=torch.float32)
+                    else:
+                        damp = refined_rkl_damp * trace
+                        H_damped = H_i + damp * torch.eye(H_dim, dtype=H_i.dtype)
+                        try:
+                            L = torch.linalg.cholesky(H_damped)
+                            A_i = torch.cholesky_solve(C_i, L)
+                        except torch._C._LinAlgError:
+                            logging.warning(
+                                "refined_rkl layer %d a=%d: Cholesky failed even with "
+                                "damp=%.3e; falling back to direct inverse.",
+                                layer_idx, a_idx, damp,
+                            )
+                            A_i = torch.linalg.inv(H_damped) @ C_i
+                    static_refined_A[layer_idx][a_idx] = A_i.to(refined_rkl_store_dtype).contiguous()
+                    refined_fit_counter[0] += 1
+                    refined_fit_shape[0] = tuple(A_i.shape)
+                    # Free the fp32 accumulators for this slot — this is the whole
+                    # point of streaming: peak CPU RAM drops from L × num_A × 2 × H²
+                    # down to L × 2 × H² + the stored (bf16) A stack.
+                    refined_C[layer_idx][a_idx] = None
+                    refined_H[layer_idx][a_idx] = None
+
+            if refined_diag_C is not None:
+                slot_Cd = refined_diag_C[layer_idx][a_idx]
+                if slot_Cd is not None:
+                    Cd = slot_Cd.to(torch.float32)            # (seq, H)
+                    Hd = refined_diag_H[layer_idx][a_idx].to(torch.float32)  # (seq, H)
+                    # Trace-normalised damp: λ = damp · mean(dy²) over all (t, i)
+                    # in this sub-A. Matches the full-version's damp scale so
+                    # the same `refined_rkl_damp` hyper-parameter applies.
+                    mean_dy_sq = Hd.mean().item()
+                    if not (mean_dy_sq > 0):
+                        logging.warning(
+                            "refined_diag_rkl layer %d a=%d: mean(dy²)=%.3e <= 0, "
+                            "setting diag-A to zero.", layer_idx, a_idx, mean_dy_sq,
+                        )
+                        Ad = torch.zeros_like(Cd)
+                    else:
+                        damp_diag = refined_rkl_damp * mean_dy_sq
+                        Ad = Cd / (Hd + damp_diag)
+                    static_refined_diag_A[layer_idx][a_idx] = (
+                        Ad.to(refined_diag_rkl_store_dtype).contiguous()
                     )
-                    A_i = torch.linalg.inv(H_damped) @ C_i
-            static_refined_A[layer_idx][a_idx] = A_i.to(refined_rkl_store_dtype).contiguous()
-            refined_fit_counter[0] += 1
-            refined_fit_shape[0] = tuple(A_i.shape)
-            # Free the fp32 accumulators for this slot — this is the whole
-            # point of streaming: peak CPU RAM drops from L × num_A × 2 × H²
-            # down to L × 2 × H² + the stored (bf16) A stack.
-            refined_C[layer_idx][a_idx] = None
-            refined_H[layer_idx][a_idx] = None
+                    refined_diag_C[layer_idx][a_idx] = None
+                    refined_diag_H[layer_idx][a_idx] = None
 
     try:
         with torch.enable_grad():
@@ -2651,7 +2730,7 @@ def collect_static_end_to_end_saliency_and_fisher(
                 leave=False,
             ):
                 global_start = shard.start + local_start
-                if collect_refined_rkl and refined_rkl_samples_per_A > 0:
+                if _collect_any_refined and refined_rkl_samples_per_A > 0:
                     # Route this batch's contributions to the correct sub-A
                     # bucket. We required `samples_per_A % batch_size == 0` so
                     # the whole batch has a single a_idx.
@@ -2696,7 +2775,7 @@ def collect_static_end_to_end_saliency_and_fisher(
             # Flush the last sub-A's accumulators. The streaming flush inside
             # the loop only fires on transitions, so the final one needs to be
             # drained explicitly.
-            if collect_refined_rkl and refined_prev_a is not None:
+            if _collect_any_refined and refined_prev_a is not None:
                 _flush_refined_rkl_sub_a(refined_prev_a)
     finally:
         for handle in handles:
@@ -2755,8 +2834,26 @@ def collect_static_end_to_end_saliency_and_fisher(
             str(refined_rkl_store_dtype).replace("torch.", ""),
             refined_rkl_damp,
         )
+    if collect_refined_diag_rkl:
+        # Summary shape: pick first populated slot for reporting.
+        _diag_shape = None
+        for l_idx in range(len(layers)):
+            for a_idx in range(refined_rkl_num_A):
+                slot = static_refined_diag_A[l_idx][a_idx]
+                if slot is not None:
+                    _diag_shape = tuple(slot.shape)
+                    break
+            if _diag_shape is not None:
+                break
+        logging.info(
+            "refined_diag_rkl: fit per-(token, channel) diag J "
+            "(shape=%s, num_A=%d, store_dtype=%s, damp=%.3g)",
+            _diag_shape, refined_rkl_num_A,
+            str(refined_diag_rkl_store_dtype).replace("torch.", ""),
+            refined_rkl_damp,
+        )
 
-    return static_saliency, static_fisher, static_refined_A
+    return static_saliency, static_fisher, static_refined_A, static_refined_diag_A
 
 
 def _pick_refined_A_for_batch(
@@ -2885,6 +2982,36 @@ def compute_refresh_loss(
             refined_delta = torch.bmm(delta, _A_cast.transpose(-1, -2))
         else:
             refined_delta = torch.matmul(delta, _A_cast.t())
+        final_with_refined = fp_final_hidden + delta + refined_delta
+        logits_perturbed = hidden2logits(final_with_refined, analyzer)
+        logits_fp = hidden2logits(fp_final_hidden, analyzer)
+        if kl_topk > 0:
+            logits_fp, indices = logits_fp.topk(kl_topk, dim=-1, sorted=False)
+            logits_perturbed = logits_perturbed.gather(-1, indices)
+        kl_loss = F.kl_div(
+            F.log_softmax(logits_perturbed, dim=-1),
+            F.softmax(logits_fp, dim=-1),
+            reduction="none",
+        )
+        return kl_loss.sum(dim=-1).mean()
+
+    if refresh_loss_type == "refined_diag_residual_kl":
+        # Diagonal variant of refined_residual_kl: treat J as diagonal per
+        # (token, channel), i.e. assume cross-channel coupling is negligible.
+        # `refined_A` has shape (seq, H) or (B, seq, H) — element-wise multiply
+        # with delta. LS fit produces A[t, i] = Σ_s dy·δ / (Σ_s dy² + λ) per
+        # (token, channel), where sums are taken over samples in the sub-A.
+        if fp_final_hidden is None:
+            raise ValueError(
+                "`fp_final_hidden` must be provided for refresh_loss_type='refined_diag_residual_kl'."
+            )
+        if refined_A is None:
+            raise ValueError(
+                "`refined_A` must be provided for refresh_loss_type='refined_diag_residual_kl'."
+            )
+        _A_cast = refined_A.to(delta.dtype)
+        # Broadcasts: (seq, H) → (1, seq, H) vs (B, seq, H). Both element-wise.
+        refined_delta = delta * _A_cast
         final_with_refined = fp_final_hidden + delta + refined_delta
         logits_perturbed = hidden2logits(final_with_refined, analyzer)
         logits_fp = hidden2logits(fp_final_hidden, analyzer)
@@ -3935,7 +4062,9 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
             else:
                 want_refined = args.grad_refresh_loss == "refined_residual_kl"
                 with pipeline_recorder.section("pipeline.static_end_to_end_saliency_fisher") if pipeline_recorder else _NULL_CONTEXT:
-                    static_saliency_by_layer, static_fisher_by_layer, static_refined_A_by_layer = \
+                    # 4th return (`refined_diag_A`) is collected only by
+                    # analyze_grad_cosine today; main quant pipeline ignores it.
+                    static_saliency_by_layer, static_fisher_by_layer, static_refined_A_by_layer, _ = \
                         collect_static_end_to_end_saliency_and_fisher(
                             model=model,
                             analyzer=analyzer,

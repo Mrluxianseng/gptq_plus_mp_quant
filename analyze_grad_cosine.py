@@ -248,6 +248,7 @@ def run_cosine_measurement(
     fp_inps_final,
     fisher_tensor,
     refined_A_list,
+    refined_diag_A_list,
     samples_per_A,
     attention_mask,
     position_ids,
@@ -276,7 +277,12 @@ def run_cosine_measurement(
         and len(refined_A_list) > 0
         and any(a is not None for a in refined_A_list)
     )
-    if has_refined and samples_per_A > 0 and samples_per_A % measure_batch_size != 0:
+    has_refined_diag = (
+        refined_diag_A_list is not None
+        and len(refined_diag_A_list) > 0
+        and any(a is not None for a in refined_diag_A_list)
+    )
+    if (has_refined or has_refined_diag) and samples_per_A > 0 and samples_per_A % measure_batch_size != 0:
         raise ValueError(
             f"refined_rkl: samples_per_A ({samples_per_A}) must be divisible by "
             f"measure_batch_size ({measure_batch_size}) so each measurement batch "
@@ -295,10 +301,12 @@ def run_cosine_measurement(
     per_batch_fisher_cos = {n: [] for n in name_to_weight}
     per_batch_residual_cos = {n: [] for n in name_to_weight}
     per_batch_refined_cos = {n: [] for n in name_to_weight}
+    per_batch_refined_diag_cos = {n: [] for n in name_to_weight}
     per_batch_true_norm = {n: [] for n in name_to_weight}
     per_batch_fisher_norm = {n: [] for n in name_to_weight}
     per_batch_residual_norm = {n: [] for n in name_to_weight}
     per_batch_refined_norm = {n: [] for n in name_to_weight}
+    per_batch_refined_diag_norm = {n: [] for n in name_to_weight}
 
     def _call_layer(h_in):
         return _layer_out(layer(
@@ -417,15 +425,53 @@ def run_cosine_measurement(
                 grads_refined = _capture_grads(name_to_weight)
                 del out_hidden, fp_hidden, refined_loss, refined_A_dev
 
+            # ---------- (5) refined_diag_residual_kl ----------
+            grads_refined_diag = None
+            if has_refined_diag:
+                a_idx_d = 0 if samples_per_A <= 0 else (start // samples_per_A)
+                if a_idx_d >= len(refined_diag_A_list):
+                    raise RuntimeError(
+                        f"refined_diag_rkl: batch start={start} resolves to "
+                        f"a_idx={a_idx_d} which exceeds num_A={len(refined_diag_A_list)}."
+                    )
+                refined_diag_slot = refined_diag_A_list[a_idx_d]
+                if refined_diag_slot is None:
+                    raise RuntimeError(
+                        f"refined_diag_rkl: missing A_diag for (layer={layer_idx}, "
+                        f"a={a_idx_d})."
+                    )
+                # (seq, H) — shared across the batch via broadcast; no bmm.
+                refined_diag_dev = refined_diag_slot.to(dev)
+                _zero_grads(target_params)
+                out_hidden = _call_layer(inp_batch)
+                with torch.no_grad():
+                    fp_hidden = _call_layer(fp_batch)
+                refined_diag_loss = compute_refresh_loss(
+                    refresh_loss_type="refined_diag_residual_kl",
+                    out_hidden=out_hidden,
+                    fp_hidden=fp_hidden,
+                    analyzer=analyzer,
+                    kl_topk=kl_topk,
+                    layer_output_fisher=None,
+                    fp_final_hidden=fp_final_batch,
+                    refined_A=refined_diag_dev,
+                )
+                refined_diag_loss.backward()
+                grads_refined_diag = _capture_grads(name_to_weight)
+                del out_hidden, fp_hidden, refined_diag_loss, refined_diag_dev
+
             # ---------- cosine + grad L2 per linear ----------
             cos_f = _cosine_per_linear(grads_true, grads_fisher)
             cos_r = _cosine_per_linear(grads_true, grads_residual)
             cos_rf = _cosine_per_linear(grads_true, grads_refined) if grads_refined is not None else None
+            cos_rfd = _cosine_per_linear(grads_true, grads_refined_diag) if grads_refined_diag is not None else None
             for n in name_to_weight:
                 per_batch_fisher_cos[n].append(cos_f[n])
                 per_batch_residual_cos[n].append(cos_r[n])
                 if cos_rf is not None:
                     per_batch_refined_cos[n].append(cos_rf[n])
+                if cos_rfd is not None:
+                    per_batch_refined_diag_cos[n].append(cos_rfd[n])
                 # Per-batch grad Frobenius / L2 norms (flattened). Useful to see
                 # not just whether surrogate grads point the right way (cosine)
                 # but also how their magnitude compares to the true KL grad's.
@@ -434,9 +480,13 @@ def run_cosine_measurement(
                 per_batch_residual_norm[n].append(grads_residual[n].flatten().norm(p=2).item())
                 if grads_refined is not None:
                     per_batch_refined_norm[n].append(grads_refined[n].flatten().norm(p=2).item())
+                if grads_refined_diag is not None:
+                    per_batch_refined_diag_norm[n].append(grads_refined_diag[n].flatten().norm(p=2).item())
             del grads_true, grads_fisher, grads_residual
             if grads_refined is not None:
                 del grads_refined
+            if grads_refined_diag is not None:
+                del grads_refined_diag
             torch.cuda.empty_cache()
 
         _zero_grads(target_params)
@@ -473,6 +523,14 @@ def run_cosine_measurement(
             entry["per_batch_refined_residual_kl"] = rf.tolist()
             entry["refined_residual_kl_grad_norm_mean"] = rfn.mean().item()
             entry["per_batch_refined_residual_kl_grad_norm"] = rfn.tolist()
+        if has_refined_diag and per_batch_refined_diag_cos[n]:
+            rfd = torch.tensor(per_batch_refined_diag_cos[n])
+            rfdn = torch.tensor(per_batch_refined_diag_norm[n])
+            entry["refined_diag_residual_kl_mean"] = rfd.mean().item()
+            entry["refined_diag_residual_kl_std"] = rfd.std(unbiased=False).item() if len(rfd) > 1 else 0.0
+            entry["per_batch_refined_diag_residual_kl"] = rfd.tolist()
+            entry["refined_diag_residual_kl_grad_norm_mean"] = rfdn.mean().item()
+            entry["per_batch_refined_diag_residual_kl_grad_norm"] = rfdn.tolist()
         results[n] = entry
     return results
 
@@ -506,7 +564,7 @@ def quantize_and_measure(args, analyzer, trainloader, dev, target_layers):
         args.nsamples // refined_rkl_num_A
         if refined_rkl_num_A > 0 else args.nsamples
     )
-    static_saliency, static_fisher_by_layer, static_refined_A_by_layer = \
+    static_saliency, static_fisher_by_layer, static_refined_A_by_layer, static_refined_diag_A_by_layer = \
         collect_static_end_to_end_saliency_and_fisher(
             model=model,
             analyzer=analyzer,
@@ -520,6 +578,7 @@ def quantize_and_measure(args, analyzer, trainloader, dev, target_layers):
             collect_refined_rkl=True,
             refined_rkl_damp=args.refined_rkl_damp,
             refined_rkl_num_A=refined_rkl_num_A,
+            collect_refined_diag_rkl=True,
             use_fsdp=False,
             fsdp_cpu_offload=False,
             saliency_clip_percentile=args.saliency_clip_percentile,
@@ -565,6 +624,11 @@ def quantize_and_measure(args, analyzer, trainloader, dev, target_layers):
                         if static_refined_A_by_layer is not None
                         else None
                     )
+                    refined_diag_A_list_i = (
+                        static_refined_diag_A_by_layer[i]
+                        if static_refined_diag_A_by_layer is not None
+                        else None
+                    )
                     cosine_results[i] = run_cosine_measurement(
                         analyzer=analyzer,
                         layer=layer,
@@ -575,6 +639,7 @@ def quantize_and_measure(args, analyzer, trainloader, dev, target_layers):
                         fp_inps_final=fp_inps_final,
                         fisher_tensor=static_fisher_by_layer[i],
                         refined_A_list=refined_A_list_i,
+                        refined_diag_A_list=refined_diag_A_list_i,
                         samples_per_A=samples_per_A,
                         attention_mask=attention_mask,
                         position_ids=position_ids,
@@ -592,6 +657,8 @@ def quantize_and_measure(args, analyzer, trainloader, dev, target_layers):
                     )
                     if "refined_residual_kl_mean" in r:
                         base += f" refined_res_kl={r['refined_residual_kl_mean']:.4f}"
+                    if "refined_diag_residual_kl_mean" in r:
+                        base += f" refined_diag_res_kl={r['refined_diag_residual_kl_mean']:.4f}"
                     base += (
                         f"] norm[true={r['true_kl_grad_norm_mean']:.3e} "
                         f"fisher={r['fisher_grad_norm_mean']:.3e} "
@@ -599,6 +666,8 @@ def quantize_and_measure(args, analyzer, trainloader, dev, target_layers):
                     )
                     if "refined_residual_kl_grad_norm_mean" in r:
                         base += f" refined_res_kl={r['refined_residual_kl_grad_norm_mean']:.3e}"
+                    if "refined_diag_residual_kl_grad_norm_mean" in r:
+                        base += f" refined_diag_res_kl={r['refined_diag_residual_kl_grad_norm_mean']:.3e}"
                     base += "]"
                     return base
                 logging.info(
@@ -789,6 +858,10 @@ def main(args):
                 out["cos_refined_res_kl"] = f"{r['refined_residual_kl_mean']:.4f}"
             if "refined_residual_kl_grad_norm_mean" in r:
                 out["gnorm_refined_res_kl"] = f"{r['refined_residual_kl_grad_norm_mean']:.3e}"
+            if "refined_diag_residual_kl_mean" in r:
+                out["cos_refined_diag_res_kl"] = f"{r['refined_diag_residual_kl_mean']:.4f}"
+            if "refined_diag_residual_kl_grad_norm_mean" in r:
+                out["gnorm_refined_diag_res_kl"] = f"{r['refined_diag_residual_kl_grad_norm_mean']:.3e}"
             return out
         logging.info(pprint.pformat({
             i: {n: _summary_entry(r) for n, r in per_layer.items()}
