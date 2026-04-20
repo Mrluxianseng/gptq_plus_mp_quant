@@ -120,6 +120,12 @@ def get_ref_logits(args, analyzer, dataset, dataloader):
         logging.info(f"Loading reference logits for {dataset}...")
         ref_logits = torch.load(ref_logits_path).cpu()
     orig_lm_head = copy.deepcopy(analyzer.model.lm_head)
+    # Align ref_logits dtype to the current lm_head dtype. Old fp16 caches
+    # collide with bf16-loaded models; casting here keeps old caches usable
+    # and costs one tensor copy at eval time.
+    target_dtype = orig_lm_head.weight.dtype
+    if ref_logits.dtype != target_dtype:
+        ref_logits = ref_logits.to(target_dtype)
     memory_utils.cleanup_memory()
     return ref_logits, orig_lm_head
 
