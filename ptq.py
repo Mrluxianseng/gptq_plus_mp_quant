@@ -142,10 +142,16 @@ def main(args):
         del orig_lm_head, ref_logits_dict
 
     if args.lm_eval and not args.skip_eval:
-        dist_utils.distribute_model(model)
-        eval_utils.qa_eval(model, tokenizer, args.lm_eval_batch_size)
+        # Run lm_eval only on rank 0. Other ranks wait at the barrier below.
+        # Running on every rank caused them to (a) contend for the same GPUs
+        # via accelerate.dispatch_model and (b) duplicate the full task suite,
+        # which made ceval-valid in particular hang with 0% SM utilisation.
+        if dist_utils.is_main():
+            dist_utils.distribute_model(model)
+            eval_utils.qa_eval(model, tokenizer, args.lm_eval_batch_size)
 
-    dist.barrier()
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
 
 
 if __name__ == "__main__":
