@@ -2658,66 +2658,103 @@ def collect_static_end_to_end_saliency_and_fisher(
         Called when a batch transition signals that the sub-A has finished
         accumulating (or at the end of the backward pass). Writes into the
         pre-allocated `static_refined_A[l][a_idx]` slot. Also solves the
-        diagonal-variant slot when `collect_refined_diag_rkl=True`."""
-        for layer_idx in range(len(layers)):
-            if refined_C is not None:
-                slot_C = refined_C[layer_idx][a_idx]
-                if slot_C is not None:
-                    C_i = slot_C.to(torch.float64)
-                    H_i = refined_H[layer_idx][a_idx].to(torch.float64)
-                    H_dim = H_i.shape[0]
-                    trace = torch.trace(H_i).item() / H_dim
-                    if not (trace > 0):
-                        logging.warning(
-                            "refined_rkl layer %d a=%d: trace(H)/H=%.3e <= 0, setting A to zero.",
-                            layer_idx, a_idx, trace,
-                        )
-                        A_i = torch.zeros(H_dim, H_dim, dtype=torch.float32)
-                    else:
-                        damp = refined_rkl_damp * trace
-                        H_damped = H_i + damp * torch.eye(H_dim, dtype=H_i.dtype)
-                        try:
-                            L = torch.linalg.cholesky(H_damped)
-                            A_i = torch.cholesky_solve(C_i, L)
-                        except torch._C._LinAlgError:
-                            logging.warning(
-                                "refined_rkl layer %d a=%d: Cholesky failed even with "
-                                "damp=%.3e; falling back to direct inverse.",
-                                layer_idx, a_idx, damp,
-                            )
-                            A_i = torch.linalg.inv(H_damped) @ C_i
-                    static_refined_A[layer_idx][a_idx] = A_i.to(refined_rkl_store_dtype).contiguous()
-                    refined_fit_counter[0] += 1
-                    refined_fit_shape[0] = tuple(A_i.shape)
-                    # Free the fp32 accumulators for this slot — this is the whole
-                    # point of streaming: peak CPU RAM drops from L × num_A × 2 × H²
-                    # down to L × 2 × H² + the stored (bf16) A stack.
-                    refined_C[layer_idx][a_idx] = None
-                    refined_H[layer_idx][a_idx] = None
+        diagonal-variant slot when `collect_refined_diag_rkl=True`.
 
-            if refined_diag_C is not None:
-                slot_Cd = refined_diag_C[layer_idx][a_idx]
-                if slot_Cd is not None:
-                    Cd = slot_Cd.to(torch.float32)            # (seq, H)
-                    Hd = refined_diag_H[layer_idx][a_idx].to(torch.float32)  # (seq, H)
-                    # Trace-normalised damp: λ = damp · mean(dy²) over all (t, i)
-                    # in this sub-A. Matches the full-version's damp scale so
-                    # the same `refined_rkl_damp` hyper-parameter applies.
-                    mean_dy_sq = Hd.mean().item()
-                    if not (mean_dy_sq > 0):
-                        logging.warning(
-                            "refined_diag_rkl layer %d a=%d: mean(dy²)=%.3e <= 0, "
-                            "setting diag-A to zero.", layer_idx, a_idx, mean_dy_sq,
-                        )
-                        Ad = torch.zeros_like(Cd)
-                    else:
-                        damp_diag = refined_rkl_damp * mean_dy_sq
-                        Ad = Cd / (Hd + damp_diag)
-                    static_refined_diag_A[layer_idx][a_idx] = (
-                        Ad.to(refined_diag_rkl_store_dtype).contiguous()
-                    )
-                    refined_diag_C[layer_idx][a_idx] = None
-                    refined_diag_H[layer_idx][a_idx] = None
+        Performance: C/H accumulators live on CPU fp32, but the Cholesky /
+        element-wise solve runs on `dev` (GPU) in fp32 — CPU fp64 Cholesky
+        was the bottleneck at H≥4096 (minutes per transition on 7B/70B).
+        fp64-on-CPU is retained only as a fallback when fp32-GPU Cholesky
+        fails numerically."""
+        with torch.no_grad():
+            for layer_idx in range(len(layers)):
+                if refined_C is not None:
+                    slot_C = refined_C[layer_idx][a_idx]
+                    if slot_C is not None:
+                        H_dim = slot_C.shape[0]
+                        # Ship fp32 accumulators to GPU. non_blocking has no
+                        # effect on non-pinned CPU tensors but doesn't hurt.
+                        C_gpu = slot_C.to(dev, dtype=torch.float32, non_blocking=True)
+                        H_gpu = refined_H[layer_idx][a_idx].to(dev, dtype=torch.float32, non_blocking=True)
+                        trace = (torch.diagonal(H_gpu).sum() / H_dim).item()
+                        if not (trace > 0):
+                            logging.warning(
+                                "refined_rkl layer %d a=%d: trace(H)/H=%.3e <= 0, setting A to zero.",
+                                layer_idx, a_idx, trace,
+                            )
+                            A_store = torch.zeros(
+                                H_dim, H_dim, dtype=refined_rkl_store_dtype,
+                            )
+                        else:
+                            damp = refined_rkl_damp * trace
+                            # In-place damp on the diagonal — saves a full H×H
+                            # eye allocation + add, which at H=8192 is 256 MB.
+                            H_gpu.diagonal().add_(damp)
+                            try:
+                                L = torch.linalg.cholesky(H_gpu)
+                                A_gpu = torch.cholesky_solve(C_gpu, L)
+                                A_store = A_gpu.to(dtype=refined_rkl_store_dtype).cpu().contiguous()
+                                del L, A_gpu
+                            except torch._C._LinAlgError:
+                                logging.warning(
+                                    "refined_rkl layer %d a=%d: fp32 GPU Cholesky failed with "
+                                    "damp=%.3e; retrying in fp64 on CPU.",
+                                    layer_idx, a_idx, damp,
+                                )
+                                # Rebuild H_damped from the pristine CPU fp32
+                                # accumulator (H_gpu was modified in place).
+                                H64 = refined_H[layer_idx][a_idx].to(torch.float64)
+                                C64 = slot_C.to(torch.float64)
+                                H64.diagonal().add_(damp)
+                                try:
+                                    L64 = torch.linalg.cholesky(H64)
+                                    A_cpu = torch.cholesky_solve(C64, L64)
+                                except torch._C._LinAlgError:
+                                    logging.warning(
+                                        "refined_rkl layer %d a=%d: fp64 Cholesky also failed; "
+                                        "falling back to direct inverse.", layer_idx, a_idx,
+                                    )
+                                    A_cpu = torch.linalg.inv(H64) @ C64
+                                A_store = A_cpu.to(refined_rkl_store_dtype).contiguous()
+                        static_refined_A[layer_idx][a_idx] = A_store
+                        refined_fit_counter[0] += 1
+                        refined_fit_shape[0] = tuple(A_store.shape)
+                        del C_gpu, H_gpu
+                        # Free the fp32 accumulators for this slot — this is the whole
+                        # point of streaming: peak CPU RAM drops from L × num_A × 2 × H²
+                        # down to L × 2 × H² + the stored (bf16) A stack.
+                        refined_C[layer_idx][a_idx] = None
+                        refined_H[layer_idx][a_idx] = None
+
+                if refined_diag_C is not None:
+                    slot_Cd = refined_diag_C[layer_idx][a_idx]
+                    if slot_Cd is not None:
+                        # GPU element-wise solve. Cheap compute but (seq, H)
+                        # tensors are memory-bandwidth heavy on CPU (64 MB each
+                        # at H=8192, seq=2048) — the PCIe copy is still faster
+                        # than doing it on CPU for large H.
+                        Cd = slot_Cd.to(dev, dtype=torch.float32, non_blocking=True)
+                        Hd = refined_diag_H[layer_idx][a_idx].to(dev, dtype=torch.float32, non_blocking=True)
+                        # Trace-normalised damp: λ = damp · mean(dy²) over all (t, i)
+                        # in this sub-A. Matches the full-version's damp scale so
+                        # the same `refined_rkl_damp` hyper-parameter applies.
+                        mean_dy_sq = Hd.mean().item()
+                        if not (mean_dy_sq > 0):
+                            logging.warning(
+                                "refined_diag_rkl layer %d a=%d: mean(dy²)=%.3e <= 0, "
+                                "setting diag-A to zero.", layer_idx, a_idx, mean_dy_sq,
+                            )
+                            Ad_store = torch.zeros(
+                                *Cd.shape, dtype=refined_diag_rkl_store_dtype,
+                            )
+                        else:
+                            damp_diag = refined_rkl_damp * mean_dy_sq
+                            Ad_gpu = Cd / (Hd + damp_diag)
+                            Ad_store = Ad_gpu.to(dtype=refined_diag_rkl_store_dtype).cpu().contiguous()
+                            del Ad_gpu
+                        static_refined_diag_A[layer_idx][a_idx] = Ad_store
+                        del Cd, Hd
+                        refined_diag_C[layer_idx][a_idx] = None
+                        refined_diag_H[layer_idx][a_idx] = None
 
     try:
         with torch.enable_grad():
