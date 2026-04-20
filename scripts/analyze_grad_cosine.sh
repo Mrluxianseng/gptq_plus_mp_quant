@@ -12,6 +12,10 @@ N_SAMPLES=128
 SEQ_LEN=2048
 MEASURE_SAMPLES=128
 MEASURE_BSZ=4
+# Subset of surrogate losses to measure against the true end-to-end KL gradient.
+# Choices: fisher_diag_mse, residual_kl, refined_residual_kl, refined_diag_residual_kl.
+# Skipping refined_residual_kl avoids the H×H A fit (big CPU-RAM win on 70B).
+MEASURE_LOSSES=${MEASURE_LOSSES:-"fisher_diag_mse,residual_kl,refined_residual_kl,refined_diag_residual_kl"}
 
 export CUDA_VISIBLE_DEVICES=${DEVICE}
 
@@ -26,4 +30,5 @@ python -m torch.distributed.run \
     --kl_topk 20 --grad_hessian_topk 20 \
     --num_groups 4 --fisher_num_groups 512 --bsz 64 --global_loss_bsz 8 \
     --target_layers ${TARGET_LAYERS} \
-    --measure_samples ${MEASURE_SAMPLES} --measure_batch_size ${MEASURE_BSZ}
+    --measure_samples ${MEASURE_SAMPLES} --measure_batch_size ${MEASURE_BSZ} \
+    --measure_losses "${MEASURE_LOSSES}"
