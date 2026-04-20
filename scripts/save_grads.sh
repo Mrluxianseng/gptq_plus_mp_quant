@@ -17,5 +17,6 @@ python ./save_grads.py \
     --model ${MODEL_PATH} \
     --exp save_grads \
     --mode gradients \
-    --dataset neuralmagic --nsamples ${N_SAMPLES} --seq_len ${SEQ_LEN} \
+    --dataset wikitext2 --nsamples ${N_SAMPLES} --seq_len ${SEQ_LEN} \
     --num_groups ${NUM_GROUPS} \
+    --rotate \

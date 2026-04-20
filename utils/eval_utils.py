@@ -55,7 +55,7 @@ def _get_logits(args, analyzer: model_utils.ModelAnalyzer, testenc, dev):
             raise ValueError
 
     layers[0] = Catcher(layers[0])
-    for i in range(nsamples):
+    for i in tqdm(range(nsamples), ncols=80, desc="Caching layer-0 inputs", leave=False):
         try:
             model(input_ids[i: i+1])
         except ValueError:
@@ -72,7 +72,7 @@ def _get_logits(args, analyzer: model_utils.ModelAnalyzer, testenc, dev):
 
     for i in tqdm(range(len(layers)), ncols=80, desc="Forwarding Layers"):
         layer = layers[i].to(dev)
-        for j in range(nsamples):
+        for j in tqdm(range(nsamples), ncols=80, desc=f"  layer {i}", leave=False, position=1):
             outs[j] = layer(
                 inps[j].unsqueeze(0),
                 attention_mask=attention_mask,
@@ -92,7 +92,7 @@ def _get_logits(args, analyzer: model_utils.ModelAnalyzer, testenc, dev):
     # Get model logits
     model.model.norm.to(dev)
     lm_logits = []
-    for i in range(nsamples):
+    for i in tqdm(range(nsamples), ncols=80, desc="Applying final norm", leave=False):
         hidden_states = inps[i: i + 1].to(dev)
         hidden_states = model.model.norm(hidden_states)
         lm_logits.append(hidden_states.cpu())
@@ -214,8 +214,7 @@ def qa_eval(model, tokenizer, lm_eval_batch_size=32):
     for task_name in task_names:
         logging.info(f"Evaluating {task_name}...")
         hflm.batch_size_per_gpu = lm_eval_batch_size
-        with log_utils.disable_logging_context():
-            result = lm_eval.simple_evaluate(hflm, tasks=[task_name], task_manager=task_manager)['results']
+        result = lm_eval.simple_evaluate(hflm, tasks=[task_name], task_manager=task_manager)['results']
         result = result[task_name]
         acc = round(result.get('acc_norm,none', result['acc,none']) * 100, 2)
         results[task_name] = acc

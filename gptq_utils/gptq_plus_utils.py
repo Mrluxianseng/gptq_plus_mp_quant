@@ -2278,6 +2278,10 @@ def collect_static_end_to_end_saliency_and_fisher(
     grad_hessian_topk,
     batch_size,
     collect_fisher=True,
+    collect_refined_rkl=False,
+    refined_rkl_damp=0.01,
+    refined_rkl_num_A=1,
+    refined_rkl_store_dtype=torch.bfloat16,
     use_fsdp=False,
     fsdp_cpu_offload=False,
     saliency_clip_percentile=0.99,
@@ -2286,6 +2290,13 @@ def collect_static_end_to_end_saliency_and_fisher(
         "Collecting static end-to-end saliency/fisher caches from a single pre-quantization full-model backward pass. "
         "Using sampled end-to-end NLL / empirical Fisher because literal KL-to-self before quantization would be zero."
     )
+    if collect_refined_rkl:
+        logging.info(
+            "Also fitting refined_residual_kl matrix A per layer via least squares "
+            "on (dy, dx-dy) pairs collected during the same backward pass. "
+            "num_A=%d sub-matrices per layer, store_dtype=%s.",
+            refined_rkl_num_A, str(refined_rkl_store_dtype).replace("torch.", ""),
+        )
     layers = analyzer.get_layers()
     # Wrap model with FSDP2 so the full-model backward fits on many small GPUs.
     # Params + grads are sharded across the current default process group; each
@@ -2344,6 +2355,33 @@ def collect_static_end_to_end_saliency_and_fisher(
         for module_dict in module_dicts
     ]
     fisher_data = [[] for _ in layers]
+    # Refined residual_kl least-squares accumulators, one per (layer, sub-A)
+    # pair. We fit A_{l,a} (H×H) such that f_l(x+Δx) ≈ f_l(x) + A_{l,a}·Δx,
+    # where a is the sub-A index. When num_A>1, samples are split into num_A
+    # contiguous groups of size `samples_per_A = nsamples/num_A`, each group
+    # gets its own A. The LS per (layer, a) comes from the backward relation
+    #   dx_i - dy = A_iᵀ · dy     (column-vec convention, A_i = Jacobian)
+    # which with N = batch*seq flattened samples stacked as rows gives
+    #   delta = dy · A_iᵀ  ⇒  A_i = inv(dy.t()·dy + λI) · (dy.t()·delta)
+    # Let H_{l,a} = Σ dyᵀdy and C_{l,a} = Σ dyᵀ·delta (both H×H), damp λ a
+    # percentage of trace(H)/H, then A_{l,a} = inv(H + damp·I) @ C.
+    # Accumulate on CPU fp32 (even when store_dtype=bf16) to avoid bf16
+    # catastrophic cancellation in the sum.
+    refined_C = (
+        [[None] * refined_rkl_num_A for _ in layers]
+        if collect_refined_rkl else None
+    )
+    refined_H = (
+        [[None] * refined_rkl_num_A for _ in layers]
+        if collect_refined_rkl else None
+    )
+    # Transient per-backward slot holding dy (grad wrt last-block output)
+    # and the active sub-A index for the current batch. The last-layer
+    # grad hook fires first during backward, which fills `dy`; earlier
+    # layers' grad hooks then consume it in the same backward call. The
+    # driver sets `a` before each backward call.
+    refined_dy_buffer = {}
+    refined_current_a_idx = {"a": 0}
     handles = []
 
     def make_module_hook(layer_idx, module_name):
@@ -2413,11 +2451,76 @@ def collect_static_end_to_end_saliency_and_fisher(
 
         return forward_hook
 
+    def make_refined_rkl_last_hook():
+        """Capture dy = grad wrt last-transformer-block output into shared buffer.
+        Runs FIRST in the backward (as this hook is closest to the loss); all
+        earlier-layer refined_rkl hooks read from this slot in the same backward."""
+        def forward_hook(module, inp, out):
+            out_tensor = out[0] if isinstance(out, (tuple, list)) else out
+            out_tensor.retain_grad()
+
+            def grad_hook(grad):
+                # grad shape (bsz, seq, H) → flatten to (N=bsz*seq, H) fp32.
+                refined_dy_buffer["dy"] = grad.detach().float().reshape(-1, grad.shape[-1])
+
+            out_tensor.register_hook(grad_hook)
+
+        return forward_hook
+
+    def make_refined_rkl_layer_hook(layer_idx):
+        """For layer_idx < N-1: capture dx_i, combine with dy from buffer, accumulate
+        C_{l,a} = Σ dyᵀ·(dx_i - dy)  and  H_{l,a} = Σ dyᵀ·dy (both H×H fp32),
+        where a = refined_current_a_idx["a"] (sub-A bucket for the current batch)."""
+        def forward_hook(module, inp, out):
+            out_tensor = out[0] if isinstance(out, (tuple, list)) else out
+            out_tensor.retain_grad()
+
+            def grad_hook(grad):
+                if "dy" not in refined_dy_buffer:
+                    # Last-layer hook hasn't fired yet — shouldn't happen because
+                    # backward flows last→first, but guard anyway to fail loudly.
+                    raise RuntimeError(
+                        f"refined_rkl layer {layer_idx}: dy not captured before "
+                        "this hook. Check hook registration order."
+                    )
+                dy = refined_dy_buffer["dy"]  # (N, H) fp32 on dev
+                dx = grad.detach().float().reshape(-1, grad.shape[-1])
+                delta = dx - dy
+                # dy.t() @ delta → (H, H); dy.t() @ dy → (H, H). Compute on dev
+                # then transfer to CPU fp32 for accumulation (avoid bf16
+                # cancellation in the sum even when A itself is stored bf16).
+                inc_C = (dy.t() @ delta).cpu()
+                inc_H = (dy.t() @ dy).cpu()
+                a = refined_current_a_idx["a"]
+                if refined_C[layer_idx][a] is None:
+                    refined_C[layer_idx][a] = inc_C
+                    refined_H[layer_idx][a] = inc_H
+                else:
+                    refined_C[layer_idx][a] += inc_C
+                    refined_H[layer_idx][a] += inc_H
+
+            out_tensor.register_hook(grad_hook)
+
+        return forward_hook
+
     for layer_idx, (layer, module_dict) in enumerate(zip(layers, module_dicts)):
         if collect_fisher:
             handles.append(layer.register_forward_hook(make_layer_hook(layer_idx)))
         for module_name, module in module_dict.items():
             handles.append(module.register_forward_hook(make_module_hook(layer_idx, module_name)))
+    if collect_refined_rkl:
+        # Register the last-layer "dy capture" hook FIRST in the hook list so
+        # it runs first in the forward pass; that way `register_hook` attaches
+        # the grad-hook before any earlier-layer grad-hook fires during
+        # backward. (Hook firing order in autograd is reverse of output-grad
+        # computation order, which flows last→first, so all layer hooks will
+        # see the last-layer dy already populated.)
+        last_idx = len(layers) - 1
+        handles.append(layers[last_idx].register_forward_hook(make_refined_rkl_last_hook()))
+        for layer_idx in range(last_idx):
+            handles.append(
+                layers[layer_idx].register_forward_hook(make_refined_rkl_layer_hook(layer_idx))
+            )
 
     token_batches = [batch[0] for batch in dataloader]
     nsamples_total = len(token_batches)
@@ -2432,6 +2535,24 @@ def collect_static_end_to_end_saliency_and_fisher(
             f"static saliency: global_loss_bsz ({batch_size}) must be divisible by world_size ({world})."
         )
     local_batch_size = batch_size // world
+    # refined_rkl sub-A alignment: samples are split into `num_A` contiguous
+    # groups of size `samples_per_A = nsamples/num_A`, and each global batch
+    # must fit within one group so the grad hook accumulates into exactly one
+    # (layer, a) bucket. Enforce divisibility here rather than silently
+    # dropping/merging samples across sub-A boundaries.
+    refined_rkl_samples_per_A = 0
+    if collect_refined_rkl:
+        if nsamples_total % refined_rkl_num_A != 0:
+            raise ValueError(
+                f"refined_rkl: nsamples_total ({nsamples_total}) must be divisible by "
+                f"refined_rkl_num_A ({refined_rkl_num_A})."
+            )
+        refined_rkl_samples_per_A = nsamples_total // refined_rkl_num_A
+        if refined_rkl_samples_per_A % batch_size != 0:
+            raise ValueError(
+                f"refined_rkl: samples_per_A ({refined_rkl_samples_per_A}) must be divisible by "
+                f"global_loss_bsz ({batch_size}) so each batch lands in one sub-A bucket."
+            )
     # Contiguous shard of sample ids; each rank only does forward/backward on
     # its own slice and keeps the collected saliency/fisher rank-local. These
     # tensors are later consumed directly by rank-local `add_batch` calls
@@ -2470,6 +2591,11 @@ def collect_static_end_to_end_saliency_and_fisher(
                 leave=False,
             ):
                 global_start = shard.start + local_start
+                if collect_refined_rkl and refined_rkl_samples_per_A > 0:
+                    # Route this batch's contributions to the correct sub-A
+                    # bucket. We required `samples_per_A % batch_size == 0` so
+                    # the whole batch has a single a_idx.
+                    refined_current_a_idx["a"] = global_start // refined_rkl_samples_per_A
                 input_ids = torch.cat(local_batches[local_start:local_start + local_batch_size], dim=0).to(dev)
                 outputs = model(input_ids=input_ids)
                 logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
@@ -2544,7 +2670,69 @@ def collect_static_end_to_end_saliency_and_fisher(
         else:
             static_fisher.append(None)
 
-    return static_saliency, static_fisher
+    # Solve per-layer, per-sub-A refined_rkl least-squares:
+    #   A_{l,a} = inv(H_{l,a} + λ·trace(H)/H · I) @ C_{l,a}
+    # Done after all batches have accumulated; each (layer, a) solved
+    # independently and C/H freed right after so peak CPU RAM is bounded
+    # by one solve at a time + the stored A stack.
+    static_refined_A = None
+    if collect_refined_rkl:
+        static_refined_A = []
+        total_fit = 0
+        total_slots = 0
+        last_shape = None
+        for layer_idx in range(len(layers)):
+            per_layer_A = []
+            for a_idx in range(refined_rkl_num_A):
+                total_slots += 1
+                slot_C = refined_C[layer_idx][a_idx] if refined_C[layer_idx] is not None else None
+                if slot_C is None:
+                    # Last layer (or a sub-A that received no samples) → skip.
+                    per_layer_A.append(None)
+                    continue
+                C_i = slot_C.to(torch.float64)
+                H_i = refined_H[layer_idx][a_idx].to(torch.float64)
+                H_dim = H_i.shape[0]
+                trace = torch.trace(H_i).item() / H_dim
+                if not (trace > 0):
+                    logging.warning(
+                        "refined_rkl layer %d a=%d: trace(H)/H=%.3e <= 0, setting A to zero.",
+                        layer_idx, a_idx, trace,
+                    )
+                    A_i = torch.zeros(H_dim, H_dim, dtype=torch.float32)
+                else:
+                    damp = refined_rkl_damp * trace
+                    H_damped = H_i + damp * torch.eye(H_dim, dtype=H_i.dtype)
+                    try:
+                        # Cholesky-based solve: faster + more stable than direct inv.
+                        L = torch.linalg.cholesky(H_damped)
+                        A_i = torch.cholesky_solve(C_i, L)
+                    except torch._C._LinAlgError:
+                        logging.warning(
+                            "refined_rkl layer %d a=%d: Cholesky failed even with "
+                            "damp=%.3e; falling back to direct inverse.",
+                            layer_idx, a_idx, damp,
+                        )
+                        A_i = torch.linalg.inv(H_damped) @ C_i
+                # Store bf16 on CPU (or whatever `refined_rkl_store_dtype`). The
+                # fit itself was fp32/fp64 so precision loss here is bounded by
+                # the cast; downstream usage casts `A.to(delta.dtype)` anyway.
+                per_layer_A.append(A_i.to(refined_rkl_store_dtype).contiguous())
+                last_shape = tuple(A_i.shape)
+                total_fit += 1
+                # Free intermediate statistics for this slot now that A is solved.
+                refined_C[layer_idx][a_idx] = None
+                refined_H[layer_idx][a_idx] = None
+            static_refined_A.append(per_layer_A)
+        logging.info(
+            "refined_rkl: fit %d/%d (layer, sub-A) matrices "
+            "(A shape %s, num_A=%d, store_dtype=%s, damp=%.3g)",
+            total_fit, total_slots, last_shape, refined_rkl_num_A,
+            str(refined_rkl_store_dtype).replace("torch.", ""),
+            refined_rkl_damp,
+        )
+
+    return static_saliency, static_fisher, static_refined_A
 
 
 def compute_refresh_loss(
@@ -2555,6 +2743,7 @@ def compute_refresh_loss(
     kl_topk,
     layer_output_fisher=None,
     fp_final_hidden=None,
+    refined_A=None,
 ):
     if refresh_loss_type == "kl":
         logits = hidden2logits(out_hidden, analyzer)
@@ -2589,6 +2778,36 @@ def compute_refresh_loss(
             )
         final_with_delta = fp_final_hidden + delta
         logits_perturbed = hidden2logits(final_with_delta, analyzer)
+        logits_fp = hidden2logits(fp_final_hidden, analyzer)
+        if kl_topk > 0:
+            logits_fp, indices = logits_fp.topk(kl_topk, dim=-1, sorted=False)
+            logits_perturbed = logits_perturbed.gather(-1, indices)
+        kl_loss = F.kl_div(
+            F.log_softmax(logits_perturbed, dim=-1),
+            F.softmax(logits_fp, dim=-1),
+            reduction="none",
+        )
+        return kl_loss.sum(dim=-1).mean()
+
+    if refresh_loss_type == "refined_residual_kl":
+        # One-step Jacobi refinement of residual_kl. Instead of assuming
+        # f(x+Δx) ≈ f(x), approximate f(x+Δx) ≈ f(x) + A · Δx with a shared
+        # per-layer linear operator A (H×H), pre-fit via least squares on
+        # (dy, dx-dy) pairs during `collect_static_end_to_end_saliency_and_fisher`.
+        # The perturbed final hidden becomes fp_final + Δx + A·Δx = fp_final + (I+A)·Δx.
+        # In pytorch batched layout (delta: (B, T, H)), A·Δx on column-vec convention
+        # translates to `delta @ A.t()`.
+        if fp_final_hidden is None:
+            raise ValueError(
+                "`fp_final_hidden` must be provided for refresh_loss_type='refined_residual_kl'."
+            )
+        if refined_A is None:
+            raise ValueError(
+                "`refined_A` must be provided for refresh_loss_type='refined_residual_kl'."
+            )
+        refined_delta = torch.matmul(delta, refined_A.to(delta.dtype).t())
+        final_with_refined = fp_final_hidden + delta + refined_delta
+        logits_perturbed = hidden2logits(final_with_refined, analyzer)
         logits_fp = hidden2logits(fp_final_hidden, analyzer)
         if kl_topk > 0:
             logits_fp, indices = logits_fp.topk(kl_topk, dim=-1, sorted=False)
@@ -2781,6 +3000,8 @@ def collect_true_weight_gradient(
     fp_inps_next=None,
     next_layer_output_fisher=None,
     fp_inps_final=None,
+    refined_A=None,
+    next_refined_A=None,
     global_shuffle=False,
     dp_rank=0,
     shard_size=None,
@@ -2851,9 +3072,11 @@ def collect_true_weight_gradient(
     loss_sum_next = 0.0
 
     # Slide-window mixes in a "next-layer" version of the same loss.
-    #   fisher_diag_mse path: needs the next-layer fisher tensor.
-    #   residual_kl    path: reuses fp_inps_final (same final-head target for
-    #                         both current- and next-layer deltas).
+    #   fisher_diag_mse      path: needs the next-layer fisher tensor.
+    #   residual_kl          path: reuses fp_inps_final (same final-head target for
+    #                              both current- and next-layer deltas).
+    #   refined_residual_kl  path: reuses fp_inps_final AND needs the next-layer A
+    #                              matrix (A_{i+1}) in place of A_i.
     slide_active = (
         slide_alpha < 1.0
         and next_layer is not None
@@ -2861,13 +3084,18 @@ def collect_true_weight_gradient(
         and (
             (refresh_loss_type == "fisher_diag_mse" and next_layer_output_fisher is not None)
             or (refresh_loss_type == "residual_kl" and fp_inps_final is not None)
+            or (
+                refresh_loss_type == "refined_residual_kl"
+                and fp_inps_final is not None
+                and next_refined_A is not None
+            )
         )
     )
 
     if len(selected_indices) > 0:
         grad_modules = [layer]
-        if refresh_loss_type in ("kl", "residual_kl"):
-            # `residual_kl` also sends grad through the final norm + lm_head,
+        if refresh_loss_type in ("kl", "residual_kl", "refined_residual_kl"):
+            # These losses also send grad through the final norm + lm_head,
             # so we must include them in `temporary_requires_grad` so their
             # param.requires_grad is forced to False for the duration of the
             # refresh (only `override_weight` should accumulate grad).
@@ -2917,6 +3145,7 @@ def collect_true_weight_gradient(
                         kl_topk,
                         layer_output_fisher=fisher_batch,
                         fp_final_hidden=fp_final_batch,
+                        refined_A=refined_A,
                     )
                     if slide_active:
                         next_out = next_layer(
@@ -2942,6 +3171,7 @@ def collect_true_weight_gradient(
                             kl_topk,
                             layer_output_fisher=fisher_batch_next,
                             fp_final_hidden=fp_final_batch,
+                            refined_A=next_refined_A,
                         )
                         refresh_loss = (
                             slide_alpha * refresh_loss_current
@@ -3000,6 +3230,7 @@ def collect_layer_grad_hessian_stats(
     precomputed_saliency_dict=None,
     precomputed_layer_output_fisher=None,
     fp_inps_final=None,
+    refined_A=None,
     layer_recorder=None,
     skip_gradient_backward=False,
 ):
@@ -3182,6 +3413,7 @@ def collect_layer_grad_hessian_stats(
                                 kl_topk,
                                 layer_output_fisher=batch_layer_output_fisher,
                                 fp_final_hidden=fp_final_batch,
+                                refined_A=refined_A,
                             )
 
                     with layer_recorder.section("layer.grad_hessian.gradient_backward.total") if layer_recorder else _NULL_CONTEXT:
@@ -3266,6 +3498,7 @@ def run_pre_quant_gd(
     refresh_loss_type,
     layer_output_fisher_by_module,
     fp_inps_final=None,
+    refined_A=None,
     global_shuffle=False,
     dp_rank=0,
     shard_size=None,
@@ -3315,6 +3548,7 @@ def run_pre_quant_gd(
                     refresh_loss_type=refresh_loss_type,
                     layer_output_fisher=fisher_tensor,
                     fp_inps_final=fp_inps_final,
+                    refined_A=refined_A,
                     global_shuffle=global_shuffle,
                     dp_rank=dp_rank,
                     shard_size=shard_size if shard_size is not None else inps.shape[0],
@@ -3479,12 +3713,13 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                 rotate_flag = int(bool(getattr(args, "rotate", False)))
                 sal_clip_pct = getattr(args, "saliency_clip_percentile", 0.99)
                 sal_clip_tag = f"{sal_clip_pct:.4f}".rstrip("0").rstrip(".")
+                rkl_na = int(getattr(args, "refined_rkl_num_A", 1))
                 static_cache_key = (
                     f"{args.model_name}_{dataset_id}_s{args.nsamples}_"
                     f"blk{args.seq_len}_rot{rotate_flag}_g{args.num_groups}_"
                     f"fng{args.fisher_num_groups}_ghtk{args.grad_hessian_topk}_"
                     f"glbsz{args.global_loss_bsz}_seed{args.seed}_"
-                    f"salclip{sal_clip_tag}"
+                    f"salclip{sal_clip_tag}_rklNA{rkl_na}"
                 )
                 static_cache_key += f"_world{dist_utils.get_world_size()}_rank{dist_utils.get_rank()}"
                 os.makedirs(static_cache_dir, exist_ok=True)
@@ -3498,25 +3733,44 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                 _loaded = torch.load(static_cache_file, map_location="cpu", weights_only=True)
                 static_saliency_by_layer = _loaded["saliency"]
                 static_fisher_by_layer = _loaded["fisher"]
-            else:
-                with pipeline_recorder.section("pipeline.static_end_to_end_saliency_fisher") if pipeline_recorder else _NULL_CONTEXT:
-                    static_saliency_by_layer, static_fisher_by_layer = collect_static_end_to_end_saliency_and_fisher(
-                        model=model,
-                        analyzer=analyzer,
-                        dataloader=dataloader,
-                        dev=dev,
-                        saliency_num_groups=args.num_groups,
-                        fisher_num_groups=args.fisher_num_groups,
-                        grad_hessian_topk=args.grad_hessian_topk,
-                        batch_size=args.global_loss_bsz,
-                        use_fsdp=bool(getattr(args, "fsdp_precompute", False)),
-                        fsdp_cpu_offload=bool(getattr(args, "fsdp_cpu_offload", False)),
-                        saliency_clip_percentile=getattr(args, "saliency_clip_percentile", 0.99),
+                # `refined_A` was added later; tolerate older caches that don't
+                # have it. If refined_residual_kl is requested but the cache is
+                # stale, the reloaded list will be empty/missing and we'd fail
+                # below — force the user to rebuild the cache.
+                static_refined_A_by_layer = _loaded.get("refined_A", None)
+                if args.grad_refresh_loss == "refined_residual_kl" and not static_refined_A_by_layer:
+                    raise RuntimeError(
+                        "Cached static saliency/fisher at %s was built before refined_A "
+                        "was added. Delete the cache and rerun to regenerate." % static_cache_file
                     )
+            else:
+                want_refined = args.grad_refresh_loss == "refined_residual_kl"
+                with pipeline_recorder.section("pipeline.static_end_to_end_saliency_fisher") if pipeline_recorder else _NULL_CONTEXT:
+                    static_saliency_by_layer, static_fisher_by_layer, static_refined_A_by_layer = \
+                        collect_static_end_to_end_saliency_and_fisher(
+                            model=model,
+                            analyzer=analyzer,
+                            dataloader=dataloader,
+                            dev=dev,
+                            saliency_num_groups=args.num_groups,
+                            fisher_num_groups=args.fisher_num_groups,
+                            grad_hessian_topk=args.grad_hessian_topk,
+                            batch_size=args.global_loss_bsz,
+                            use_fsdp=bool(getattr(args, "fsdp_precompute", False)),
+                            fsdp_cpu_offload=bool(getattr(args, "fsdp_cpu_offload", False)),
+                            saliency_clip_percentile=getattr(args, "saliency_clip_percentile", 0.99),
+                            collect_refined_rkl=want_refined,
+                            refined_rkl_damp=getattr(args, "refined_rkl_damp", 0.01),
+                            refined_rkl_num_A=int(getattr(args, "refined_rkl_num_A", 1)),
+                        )
                 if static_cache_file is not None:
                     logging.info("Saving static saliency/fisher cache to %s", static_cache_file)
                     torch.save(
-                        {"saliency": static_saliency_by_layer, "fisher": static_fisher_by_layer},
+                        {
+                            "saliency": static_saliency_by_layer,
+                            "fisher": static_fisher_by_layer,
+                            "refined_A": static_refined_A_by_layer,
+                        },
                         static_cache_file,
                     )
             logging.info(
@@ -3648,18 +3902,19 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                 )
         final_layer_idx = len(layers) - 1
 
-        # residual_kl refresh loss needs the FP output of the last transformer
-        # block per sample (input to final norm + lm_head). We compute it once
-        # here with a full FP forward over all layers and store a buffer
-        # `fp_inps_final` with the same (n_local, seq, hidden) shape as fp_inps.
-        # Any other refresh loss keeps `fp_inps_final = None` and pays nothing.
+        # residual_kl / refined_residual_kl refresh losses need the FP output
+        # of the last transformer block per sample (input to final norm +
+        # lm_head). We compute it once here with a full FP forward over all
+        # layers and store a buffer `fp_inps_final` with the same
+        # (n_local, seq, hidden) shape as fp_inps. Any other refresh loss
+        # keeps `fp_inps_final = None` and pays nothing.
         fp_inps_final = None
-        if args.grad_refresh_loss == "residual_kl":
+        if args.grad_refresh_loss in ("residual_kl", "refined_residual_kl"):
             with pipeline_recorder.section("pipeline.fp_final_precompute") if pipeline_recorder else _NULL_CONTEXT:
                 logging.info(
-                    "Precomputing FP final-layer hidden states for residual_kl "
+                    "Precomputing FP final-layer hidden states for %s "
                     "(nsamples_local=%d, layers=%d).",
-                    inps.shape[0], len(layers),
+                    args.grad_refresh_loss, inps.shape[0], len(layers),
                 )
                 # Work on a scratch copy so we don't disturb the main `fp_inps`
                 # buffer (which is still at the layer-0 input stage).
@@ -3737,6 +3992,33 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     args.grad_refresh_loss,
                     layer_refresh_loss_type,
                 )
+            # Pull layer-i's refined_residual_kl A matrix onto dev for the
+            # duration of this layer's quantization. The last layer's A is
+            # always None (no downstream f). For any other refresh loss type
+            # this stays None and costs nothing.
+            # NOTE: `static_refined_A_by_layer[i]` is a list-of-A (len = num_A).
+            # Main pipeline currently does not dispatch per-batch sub-A, so we
+            # require num_A=1 here. analyze_grad_cosine is the only consumer
+            # that already handles num_A>1. Extending the main pipeline is a
+            # follow-up that requires threading a per-batch a_idx through
+            # `collect_true_weight_gradient` / `run_pre_quant_gd` / refresh_fn.
+            layer_refined_A = None
+            if (
+                layer_refresh_loss_type == "refined_residual_kl"
+                and static_refined_A_by_layer is not None
+                and static_refined_A_by_layer[i] is not None
+                and len(static_refined_A_by_layer[i]) > 0
+            ):
+                if len(static_refined_A_by_layer[i]) > 1:
+                    raise RuntimeError(
+                        "Main quant pipeline does not yet support "
+                        "--refined_rkl_num_A > 1 for refined_residual_kl. Either set "
+                        "--refined_rkl_num_A=1 or restrict the multi-A workflow to "
+                        "analyze_grad_cosine.py."
+                    )
+                slot = static_refined_A_by_layer[i][0]
+                if slot is not None:
+                    layer_refined_A = slot.to(dev)
             # Interpret all *_bsz knobs as GLOBAL batch sizes and split per
             # rank. With N=1 these reduce to their original values, so N=1
             # behavior w.r.t. bsz is unchanged.
@@ -3773,6 +4055,8 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
             #     global_loss must be on).
             #   * residual_kl    — reuses the already-precomputed fp_inps_final
             #     (no next-layer fisher needed).
+            #   * refined_residual_kl — reuses fp_inps_final and additionally
+            #     needs the next-layer A matrix from static_refined_A_by_layer.
             # Skipped at and past the second-to-last layer per the spec.
             slide_active_layer = False
             if (
@@ -3791,20 +4075,35 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     and fp_inps_final is not None
                 ):
                     slide_active_layer = True
+                elif (
+                    layer_refresh_loss_type == "refined_residual_kl"
+                    and fp_inps_final is not None
+                    and static_refined_A_by_layer is not None
+                    and static_refined_A_by_layer[i + 1] is not None
+                    and len(static_refined_A_by_layer[i + 1]) > 0
+                    and static_refined_A_by_layer[i + 1][0] is not None
+                ):
+                    slide_active_layer = True
             slide_next_layer = None
             slide_fp_inps_next = None
             slide_next_layer_output_fisher = None
+            slide_next_refined_A = None
             slide_next_bits_config = None
             if slide_active_layer:
                 with layer_recorder.section("layer.slide_window.next_fp_reference") if layer_recorder else _NULL_CONTEXT:
                     slide_next_layer = layers[i + 1].to(dev)
                     slide_next_bits_config = quant_utils.disable_act_quant(slide_next_layer)
-                    # Only fisher_diag_mse needs the next-layer fisher. For
-                    # residual_kl we leave this None and the loss computation
-                    # in collect_true_weight_gradient routes through
-                    # fp_inps_final instead.
+                    # Only fisher_diag_mse needs the next-layer fisher; refined
+                    # _residual_kl needs the next-layer A. residual_kl needs
+                    # neither — loss routes through fp_inps_final only.
                     if layer_refresh_loss_type == "fisher_diag_mse":
                         slide_next_layer_output_fisher = static_fisher_by_layer[i + 1]
+                    elif layer_refresh_loss_type == "refined_residual_kl":
+                        # Main pipeline is gated to num_A=1 above, so the next
+                        # layer's sub-A list also has length 1. Pick slot 0.
+                        _next_list = static_refined_A_by_layer[i + 1]
+                        if _next_list is not None and len(_next_list) > 0 and _next_list[0] is not None:
+                            slide_next_refined_A = _next_list[0].to(dev)
                     slide_fp_inps_next = torch.empty_like(fp_inps)
                     for j in range(fp_inps.shape[0]):
                         slide_fp_inps_next[j] = slide_next_layer(
@@ -3911,6 +4210,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             refresh_loss_type=layer_refresh_loss_type,
                             layer_output_fisher_by_module=layer_output_fisher_by_module,
                             fp_inps_final=fp_inps_final,
+                            refined_A=layer_refined_A,
                             global_shuffle=dp_global_shuffle,
                             dp_rank=dp_rank,
                             shard_size=n_local,
@@ -3943,6 +4243,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     else None
                 ),
                 fp_inps_final=fp_inps_final,
+                refined_A=layer_refined_A,
                 layer_recorder=layer_recorder,
                 skip_gradient_backward=skip_ref_backward,
             )
@@ -4032,6 +4333,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                 slide_next_layer=None,
                 slide_fp_inps_next=None,
                 slide_next_layer_output_fisher=None,
+                slide_next_refined_A=None,
             ):
                 def refresh_fn(weight_snapshot, slide_alpha=1.0):
                     if args.final_layer_full_backward and i == final_layer_idx:
@@ -4061,6 +4363,8 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             fp_inps_next=slide_fp_inps_next,
                             next_layer_output_fisher=slide_next_layer_output_fisher,
                             fp_inps_final=fp_inps_final,
+                            refined_A=layer_refined_A,
+                            next_refined_A=slide_next_refined_A,
                             global_shuffle=dp_global_shuffle,
                             dp_rank=dp_rank,
                             shard_size=n_local,
@@ -4235,6 +4539,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             slide_next_layer=slide_next_layer,
                             slide_fp_inps_next=slide_fp_inps_next,
                             slide_next_layer_output_fisher=slide_next_layer_output_fisher,
+                            slide_next_refined_A=slide_next_refined_A,
                         ) if args.g_update_mode in {"block_backward", "block_gd"} else None,
                         grad_lr=effective_grad_lr,
                         grad_optimizer=effective_grad_optimizer,

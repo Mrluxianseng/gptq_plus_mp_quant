@@ -116,12 +116,15 @@ def parse_gen():
         "--grad_refresh_loss",
         type=str,
         default="kl",
-        choices=["kl", "hidden_mse", "fisher_diag_mse", "residual_kl"],
+        choices=["kl", "hidden_mse", "fisher_diag_mse", "residual_kl", "refined_residual_kl"],
         help=(
             "Loss used to compute the true refresh gradient in block_backward/block_gd. "
             "'residual_kl' assumes the current-layer output delta flows through the "
             "remaining residual stream unchanged and only measures its effect after the "
-            "final norm + lm_head (cheap approximation of end-to-end KL)."
+            "final norm + lm_head (cheap approximation of end-to-end KL). "
+            "'refined_residual_kl' replaces that zero-order approximation with a first-order "
+            "Jacobian f(x+Δx) ≈ f(x) + A·Δx; the shared H×H matrix A per layer is fit via "
+            "least squares on (dy, dx-dy) pairs during the static end-to-end backward."
         ),
     )
     parser.add_argument(
@@ -439,6 +442,51 @@ def parse_gen():
         default=3.0,
         help="Flag a block as `is_spike` in meta.json when loss[i]/loss[i-1] exceeds this.",
     )
+    # analyze_grad_cosine.py only
+    parser.add_argument(
+        "--target_layers",
+        type=str,
+        default="1,5,10,15",
+        help=(
+            "Comma-separated transformer block indices at which to measure gradient cosine "
+            "(true KL vs fisher_diag_mse vs residual_kl). Use 'all' for every layer. Index 0 "
+            "is dropped with a warning because inps==fp_inps there makes the surrogate grads zero."
+        ),
+    )
+    parser.add_argument(
+        "--measure_samples",
+        type=int,
+        default=64,
+        help="Number of calibration samples used to compute gradient cosine at each target layer.",
+    )
+    parser.add_argument(
+        "--measure_batch_size",
+        type=int,
+        default=4,
+        help="Batch size for each backward pass in the cosine measurement loop.",
+    )
+    parser.add_argument(
+        "--refined_rkl_damp",
+        type=float,
+        default=0.01,
+        help=(
+            "Damping coefficient for the refined_residual_kl least-squares fit of A. "
+            "H = Σ dyᵀdy gets a diagonal bump of damp · trace(H)/H · I before inversion. "
+            "Default 0.01 matches GPTQ-style percent damping."
+        ),
+    )
+    parser.add_argument(
+        "--refined_rkl_num_A",
+        type=int,
+        default=1,
+        help=(
+            "Number of A matrices per layer for refined_residual_kl. Samples are split "
+            "into num_A contiguous groups of size nsamples/num_A, each group fits its "
+            "own A via LS. At inference time, batch picks A based on its sample id. "
+            "Requires nsamples % num_A == 0 and (nsamples/num_A) divisible by batch sizes "
+            "used during fit and measurement. Default 1 = original single-A behaviour."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -514,10 +562,10 @@ def parse_gen():
     if getattr(args, "loss_slide_window", False):
         if args.g_update_mode != "block_gd":
             raise ValueError("--loss_slide_window requires --g_update_mode=block_gd.")
-        if args.grad_refresh_loss not in ("fisher_diag_mse", "residual_kl"):
+        if args.grad_refresh_loss not in ("fisher_diag_mse", "residual_kl", "refined_residual_kl"):
             raise ValueError(
                 "--loss_slide_window requires --grad_refresh_loss in "
-                "{fisher_diag_mse, residual_kl}."
+                "{fisher_diag_mse, residual_kl, refined_residual_kl}."
             )
         if args.grad_refresh_loss == "fisher_diag_mse" and not args.global_loss:
             raise ValueError(
@@ -527,6 +575,28 @@ def parse_gen():
     # residual_kl + slide_window is supported: the next-layer loss computes
     # δ_next = next_layer(out_hidden) - fp_inps_next, then runs the same
     # residual-stream shortcut using fp_inps_final. No incompatibility.
+    # refined_residual_kl + slide_window is also supported: the next-layer
+    # loss uses A_{i+1} in place of A_i. --global_loss is required for both
+    # fp_inps_final and A to be cached, which is enforced below.
+    if args.grad_refresh_loss == "refined_residual_kl":
+        # refined_residual_kl needs the per-layer A matrix, which is fit inside
+        # `collect_static_end_to_end_saliency_and_fisher`. That precompute only
+        # runs when global_loss is enabled, so refuse early rather than silently
+        # fall back to residual_kl-style behavior with no A.
+        if not args.global_loss:
+            raise ValueError(
+                "--grad_refresh_loss=refined_residual_kl requires --global_loss "
+                "(the per-layer A matrix is fit during the global-loss precompute)."
+            )
+    if getattr(args, "refined_rkl_num_A", 1) < 1:
+        raise ValueError(
+            f"`refined_rkl_num_A` must be >= 1. Got {args.refined_rkl_num_A}."
+        )
+    if args.refined_rkl_num_A > 1 and args.nsamples % args.refined_rkl_num_A != 0:
+        raise ValueError(
+            f"refined_rkl_num_A ({args.refined_rkl_num_A}) must divide nsamples "
+            f"({args.nsamples}) evenly."
+        )
     if args.nsamples % args.backward_samples != 0:
         raise ValueError(
             f"`nsamples` ({args.nsamples}) must be divisible by `backward_samples` ({args.backward_samples})."

@@ -16,6 +16,7 @@ python -m torch.distributed.run \
     --nnodes=1 --nproc_per_node=1 --rdzv_endpoint=localhost:2940${DEVICE} ./ptq.py \
     --model ${MODEL_PATH} \
     --exp gptq \
-    --dataset neuralmagic --nsamples ${N_SAMPLES} --seq_len ${SEQ_LEN} \
+    --dataset wikitext2 --nsamples ${N_SAMPLES} --seq_len ${SEQ_LEN} \
     --w_method gptq --w_bits 4 --w_clip --act_order \
     --lm_eval --lm_eval_batch_size 32 \
+    --rotate \

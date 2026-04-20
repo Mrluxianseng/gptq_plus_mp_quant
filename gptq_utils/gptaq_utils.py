@@ -35,7 +35,7 @@ class GPTAQ:
         self.nsamples += tmp
         inp = math.sqrt(2 / self.nsamples) * inp.float()
         self.H += inp.matmul(inp.t())
-        dX = self.fp_inp[0].float() * math.sqrt(2 / self.nsamples) - inp
+        dX = self.fp_inp[0].to(self.dev).float() * math.sqrt(2 / self.nsamples) - inp
         self.dXXT += dX.matmul(inp.t())
 
         del self.fp_inp[0]
@@ -186,7 +186,7 @@ class FPInputsCache:
         inp = inp[0].detach()
         if len(inp.shape) == 3:
             inp = inp.reshape((-1, inp.shape[-1]))
-        self.fp_cache[name] += [inp.t()]
+        self.fp_cache[name] += [inp.t().cpu()]
 
     def add_hook(self, full):
         for name in self.names:
