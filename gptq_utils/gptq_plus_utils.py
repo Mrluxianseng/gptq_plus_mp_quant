@@ -4061,6 +4061,11 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     )
             else:
                 want_refined = args.grad_refresh_loss == "refined_residual_kl"
+                # fisher is only consumed when the refresh loss is fisher_diag_mse
+                # (per-layer reads in the refresh and slide-window paths are
+                # guarded by this same check). Skipping collection halves CPU
+                # RAM for the refined_residual_kl / residual_kl configurations.
+                want_fisher = args.grad_refresh_loss == "fisher_diag_mse"
                 with pipeline_recorder.section("pipeline.static_end_to_end_saliency_fisher") if pipeline_recorder else _NULL_CONTEXT:
                     # 4th return (`refined_diag_A`) is collected only by
                     # analyze_grad_cosine today; main quant pipeline ignores it.
@@ -4077,6 +4082,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             use_fsdp=bool(getattr(args, "fsdp_precompute", False)),
                             fsdp_cpu_offload=bool(getattr(args, "fsdp_cpu_offload", False)),
                             saliency_clip_percentile=getattr(args, "saliency_clip_percentile", 0.99),
+                            collect_fisher=want_fisher,
                             collect_refined_rkl=want_refined,
                             refined_rkl_damp=getattr(args, "refined_rkl_damp", 0.01),
                             refined_rkl_num_A=int(getattr(args, "refined_rkl_num_A", 1)),
