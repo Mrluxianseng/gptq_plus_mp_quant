@@ -2367,6 +2367,12 @@ def collect_static_end_to_end_saliency_and_fisher(
     # percentage of trace(H)/H, then A_{l,a} = inv(H + damp·I) @ C.
     # Accumulate on CPU fp32 (even when store_dtype=bf16) to avoid bf16
     # catastrophic cancellation in the sum.
+    #
+    # Peak CPU memory is bounded by ONE sub-A's worth of accumulators across
+    # all layers (L × 2 × H²) rather than L × num_A × 2 × H² — we stream the
+    # solve: once a sub-A's batches have all been consumed (detected by the
+    # next batch's a_idx changing), solve A_{l,a} for every layer and free
+    # the corresponding C/H slots immediately.
     refined_C = (
         [[None] * refined_rkl_num_A for _ in layers]
         if collect_refined_rkl else None
@@ -2375,6 +2381,13 @@ def collect_static_end_to_end_saliency_and_fisher(
         [[None] * refined_rkl_num_A for _ in layers]
         if collect_refined_rkl else None
     )
+    static_refined_A = (
+        [[None] * refined_rkl_num_A for _ in layers]
+        if collect_refined_rkl else None
+    )
+    # Counter (list so inner closure can mutate) + remembered shape for the log.
+    refined_fit_counter = [0]
+    refined_fit_shape = [None]
     # Transient per-backward slot holding dy (grad wrt last-block output)
     # and the active sub-A index for the current batch. The last-layer
     # grad hook fires first during backward, which fills `dy`; earlier
@@ -2581,8 +2594,55 @@ def collect_static_end_to_end_saliency_and_fisher(
         if isinstance(inputs, tuple) and len(inputs) > 0 and torch.is_tensor(inputs[0]):
             inputs[0].requires_grad_(True)
     _kick_off_handle = analyzer.get_layers()[0].register_forward_pre_hook(_kick_off_grad_hook)
+
+    def _flush_refined_rkl_sub_a(a_idx):
+        """Solve A_{l, a_idx} for all layers and free the (l, a) C/H slots.
+        Called when a batch transition signals that the sub-A has finished
+        accumulating (or at the end of the backward pass). Writes into the
+        pre-allocated `static_refined_A[l][a_idx]` slot."""
+        for layer_idx in range(len(layers)):
+            if refined_C[layer_idx] is None:
+                continue
+            slot_C = refined_C[layer_idx][a_idx]
+            if slot_C is None:
+                # Last layer (no hook registered) or empty sub-A (shouldn't
+                # happen given samples_per_A alignment). Leave slot None.
+                continue
+            C_i = slot_C.to(torch.float64)
+            H_i = refined_H[layer_idx][a_idx].to(torch.float64)
+            H_dim = H_i.shape[0]
+            trace = torch.trace(H_i).item() / H_dim
+            if not (trace > 0):
+                logging.warning(
+                    "refined_rkl layer %d a=%d: trace(H)/H=%.3e <= 0, setting A to zero.",
+                    layer_idx, a_idx, trace,
+                )
+                A_i = torch.zeros(H_dim, H_dim, dtype=torch.float32)
+            else:
+                damp = refined_rkl_damp * trace
+                H_damped = H_i + damp * torch.eye(H_dim, dtype=H_i.dtype)
+                try:
+                    L = torch.linalg.cholesky(H_damped)
+                    A_i = torch.cholesky_solve(C_i, L)
+                except torch._C._LinAlgError:
+                    logging.warning(
+                        "refined_rkl layer %d a=%d: Cholesky failed even with "
+                        "damp=%.3e; falling back to direct inverse.",
+                        layer_idx, a_idx, damp,
+                    )
+                    A_i = torch.linalg.inv(H_damped) @ C_i
+            static_refined_A[layer_idx][a_idx] = A_i.to(refined_rkl_store_dtype).contiguous()
+            refined_fit_counter[0] += 1
+            refined_fit_shape[0] = tuple(A_i.shape)
+            # Free the fp32 accumulators for this slot — this is the whole
+            # point of streaming: peak CPU RAM drops from L × num_A × 2 × H²
+            # down to L × 2 × H² + the stored (bf16) A stack.
+            refined_C[layer_idx][a_idx] = None
+            refined_H[layer_idx][a_idx] = None
+
     try:
         with torch.enable_grad():
+            refined_prev_a = None
             for local_start in tqdm(
                 range(0, len(local_batches), local_batch_size),
                 ncols=120,
@@ -2595,7 +2655,14 @@ def collect_static_end_to_end_saliency_and_fisher(
                     # Route this batch's contributions to the correct sub-A
                     # bucket. We required `samples_per_A % batch_size == 0` so
                     # the whole batch has a single a_idx.
-                    refined_current_a_idx["a"] = global_start // refined_rkl_samples_per_A
+                    cur_a = global_start // refined_rkl_samples_per_A
+                    if refined_prev_a is not None and cur_a != refined_prev_a:
+                        # All batches belonging to `refined_prev_a` have been
+                        # consumed — solve and free before continuing so peak
+                        # CPU RAM is bounded by one sub-A's accumulators.
+                        _flush_refined_rkl_sub_a(refined_prev_a)
+                    refined_current_a_idx["a"] = cur_a
+                    refined_prev_a = cur_a
                 input_ids = torch.cat(local_batches[local_start:local_start + local_batch_size], dim=0).to(dev)
                 outputs = model(input_ids=input_ids)
                 logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
@@ -2626,6 +2693,11 @@ def collect_static_end_to_end_saliency_and_fisher(
                 )
                 loss.backward()
                 del outputs, logits, teacher_logits, student_logits, labels, loss, input_ids
+            # Flush the last sub-A's accumulators. The streaming flush inside
+            # the loop only fires on transitions, so the final one needs to be
+            # drained explicitly.
+            if collect_refined_rkl and refined_prev_a is not None:
+                _flush_refined_rkl_sub_a(refined_prev_a)
     finally:
         for handle in handles:
             handle.remove()
@@ -2670,69 +2742,68 @@ def collect_static_end_to_end_saliency_and_fisher(
         else:
             static_fisher.append(None)
 
-    # Solve per-layer, per-sub-A refined_rkl least-squares:
-    #   A_{l,a} = inv(H_{l,a} + λ·trace(H)/H · I) @ C_{l,a}
-    # Done after all batches have accumulated; each (layer, a) solved
-    # independently and C/H freed right after so peak CPU RAM is bounded
-    # by one solve at a time + the stored A stack.
-    static_refined_A = None
+    # refined_residual_kl A matrices have already been streamed into
+    # `static_refined_A[l][a]` by `_flush_refined_rkl_sub_a` as each sub-A's
+    # batches finished accumulating. Here we just emit the summary log.
     if collect_refined_rkl:
-        static_refined_A = []
-        total_fit = 0
-        total_slots = 0
-        last_shape = None
-        for layer_idx in range(len(layers)):
-            per_layer_A = []
-            for a_idx in range(refined_rkl_num_A):
-                total_slots += 1
-                slot_C = refined_C[layer_idx][a_idx] if refined_C[layer_idx] is not None else None
-                if slot_C is None:
-                    # Last layer (or a sub-A that received no samples) → skip.
-                    per_layer_A.append(None)
-                    continue
-                C_i = slot_C.to(torch.float64)
-                H_i = refined_H[layer_idx][a_idx].to(torch.float64)
-                H_dim = H_i.shape[0]
-                trace = torch.trace(H_i).item() / H_dim
-                if not (trace > 0):
-                    logging.warning(
-                        "refined_rkl layer %d a=%d: trace(H)/H=%.3e <= 0, setting A to zero.",
-                        layer_idx, a_idx, trace,
-                    )
-                    A_i = torch.zeros(H_dim, H_dim, dtype=torch.float32)
-                else:
-                    damp = refined_rkl_damp * trace
-                    H_damped = H_i + damp * torch.eye(H_dim, dtype=H_i.dtype)
-                    try:
-                        # Cholesky-based solve: faster + more stable than direct inv.
-                        L = torch.linalg.cholesky(H_damped)
-                        A_i = torch.cholesky_solve(C_i, L)
-                    except torch._C._LinAlgError:
-                        logging.warning(
-                            "refined_rkl layer %d a=%d: Cholesky failed even with "
-                            "damp=%.3e; falling back to direct inverse.",
-                            layer_idx, a_idx, damp,
-                        )
-                        A_i = torch.linalg.inv(H_damped) @ C_i
-                # Store bf16 on CPU (or whatever `refined_rkl_store_dtype`). The
-                # fit itself was fp32/fp64 so precision loss here is bounded by
-                # the cast; downstream usage casts `A.to(delta.dtype)` anyway.
-                per_layer_A.append(A_i.to(refined_rkl_store_dtype).contiguous())
-                last_shape = tuple(A_i.shape)
-                total_fit += 1
-                # Free intermediate statistics for this slot now that A is solved.
-                refined_C[layer_idx][a_idx] = None
-                refined_H[layer_idx][a_idx] = None
-            static_refined_A.append(per_layer_A)
+        total_slots = len(layers) * refined_rkl_num_A
         logging.info(
             "refined_rkl: fit %d/%d (layer, sub-A) matrices "
             "(A shape %s, num_A=%d, store_dtype=%s, damp=%.3g)",
-            total_fit, total_slots, last_shape, refined_rkl_num_A,
+            refined_fit_counter[0], total_slots, refined_fit_shape[0],
+            refined_rkl_num_A,
             str(refined_rkl_store_dtype).replace("torch.", ""),
             refined_rkl_damp,
         )
 
     return static_saliency, static_fisher, static_refined_A
+
+
+def _pick_refined_A_for_batch(
+    *,
+    refined_A_list,
+    samples_per_A,
+    loss_type,
+    batch_local_start,
+    batch_size_local,
+    dp_rank,
+    dp_shard_size,
+    dev,
+):
+    """Pick the refined_residual_kl A matrix(es) for a given contiguous batch.
+
+    Returns either a 2D (H, H) tensor — when num_A==1 or all samples share one
+    sub-A — or a 3D (B, H, H) stacked tensor with A[a_idx_of_sample_b] per row.
+    `compute_refresh_loss` routes 3D input through bmm so batches may freely
+    cross sub-A boundaries.
+    """
+    # Fast-exit for non-refined losses or single-A lists.
+    if refined_A_list is None or len(refined_A_list) == 0:
+        return None
+    if loss_type != "refined_residual_kl" or samples_per_A <= 0 or len(refined_A_list) == 1:
+        return refined_A_list[0]
+
+    a_per_sample = torch.tensor(
+        [(dp_rank * dp_shard_size + batch_local_start + k) // samples_per_A
+         for k in range(batch_size_local)],
+        dtype=torch.long,
+        device=dev,
+    )
+    unique_a = torch.unique(a_per_sample)
+    ref_slot = next((s for s in refined_A_list if s is not None), None)
+    if ref_slot is None:
+        return None
+    if unique_a.numel() == 1:
+        return refined_A_list[int(unique_a.item())]
+    # Build a (B, H, H) stack; None slots get zeros. Common in practice: only
+    # 2-3 distinct a_idx per batch, so the whole stack is cheap to materialise.
+    return torch.stack(
+        [
+            refined_A_list[int(a)] if refined_A_list[int(a)] is not None else torch.zeros_like(ref_slot)
+            for a in a_per_sample.tolist()
+        ],
+        dim=0,
+    )
 
 
 def compute_refresh_loss(
@@ -2797,6 +2868,9 @@ def compute_refresh_loss(
         # The perturbed final hidden becomes fp_final + Δx + A·Δx = fp_final + (I+A)·Δx.
         # In pytorch batched layout (delta: (B, T, H)), A·Δx on column-vec convention
         # translates to `delta @ A.t()`.
+        # When `refined_A` has shape (B, H, H), we're in per-sample sub-A
+        # dispatch mode (num_A > 1, samples in this batch map to different
+        # A matrices); use bmm. When 2D, all samples share one A → matmul.
         if fp_final_hidden is None:
             raise ValueError(
                 "`fp_final_hidden` must be provided for refresh_loss_type='refined_residual_kl'."
@@ -2805,7 +2879,12 @@ def compute_refresh_loss(
             raise ValueError(
                 "`refined_A` must be provided for refresh_loss_type='refined_residual_kl'."
             )
-        refined_delta = torch.matmul(delta, refined_A.to(delta.dtype).t())
+        _A_cast = refined_A.to(delta.dtype)
+        if _A_cast.dim() == 3:
+            # per-sample: (B, H, H) · Δx = torch.bmm(delta, A.transpose(-1,-2))
+            refined_delta = torch.bmm(delta, _A_cast.transpose(-1, -2))
+        else:
+            refined_delta = torch.matmul(delta, _A_cast.t())
         final_with_refined = fp_final_hidden + delta + refined_delta
         logits_perturbed = hidden2logits(final_with_refined, analyzer)
         logits_fp = hidden2logits(fp_final_hidden, analyzer)
@@ -3000,8 +3079,9 @@ def collect_true_weight_gradient(
     fp_inps_next=None,
     next_layer_output_fisher=None,
     fp_inps_final=None,
-    refined_A=None,
-    next_refined_A=None,
+    refined_A_list=None,
+    next_refined_A_list=None,
+    samples_per_A=0,
     global_shuffle=False,
     dp_rank=0,
     shard_size=None,
@@ -3050,6 +3130,21 @@ def collect_true_weight_gradient(
     else:
         selected_indices = raw_indices
 
+    # Sub-A dispatch for refined_residual_kl with num_A > 1: each sample in a
+    # batch picks its own A based on its global sample id, regardless of where
+    # the batch boundary falls. Per-batch we build either a (H, H) matrix (when
+    # all samples share one a_idx — fast path) or a stacked (B, H, H) tensor
+    # with one A per sample (gather + bmm — slower path). No sorting / trimming
+    # required; batches can freely span sub-A boundaries.
+    num_A = len(refined_A_list) if refined_A_list is not None else 1
+    num_A_next = len(next_refined_A_list) if next_refined_A_list is not None else 1
+    sub_a_mode = (
+        refined_A_list is not None
+        and num_A > 1
+        and samples_per_A > 0
+        and refresh_loss_type == "refined_residual_kl"
+    )
+
     if weight_override is None:
         override_weight = module.weight.detach().clone()
     else:
@@ -3077,6 +3172,10 @@ def collect_true_weight_gradient(
     #                              both current- and next-layer deltas).
     #   refined_residual_kl  path: reuses fp_inps_final AND needs the next-layer A
     #                              matrix (A_{i+1}) in place of A_i.
+    has_next_refined_A = (
+        next_refined_A_list is not None
+        and any(a is not None for a in next_refined_A_list)
+    )
     slide_active = (
         slide_alpha < 1.0
         and next_layer is not None
@@ -3087,7 +3186,7 @@ def collect_true_weight_gradient(
             or (
                 refresh_loss_type == "refined_residual_kl"
                 and fp_inps_final is not None
-                and next_refined_A is not None
+                and has_next_refined_A
             )
         )
     )
@@ -3137,6 +3236,64 @@ def collect_true_weight_gradient(
                         None if fp_inps_final is None
                         else fp_inps_final[batch_indices].to(dev)
                     )
+                    # Per-sample sub-A dispatch for refined_residual_kl. batches
+                    # may freely cross sub-A boundaries; each sample picks its
+                    # own A_{a_idx}. See `_pick_refined_A_for_batch` for the
+                    # 2D-fast-path / 3D-bmm-fallback selection.
+                    if sub_a_mode:
+                        _shard_local = shard_size if shard_size is not None else inps.shape[0]
+                        # `batch_indices` here is a list of rank-local indices
+                        # into `inps`; we forward the first-sample offset and
+                        # batch size to the helper, which rebuilds per-sample
+                        # a_idx internally. That's fine because the helper only
+                        # looks at contiguous batch_local_start+k offsets.
+                        # We pre-stack implicitly by calling the helper with a
+                        # proxy that wraps the non-contiguous batch_indices as
+                        # an explicit list of locals.
+                        _a_per_sample = torch.tensor(
+                            [(dp_rank * _shard_local + li) // samples_per_A for li in batch_indices],
+                            dtype=torch.long,
+                            device=dev,
+                        )
+                        _unique_a = torch.unique(_a_per_sample)
+                        _ref_slot = next((s for s in refined_A_list if s is not None), None)
+                        if _ref_slot is None:
+                            refined_A_batch = None
+                        elif _unique_a.numel() == 1:
+                            refined_A_batch = refined_A_list[int(_unique_a.item())]
+                        else:
+                            refined_A_batch = torch.stack(
+                                [
+                                    refined_A_list[int(a)] if refined_A_list[int(a)] is not None else torch.zeros_like(_ref_slot)
+                                    for a in _a_per_sample.tolist()
+                                ],
+                                dim=0,
+                            )
+                        if next_refined_A_list is not None and any(s is not None for s in next_refined_A_list):
+                            _ref2 = next(s for s in next_refined_A_list if s is not None)
+                            if _unique_a.numel() == 1:
+                                next_refined_A_batch = next_refined_A_list[int(_unique_a.item())]
+                            else:
+                                next_refined_A_batch = torch.stack(
+                                    [
+                                        next_refined_A_list[int(a)] if next_refined_A_list[int(a)] is not None else torch.zeros_like(_ref2)
+                                        for a in _a_per_sample.tolist()
+                                    ],
+                                    dim=0,
+                                )
+                        else:
+                            next_refined_A_batch = None
+                    else:
+                        refined_A_batch = (
+                            refined_A_list[0]
+                            if refined_A_list is not None and len(refined_A_list) > 0
+                            else None
+                        )
+                        next_refined_A_batch = (
+                            next_refined_A_list[0]
+                            if next_refined_A_list is not None and len(next_refined_A_list) > 0
+                            else None
+                        )
                     refresh_loss_current = compute_refresh_loss(
                         refresh_loss_type,
                         out_hidden,
@@ -3145,7 +3302,7 @@ def collect_true_weight_gradient(
                         kl_topk,
                         layer_output_fisher=fisher_batch,
                         fp_final_hidden=fp_final_batch,
-                        refined_A=refined_A,
+                        refined_A=refined_A_batch,
                     )
                     if slide_active:
                         next_out = next_layer(
@@ -3171,7 +3328,7 @@ def collect_true_weight_gradient(
                             kl_topk,
                             layer_output_fisher=fisher_batch_next,
                             fp_final_hidden=fp_final_batch,
-                            refined_A=next_refined_A,
+                            refined_A=next_refined_A_batch,
                         )
                         refresh_loss = (
                             slide_alpha * refresh_loss_current
@@ -3230,7 +3387,10 @@ def collect_layer_grad_hessian_stats(
     precomputed_saliency_dict=None,
     precomputed_layer_output_fisher=None,
     fp_inps_final=None,
-    refined_A=None,
+    refined_A_list=None,
+    samples_per_A=0,
+    dp_rank=0,
+    dp_shard_size=None,
     layer_recorder=None,
     skip_gradient_backward=False,
 ):
@@ -3405,6 +3565,19 @@ def collect_layer_grad_hessian_stats(
                                 None if fp_inps_final is None
                                 else fp_inps_final[j : j + bsz].to(dev)
                             )
+                            # Per-sample sub-A dispatch for refined_residual_kl.
+                            # Each sample picks its own A by global sample id;
+                            # batches may freely cross sub-A boundaries.
+                            refined_A_batch = _pick_refined_A_for_batch(
+                                refined_A_list=refined_A_list,
+                                samples_per_A=samples_per_A,
+                                loss_type=gptq_reference_loss_type,
+                                batch_local_start=j,
+                                batch_size_local=min(bsz, inps.shape[0] - j),
+                                dp_rank=dp_rank,
+                                dp_shard_size=dp_shard_size if dp_shard_size is not None else inps.shape[0],
+                                dev=dev,
+                            )
                             gradient_loss = compute_refresh_loss(
                                 gptq_reference_loss_type,
                                 out_hidden,
@@ -3413,7 +3586,7 @@ def collect_layer_grad_hessian_stats(
                                 kl_topk,
                                 layer_output_fisher=batch_layer_output_fisher,
                                 fp_final_hidden=fp_final_batch,
-                                refined_A=refined_A,
+                                refined_A=refined_A_batch,
                             )
 
                     with layer_recorder.section("layer.grad_hessian.gradient_backward.total") if layer_recorder else _NULL_CONTEXT:
@@ -3498,7 +3671,8 @@ def run_pre_quant_gd(
     refresh_loss_type,
     layer_output_fisher_by_module,
     fp_inps_final=None,
-    refined_A=None,
+    refined_A_list=None,
+    samples_per_A=0,
     global_shuffle=False,
     dp_rank=0,
     shard_size=None,
@@ -3548,7 +3722,8 @@ def run_pre_quant_gd(
                     refresh_loss_type=refresh_loss_type,
                     layer_output_fisher=fisher_tensor,
                     fp_inps_final=fp_inps_final,
-                    refined_A=refined_A,
+                    refined_A_list=refined_A_list,
+                    samples_per_A=samples_per_A,
                     global_shuffle=global_shuffle,
                     dp_rank=dp_rank,
                     shard_size=shard_size if shard_size is not None else inps.shape[0],
@@ -3665,6 +3840,20 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
     skip_ref_backward = args.alpha == 0
     effective_pre_gd_steps = args.pre_gd_steps if preclip_enabled else 0
     global_loss_enabled = bool(getattr(args, "global_loss", False))
+    # Per-sub-A sample window for refined_residual_kl (num_A > 1). Computed
+    # once here so the per-layer callers (run_pre_quant_gd,
+    # collect_layer_grad_hessian_stats, refresh_fn) can route samples to the
+    # right sub-A. Zero means single-A (no per-sample routing).
+    refined_rkl_num_A = int(getattr(args, "refined_rkl_num_A", 1))
+    if refined_rkl_num_A > 1 and args.grad_refresh_loss == "refined_residual_kl":
+        if args.nsamples % refined_rkl_num_A != 0:
+            raise ValueError(
+                f"refined_rkl: nsamples ({args.nsamples}) must be divisible by "
+                f"refined_rkl_num_A ({refined_rkl_num_A})."
+            )
+        refined_rkl_samples_per_A = args.nsamples // refined_rkl_num_A
+    else:
+        refined_rkl_samples_per_A = 0
     if args.pre_gd_steps > 0 and not preclip_enabled:
         logging.info(
             "Pre-quantization GD is disabled because preclip is off (w_clip=%s, pre_clip=%s).",
@@ -3992,33 +4181,22 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     args.grad_refresh_loss,
                     layer_refresh_loss_type,
                 )
-            # Pull layer-i's refined_residual_kl A matrix onto dev for the
-            # duration of this layer's quantization. The last layer's A is
-            # always None (no downstream f). For any other refresh loss type
-            # this stays None and costs nothing.
-            # NOTE: `static_refined_A_by_layer[i]` is a list-of-A (len = num_A).
-            # Main pipeline currently does not dispatch per-batch sub-A, so we
-            # require num_A=1 here. analyze_grad_cosine is the only consumer
-            # that already handles num_A>1. Extending the main pipeline is a
-            # follow-up that requires threading a per-batch a_idx through
-            # `collect_true_weight_gradient` / `run_pre_quant_gd` / refresh_fn.
-            layer_refined_A = None
+            # Pull layer-i's refined_residual_kl A matrices onto dev for the
+            # duration of this layer's quantization. `static_refined_A_by_layer[i]`
+            # is a list of length `refined_rkl_num_A`; each slot is either an A
+            # tensor (bf16 CPU) or None (e.g. the last layer's slots). We move
+            # the whole list to dev here so per-batch `refined_A_list[a_idx]`
+            # dispatches don't incur a H2D copy per batch.
+            layer_refined_A_list = None
             if (
                 layer_refresh_loss_type == "refined_residual_kl"
                 and static_refined_A_by_layer is not None
                 and static_refined_A_by_layer[i] is not None
-                and len(static_refined_A_by_layer[i]) > 0
             ):
-                if len(static_refined_A_by_layer[i]) > 1:
-                    raise RuntimeError(
-                        "Main quant pipeline does not yet support "
-                        "--refined_rkl_num_A > 1 for refined_residual_kl. Either set "
-                        "--refined_rkl_num_A=1 or restrict the multi-A workflow to "
-                        "analyze_grad_cosine.py."
-                    )
-                slot = static_refined_A_by_layer[i][0]
-                if slot is not None:
-                    layer_refined_A = slot.to(dev)
+                layer_refined_A_list = [
+                    (slot.to(dev) if slot is not None else None)
+                    for slot in static_refined_A_by_layer[i]
+                ]
             # Interpret all *_bsz knobs as GLOBAL batch sizes and split per
             # rank. With N=1 these reduce to their original values, so N=1
             # behavior w.r.t. bsz is unchanged.
@@ -4080,14 +4258,13 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     and fp_inps_final is not None
                     and static_refined_A_by_layer is not None
                     and static_refined_A_by_layer[i + 1] is not None
-                    and len(static_refined_A_by_layer[i + 1]) > 0
-                    and static_refined_A_by_layer[i + 1][0] is not None
+                    and any(s is not None for s in static_refined_A_by_layer[i + 1])
                 ):
                     slide_active_layer = True
             slide_next_layer = None
             slide_fp_inps_next = None
             slide_next_layer_output_fisher = None
-            slide_next_refined_A = None
+            slide_next_refined_A_list = None
             slide_next_bits_config = None
             if slide_active_layer:
                 with layer_recorder.section("layer.slide_window.next_fp_reference") if layer_recorder else _NULL_CONTEXT:
@@ -4099,11 +4276,14 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     if layer_refresh_loss_type == "fisher_diag_mse":
                         slide_next_layer_output_fisher = static_fisher_by_layer[i + 1]
                     elif layer_refresh_loss_type == "refined_residual_kl":
-                        # Main pipeline is gated to num_A=1 above, so the next
-                        # layer's sub-A list also has length 1. Pick slot 0.
+                        # Load the next layer's full A list onto dev for
+                        # per-batch sub-A dispatch in the slide branch.
                         _next_list = static_refined_A_by_layer[i + 1]
-                        if _next_list is not None and len(_next_list) > 0 and _next_list[0] is not None:
-                            slide_next_refined_A = _next_list[0].to(dev)
+                        if _next_list is not None and len(_next_list) > 0:
+                            slide_next_refined_A_list = [
+                                (s.to(dev) if s is not None else None)
+                                for s in _next_list
+                            ]
                     slide_fp_inps_next = torch.empty_like(fp_inps)
                     for j in range(fp_inps.shape[0]):
                         slide_fp_inps_next[j] = slide_next_layer(
@@ -4210,7 +4390,8 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             refresh_loss_type=layer_refresh_loss_type,
                             layer_output_fisher_by_module=layer_output_fisher_by_module,
                             fp_inps_final=fp_inps_final,
-                            refined_A=layer_refined_A,
+                            refined_A_list=layer_refined_A_list,
+                            samples_per_A=refined_rkl_samples_per_A,
                             global_shuffle=dp_global_shuffle,
                             dp_rank=dp_rank,
                             shard_size=n_local,
@@ -4243,7 +4424,10 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     else None
                 ),
                 fp_inps_final=fp_inps_final,
-                refined_A=layer_refined_A,
+                refined_A_list=layer_refined_A_list,
+                samples_per_A=refined_rkl_samples_per_A,
+                dp_rank=dp_rank,
+                dp_shard_size=n_local,
                 layer_recorder=layer_recorder,
                 skip_gradient_backward=skip_ref_backward,
             )
@@ -4333,7 +4517,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                 slide_next_layer=None,
                 slide_fp_inps_next=None,
                 slide_next_layer_output_fisher=None,
-                slide_next_refined_A=None,
+                slide_next_refined_A_list=None,
             ):
                 def refresh_fn(weight_snapshot, slide_alpha=1.0):
                     if args.final_layer_full_backward and i == final_layer_idx:
@@ -4363,8 +4547,9 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             fp_inps_next=slide_fp_inps_next,
                             next_layer_output_fisher=slide_next_layer_output_fisher,
                             fp_inps_final=fp_inps_final,
-                            refined_A=layer_refined_A,
-                            next_refined_A=slide_next_refined_A,
+                            refined_A_list=layer_refined_A_list,
+                            next_refined_A_list=slide_next_refined_A_list,
+                            samples_per_A=refined_rkl_samples_per_A,
                             global_shuffle=dp_global_shuffle,
                             dp_rank=dp_rank,
                             shard_size=n_local,
@@ -4539,7 +4724,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             slide_next_layer=slide_next_layer,
                             slide_fp_inps_next=slide_fp_inps_next,
                             slide_next_layer_output_fisher=slide_next_layer_output_fisher,
-                            slide_next_refined_A=slide_next_refined_A,
+                            slide_next_refined_A_list=slide_next_refined_A_list,
                         ) if args.g_update_mode in {"block_backward", "block_gd"} else None,
                         grad_lr=effective_grad_lr,
                         grad_optimizer=effective_grad_optimizer,

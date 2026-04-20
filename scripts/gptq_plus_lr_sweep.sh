@@ -24,7 +24,7 @@ DEVICE=${3}
 shift 3
 
 # Sweep configuration. Override from the shell when needed.
-GRAD_LRS_STR=${GRAD_LRS:-"0.000005"}
+GRAD_LRS_STR=${GRAD_LRS:-"0.00001"}
 DATASET=${DATASET:-wikitext2} # wikitext2 / neuralmagic / ultrachat_2k / numinamath
 N_SAMPLES=${N_SAMPLES:-1024}
 SEQ_LEN=${SEQ_LEN:-2048}
@@ -41,8 +41,11 @@ BLOCK_ATOMIC_QUANT=${BLOCK_ATOMIC_QUANT:-0}
 GRAD_OPTIMIZER=${GRAD_OPTIMIZER:-adam}
 FINAL_LAYER_GRAD_OPTIMIZER=${FINAL_LAYER_GRAD_OPTIMIZER:-adam}
 GRAD_CLIP=${GRAD_CLIP:-1.0}
-# --grad_refresh_loss {kl,hidden_mse,fisher_diag_mse,residual_kl}
+# --grad_refresh_loss {kl,hidden_mse,fisher_diag_mse,residual_kl,refined_residual_kl}
 GRAD_REFRESH_LOSS=${GRAD_REFRESH_LOSS:-refined_residual_kl}
+# refined_residual_kl knobs (only used when GRAD_REFRESH_LOSS=refined_residual_kl)
+REFINED_RKL_NUM_A=${REFINED_RKL_NUM_A:-32}
+REFINED_RKL_DAMP=${REFINED_RKL_DAMP:-0.01}
 FINAL_LAYER_GRAD_LR=${FINAL_LAYER_GRAD_LR:-0.000007}
 PRE_GD_STEPS=${PRE_GD_STEPS:-10}
 PRE_GRAD_LR=${PRE_GRAD_LR:-0.00003}
@@ -264,6 +267,15 @@ for grad_lr in "${GRAD_LRS[@]}"; do
     if [[ "${GRAD_REFRESH_LOSS}" != "kl" ]]; then
         refresh_suffix="_${GRAD_REFRESH_LOSS}"
     fi
+    refined_rkl_suffix=""
+    if [[ "${GRAD_REFRESH_LOSS}" == "refined_residual_kl" ]]; then
+        if [[ "${REFINED_RKL_NUM_A}" != "1" ]]; then
+            refined_rkl_suffix="_numA${REFINED_RKL_NUM_A}"
+        fi
+        if [[ "${REFINED_RKL_DAMP}" != "0.01" ]]; then
+            refined_rkl_suffix="${refined_rkl_suffix}_damp$(sanitize_float "${REFINED_RKL_DAMP}")"
+        fi
+    fi
     grad_hessian_suffix=""
     if [[ "${GRAD_HESSIAN_TOPK}" != "-1" ]]; then
         grad_hessian_suffix="_ghtk${GRAD_HESSIAN_TOPK}"
@@ -282,7 +294,7 @@ for grad_lr in "${GRAD_LRS[@]}"; do
             pre_gd_suffix="${pre_gd_suffix}_flopt${PRE_FINAL_LAYER_GRAD_OPTIMIZER}"
         fi
     fi
-    exp_name="${BASE_EXP}_block_gd_${GRAD_OPTIMIZER}${refresh_suffix}${reg_suffix}${grad_hessian_suffix}${fisher_groups_suffix}_lr${grad_lr_tag}_fllr${final_layer_grad_lr_tag}_s${second_order_tag}${pre_gd_suffix}${PRE_CLIP_TAG}${BLOCK_ATOMIC_TAG}${FINAL_LAYER_FULL_BACKWARD_TAG}${GLOBAL_LOSS_TAG}${LOSS_SLIDE_WINDOW_TAG}${DP_GLOBAL_SHUFFLE_TAG}${GRAD_LR_LAYER_SCHEDULE_TAG}"
+    exp_name="${BASE_EXP}_block_gd_${GRAD_OPTIMIZER}${refresh_suffix}${refined_rkl_suffix}${reg_suffix}${grad_hessian_suffix}${fisher_groups_suffix}_lr${grad_lr_tag}_fllr${final_layer_grad_lr_tag}_s${second_order_tag}${pre_gd_suffix}${PRE_CLIP_TAG}${BLOCK_ATOMIC_TAG}${FINAL_LAYER_FULL_BACKWARD_TAG}${GLOBAL_LOSS_TAG}${LOSS_SLIDE_WINDOW_TAG}${DP_GLOBAL_SHUFFLE_TAG}${GRAD_LR_LAYER_SCHEDULE_TAG}"
 
     echo "============================================================"
     echo "Running GPTQ+ LR sweep"
@@ -295,6 +307,10 @@ for grad_lr in "${GRAD_LRS[@]}"; do
     echo "  flopt  : ${FINAL_LAYER_GRAD_OPTIMIZER}"
     echo "  gclip  : ${GRAD_CLIP}"
     echo "  rloss  : ${GRAD_REFRESH_LOSS}"
+    if [[ "${GRAD_REFRESH_LOSS}" == "refined_residual_kl" ]]; then
+        echo "  rkl_NA : ${REFINED_RKL_NUM_A}"
+        echo "  rkl_dmp: ${REFINED_RKL_DAMP}"
+    fi
     echo "  reg    : ${GRAD_REG_STRATEGY}"
     echo "  reg_l  : ${GRAD_REG_LAMBDA}"
     echo "  gate_f : ${GRAD_GATE_FLOOR}"
@@ -341,6 +357,7 @@ for grad_lr in "${GRAD_LRS[@]}"; do
         ${HESSIAN_ACCUM_BSZ:+--hessian_accum_bsz "${HESSIAN_ACCUM_BSZ}"} \
         --backward_samples "${BACKWARD_SAMPLES}" --backward_bsz "${BACKWARD_BSZ}" --final_layer_backward_bsz "${FINAL_LAYER_BACKWARD_BSZ}" \
         --g_update_mode block_gd --grad_lr "${grad_lr}" --grad_optimizer "${GRAD_OPTIMIZER}" --grad_refresh_loss "${GRAD_REFRESH_LOSS}" \
+        --refined_rkl_num_A "${REFINED_RKL_NUM_A}" --refined_rkl_damp "${REFINED_RKL_DAMP}" \
         --rotate \
         "${GLOBAL_LOSS_ARGS[@]}" \
         "${LOSS_SLIDE_WINDOW_ARGS[@]}" \
