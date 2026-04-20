@@ -696,6 +696,8 @@ class GPTQPlus:
         block_observer=None,
         grad_clip=1.0,
         diagnostic_recorder=None,
+        slide_refresh_start=0,
+        slide_refresh_block_total=None,
     ):
         profile_recorder = profile_recorder or self.profile_recorder
         # Alias the recorder so call sites can do `rec and rec.save_block(...)`.
@@ -1307,15 +1309,29 @@ class GPTQPlus:
                                 )
                                 weight_snapshot[state["row_start"]:state["row_end"], :] = current_sub_weight_orig
 
-                            # Loss-slide-window schedule: α=1 at the first
-                            # refresh, α=0 at the last. refresh_idx = i1 /
-                            # blocksize, and n_refresh_total refreshes fire
-                            # per module. When only one refresh fires we keep
-                            # α=1 (pure current-layer loss).
+                            # Loss-slide-window schedule. The schedule spans
+                            # the whole transformer block when the caller
+                            # passes slide_refresh_block_total (sum of refresh
+                            # counts across all linear modules in the block)
+                            # and slide_refresh_start (cumulative count of
+                            # refreshes completed in prior modules of this
+                            # block). α=1 at the very first block-level
+                            # refresh, α=0 at the very last. This matches the
+                            # definition of next-layer loss, which is scoped
+                            # to the NEXT transformer block rather than the
+                            # next linear layer. When the caller doesn't pass
+                            # these (slide_refresh_block_total is None), fall
+                            # back to the per-module schedule.
                             refresh_idx = i1 // blocksize
+                            effective_total = (
+                                slide_refresh_block_total
+                                if slide_refresh_block_total is not None
+                                else n_refresh_total
+                            )
+                            effective_idx = slide_refresh_start + refresh_idx
                             slide_alpha = (
-                                1.0 - refresh_idx / max(n_refresh_total - 1, 1)
-                                if n_refresh_total > 1 else 1.0
+                                1.0 - effective_idx / max(effective_total - 1, 1)
+                                if effective_total > 1 else 1.0
                             )
                             refreshed_grad, refresh_meta = gradient_refresh_fn(
                                 weight_snapshot,
@@ -4123,6 +4139,22 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                 return observer
 
             with layer_recorder.section("layer.module_quantization") if layer_recorder else _NULL_CONTEXT:
+                # Pre-compute block-level slide-window refresh counters. The
+                # α=1→0 schedule should span the whole transformer block
+                # (because next-layer loss is defined against the NEXT block),
+                # not a single linear layer. Each module's refresh count is
+                # ceil(cols/blocksize) - 1 since the last block doesn't fire
+                # a refresh.
+                slide_refreshes_per_module = {}
+                for _name in subset:
+                    if _name not in gptq:
+                        slide_refreshes_per_module[_name] = 0
+                        continue
+                    _cols = subset[_name].weight.shape[1]
+                    _n_blocks = (_cols + args.blocksize - 1) // args.blocksize
+                    slide_refreshes_per_module[_name] = max(_n_blocks - 1, 0)
+                slide_refresh_block_total = sum(slide_refreshes_per_module.values())
+                slide_refresh_cursor = 0
                 for name in subset:
                     if name not in gptq:
                         continue
@@ -4216,7 +4248,10 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         block_observer=make_block_observer(name, effective_grad_optimizer) if args.g_update_mode in {"block_backward", "block_gd"} else None,
                         grad_clip=args.grad_clip,
                         diagnostic_recorder=diagnostic_registry.get_or_create(i, name),
+                        slide_refresh_start=slide_refresh_cursor,
+                        slide_refresh_block_total=slide_refresh_block_total,
                     )
+                    slide_refresh_cursor += slide_refreshes_per_module[name]
                     # DP correctness check (debug only): fasterquant is meant
                     # to be deterministic given identical inputs, and since H /
                     # gradients / act_square are bit-identical across ranks after
