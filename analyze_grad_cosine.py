@@ -46,6 +46,7 @@ from utils import (
 from gptq_utils.gptaq_utils import GPTAQ, FPInputsCache
 from gptq_utils.gptq_plus_utils import (
     collect_static_end_to_end_saliency_and_fisher,
+    collect_layer_output_grad_for_refined_mse,
     compute_refresh_loss,
     hidden2logits,
     temporary_requires_grad,
@@ -63,6 +64,7 @@ _VALID_MEASURE_LOSSES = {
     "residual_kl",
     "refined_residual_kl",
     "refined_diag_residual_kl",
+    "refined_mse",
 }
 
 
@@ -293,6 +295,9 @@ def run_cosine_measurement(
     dev,
     measure_losses,
     grad_clip=None,
+    refined_mse_pool_ids=None,
+    refined_mse_grad_pool=None,
+    refined_mse_mean_grad=None,
 ):
     if measure_samples % measure_batch_size != 0:
         raise ValueError(
@@ -312,6 +317,12 @@ def run_cosine_measurement(
     want_residual = "residual_kl" in measure_losses
     want_refined_full = "refined_residual_kl" in measure_losses
     want_refined_diag = "refined_diag_residual_kl" in measure_losses
+    want_refined_mse = "refined_mse" in measure_losses
+    # refined_mse's second-order term is fisher_diag_mse, so it shares the
+    # same batch-level fisher slice. Use a broader "needs fisher slice" gate
+    # for the per-batch indexing below without touching `want_fisher` (which
+    # still drives the dedicated fisher-surrogate measurement branch).
+    need_fisher_slice = want_fisher or want_refined_mse
     has_refined = (
         want_refined_full
         and refined_A_list is not None
@@ -324,16 +335,26 @@ def run_cosine_measurement(
         and len(refined_diag_A_list) > 0
         and any(a is not None for a in refined_diag_A_list)
     )
+    has_refined_mse = (
+        want_refined_mse
+        and refined_mse_mean_grad is not None
+    )
+    # refined_mse pool lookup: local_idx -> pool_pos. Built once per measurement.
+    refined_mse_pool_lookup = {}
+    if has_refined_mse and refined_mse_pool_ids is not None:
+        refined_mse_pool_lookup = {
+            int(li): int(pp) for pp, li in enumerate(refined_mse_pool_ids.tolist())
+        }
     if (has_refined or has_refined_diag) and samples_per_A > 0 and samples_per_A % measure_batch_size != 0:
         raise ValueError(
             f"refined_rkl: samples_per_A ({samples_per_A}) must be divisible by "
             f"measure_batch_size ({measure_batch_size}) so each measurement batch "
             f"lands in one sub-A bucket."
         )
-    if want_fisher and fisher_tensor is None:
+    if need_fisher_slice and fisher_tensor is None:
         raise RuntimeError(
-            "measure_losses requested fisher_diag_mse but fisher was not collected "
-            "(check collect_fisher flag)."
+            "measure_losses requested fisher_diag_mse or refined_mse but fisher was "
+            "not collected (check collect_fisher flag)."
         )
 
     # Canonicalise linear names ("q_proj" not "q_proj.module" after ActQuantWrapper).
@@ -349,11 +370,13 @@ def run_cosine_measurement(
     per_batch_residual_cos = {n: [] for n in name_to_weight}
     per_batch_refined_cos = {n: [] for n in name_to_weight}
     per_batch_refined_diag_cos = {n: [] for n in name_to_weight}
+    per_batch_refined_mse_cos = {n: [] for n in name_to_weight}
     per_batch_true_norm = {n: [] for n in name_to_weight}
     per_batch_fisher_norm = {n: [] for n in name_to_weight}
     per_batch_residual_norm = {n: [] for n in name_to_weight}
     per_batch_refined_norm = {n: [] for n in name_to_weight}
     per_batch_refined_diag_norm = {n: [] for n in name_to_weight}
+    per_batch_refined_mse_norm = {n: [] for n in name_to_weight}
 
     def _call_layer(h_in):
         return _layer_out(layer(
@@ -379,7 +402,7 @@ def run_cosine_measurement(
             fp_final_batch = fp_inps_final[start:end].to(dev)
             fisher_batch = (
                 fisher_tensor[start:end].to(dev).float()
-                if want_fisher and fisher_tensor is not None else None
+                if need_fisher_slice and fisher_tensor is not None else None
             )
 
             # ---------- (1) true KL ----------
@@ -514,11 +537,57 @@ def run_cosine_measurement(
                 grads_refined_diag = _capture_grads(name_to_weight, grad_clip=grad_clip)
                 del out_hidden, fp_hidden, refined_diag_loss, refined_diag_dev
 
+            # ---------- (6) refined_mse ----------
+            grads_refined_mse = None
+            if has_refined_mse and fisher_tensor is not None:
+                # Which measurement samples land in the pre-collected pool?
+                # (Measurement batch is contiguous; we just look up each row.)
+                pool_pos_list = []
+                batch_row_list = []
+                for p_in_batch in range(measure_batch_size):
+                    li = start + p_in_batch
+                    pp = refined_mse_pool_lookup.get(int(li))
+                    if pp is not None:
+                        pool_pos_list.append(pp)
+                        batch_row_list.append(p_in_batch)
+                if batch_row_list:
+                    layer_output_grad_exact = (
+                        refined_mse_grad_pool[pool_pos_list].to(dev, dtype=torch.float32)
+                    )
+                    pool_positions = torch.tensor(
+                        batch_row_list, dtype=torch.long, device=dev
+                    )
+                else:
+                    layer_output_grad_exact = None
+                    pool_positions = None
+                _zero_grads(target_params)
+                out_hidden = _call_layer(inp_batch)
+                with torch.no_grad():
+                    fp_hidden = _call_layer(fp_batch)
+                refined_mse_loss = compute_refresh_loss(
+                    refresh_loss_type="refined_mse",
+                    out_hidden=out_hidden,
+                    fp_hidden=fp_hidden,
+                    analyzer=analyzer,
+                    kl_topk=kl_topk,
+                    layer_output_fisher=fisher_batch,
+                    fp_final_hidden=None,
+                    layer_output_grad_exact=layer_output_grad_exact,
+                    layer_output_grad_mean=refined_mse_mean_grad,
+                    pool_positions=pool_positions,
+                )
+                refined_mse_loss.backward()
+                grads_refined_mse = _capture_grads(name_to_weight, grad_clip=grad_clip)
+                del out_hidden, fp_hidden, refined_mse_loss
+                if layer_output_grad_exact is not None:
+                    del layer_output_grad_exact
+
             # ---------- cosine + grad L2 per linear ----------
             cos_f = _cosine_per_linear(grads_true, grads_fisher) if grads_fisher is not None else None
             cos_r = _cosine_per_linear(grads_true, grads_residual) if grads_residual is not None else None
             cos_rf = _cosine_per_linear(grads_true, grads_refined) if grads_refined is not None else None
             cos_rfd = _cosine_per_linear(grads_true, grads_refined_diag) if grads_refined_diag is not None else None
+            cos_rm = _cosine_per_linear(grads_true, grads_refined_mse) if grads_refined_mse is not None else None
             for n in name_to_weight:
                 if cos_f is not None:
                     per_batch_fisher_cos[n].append(cos_f[n])
@@ -528,6 +597,8 @@ def run_cosine_measurement(
                     per_batch_refined_cos[n].append(cos_rf[n])
                 if cos_rfd is not None:
                     per_batch_refined_diag_cos[n].append(cos_rfd[n])
+                if cos_rm is not None:
+                    per_batch_refined_mse_cos[n].append(cos_rm[n])
                 # Per-batch grad Frobenius / L2 norms (flattened). Useful to see
                 # not just whether surrogate grads point the right way (cosine)
                 # but also how their magnitude compares to the true KL grad's.
@@ -540,6 +611,8 @@ def run_cosine_measurement(
                     per_batch_refined_norm[n].append(grads_refined[n].flatten().norm(p=2).item())
                 if grads_refined_diag is not None:
                     per_batch_refined_diag_norm[n].append(grads_refined_diag[n].flatten().norm(p=2).item())
+                if grads_refined_mse is not None:
+                    per_batch_refined_mse_norm[n].append(grads_refined_mse[n].flatten().norm(p=2).item())
             del grads_true
             if grads_fisher is not None:
                 del grads_fisher
@@ -549,6 +622,8 @@ def run_cosine_measurement(
                 del grads_refined
             if grads_refined_diag is not None:
                 del grads_refined_diag
+            if grads_refined_mse is not None:
+                del grads_refined_mse
             torch.cuda.empty_cache()
 
         _zero_grads(target_params)
@@ -595,6 +670,14 @@ def run_cosine_measurement(
             entry["per_batch_refined_diag_residual_kl"] = rfd.tolist()
             entry["refined_diag_residual_kl_grad_norm_mean"] = rfdn.mean().item()
             entry["per_batch_refined_diag_residual_kl_grad_norm"] = rfdn.tolist()
+        if has_refined_mse and per_batch_refined_mse_cos[n]:
+            rm = torch.tensor(per_batch_refined_mse_cos[n])
+            rmn = torch.tensor(per_batch_refined_mse_norm[n])
+            entry["refined_mse_mean"] = rm.mean().item()
+            entry["refined_mse_std"] = rm.std(unbiased=False).item() if len(rm) > 1 else 0.0
+            entry["per_batch_refined_mse"] = rm.tolist()
+            entry["refined_mse_grad_norm_mean"] = rmn.mean().item()
+            entry["per_batch_refined_mse_grad_norm"] = rmn.tolist()
         results[n] = entry
     return results
 
@@ -631,7 +714,7 @@ def quantize_and_measure(args, analyzer, trainloader, dev, target_layers, measur
     # Only run the fits/accumulators actually needed by `measure_losses`. The
     # full refined A fit is particularly heavy (H×H per sub-A) so skipping it
     # when the user only asked for diag/residual variants is the usual win.
-    _want_fisher = "fisher_diag_mse" in measure_losses
+    _want_fisher = "fisher_diag_mse" in measure_losses or "refined_mse" in measure_losses
     _want_refined_full = "refined_residual_kl" in measure_losses
     _want_refined_diag = "refined_diag_residual_kl" in measure_losses
     logging.info(
@@ -716,6 +799,66 @@ def quantize_and_measure(args, analyzer, trainloader, dev, target_layers, measur
                         if i == final_layer_idx and fl_clip is not None
                         else getattr(args, "grad_clip", None)
                     )
+                    # refined_mse: collect per-layer grad pool at the same
+                    # upstream-quantized state the production refresh sees. The
+                    # helper disables act-quant on layer + downstream and runs
+                    # end-to-end KL → backward to out_of_layer_idx. Layer 0 is
+                    # already dropped from target_layers (delta=0, g=0), but
+                    # handle it robustly in case someone overrides.
+                    refined_mse_pool_ids_i = None
+                    refined_mse_grad_pool_i = None
+                    refined_mse_mean_grad_i = None
+                    if "refined_mse" in measure_losses:
+                        if i == 0:
+                            refined_mse_pool_ids_i = torch.tensor([], dtype=torch.long)
+                            refined_mse_mean_grad_i = torch.zeros(
+                                analyzer.model.config.hidden_size,
+                                dtype=torch.float32, device=dev,
+                            )
+                        else:
+                            import random as _rng_mod
+                            n_pool = int(
+                                getattr(args, "num_samples_for_refined_mse", 32)
+                            )
+                            if n_pool > inps.shape[0]:
+                                raise ValueError(
+                                    f"num_samples_for_refined_mse ({n_pool}) "
+                                    f"exceeds calibration pool ({inps.shape[0]})."
+                                )
+                            # Match production: fresh rng per layer, seed =
+                            # args.seed + layer_idx, sample without replacement.
+                            rng = _rng_mod.Random(args.seed + i)
+                            sample_ids_local = sorted(
+                                rng.sample(range(inps.shape[0]), n_pool)
+                            )
+                            rm_bwd_bsz = args.global_loss_bsz
+                            if n_pool % rm_bwd_bsz != 0:
+                                raise ValueError(
+                                    f"num_samples_for_refined_mse ({n_pool}) "
+                                    f"must be divisible by global_loss_bsz "
+                                    f"({rm_bwd_bsz})."
+                                )
+                            (
+                                refined_mse_grad_pool_i,
+                                refined_mse_mean_grad_i,
+                            ) = collect_layer_output_grad_for_refined_mse(
+                                analyzer=analyzer,
+                                layer=layer,
+                                layer_idx=i,
+                                layers=layers,
+                                inps=inps,
+                                fp_inps_final=fp_inps_final,
+                                attention_mask=attention_mask,
+                                position_ids=position_ids,
+                                position_embeddings=position_embeddings,
+                                sample_ids_local=sample_ids_local,
+                                backward_bsz=rm_bwd_bsz,
+                                kl_topk=args.kl_topk,
+                                dev=dev,
+                            )
+                            refined_mse_pool_ids_i = torch.tensor(
+                                sample_ids_local, dtype=torch.long
+                            )
                     cosine_results[i] = run_cosine_measurement(
                         analyzer=analyzer,
                         layer=layer,
@@ -737,6 +880,9 @@ def quantize_and_measure(args, analyzer, trainloader, dev, target_layers, measur
                         dev=dev,
                         measure_losses=measure_losses,
                         grad_clip=layer_grad_clip,
+                        refined_mse_pool_ids=refined_mse_pool_ids_i,
+                        refined_mse_grad_pool=refined_mse_grad_pool_i,
+                        refined_mse_mean_grad=refined_mse_mean_grad_i,
                     )
                 def _fmt_entry(name, r):
                     cos_bits = []
@@ -748,6 +894,8 @@ def quantize_and_measure(args, analyzer, trainloader, dev, target_layers, measur
                         cos_bits.append(f"refined_res_kl={r['refined_residual_kl_mean']:.4f}")
                     if "refined_diag_residual_kl_mean" in r:
                         cos_bits.append(f"refined_diag_res_kl={r['refined_diag_residual_kl_mean']:.4f}")
+                    if "refined_mse_mean" in r:
+                        cos_bits.append(f"refined_mse={r['refined_mse_mean']:.4f}")
                     norm_bits = [f"true={r['true_kl_grad_norm_mean']:.3e}"]
                     if "fisher_grad_norm_mean" in r:
                         norm_bits.append(f"fisher={r['fisher_grad_norm_mean']:.3e}")
@@ -757,6 +905,8 @@ def quantize_and_measure(args, analyzer, trainloader, dev, target_layers, measur
                         norm_bits.append(f"refined_res_kl={r['refined_residual_kl_grad_norm_mean']:.3e}")
                     if "refined_diag_residual_kl_grad_norm_mean" in r:
                         norm_bits.append(f"refined_diag_res_kl={r['refined_diag_residual_kl_grad_norm_mean']:.3e}")
+                    if "refined_mse_grad_norm_mean" in r:
+                        norm_bits.append(f"refined_mse={r['refined_mse_grad_norm_mean']:.3e}")
                     return f"{name} cos[{' '.join(cos_bits)}] norm[{' '.join(norm_bits)}]"
                 logging.info(
                     "Layer %d cosine+grad-norm (batch-avg): %s",
@@ -956,6 +1106,9 @@ def main(args):
             if "refined_diag_residual_kl_mean" in r:
                 out["cos_refined_diag_res_kl"] = f"{r['refined_diag_residual_kl_mean']:.4f}"
                 out["gnorm_refined_diag_res_kl"] = f"{r['refined_diag_residual_kl_grad_norm_mean']:.3e}"
+            if "refined_mse_mean" in r:
+                out["cos_refined_mse"] = f"{r['refined_mse_mean']:.4f}"
+                out["gnorm_refined_mse"] = f"{r['refined_mse_grad_norm_mean']:.3e}"
             return out
         logging.info(pprint.pformat({
             i: {n: _summary_entry(r) for n, r in per_layer.items()}

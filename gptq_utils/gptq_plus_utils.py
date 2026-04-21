@@ -2992,6 +2992,9 @@ def compute_refresh_loss(
     layer_output_fisher=None,
     fp_final_hidden=None,
     refined_A=None,
+    layer_output_grad_exact=None,
+    layer_output_grad_mean=None,
+    pool_positions=None,
 ):
     if refresh_loss_type == "kl":
         logits = hidden2logits(out_hidden, analyzer)
@@ -3106,7 +3109,10 @@ def compute_refresh_loss(
         return kl_loss.sum(dim=-1).mean()
 
     if layer_output_fisher is None:
-        raise ValueError("`layer_output_fisher` must be provided for refresh_loss_type='fisher_diag_mse'.")
+        raise ValueError(
+            f"`layer_output_fisher` must be provided for refresh_loss_type='{refresh_loss_type}' "
+            "(fisher_diag_mse / refined_mse)."
+        )
     num_groups = layer_output_fisher.shape[-1]
     if delta.shape[-1] % num_groups != 0:
         raise ValueError(
@@ -3118,10 +3124,186 @@ def compute_refresh_loss(
     # Normalize Fisher weights independently for each (batch, token) across the
     # group axis so the weighting reflects only relative saliency structure for
     # that token, not the absolute Fisher magnitude of the current batch slice.
-    fisher_l2 = torch.linalg.vector_norm(layer_output_fisher, ord=2, dim=-1, keepdim=True)
-    fisher_norm = layer_output_fisher / (fisher_l2 + 1e-12)
-    weighted_sq = fisher_norm.unsqueeze(-1) * delta_grouped.square()
-    return 0.5 * weighted_sq.sum(dim=(-1, -2)).mean() / hidden_size
+    # fisher_l2 = torch.linalg.vector_norm(layer_output_fisher, ord=2, dim=-1, keepdim=True)
+    # fisher_norm = layer_output_fisher / (fisher_l2 + 1e-12) 删掉标准化更好
+    weighted_sq = layer_output_fisher.unsqueeze(-1) * delta_grouped.square()
+    fisher_loss = 0.5 * weighted_sq.sum(dim=(-1, -2)).mean()
+
+    if refresh_loss_type != "refined_mse":
+        return fisher_loss
+
+    # refined_mse = fisher_diag_mse + first-order Taylor term  g · Δy .
+    # Caller provides per-layer grad pool state:
+    #   - layer_output_grad_exact: (B_pool, seq, H) exact per-token grad for
+    #     the subset of samples in this batch that hit the pre-collected pool.
+    #   - pool_positions: (B_pool,) LongTensor giving batch-local row ids where
+    #     the exact grads apply (same ordering as layer_output_grad_exact).
+    #   - layer_output_grad_mean: (H,) mean of the full pool over (N_pool, seq),
+    #     used for batch rows that are NOT in the pool.
+    # At layer 0 the whole KL-gradient is identically zero, so the caller just
+    # passes mean=zeros + empty pool_positions → first_order collapses to 0 and
+    # refined_mse degenerates to fisher_diag_mse, matching the physics.
+    if layer_output_grad_mean is None:
+        raise ValueError(
+            "`layer_output_grad_mean` must be provided for refresh_loss_type='refined_mse'."
+        )
+    B = delta.shape[0]
+    mean_grad_cast = layer_output_grad_mean.to(delta.dtype)
+    # Split loss so we avoid materialising a (B, seq, H) broadcast of mean_grad.
+    if pool_positions is not None and pool_positions.numel() > 0:
+        if layer_output_grad_exact is None:
+            raise ValueError(
+                "refined_mse: `pool_positions` non-empty but `layer_output_grad_exact` is None."
+            )
+        grad_exact_cast = layer_output_grad_exact.to(delta.dtype)
+        delta_pool = delta.index_select(0, pool_positions.to(delta.device))
+        fo_pool_sum = (grad_exact_cast * delta_pool).sum(dim=-1).mean(dim=-1).sum()
+        # Build non-pool mask on the fly; fine because B is small (≤64 typical).
+        non_pool_mask = torch.ones(B, dtype=torch.bool, device=delta.device)
+        non_pool_mask[pool_positions.to(delta.device)] = False
+    else:
+        fo_pool_sum = torch.zeros((), dtype=delta.dtype, device=delta.device)
+        non_pool_mask = torch.ones(B, dtype=torch.bool, device=delta.device)
+    if non_pool_mask.any():
+        delta_nonpool_mean_t = delta[non_pool_mask].mean(dim=1)  # (B_nonpool, H)
+        fo_nonpool_sum = (delta_nonpool_mean_t @ mean_grad_cast).sum()
+    else:
+        fo_nonpool_sum = torch.zeros((), dtype=delta.dtype, device=delta.device)
+    first_order = (fo_pool_sum + fo_nonpool_sum) / B
+    return fisher_loss + first_order
+
+
+def collect_layer_output_grad_for_refined_mse(
+    *,
+    analyzer,
+    layer,
+    layer_idx,
+    layers,
+    inps,
+    fp_inps_final,
+    attention_mask,
+    position_ids,
+    position_embeddings,
+    sample_ids_local,
+    backward_bsz,
+    kl_topk,
+    dev,
+    store_dtype=torch.bfloat16,
+):
+    """Capture g = ∂(top-k KL vs teacher) / ∂(out_of_layer_idx) for a per-layer
+    random sample pool. Used only by refresh_loss_type='refined_mse' to supply
+    the first-order Taylor term `g · Δy` on top of fisher_diag_mse.
+
+    Semantic state:
+        - inps already reflects upstream (layers 0..layer_idx-1) weight/act
+          quantization errors — same buffer the main quant loop uses.
+        - layer_idx and all downstream blocks are forward'd in FP (act-quant
+          wrappers disabled inside this call for the duration).
+        - Backward runs to `out_of_layer_idx` only; we don't need gradients at
+          the input side.
+
+    Caller must have moved `layer` + `layers[layer_idx+1:]` +
+    `analyzer.get_layernorm_before_head()` + `analyzer.get_lm_head()` to
+    `dev` before invoking, and must restore original residency afterwards.
+
+    Returns
+    -------
+    grad_pool : Tensor of shape (N, seq, H) dtype=store_dtype on CPU
+        Per-sample per-token gradient at the layer's output.
+    mean_grad : Tensor of shape (H,) fp32 on `dev`
+        Mean over (sample, seq) dims of the pool. Broadcast in refresh loss
+        for batch rows that don't hit the pool.
+    """
+    N = len(sample_ids_local)
+    if N == 0:
+        raise ValueError("`sample_ids_local` must be non-empty.")
+    if N % backward_bsz != 0:
+        raise ValueError(
+            f"num_samples_for_refined_mse ({N}) must be divisible by "
+            f"backward_bsz ({backward_bsz})."
+        )
+    seq_len = inps.shape[1]
+    hidden_size = inps.shape[2]
+    grad_pool = torch.empty(
+        (N, seq_len, hidden_size), dtype=store_dtype, device="cpu"
+    )
+
+    # Drop act-quant on the current + downstream layers so the forward used
+    # for the gradient measurement is pure FP. (Weights are still FP — this
+    # layer hasn't been quantised yet, and downstream layers haven't either.)
+    restore_bits = []
+    downstream_layers = layers[layer_idx + 1:]
+    all_layers_for_grad = [layer, *downstream_layers]
+    for lay in all_layers_for_grad:
+        restore_bits.append((lay, quant_utils.disable_act_quant(lay)))
+
+    grad_modules = all_layers_for_grad + [
+        analyzer.get_layernorm_before_head(),
+        analyzer.get_lm_head(),
+    ]
+    try:
+        with temporary_requires_grad(grad_modules, []):
+            with torch.enable_grad():
+                for start in range(0, N, backward_bsz):
+                    batch_ids = sample_ids_local[start:start + backward_bsz]
+                    bsz = len(batch_ids)
+                    b_attn = attention_mask.expand(bsz, -1, -1, -1)
+                    b_pos_ids = position_ids.expand(bsz, -1)
+                    b_pos_emb = (
+                        position_embeddings[0].expand(bsz, -1, -1),
+                        position_embeddings[1].expand(bsz, -1, -1),
+                    )
+                    h_in = (
+                        inps[batch_ids]
+                        .to(dev)
+                        .detach()
+                        .clone()
+                        .requires_grad_(True)
+                    )
+                    out = layer(
+                        h_in,
+                        attention_mask=b_attn,
+                        position_ids=b_pos_ids,
+                        position_embeddings=b_pos_emb,
+                    )
+                    out_i = out[0] if isinstance(out, (tuple, list)) else out
+                    h = out_i
+                    for k in range(layer_idx + 1, len(layers)):
+                        out_k = layers[k](
+                            h,
+                            attention_mask=b_attn,
+                            position_ids=b_pos_ids,
+                            position_embeddings=b_pos_emb,
+                        )
+                        h = out_k[0] if isinstance(out_k, (tuple, list)) else out_k
+                    logits_student = hidden2logits(h, analyzer)
+                    logits_teacher = hidden2logits(
+                        fp_inps_final[batch_ids].to(dev), analyzer
+                    ).detach()
+                    if kl_topk > 0:
+                        logits_teacher, idx_top = logits_teacher.topk(
+                            kl_topk, dim=-1, sorted=False
+                        )
+                        logits_student = logits_student.gather(-1, idx_top)
+                    kl_loss = F.kl_div(
+                        F.log_softmax(logits_student, dim=-1),
+                        F.softmax(logits_teacher, dim=-1),
+                        reduction="none",
+                    ).sum(dim=-1).mean()
+                    grad_out = torch.autograd.grad(
+                        kl_loss, out_i, retain_graph=False
+                    )[0]
+                    grad_pool[start:start + bsz] = (
+                        grad_out.detach().to(store_dtype).cpu()
+                    )
+                    del out, out_i, h, logits_student, logits_teacher
+                    del kl_loss, grad_out, h_in
+    finally:
+        for lay, bits_cfg in restore_bits:
+            quant_utils.enable_act_quant(lay, bits_cfg)
+
+    mean_grad = grad_pool.float().mean(dim=(0, 1)).to(dev)
+    return grad_pool, mean_grad
 
 
 def apply_dense_optimizer_step(
@@ -3292,6 +3474,10 @@ def collect_true_weight_gradient(
     global_shuffle=False,
     dp_rank=0,
     shard_size=None,
+    refresh_mb=None,
+    refined_mse_pool_ids=None,
+    refined_mse_grad_pool=None,
+    refined_mse_mean_grad=None,
 ):
     """Compute the refresh gradient as a per-rank partial sum + count.
 
@@ -3351,6 +3537,27 @@ def collect_true_weight_gradient(
         and samples_per_A > 0
         and refresh_loss_type == "refined_residual_kl"
     )
+
+    # refined_mse: build {local_idx -> pool_pos} lookup once. Samples whose
+    # local id lands in the pool use their own per-token gradient; everyone
+    # else falls back to the pool's (batch, seq)-mean. The pool was collected
+    # by `collect_layer_output_grad_for_refined_mse` before this layer's quant
+    # loop opens, and stays fixed through all refresh steps on this layer.
+    if refresh_loss_type == "refined_mse":
+        if refined_mse_mean_grad is None:
+            raise ValueError(
+                "refined_mse: refined_mse_mean_grad is required (pass mean_grad "
+                "from collect_layer_output_grad_for_refined_mse, or zeros(H) at "
+                "layer 0)."
+            )
+        if refined_mse_pool_ids is not None and refined_mse_pool_ids.numel() > 0:
+            refined_mse_pool_lookup = {
+                int(li): int(pp) for pp, li in enumerate(refined_mse_pool_ids.tolist())
+            }
+        else:
+            refined_mse_pool_lookup = {}
+    else:
+        refined_mse_pool_lookup = None
 
     if weight_override is None:
         override_weight = module.weight.detach().clone()
@@ -3412,8 +3619,23 @@ def collect_true_weight_gradient(
             grad_modules.append(next_layer)
         with temporary_requires_grad(grad_modules, []):
             with torch.enable_grad():
-                for start in range(0, len(selected_indices), bsz):
-                    batch_indices = selected_indices[start:start + bsz]
+                # Optional memory cap: losses that go through the LM head
+                # (kl / residual_kl / refined_residual_kl / refined_diag_residual_kl)
+                # materialise a full (B, T, V) logits tensor during forward.
+                # When vocab is huge (Llama-3: V≈150K → ~20 GB at bsz=32, bf16)
+                # we split the batch into `refresh_mb`-sized micro-batches; the
+                # accumulation into `partial_grad_sum` is linear so the final
+                # gradient is identical to using the full `bsz`. Losses that
+                # don't hit the LM head (fisher_diag_mse, hidden_mse) ignore the
+                # cap — memory isn't their bottleneck.
+                _lm_head_loss = refresh_loss_type in (
+                    "kl", "residual_kl", "refined_residual_kl", "refined_diag_residual_kl",
+                )
+                _step = bsz
+                if refresh_mb is not None and refresh_mb > 0 and _lm_head_loss:
+                    _step = min(bsz, int(refresh_mb))
+                for start in range(0, len(selected_indices), _step):
+                    batch_indices = selected_indices[start:start + _step]
                     batch_size = len(batch_indices)
                     batch_attention_mask = attention_mask.expand(batch_size, -1, -1, -1)
                     batch_position_ids = position_ids.expand(batch_size, -1)
@@ -3501,6 +3723,29 @@ def collect_true_weight_gradient(
                             if next_refined_A_list is not None and len(next_refined_A_list) > 0
                             else None
                         )
+                    # refined_mse: pick per-batch exact-grad slice + positions.
+                    # Slide-window path is explicitly disallowed at argparse
+                    # time for refined_mse, so we only assemble the current-
+                    # layer inputs here; the next-layer call below receives
+                    # `None`s if it ever fires (it won't in practice).
+                    refined_mse_pool_positions = None
+                    refined_mse_exact_batch = None
+                    if refresh_loss_type == "refined_mse" and refined_mse_pool_lookup:
+                        pool_pos_list = []
+                        batch_row_list = []
+                        for p_in_batch, li in enumerate(batch_indices):
+                            pp = refined_mse_pool_lookup.get(int(li))
+                            if pp is not None:
+                                pool_pos_list.append(pp)
+                                batch_row_list.append(p_in_batch)
+                        if batch_row_list:
+                            refined_mse_exact_batch = (
+                                refined_mse_grad_pool[pool_pos_list]
+                                .to(dev, dtype=out_hidden.dtype)
+                            )
+                            refined_mse_pool_positions = torch.tensor(
+                                batch_row_list, dtype=torch.long, device=dev
+                            )
                     refresh_loss_current = compute_refresh_loss(
                         refresh_loss_type,
                         out_hidden,
@@ -3510,6 +3755,12 @@ def collect_true_weight_gradient(
                         layer_output_fisher=fisher_batch,
                         fp_final_hidden=fp_final_batch,
                         refined_A=refined_A_batch,
+                        layer_output_grad_exact=refined_mse_exact_batch,
+                        layer_output_grad_mean=(
+                            refined_mse_mean_grad
+                            if refresh_loss_type == "refined_mse" else None
+                        ),
+                        pool_positions=refined_mse_pool_positions,
                     )
                     if slide_active:
                         next_out = next_layer(
@@ -3604,10 +3855,11 @@ def collect_layer_grad_hessian_stats(
     need_saliency_collection = precomputed_saliency_dict is None
     # When the caller sets skip_gradient_backward, we're running pure GPTQ with
     # enable_gptq_plus=0: no gradient reference loss, no fisher collection on
-    # this path (fisher only feeds fisher_diag_mse refresh, which is also off).
+    # this path (fisher only feeds fisher_diag_mse / refined_mse refresh,
+    # which is also off).
     need_layer_output_fisher_collection = (
         not skip_gradient_backward
-        and layer_refresh_loss_type == "fisher_diag_mse"
+        and layer_refresh_loss_type in ("fisher_diag_mse", "refined_mse")
         and precomputed_layer_output_fisher is None
     )
     need_gradient_backward = not skip_gradient_backward
@@ -3711,7 +3963,7 @@ def collect_layer_grad_hessian_stats(
                         saliency_cache.disable_hooks()
 
                 batch_layer_output_fisher = None
-                if layer_refresh_loss_type == "fisher_diag_mse" and precomputed_layer_output_fisher is not None:
+                if layer_refresh_loss_type in ("fisher_diag_mse", "refined_mse") and precomputed_layer_output_fisher is not None:
                     with layer_recorder.section("layer.grad_hessian.fisher_slice") if layer_recorder else _NULL_CONTEXT:
                         batch_layer_output_fisher = precomputed_layer_output_fisher[j : j + bsz].to(dev).float()
                 elif need_layer_output_fisher_collection:
@@ -3883,6 +4135,10 @@ def run_pre_quant_gd(
     global_shuffle=False,
     dp_rank=0,
     shard_size=None,
+    refresh_mb=None,
+    refined_mse_pool_ids=None,
+    refined_mse_grad_pool=None,
+    refined_mse_mean_grad=None,
 ):
     if num_steps <= 0 or not module_names:
         return
@@ -3934,6 +4190,10 @@ def run_pre_quant_gd(
                     global_shuffle=global_shuffle,
                     dp_rank=dp_rank,
                     shard_size=shard_size if shard_size is not None else inps.shape[0],
+                    refresh_mb=refresh_mb,
+                    refined_mse_pool_ids=refined_mse_pool_ids,
+                    refined_mse_grad_pool=refined_mse_grad_pool,
+                    refined_mse_mean_grad=refined_mse_mean_grad,
                 )
             )
             # DP aggregation via sum + count. The same code path handles both
@@ -4141,13 +4401,16 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     )
             else:
                 want_refined = args.grad_refresh_loss == "refined_residual_kl"
-                # fisher is only consumed when the refresh loss is fisher_diag_mse
-                # (per-layer reads in the refresh and slide-window paths are
-                # guarded by this same check). Skipping collection halves CPU
-                # RAM for the refined_residual_kl / residual_kl configurations.
-                want_fisher = args.grad_refresh_loss == "fisher_diag_mse"
+                # fisher is consumed by fisher_diag_mse (twofold: the refresh
+                # loss itself, and the slide-window blend reads the next
+                # layer's fisher) AND by refined_mse (as its second-order term
+                # — the first-order g·Δy is stacked on top). Everything else
+                # (kl / hidden_mse / residual_kl / refined_residual_kl) does
+                # not touch the static fisher cache, so skipping the collect
+                # halves CPU RAM for those configurations.
+                want_fisher = args.grad_refresh_loss in ("fisher_diag_mse", "refined_mse")
                 with pipeline_recorder.section("pipeline.static_end_to_end_saliency_fisher") if pipeline_recorder else _NULL_CONTEXT:
-                    # 4th return (`refined_diag_A`) is collected only by
+                    # 4th return (`refined_diag_A`) is only used by
                     # analyze_grad_cosine today; main quant pipeline ignores it.
                     static_saliency_by_layer, static_fisher_by_layer, static_refined_A_by_layer, _ = \
                         collect_static_end_to_end_saliency_and_fisher(
@@ -4313,7 +4576,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
         # (n_local, seq, hidden) shape as fp_inps. Any other refresh loss
         # keeps `fp_inps_final = None` and pays nothing.
         fp_inps_final = None
-        if args.grad_refresh_loss in ("residual_kl", "refined_residual_kl"):
+        if args.grad_refresh_loss in ("residual_kl", "refined_residual_kl", "refined_mse"):
             with pipeline_recorder.section("pipeline.fp_final_precompute") if pipeline_recorder else _NULL_CONTEXT:
                 logging.info(
                     "Precomputing FP final-layer hidden states for %s "
@@ -4428,6 +4691,77 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
             layer_backward_bsz = layer_backward_bsz_global // dp_world
             layer_stats_bsz = layer_stats_bsz_global // dp_world
 
+            # refined_mse: before this layer's quant/refresh loop opens, capture
+            # ∂KL/∂(layer_i output) on a fresh per-layer random pool. The pool
+            # grad is used inside `compute_refresh_loss(refined_mse, ...)` to
+            # add a first-order term `g · Δy` on top of fisher_diag_mse. At
+            # layer 0 the model output equals the teacher, so g ≡ 0; we skip
+            # the backward and plant zeros.
+            layer_refined_mse_pool_ids = None
+            layer_refined_mse_grad_pool = None
+            layer_refined_mse_mean_grad = None
+            if layer_refresh_loss_type == "refined_mse":
+                hidden_size = model.config.hidden_size
+                if i == 0:
+                    layer_refined_mse_pool_ids = torch.tensor([], dtype=torch.long)
+                    layer_refined_mse_mean_grad = torch.zeros(
+                        hidden_size, dtype=torch.float32, device=dev
+                    )
+                else:
+                    n_pool = int(args.num_samples_for_refined_mse)
+                    if n_pool > n_local:
+                        raise ValueError(
+                            f"num_samples_for_refined_mse ({n_pool}) exceeds rank-local "
+                            f"calibration size ({n_local} = nsamples // world)."
+                        )
+                    rm_bwd_bsz = args.global_loss_bsz // dp_world
+                    if rm_bwd_bsz <= 0 or n_pool % rm_bwd_bsz != 0:
+                        raise ValueError(
+                            f"refined_mse: num_samples_for_refined_mse ({n_pool}) "
+                            f"must be divisible by per-rank backward bsz "
+                            f"({rm_bwd_bsz} = global_loss_bsz // world)."
+                        )
+                    rng = random.Random(args.seed + i)
+                    sample_ids_local = sorted(rng.sample(range(n_local), n_pool))
+                    # Downstream transformer blocks live on CPU during the main
+                    # quant loop; move them to dev for the end-to-end backward,
+                    # restore after. pre_block / norm / lm_head are already on
+                    # dev (see `per_layer_runtime_modules` setup at fn entry).
+                    for k in range(i + 1, len(layers)):
+                        layers[k].to(dev)
+                    try:
+                        (
+                            layer_refined_mse_grad_pool,
+                            layer_refined_mse_mean_grad,
+                        ) = collect_layer_output_grad_for_refined_mse(
+                            analyzer=analyzer,
+                            layer=layer,
+                            layer_idx=i,
+                            layers=layers,
+                            inps=inps,
+                            fp_inps_final=fp_inps_final,
+                            attention_mask=attention_mask,
+                            position_ids=position_ids,
+                            position_embeddings=position_embeddings,
+                            sample_ids_local=sample_ids_local,
+                            backward_bsz=rm_bwd_bsz,
+                            kl_topk=args.kl_topk,
+                            dev=dev,
+                        )
+                    finally:
+                        for k in range(i + 1, len(layers)):
+                            layers[k] = layers[k].to(orig_device)
+                        memory_utils.cleanup_memory()
+                    layer_refined_mse_pool_ids = torch.tensor(
+                        sample_ids_local, dtype=torch.long
+                    )
+                    logging.info(
+                        "refined_mse: collected per-layer grad pool layer=%d N=%d "
+                        "bwd_bsz=%d |mean_grad|=%.3e",
+                        i, n_pool, rm_bwd_bsz,
+                        layer_refined_mse_mean_grad.norm(p=2).item(),
+                    )
+
             with layer_recorder.section("layer.fp_reference_forward") if layer_recorder else _NULL_CONTEXT:
                 bits_config = quant_utils.disable_act_quant(layer)
                 # inps/fp_inps are rank-local shards of length n_local.
@@ -4537,7 +4871,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
             subset = {n: full.get(n, full.get(n + ".module", None)) for n in names}
             layer_output_fisher_by_module = {}
             pre_gd_refresh_loss_type = layer_refresh_loss_type
-            if effective_pre_gd_steps > 0 and pre_gd_refresh_loss_type == "fisher_diag_mse":
+            if effective_pre_gd_steps > 0 and pre_gd_refresh_loss_type in ("fisher_diag_mse", "refined_mse"):
                 layer_output_fisher = static_fisher_by_layer[i]
                 if layer_output_fisher is None:
                     with layer_recorder.section("layer.pre_quant_fisher_collect") if layer_recorder else _NULL_CONTEXT:
@@ -4617,6 +4951,10 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             global_shuffle=dp_global_shuffle,
                             dp_rank=dp_rank,
                             shard_size=n_local,
+                            refresh_mb=getattr(args, "refresh_mb", None),
+                            refined_mse_pool_ids=layer_refined_mse_pool_ids,
+                            refined_mse_grad_pool=layer_refined_mse_grad_pool,
+                            refined_mse_mean_grad=layer_refined_mse_mean_grad,
                         )
 
             saliency_dict, gradients_dict, mean_reference_loss, layer_output_fisher = collect_layer_grad_hessian_stats(
@@ -4642,7 +4980,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                 precomputed_saliency_dict=static_saliency_by_layer[i],
                 precomputed_layer_output_fisher=(
                     static_fisher_by_layer[i]
-                    if layer_refresh_loss_type == "fisher_diag_mse"
+                    if layer_refresh_loss_type in ("fisher_diag_mse", "refined_mse")
                     else None
                 ),
                 fp_inps_final=fp_inps_final,
@@ -4775,6 +5113,10 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             global_shuffle=dp_global_shuffle,
                             dp_rank=dp_rank,
                             shard_size=n_local,
+                            refresh_mb=getattr(args, "refresh_mb", None),
+                            refined_mse_pool_ids=layer_refined_mse_pool_ids,
+                            refined_mse_grad_pool=layer_refined_mse_grad_pool,
+                            refined_mse_mean_grad=layer_refined_mse_mean_grad,
                         )
                     )
                     # DP aggregation via sum + count. Works uniformly whether
@@ -5013,6 +5355,12 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                 del layer
                 del gptq
                 del saliency_dict, gradients_dict
+                if layer_refined_mse_grad_pool is not None:
+                    del layer_refined_mse_grad_pool
+                if layer_refined_mse_mean_grad is not None:
+                    del layer_refined_mse_mean_grad
+                if layer_refined_mse_pool_ids is not None:
+                    del layer_refined_mse_pool_ids
                 memory_utils.cleanup_memory()
 
             if quant_stop_layer is not None and i >= quant_stop_layer:

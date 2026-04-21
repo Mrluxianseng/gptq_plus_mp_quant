@@ -53,6 +53,7 @@
 - DOWN_PROJ_LR_SCALE：调整down_proj层用的学习率（这个层一般比较爆炸）
 - SECOND_ORDER_SCALE：调整gptq式二阶更新的scale，固定为1就行
 - FISHER_NUM_GROUPS：每layer输出空间的fisher系数保留多少组（组内共享系数）
+- NUM_SAMPLES_FOR_REFINED_MSE：`GRAD_REFRESH_LOSS=refined_mse` 时才用。每 layer 端到端反传采集 grad 的 per-rank pool 大小，默认 32。需要 `<= nsamples // world` 且 `% (global_loss_bsz // world) == 0`。和 `LOSS_SLIDE_WINDOW=1` 不兼容（argparse 会报错）。
 - PRE_CLIP：弃用，固定为0
 - GLOBAL_LOSS：调整gptq的hessian估计以及fisher mse loss的fisher系数使用端到端的kl loss，固定为1就行
 - GLOBAL_LOSS_BSZ：预计算整个模型反传时的batchsize
@@ -131,7 +132,9 @@ FSDP_PRECOMPUTE=0 \
 
 - fisher_diag_mse：将最后一层（开启global loss）输出的kl loss在当前层的输出隐空间上二阶展开： $loss = \frac{1}{2} \Delta y ^T H \Delta y$ ，其中H使用fisher矩阵估算对角项。
 
-这里为了保持数值稳定，fisher系数做了逐样本的group维度标准化l2norm为1。
+这里之前做过逐样本group维度l2norm为1的标准化，现在删掉了（效果更好），就是严格二阶展开式，不加任何归一化。
+
+- refined_mse：在fisher_diag_mse的基础上再加一阶项 $g \cdot \Delta y$ ，即端到端kl loss对当前layer输出的完整Taylor二阶展开式。一阶项里的 $g$ 不能从预处理阶段的全精度反传拿（那时上游还没量化，$g=0$），所以每量化一层之前，用当前已经部分量化的模型做一次端到端反传：随机抽 `num_samples_for_refined_mse`（默认32，per-rank）条rank-local样本，per-layer seed=`args.seed + layer_idx`，按 `global_loss_bsz` 的 batchsize 过 layer i（FP，未量化）+ 下游（全FP）+ lm_head 算 top-k KL vs teacher(fp_inps_final)，再 `torch.autograd.grad` 回 layer i 的输出。block_gd refresh 时 batch 内落入 pool 的样本用精准 per-token g，落不到 pool 的样本用整个 pool 在 (sample, seq) 维上的平均 g（shape (H,)，broadcast）。layer 0 上 student==teacher，$g \equiv 0$，自动退化成 fisher_diag_mse。不支持和 loss_slide_window 同开。
 
 - res_kl：假设当前层的全精度模型输出为x，量化模型输出为x+Δx，假设后续层的变换可以近似为恒等变换加上一个较小的函数f，则全精度模型最终输出： $x+f(x)$ ，量化模型输出： $x+Δx+f(x+Δx)$ 约等于 $x+Δx+f(x)$ ，因此可以考虑直接比较这两个量过输出头之后的kl loss。其中 $x+f(x)$ 一开始就缓存下来了（全精度模型的激活值）。
 
@@ -178,4 +181,5 @@ $$
 - 试试给res kl加二阶修正
 - 测一些极低精度/激活值量化的数据 W4A4 W2A4等
 - 测一下正则化
+- refined_mse 现在采集 grad 时是每 GPU 存一份完整模型权重、把下游 transformer block 临时搬到 dev 做端到端反传。大模型（70B+）装不下时需要像 `collect_static_end_to_end_saliency_and_fisher` 那样上 FSDP2 shard。
 - 测一下调度器

@@ -24,9 +24,9 @@ DEVICE=${3}
 shift 3
 
 # Sweep configuration. Override from the shell when needed.
-GRAD_LRS_STR=${GRAD_LRS:-"0.00002"}
+GRAD_LRS_STR=${GRAD_LRS:-"0.00001"}
 DATASET=${DATASET:-wikitext2} # wikitext2 / neuralmagic / ultrachat_2k / numinamath
-N_SAMPLES=${N_SAMPLES:-1024}
+N_SAMPLES=${N_SAMPLES:-512}
 SEQ_LEN=${SEQ_LEN:-2048}
 BSZ=${BSZ:-128}
 FINAL_LAYER_STATS_BSZ=${FINAL_LAYER_STATS_BSZ:-8}
@@ -40,17 +40,21 @@ BLOCKSIZE=${BLOCKSIZE:-256}
 BLOCK_ATOMIC_QUANT=${BLOCK_ATOMIC_QUANT:-0}
 GRAD_OPTIMIZER=${GRAD_OPTIMIZER:-adam}
 FINAL_LAYER_GRAD_OPTIMIZER=${FINAL_LAYER_GRAD_OPTIMIZER:-adam}
-GRAD_CLIP=${GRAD_CLIP:-100.0}
+GRAD_CLIP=${GRAD_CLIP:-5e-5}
 # Optional: clip threshold applied ONLY to the final transformer layer. The
 # final layer's grads flow through lm_head + final norm and often blow up
 # relative to earlier blocks. Empty / "none" → reuse GRAD_CLIP for every layer.
-FINAL_LAYER_GRAD_CLIP=${FINAL_LAYER_GRAD_CLIP:-5e-5}
-# --grad_refresh_loss {kl,hidden_mse,fisher_diag_mse,residual_kl,refined_residual_kl}
+FINAL_LAYER_GRAD_CLIP=${FINAL_LAYER_GRAD_CLIP:-5e-4}
+# --grad_refresh_loss {kl,hidden_mse,fisher_diag_mse,residual_kl,refined_residual_kl,refined_mse}
 GRAD_REFRESH_LOSS=${GRAD_REFRESH_LOSS:-refined_residual_kl}
 # refined_residual_kl knobs (only used when GRAD_REFRESH_LOSS=refined_residual_kl)
 REFINED_RKL_NUM_A=${REFINED_RKL_NUM_A:-1}
 REFINED_RKL_DAMP=${REFINED_RKL_DAMP:-0.01}
-FINAL_LAYER_GRAD_LR=${FINAL_LAYER_GRAD_LR:-0.000007}
+# refined_mse knobs (only used when GRAD_REFRESH_LOSS=refined_mse). Per-layer
+# random pool size (rank-local) used for end-to-end grad collection before
+# that layer's quant loop opens. Must divide GLOBAL_LOSS_BSZ / world.
+NUM_SAMPLES_FOR_REFINED_MSE=${NUM_SAMPLES_FOR_REFINED_MSE:-32}
+FINAL_LAYER_GRAD_LR=${FINAL_LAYER_GRAD_LR:-0.000003}
 PRE_GD_STEPS=${PRE_GD_STEPS:-10}
 PRE_GRAD_LR=${PRE_GRAD_LR:-0.00003}
 PRE_FINAL_LAYER_GRAD_LR=${PRE_FINAL_LAYER_GRAD_LR:-0.3}
@@ -63,7 +67,7 @@ GRAD_GATE_FLOOR=${GRAD_GATE_FLOOR:-0.01}
 GRAD_GATE_SHARPNESS=${GRAD_GATE_SHARPNESS:-5.0}
 GRAD_GATE_SINE_AMP=${GRAD_GATE_SINE_AMP:-0.0005}
 GRAD_HESSIAN_TOPK=${GRAD_HESSIAN_TOPK:-20}
-SALIENCY_CLIP_PERCENTILE=${SALIENCY_CLIP_PERCENTILE:-0.99}
+SALIENCY_CLIP_PERCENTILE=${SALIENCY_CLIP_PERCENTILE:-1.0}
 PROJ_LR_SCALE=${PROJ_LR_SCALE:-1.0}
 DOWN_PROJ_LR_SCALE=${DOWN_PROJ_LR_SCALE:-1.0}
 SECOND_ORDER_SCALE=${SECOND_ORDER_SCALE:-1.0}
@@ -285,6 +289,12 @@ for grad_lr in "${GRAD_LRS[@]}"; do
             refined_rkl_suffix="${refined_rkl_suffix}_damp$(sanitize_float "${REFINED_RKL_DAMP}")"
         fi
     fi
+    refined_mse_suffix=""
+    if [[ "${GRAD_REFRESH_LOSS}" == "refined_mse" ]]; then
+        if [[ "${NUM_SAMPLES_FOR_REFINED_MSE}" != "32" ]]; then
+            refined_mse_suffix="_nRM${NUM_SAMPLES_FOR_REFINED_MSE}"
+        fi
+    fi
     grad_hessian_suffix=""
     if [[ "${GRAD_HESSIAN_TOPK}" != "-1" ]]; then
         grad_hessian_suffix="_ghtk${GRAD_HESSIAN_TOPK}"
@@ -303,7 +313,7 @@ for grad_lr in "${GRAD_LRS[@]}"; do
             pre_gd_suffix="${pre_gd_suffix}_flopt${PRE_FINAL_LAYER_GRAD_OPTIMIZER}"
         fi
     fi
-    exp_name="${BASE_EXP}_block_gd_${GRAD_OPTIMIZER}${refresh_suffix}${refined_rkl_suffix}${reg_suffix}${grad_hessian_suffix}${fisher_groups_suffix}_lr${grad_lr_tag}_fllr${final_layer_grad_lr_tag}_s${second_order_tag}${pre_gd_suffix}${PRE_CLIP_TAG}${BLOCK_ATOMIC_TAG}${FINAL_LAYER_FULL_BACKWARD_TAG}${GLOBAL_LOSS_TAG}${LOSS_SLIDE_WINDOW_TAG}${DP_GLOBAL_SHUFFLE_TAG}${GRAD_LR_LAYER_SCHEDULE_TAG}"
+    exp_name="${BASE_EXP}_block_gd_${GRAD_OPTIMIZER}${refresh_suffix}${refined_rkl_suffix}${refined_mse_suffix}${reg_suffix}${grad_hessian_suffix}${fisher_groups_suffix}_lr${grad_lr_tag}_fllr${final_layer_grad_lr_tag}_s${second_order_tag}${pre_gd_suffix}${PRE_CLIP_TAG}${BLOCK_ATOMIC_TAG}${FINAL_LAYER_FULL_BACKWARD_TAG}${GLOBAL_LOSS_TAG}${LOSS_SLIDE_WINDOW_TAG}${DP_GLOBAL_SHUFFLE_TAG}${GRAD_LR_LAYER_SCHEDULE_TAG}"
 
     echo "============================================================"
     echo "Running GPTQ+ LR sweep"
@@ -368,6 +378,7 @@ for grad_lr in "${GRAD_LRS[@]}"; do
         --backward_samples "${BACKWARD_SAMPLES}" --backward_bsz "${BACKWARD_BSZ}" --final_layer_backward_bsz "${FINAL_LAYER_BACKWARD_BSZ}" \
         --g_update_mode block_gd --grad_lr "${grad_lr}" --grad_optimizer "${GRAD_OPTIMIZER}" --grad_refresh_loss "${GRAD_REFRESH_LOSS}" \
         --refined_rkl_num_A "${REFINED_RKL_NUM_A}" --refined_rkl_damp "${REFINED_RKL_DAMP}" \
+        --num_samples_for_refined_mse "${NUM_SAMPLES_FOR_REFINED_MSE}" \
         --rotate \
         "${GLOBAL_LOSS_ARGS[@]}" \
         "${LOSS_SLIDE_WINDOW_ARGS[@]}" \

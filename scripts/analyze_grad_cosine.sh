@@ -5,7 +5,7 @@
 
 MODEL_PATH=${1}
 DEVICE=${2}
-TARGET_LAYERS=${3:-"7,14,20,26"}
+TARGET_LAYERS=${3:-"5,10,15,20,25,30"}
 
 MODEL_NAME=$(basename ${MODEL_PATH})
 N_SAMPLES=128
@@ -15,7 +15,7 @@ MEASURE_BSZ=4
 # Subset of surrogate losses to measure against the true end-to-end KL gradient.
 # Choices: fisher_diag_mse, residual_kl, refined_residual_kl, refined_diag_residual_kl.
 # Skipping refined_residual_kl avoids the H×H A fit (big CPU-RAM win on 70B).
-MEASURE_LOSSES=${MEASURE_LOSSES:-"fisher_diag_mse,residual_kl,refined_residual_kl,refined_diag_residual_kl"}
+MEASURE_LOSSES=${MEASURE_LOSSES:-"refined_mse"}
 # Grad clip applied element-wise to every captured gradient before cosine /
 # L2-norm measurement. Mirrors the main pipeline so the diagnostic reflects
 # what block_gd actually sees. Negative → disable. FINAL_LAYER_GRAD_CLIP is
@@ -40,7 +40,7 @@ python -m torch.distributed.run \
     --rotate \
     --skip_eval \
     --kl_topk 20 --grad_hessian_topk 20 \
-    --num_groups 4 --fisher_num_groups 512 --bsz 64 --global_loss_bsz 8 \
+    --num_groups 4 --fisher_num_groups 512 --bsz 32 --global_loss_bsz 2 \
     --target_layers ${TARGET_LAYERS} \
     --measure_samples ${MEASURE_SAMPLES} --measure_batch_size ${MEASURE_BSZ} \
     --measure_losses "${MEASURE_LOSSES}" \

@@ -128,7 +128,7 @@ def parse_gen():
         "--grad_refresh_loss",
         type=str,
         default="kl",
-        choices=["kl", "hidden_mse", "fisher_diag_mse", "residual_kl", "refined_residual_kl"],
+        choices=["kl", "hidden_mse", "fisher_diag_mse", "residual_kl", "refined_residual_kl", "refined_mse"],
         help=(
             "Loss used to compute the true refresh gradient in block_backward/block_gd. "
             "'residual_kl' assumes the current-layer output delta flows through the "
@@ -136,7 +136,11 @@ def parse_gen():
             "final norm + lm_head (cheap approximation of end-to-end KL). "
             "'refined_residual_kl' replaces that zero-order approximation with a first-order "
             "Jacobian f(x+Δx) ≈ f(x) + A·Δx; the shared H×H matrix A per layer is fit via "
-            "least squares on (dy, dx-dy) pairs during the static end-to-end backward."
+            "least squares on (dy, dx-dy) pairs during the static end-to-end backward. "
+            "'refined_mse' adds a first-order term g·Δy (where g = ∂KL/∂layer_output, "
+            "collected end-to-end per layer just before its quant loop opens) on top of "
+            "fisher_diag_mse's second-order term — the full Taylor expansion of end-to-end "
+            "KL in the layer output."
         ),
     )
     parser.add_argument(
@@ -500,15 +504,31 @@ def parse_gen():
         ),
     )
     parser.add_argument(
+        "--num_samples_for_refined_mse",
+        type=int,
+        default=32,
+        help=(
+            "refined_mse only: per-rank size of the end-to-end grad pool collected "
+            "fresh before each transformer block's quant loop opens. For each layer, "
+            "a random subset of the rank-local calibration samples (seeded with "
+            "seed + layer_idx) is forwarded end-to-end in FP and backward'd to capture "
+            "g = ∂KL/∂(layer output) per (sample, token). Refresh mini-batches pull "
+            "exact g for samples in the pool and fall back to the pool mean (over "
+            "sample, seq) for everyone else. Must be >0, ≤ nsamples // world, and "
+            "divisible by (global_loss_bsz // world)."
+        ),
+    )
+    parser.add_argument(
         "--measure_losses",
         type=str,
         default="fisher_diag_mse,residual_kl,refined_residual_kl,refined_diag_residual_kl",
         help=(
             "Comma-separated subset of surrogate losses to measure against the true "
             "end-to-end KL gradient in analyze_grad_cosine. Choices: fisher_diag_mse, "
-            "residual_kl, refined_residual_kl, refined_diag_residual_kl. Only the "
-            "fits / backward passes needed for the selected set are run (saves memory "
-            "and time — e.g. skipping refined_residual_kl avoids the H×H A fit)."
+            "residual_kl, refined_residual_kl, refined_diag_residual_kl, refined_mse. "
+            "Only the fits / backward passes needed for the selected set are run "
+            "(saves memory and time — e.g. skipping refined_residual_kl avoids the "
+            "H×H A fit)."
         ),
     )
 
@@ -621,6 +641,51 @@ def parse_gen():
             f"refined_rkl_num_A ({args.refined_rkl_num_A}) must divide nsamples "
             f"({args.nsamples}) evenly."
         )
+    # refined_mse validation: needs end-to-end forward machinery (→ global_loss
+    # enables fp_inps_final precompute), per-rank pool size bounded by local
+    # shard + divisible by per-rank backward batch so the collection loop
+    # doesn't trail a short batch.
+    if args.grad_refresh_loss == "refined_mse":
+        if not args.global_loss:
+            raise ValueError(
+                "--grad_refresh_loss=refined_mse requires --global_loss (fp_inps_final "
+                "is only cached under the global-loss precompute path)."
+            )
+        if getattr(args, "loss_slide_window", False):
+            raise ValueError(
+                "--loss_slide_window is not supported with --grad_refresh_loss=refined_mse "
+                "in v1 (next-layer grad pool would also need collecting; deferred)."
+            )
+        if int(getattr(args, "enable_gptq_plus", 1)) != 0:
+            raise ValueError(
+                "--grad_refresh_loss=refined_mse requires --enable_gptq_plus 0 in v1. "
+                "With GPTQ+ on (alpha≠0) the reference-loss backward inside "
+                "collect_layer_grad_hessian_stats would call compute_refresh_loss("
+                "'refined_mse', ...) without the per-layer grad pool plumbed through; "
+                "pushing pool args down that code path is deferred."
+            )
+        if args.num_samples_for_refined_mse <= 0:
+            raise ValueError(
+                f"--num_samples_for_refined_mse must be positive. "
+                f"Got {args.num_samples_for_refined_mse}."
+            )
+        # Per-rank divisibility checks: dp_world inferred from WORLD_SIZE env
+        # (falls back to 1 in single-GPU runs). nsamples/global_loss_bsz div
+        # by world is already validated further up, so //world is integer.
+        _dp_world_r = int(os.environ.get("WORLD_SIZE", "1"))
+        _n_local = args.nsamples // _dp_world_r
+        if args.num_samples_for_refined_mse > _n_local:
+            raise ValueError(
+                f"--num_samples_for_refined_mse ({args.num_samples_for_refined_mse}) "
+                f"must be <= nsamples // world ({_n_local})."
+            )
+        _bwd_bsz_local = args.global_loss_bsz // _dp_world_r
+        if _bwd_bsz_local <= 0 or args.num_samples_for_refined_mse % _bwd_bsz_local != 0:
+            raise ValueError(
+                f"--num_samples_for_refined_mse ({args.num_samples_for_refined_mse}) "
+                f"must be divisible by per-rank backward bsz ({_bwd_bsz_local} = "
+                f"global_loss_bsz // world)."
+            )
     if args.nsamples % args.backward_samples != 0:
         raise ValueError(
             f"`nsamples` ({args.nsamples}) must be divisible by `backward_samples` ({args.backward_samples})."
