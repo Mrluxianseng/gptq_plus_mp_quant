@@ -191,7 +191,8 @@ def kl_ppl_eval(args, analyzer, orig_lm_head, test_loader_dict, ref_logits_dict)
 def qa_eval(model, tokenizer, lm_eval_batch_size=32):
     hflm = HFLM(pretrained=model, tokenizer=tokenizer, batch_size=lm_eval_batch_size)
 
-    tasks = ["piqa", "hellaswag", "arc_easy", "arc_challenge", "winogrande", "lambada_openai", "ceval-valid"]
+    tasks = ["piqa", "hellaswag", "arc_easy", "arc_challenge", "winogrande", "lambada_openai", "ceval-valid",
+             "boolq", "openbookqa", "social_iqa"]
     # Pick up the project's custom task YAMLs only if that directory exists.
     # Without this guard, `include_defaults=False` + a missing include_path
     # leaves `all_tasks` empty → `pattern_match` returns [] → later division
