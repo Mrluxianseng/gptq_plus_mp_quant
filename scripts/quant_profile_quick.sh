@@ -296,9 +296,52 @@ fi
 
 CMD+=("$@")
 
-if [[ "${NSYS}" == "1" ]]; then
+if [[ "${NSYS}" == "1" && -n "${NSYS_BIN:-}" && -x "${NSYS_BIN}" ]]; then
     mkdir -p "$(dirname "${NSYS_OUTPUT}")"
-    if [[ -n "${NSYS_BIN}" && -x "${NSYS_BIN}" ]]; then
+
+    if [[ "${N_GPUS}" -gt 1 ]]; then
+        # Multi-rank: wrapping `nsys profile` around `torch.distributed.run`
+        # only traces the launcher process — the worker ranks (where all the
+        # CUDA kernels + NVTX ranges actually live) are spawned as children
+        # and get skipped. Instead, let torchrun launch a small bash wrapper
+        # per rank, which execs `nsys profile → python`. Each rank drops its
+        # own .nsys-rep suffixed by LOCAL_RANK so they open cleanly in Nsight
+        # without one giant merged file.
+        export NSYS_BIN NSYS_TRACE NSYS_WAIT
+        NSYS_OUTPUT_BASE="${NSYS_OUTPUT}"
+        export NSYS_OUTPUT_BASE
+
+        RANK_WRAPPER=$(mktemp /tmp/nsys_rank_wrap.XXXXXX)
+        trap 'rm -f "${RANK_WRAPPER}"' EXIT
+        cat >"${RANK_WRAPPER}" <<'EOF'
+#!/bin/bash
+set -e
+exec "${NSYS_BIN}" profile \
+    --force-overwrite=true \
+    --trace="${NSYS_TRACE}" \
+    --sample=none \
+    --cpuctxsw=none \
+    --backtrace=none \
+    --python-sampling=false \
+    --wait="${NSYS_WAIT}" \
+    --capture-range=none \
+    --output="${NSYS_OUTPUT_BASE}_rank${LOCAL_RANK:-0}" \
+    "$@"
+EOF
+        chmod +x "${RANK_WRAPPER}"
+
+        # CMD[0..5] = launcher (python -m torch.distributed.run + its flags);
+        # CMD[6]    = ./ptq.py; CMD[7..] = ptq.py args. We re-assemble so
+        # torchrun (with --no-python) execs `${RANK_WRAPPER} python ptq.py ...`
+        # in each rank, and the wrapper in turn execs `nsys profile python ...`.
+        python -m torch.distributed.run \
+            --nnodes=1 --nproc_per_node=${N_GPUS} --rdzv_endpoint=localhost:${RDZV_PORT} \
+            --no-python \
+            "${RANK_WRAPPER}" python "${CMD[@]:6}"
+    else
+        # Single-GPU: wrap nsys around the whole thing. With nproc_per_node=1
+        # the launcher overhead is negligible, and having nsys at the outer
+        # layer keeps the one-file report simple.
         "${NSYS_BIN}" profile \
             --force-overwrite=true \
             --trace="${NSYS_TRACE}" \
@@ -310,10 +353,10 @@ if [[ "${NSYS}" == "1" ]]; then
             --capture-range=none \
             --output="${NSYS_OUTPUT}" \
             "${CMD[@]}"
-    else
-        echo "Warning: nsys not found; running with NVTX ranges enabled but without Nsight capture." >&2
-        "${CMD[@]}"
     fi
+elif [[ "${NSYS}" == "1" ]]; then
+    echo "Warning: nsys not found; running with NVTX ranges enabled but without Nsight capture." >&2
+    "${CMD[@]}"
 else
     "${CMD[@]}"
 fi
