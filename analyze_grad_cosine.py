@@ -239,12 +239,23 @@ def _zero_grads(param_list):
             p.grad.zero_()
 
 
-def _capture_grads(name_to_weight):
+def _capture_grads(name_to_weight, grad_clip=None):
+    """Copy `.grad` off each weight into a fresh fp32 tensor.
+
+    If `grad_clip` is provided and positive, apply the same element-wise clamp
+    that block_gd does in `apply_dense_optimizer_step` (see gptq_plus_utils.py).
+    This makes the measured cosine/norm reflect what the optimizer actually
+    sees, not the raw autograd output — useful when grad_clip is a meaningful
+    hyper-parameter in production runs (default 1.0 is a wide permissive band;
+    small values like 5e-6 used in the lr sweep aggressively reshape grads)."""
     grads = {}
     for name, w in name_to_weight.items():
         if w.grad is None:
             raise RuntimeError(f"weight `{name}` received no gradient.")
-        grads[name] = w.grad.detach().float().clone()
+        g = w.grad.detach().float().clone()
+        if grad_clip is not None and grad_clip > 0:
+            g.clamp_(min=-grad_clip, max=grad_clip)
+        grads[name] = g
     return grads
 
 
@@ -281,6 +292,7 @@ def run_cosine_measurement(
     kl_topk,
     dev,
     measure_losses,
+    grad_clip=None,
 ):
     if measure_samples % measure_batch_size != 0:
         raise ValueError(
@@ -387,7 +399,7 @@ def run_cosine_measurement(
                 reduction="none",
             ).sum(dim=-1).mean()
             kl_loss.backward()
-            grads_true = _capture_grads(name_to_weight)
+            grads_true = _capture_grads(name_to_weight, grad_clip=grad_clip)
             del h_student, logits_student, logits_teacher, kl_loss
 
             # ---------- (2) fisher_diag_mse ----------
@@ -407,7 +419,7 @@ def run_cosine_measurement(
                     fp_final_hidden=None,
                 )
                 fisher_loss.backward()
-                grads_fisher = _capture_grads(name_to_weight)
+                grads_fisher = _capture_grads(name_to_weight, grad_clip=grad_clip)
                 del out_hidden, fp_hidden, fisher_loss
 
             # ---------- (3) residual_kl ----------
@@ -427,7 +439,7 @@ def run_cosine_measurement(
                     fp_final_hidden=fp_final_batch,
                 )
                 residual_loss.backward()
-                grads_residual = _capture_grads(name_to_weight)
+                grads_residual = _capture_grads(name_to_weight, grad_clip=grad_clip)
                 del out_hidden, fp_hidden, residual_loss
 
             # ---------- (4) refined_residual_kl ----------
@@ -464,7 +476,7 @@ def run_cosine_measurement(
                     refined_A=refined_A_dev,
                 )
                 refined_loss.backward()
-                grads_refined = _capture_grads(name_to_weight)
+                grads_refined = _capture_grads(name_to_weight, grad_clip=grad_clip)
                 del out_hidden, fp_hidden, refined_loss, refined_A_dev
 
             # ---------- (5) refined_diag_residual_kl ----------
@@ -499,7 +511,7 @@ def run_cosine_measurement(
                     refined_A=refined_diag_dev,
                 )
                 refined_diag_loss.backward()
-                grads_refined_diag = _capture_grads(name_to_weight)
+                grads_refined_diag = _capture_grads(name_to_weight, grad_clip=grad_clip)
                 del out_hidden, fp_hidden, refined_diag_loss, refined_diag_dev
 
             # ---------- cosine + grad L2 per linear ----------
@@ -624,8 +636,10 @@ def quantize_and_measure(args, analyzer, trainloader, dev, target_layers, measur
     _want_refined_diag = "refined_diag_residual_kl" in measure_losses
     logging.info(
         "Measurement plan: losses=%s  → collect_fisher=%s, collect_refined_rkl=%s, "
-        "collect_refined_diag_rkl=%s",
+        "collect_refined_diag_rkl=%s  grad_clip=%s final_layer_grad_clip=%s",
         sorted(measure_losses), _want_fisher, _want_refined_full, _want_refined_diag,
+        getattr(args, "grad_clip", None),
+        getattr(args, "final_layer_grad_clip", None),
     )
     static_saliency, static_fisher_by_layer, static_refined_A_by_layer, static_refined_diag_A_by_layer = \
         collect_static_end_to_end_saliency_and_fisher(
@@ -692,6 +706,16 @@ def quantize_and_measure(args, analyzer, trainloader, dev, target_layers, measur
                         if static_refined_diag_A_by_layer is not None
                         else None
                     )
+                    # Same per-layer selection as the main pipeline: final
+                    # layer uses `--final_layer_grad_clip` if set; everyone
+                    # else uses `--grad_clip`. Negative value → disabled.
+                    final_layer_idx = len(layers) - 1
+                    fl_clip = getattr(args, "final_layer_grad_clip", None)
+                    layer_grad_clip = (
+                        fl_clip
+                        if i == final_layer_idx and fl_clip is not None
+                        else getattr(args, "grad_clip", None)
+                    )
                     cosine_results[i] = run_cosine_measurement(
                         analyzer=analyzer,
                         layer=layer,
@@ -712,6 +736,7 @@ def quantize_and_measure(args, analyzer, trainloader, dev, target_layers, measur
                         kl_topk=args.kl_topk,
                         dev=dev,
                         measure_losses=measure_losses,
+                        grad_clip=layer_grad_clip,
                     )
                 def _fmt_entry(name, r):
                     cos_bits = []

@@ -34,6 +34,23 @@ def format_log_value(value, digits=6):
     return f"{float(value):.{digits}g}"
 
 
+def _quantile_large(tensor, q):
+    """torch.quantile chokes on very large inputs on some torch versions
+    (pre-2.0 had a 16M element cap). For block_gd diagnostics where the
+    flattened update can hit 100M+ entries, fall back to `kthvalue` on sort,
+    which is O(n log n) but handles any size. Assumes `tensor` is non-empty
+    float (callers pass `.abs()` of a float tensor)."""
+    flat = tensor.reshape(-1)
+    n = flat.numel()
+    if n == 0:
+        return None
+    k = max(1, min(n, int(n * q + 0.5)))
+    try:
+        return torch.quantile(flat, q).item()
+    except RuntimeError:
+        return flat.kthvalue(k).values.item()
+
+
 def normalize_quant_module_name(name: str) -> str:
     return name[:-7] if name.endswith(".module") else name
 
@@ -1207,10 +1224,14 @@ class GPTQPlus:
                                         "remaining_grad_mean_row_l2": trailing_grad_mean_row_l2,
                                         "second_order_update_abs_mean": None,
                                         "second_order_update_mean_row_l2": None,
+                                        "second_order_update_abs_max": None,
+                                        "second_order_update_abs_q99": None,
                                         "first_order_raw_abs_mean": None,
                                         "first_order_raw_mean_row_l2": None,
                                         "first_order_update_abs_mean": None,
                                         "first_order_update_mean_row_l2": None,
+                                        "first_order_update_abs_max": None,
+                                        "first_order_update_abs_q99": None,
                                         "regularizer_update_abs_mean": None,
                                         "regularizer_update_mean_row_l2": None,
                                         "sine_regularizer_update_abs_mean": None,
@@ -1352,10 +1373,14 @@ class GPTQPlus:
                             trailing_grad_clipped_abs_mean = None
                             second_order_abs_mean = None
                             second_order_mean_row_l2 = None
+                            second_order_abs_max = None
+                            second_order_abs_q99 = None
                             first_order_raw_abs_mean = None
                             first_order_raw_mean_row_l2 = None
                             first_order_abs_mean = None
                             first_order_mean_row_l2 = None
+                            first_order_abs_max = None
+                            first_order_abs_q99 = None
                             regularizer_abs_mean = None
                             regularizer_mean_row_l2 = None
                             sine_regularizer_abs_mean = None
@@ -1366,11 +1391,18 @@ class GPTQPlus:
                             sine_regularizer_updates = []
                             if block_second_order_chunks:
                                 second_order_cat = torch.cat(block_second_order_chunks, dim=0).float()
-                                second_order_abs_mean = second_order_cat.abs().mean().item()
+                                _so_abs = second_order_cat.abs()
+                                second_order_abs_mean = _so_abs.mean().item()
                                 second_order_mean_row_l2 = torch.linalg.norm(
                                     second_order_cat,
                                     dim=1,
                                 ).mean().item()
+                                # Outlier stats — the max and 0.99 quantile of
+                                # |second-order update|. Useful to spot whether a
+                                # handful of rows/cols dominate the step; the mean
+                                # alone hides heavy-tailed distributions.
+                                second_order_abs_max = _so_abs.max().item()
+                                second_order_abs_q99 = _quantile_large(_so_abs, 0.99)
                             if trailing_grad_chunks:
                                 trailing_grad_cat = torch.cat(trailing_grad_chunks, dim=0).float()
                                 trailing_grad_abs_mean = trailing_grad_cat.abs().mean().item()
@@ -1474,11 +1506,18 @@ class GPTQPlus:
                                 ).mean().item()
                             if optimizer_updates:
                                 optimizer_update_cat = torch.cat(optimizer_updates, dim=0).float()
-                                first_order_abs_mean = optimizer_update_cat.abs().mean().item()
+                                _fo_abs = optimizer_update_cat.abs()
+                                first_order_abs_mean = _fo_abs.mean().item()
                                 first_order_mean_row_l2 = torch.linalg.norm(
                                     optimizer_update_cat,
                                     dim=1,
                                 ).mean().item()
+                                # Outlier stats for the applied first-order step
+                                # (post regularizer / gate). Paired with the
+                                # second-order outlier stats above to see which
+                                # term produces the spikiest updates.
+                                first_order_abs_max = _fo_abs.max().item()
+                                first_order_abs_q99 = _quantile_large(_fo_abs, 0.99)
                             if gate_regularizer_updates:
                                 regularizer_update_cat = torch.cat(gate_regularizer_updates, dim=0).float()
                                 regularizer_abs_mean = regularizer_update_cat.abs().mean().item()
@@ -1505,10 +1544,14 @@ class GPTQPlus:
                                         "remaining_grad_mean_row_l2": trailing_grad_mean_row_l2,
                                         "second_order_update_abs_mean": second_order_abs_mean,
                                         "second_order_update_mean_row_l2": second_order_mean_row_l2,
+                                        "second_order_update_abs_max": second_order_abs_max,
+                                        "second_order_update_abs_q99": second_order_abs_q99,
                                         "first_order_raw_abs_mean": first_order_raw_abs_mean,
                                         "first_order_raw_mean_row_l2": first_order_raw_mean_row_l2,
                                         "first_order_update_abs_mean": first_order_abs_mean,
                                         "first_order_update_mean_row_l2": first_order_mean_row_l2,
+                                        "first_order_update_abs_max": first_order_abs_max,
+                                        "first_order_update_abs_q99": first_order_abs_q99,
                                         "regularizer_update_abs_mean": regularizer_abs_mean,
                                         "regularizer_update_mean_row_l2": regularizer_mean_row_l2,
                                         "sine_regularizer_update_abs_mean": sine_regularizer_abs_mean,
@@ -4530,6 +4573,13 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     if i == final_layer_idx and args.pre_final_layer_grad_lr is not None
                     else args.pre_grad_lr * grad_lr_layer_scale
                 )
+                # Final-layer gradients come through lm_head + final norm and are
+                # often orders of magnitude larger; allow an independent clip.
+                effective_grad_clip = (
+                    args.final_layer_grad_clip
+                    if i == final_layer_idx and args.final_layer_grad_clip is not None
+                    else args.grad_clip
+                )
                 if pre_grad_lr > 0:
                     with layer_recorder.section("layer.pre_quant_gd") if layer_recorder else _NULL_CONTEXT:
                         logging.info(
@@ -4558,7 +4608,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             num_steps=effective_pre_gd_steps,
                             grad_lr=pre_grad_lr,
                             grad_optimizer=pre_grad_optimizer,
-                            grad_clip=args.grad_clip,
+                            grad_clip=effective_grad_clip,
                             refresh_loss_type=layer_refresh_loss_type,
                             layer_output_fisher_by_module=layer_output_fisher_by_module,
                             fp_inps_final=fp_inps_final,
@@ -4771,7 +4821,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
             def make_block_observer(module_name, effective_grad_optimizer):
                 def observer(payload):
                     logging.info(
-                        "block-metrics layer=%d module=%s mode=%s grad_opt=%s block=%d cols=[%d,%d) remain=%d grad_abs_mean=%s grad_clipped_abs_mean=%s grad_row_l2=%s loss=%s refresh_loss=%s train_loss=%s val_loss=%s second_abs=%s first_raw_abs=%s first_abs=%s reg_abs=%s sine_abs=%s slide_alpha=%s loss_cur=%s loss_next=%s",
+                        "block-metrics layer=%d module=%s mode=%s grad_opt=%s block=%d cols=[%d,%d) remain=%d grad_abs_mean=%s grad_clipped_abs_mean=%s grad_row_l2=%s loss=%s refresh_loss=%s train_loss=%s val_loss=%s second_abs=%s second_abs_max=%s second_abs_q99=%s first_raw_abs=%s first_abs=%s first_abs_max=%s first_abs_q99=%s reg_abs=%s sine_abs=%s slide_alpha=%s loss_cur=%s loss_next=%s",
                         i,
                         module_name,
                         args.g_update_mode,
@@ -4788,8 +4838,12 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         format_log_value(payload["train_mean_refresh_loss"], digits=6),
                         format_log_value(payload["val_mean_refresh_loss"], digits=6),
                         format_log_value(payload["second_order_update_abs_mean"], digits=4),
+                        format_log_value(payload.get("second_order_update_abs_max"), digits=4),
+                        format_log_value(payload.get("second_order_update_abs_q99"), digits=4),
                         format_log_value(payload["first_order_raw_abs_mean"], digits=4),
                         format_log_value(payload["first_order_update_abs_mean"], digits=4),
+                        format_log_value(payload.get("first_order_update_abs_max"), digits=4),
+                        format_log_value(payload.get("first_order_update_abs_q99"), digits=4),
                         format_log_value(payload["regularizer_update_abs_mean"], digits=4),
                         format_log_value(payload["sine_regularizer_update_abs_mean"], digits=4),
                         format_log_value(payload.get("slide_alpha"), digits=3),
@@ -4832,6 +4886,15 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         else args.grad_lr * grad_lr_layer_scale
                     )
                     effective_grad_reg_strategy = "none" if i == final_layer_idx else args.grad_reg_strategy
+                    # Final-layer gradients come through lm_head + final norm and
+                    # are often orders of magnitude larger; allow an independent
+                    # clip. Falls back to `--grad_clip` for non-final layers or
+                    # when the override is not set.
+                    effective_main_grad_clip = (
+                        args.final_layer_grad_clip
+                        if i == final_layer_idx and args.final_layer_grad_clip is not None
+                        else args.grad_clip
+                    )
                     effective_grad_lr = get_module_grad_lr(
                         name,
                         base_grad_lr,
@@ -4908,7 +4971,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         second_order_scale=args.second_order_scale,
                         block_atomic_quant=args.block_atomic_quant,
                         block_observer=make_block_observer(name, effective_grad_optimizer) if args.g_update_mode in {"block_backward", "block_gd"} else None,
-                        grad_clip=args.grad_clip,
+                        grad_clip=effective_main_grad_clip,
                         diagnostic_recorder=diagnostic_registry.get_or_create(i, name),
                         slide_refresh_start=slide_refresh_cursor,
                         slide_refresh_block_total=slide_refresh_block_total,

@@ -24,7 +24,7 @@ DEVICE=${3}
 shift 3
 
 # Sweep configuration. Override from the shell when needed.
-GRAD_LRS_STR=${GRAD_LRS:-"0.0 0.000001 0.000005 0.000007 0.00001 0.00002 0.00004 0.00006 0.00008 0.0001 0.0003"}
+GRAD_LRS_STR=${GRAD_LRS:-"0.00002"}
 DATASET=${DATASET:-wikitext2} # wikitext2 / neuralmagic / ultrachat_2k / numinamath
 N_SAMPLES=${N_SAMPLES:-1024}
 SEQ_LEN=${SEQ_LEN:-2048}
@@ -40,11 +40,15 @@ BLOCKSIZE=${BLOCKSIZE:-256}
 BLOCK_ATOMIC_QUANT=${BLOCK_ATOMIC_QUANT:-0}
 GRAD_OPTIMIZER=${GRAD_OPTIMIZER:-adam}
 FINAL_LAYER_GRAD_OPTIMIZER=${FINAL_LAYER_GRAD_OPTIMIZER:-adam}
-GRAD_CLIP=${GRAD_CLIP:-1.0}
+GRAD_CLIP=${GRAD_CLIP:-100.0}
+# Optional: clip threshold applied ONLY to the final transformer layer. The
+# final layer's grads flow through lm_head + final norm and often blow up
+# relative to earlier blocks. Empty / "none" → reuse GRAD_CLIP for every layer.
+FINAL_LAYER_GRAD_CLIP=${FINAL_LAYER_GRAD_CLIP:-5e-5}
 # --grad_refresh_loss {kl,hidden_mse,fisher_diag_mse,residual_kl,refined_residual_kl}
 GRAD_REFRESH_LOSS=${GRAD_REFRESH_LOSS:-refined_residual_kl}
 # refined_residual_kl knobs (only used when GRAD_REFRESH_LOSS=refined_residual_kl)
-REFINED_RKL_NUM_A=${REFINED_RKL_NUM_A:-32}
+REFINED_RKL_NUM_A=${REFINED_RKL_NUM_A:-1}
 REFINED_RKL_DAMP=${REFINED_RKL_DAMP:-0.01}
 FINAL_LAYER_GRAD_LR=${FINAL_LAYER_GRAD_LR:-0.000007}
 PRE_GD_STEPS=${PRE_GD_STEPS:-10}
@@ -58,7 +62,7 @@ GRAD_REG_LAMBDA=${GRAD_REG_LAMBDA:-0.01}
 GRAD_GATE_FLOOR=${GRAD_GATE_FLOOR:-0.01}
 GRAD_GATE_SHARPNESS=${GRAD_GATE_SHARPNESS:-5.0}
 GRAD_GATE_SINE_AMP=${GRAD_GATE_SINE_AMP:-0.0005}
-GRAD_HESSIAN_TOPK=${GRAD_HESSIAN_TOPK:--1}
+GRAD_HESSIAN_TOPK=${GRAD_HESSIAN_TOPK:-20}
 SALIENCY_CLIP_PERCENTILE=${SALIENCY_CLIP_PERCENTILE:-0.99}
 PROJ_LR_SCALE=${PROJ_LR_SCALE:-1.0}
 DOWN_PROJ_LR_SCALE=${DOWN_PROJ_LR_SCALE:-1.0}
@@ -72,7 +76,7 @@ DP_GLOBAL_SHUFFLE=${DP_GLOBAL_SHUFFLE:-1}
 # --grad_lr_layer_schedule {none, cosine, linear, sqrt}
 GRAD_LR_LAYER_SCHEDULE=${GRAD_LR_LAYER_SCHEDULE:-cosine}
 ALPHA=${ALPHA:-0.0}
-KL_TOPK=${KL_TOPK:--1}
+KL_TOPK=${KL_TOPK:-20}
 LM_EVAL_BATCH_SIZE=${LM_EVAL_BATCH_SIZE:-32}
 ENABLE_QA_EVAL=${ENABLE_QA_EVAL:-1}
 BASE_EXP=${BASE_EXP:-gptq_plus_lr_sweep}
@@ -146,6 +150,11 @@ fi
 PRE_FINAL_LAYER_GRAD_LR_ARGS=()
 if [[ -n "${PRE_FINAL_LAYER_GRAD_LR}" && "${PRE_FINAL_LAYER_GRAD_LR}" != "none" ]]; then
     PRE_FINAL_LAYER_GRAD_LR_ARGS=(--pre_final_layer_grad_lr "${PRE_FINAL_LAYER_GRAD_LR}")
+fi
+
+FINAL_LAYER_GRAD_CLIP_ARGS=()
+if [[ -n "${FINAL_LAYER_GRAD_CLIP}" && "${FINAL_LAYER_GRAD_CLIP}" != "none" ]]; then
+    FINAL_LAYER_GRAD_CLIP_ARGS=(--final_layer_grad_clip "${FINAL_LAYER_GRAD_CLIP}")
 fi
 
 PRE_FINAL_LAYER_GRAD_OPTIMIZER_ARGS=()
@@ -306,6 +315,7 @@ for grad_lr in "${GRAD_LRS[@]}"; do
     echo "  opt    : ${GRAD_OPTIMIZER}"
     echo "  flopt  : ${FINAL_LAYER_GRAD_OPTIMIZER}"
     echo "  gclip  : ${GRAD_CLIP}"
+    echo "  flgclip: ${FINAL_LAYER_GRAD_CLIP:-<default>}"
     echo "  rloss  : ${GRAD_REFRESH_LOSS}"
     if [[ "${GRAD_REFRESH_LOSS}" == "refined_residual_kl" ]]; then
         echo "  rkl_NA : ${REFINED_RKL_NUM_A}"
@@ -366,6 +376,7 @@ for grad_lr in "${GRAD_LRS[@]}"; do
         "${FSDP_ARGS[@]}" \
         --final_layer_grad_optimizer "${FINAL_LAYER_GRAD_OPTIMIZER}" \
         --grad_clip "${GRAD_CLIP}" \
+        "${FINAL_LAYER_GRAD_CLIP_ARGS[@]}" \
         --final_layer_grad_lr "${FINAL_LAYER_GRAD_LR}" \
         --grad_hessian_topk "${GRAD_HESSIAN_TOPK}" \
         --saliency_clip_percentile "${SALIENCY_CLIP_PERCENTILE}" \

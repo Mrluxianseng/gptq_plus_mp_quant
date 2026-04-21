@@ -16,6 +16,18 @@ MEASURE_BSZ=4
 # Choices: fisher_diag_mse, residual_kl, refined_residual_kl, refined_diag_residual_kl.
 # Skipping refined_residual_kl avoids the H×H A fit (big CPU-RAM win on 70B).
 MEASURE_LOSSES=${MEASURE_LOSSES:-"fisher_diag_mse,residual_kl,refined_residual_kl,refined_diag_residual_kl"}
+# Grad clip applied element-wise to every captured gradient before cosine /
+# L2-norm measurement. Mirrors the main pipeline so the diagnostic reflects
+# what block_gd actually sees. Negative → disable. FINAL_LAYER_GRAD_CLIP is
+# an optional override used only when the final transformer block is in the
+# target list; leave empty / "none" to reuse GRAD_CLIP everywhere.
+GRAD_CLIP=${GRAD_CLIP:--1}
+FINAL_LAYER_GRAD_CLIP=${FINAL_LAYER_GRAD_CLIP:-}
+
+FINAL_LAYER_GRAD_CLIP_ARGS=()
+if [[ -n "${FINAL_LAYER_GRAD_CLIP}" && "${FINAL_LAYER_GRAD_CLIP}" != "none" ]]; then
+    FINAL_LAYER_GRAD_CLIP_ARGS=(--final_layer_grad_clip "${FINAL_LAYER_GRAD_CLIP}")
+fi
 
 export CUDA_VISIBLE_DEVICES=${DEVICE}
 
@@ -31,4 +43,6 @@ python -m torch.distributed.run \
     --num_groups 4 --fisher_num_groups 512 --bsz 64 --global_loss_bsz 8 \
     --target_layers ${TARGET_LAYERS} \
     --measure_samples ${MEASURE_SAMPLES} --measure_batch_size ${MEASURE_BSZ} \
-    --measure_losses "${MEASURE_LOSSES}"
+    --measure_losses "${MEASURE_LOSSES}" \
+    --grad_clip "${GRAD_CLIP}" \
+    "${FINAL_LAYER_GRAD_CLIP_ARGS[@]}"

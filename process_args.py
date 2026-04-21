@@ -113,6 +113,18 @@ def parse_gen():
         help="Elementwise clip threshold applied to the true refresh gradient before optimizer updates. Set negative to disable clipping.",
     )
     parser.add_argument(
+        "--final_layer_grad_clip",
+        type=float,
+        default=None,
+        help=(
+            "Optional override for --grad_clip used only in the final transformer "
+            "layer. The final layer's backward path goes through lm_head + final "
+            "norm and often produces much larger gradients than earlier blocks, "
+            "so a looser (or tighter) clip can help. Leave unset to reuse "
+            "--grad_clip. Set negative to disable clipping on the final layer."
+        ),
+    )
+    parser.add_argument(
         "--grad_refresh_loss",
         type=str,
         default="kl",
@@ -617,6 +629,11 @@ def parse_gen():
         raise ValueError(f"`grad_reg_lambda` must be non-negative. Got {args.grad_reg_lambda}.")
     if args.grad_clip == 0:
         raise ValueError("`grad_clip` must be non-zero. Use a negative value to disable clipping.")
+    if args.final_layer_grad_clip is not None and args.final_layer_grad_clip == 0:
+        raise ValueError(
+            "`final_layer_grad_clip` must be non-zero when provided. "
+            "Use a negative value to disable clipping on the final layer."
+        )
     if args.final_layer_grad_lr is not None and args.final_layer_grad_lr < 0:
         raise ValueError(f"`final_layer_grad_lr` must be non-negative when provided. Got {args.final_layer_grad_lr}.")
     if args.pre_gd_steps < 0:
