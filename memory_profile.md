@@ -36,9 +36,10 @@
 ├─────────────────────────────────────────────────────────────────┤
 │ Stage 1: 预计算 static saliency + fisher（GLOBAL_LOSS=1）        │
 ├─────────────────────────────────────────────────────────────────┤
-│ Stage 2: 预计算 fp_inps_final（仅 residual_kl）                  │
+│ Stage 2: 预计算 fp_inps_final（residual_kl / refined_mse）       │
 ├─────────────────────────────────────────────────────────────────┤
 │ 每层循环 (× L):                                                   │
+│   Stage 2.5: refined_mse 每层 grad pool 采集（仅 refined_mse）    │
 │   Stage 3a: Reference FP forward                                 │
 │   Stage 3b: Slide window 的 next-FP forward                      │
 │   Stage 3c: Stats 收集（saliency NLL + reference loss backward） │
@@ -342,7 +343,157 @@ slide 会**再生成一对** logits 用于 next_layer 的 residual_kl loss：
 
 ---
 
-## 推荐配置
+# 版本 C：`GRAD_REFRESH_LOSS = refined_mse`
+
+refined_mse = fisher_diag_mse（二阶项）+ 一阶项 $g\cdot\Delta y$ 。详见 [README 的 refined_mse 详解](README.md#refined_mse-详解)。显存特征可以这样理解：
+
+- **二阶项**和版本 A 完全一致（共用 fisher 预计算、共用 `compute_refresh_loss` 里的 fisher_diag_mse 计算路径）。
+- **一阶项**引入两部分新开销：(a) 每 layer 量化前的一次端到端反传采 grad pool；(b) per-mini-batch refresh 时按 pool 查表取精准 grad / mean grad。
+- **不额外触发 `hidden2logits`**，block refresh 的峰值接近版本 A（不是版本 B）。
+
+## Stage 0, 1 — 与版本 A 相同
+
+Stage 1 precompute 里 `collect_fisher=True` 触发条件从 `fisher_diag_mse` 拓展到 `("fisher_diag_mse", "refined_mse")`，显存峰值不变。
+
+## Stage 2 — `fp_inps_final` 预计算 ⚡
+
+refined_mse 需要 teacher 的 final hidden（用于端到端 KL），同版本 B 一样触发。
+
+| 对象 | 公式 | 4B |
+|------|------|-----|
+| `scratch` 缓冲（bf16） | `2·n_local·T·d` | 4 GB |
+| 全局 `fp_inps_final` 永久缓冲（bf16） | `2·n_local·T·d` | **+4 GB 常驻** |
+
+**Stage 2 峰值 ≈ 12 GB**（期间），**永久开销 +4 GB**
+
+## Stage 2.5 — refined_mse grad pool 采集（每层都做） ⚡⚡
+
+这是 refined_mse 独有的阶段，每量化一层前触发一次。伪代码：
+
+```python
+# 下游 layer + lm_head + final norm 临时搬 dev
+for k in range(i+1, L):
+    layers[k].to(dev)
+# 关掉 layer[i..L-1] 的 act-quant wrapper（FP 前向）
+# 冻结全部 param，只让 activation 有 grad
+for start in range(0, N_pool, global_loss_bsz_local):
+    h = inps[batch].detach().clone().requires_grad_(True)
+    out_i = layer(h, ...)[0]
+    for k in range(i+1, L):
+        out_i = layers[k](out_i, ...)[0]
+    logits_student = hidden2logits(out_i, analyzer)         # (B, T, V)
+    logits_teacher = hidden2logits(fp_inps_final[batch])    # (B, T, V)
+    kl = F.kl_div(log_softmax, softmax).sum(-1).mean()
+    grad = torch.autograd.grad(kl, out_i)[0]                # (B, T, d)
+    grad_pool[start:start+B] = grad.to(bf16).cpu()
+# 下游 layer 搬回 CPU；act-quant wrapper 还原
+```
+
+每 batch 内的显存：
+
+| 对象 | 公式 | 4B, GL_BSZ=4, N_pool=32 |
+|------|------|------|
+| 全下游 layer 常驻 GPU（bf16） | `2·P·(L-i)/L` | 峰值在 i=0 时 ≈ `2·P` = **8 GB** |
+| 反传用 `h_in + out_i + 下游激活图` | `~10·GL_BSZ·T·d·(L-i)·2` | 峰值 i=0 ≈ **15 GB** |
+| `logits_student + logits_teacher` | `2·GL_BSZ·T·V·2` | **2.5 GB** |
+| autograd softmax 中间量 | `~2·GL_BSZ·T·V·2` | 2.5 GB |
+| `fp_inps_final[batch]` 切片 | `2·GL_BSZ·T·d` | 0.05 GB |
+| **grad_pool**（CPU bf16，不占 GPU） | `2·N_pool·T·d` | 0.3 GB（CPU，逐 layer 丢弃） |
+| `mean_grad`（fp32 on dev） | `4·d` | 10 KB（忽略） |
+| 上一 layer 的 inps/fp_inps 常驻 | `4·n_local·T·d` | 8 GB |
+
+**Stage 2.5 峰值（layer i=0） ≈ `2P + 10·GL_BSZ·T·d·L·2 + 2·GL_BSZ·T·V·2·2 + 4·n_local·T·d`**
+**4B (GL_BSZ=4, N_pool=32) ≈ 8 + 15 + 5 + 8 = 36 GB**（i=0）  
+**layer i=L/2 时 ≈ 8 + 7.5 + 5 + 8 ≈ 28 GB**，layer i=L-1 时退化到 ≈ 8 + 0 + 5 + 8 = 21 GB（只有 lm_head/norm，没下游 block）。
+
+**压这一阶段显存的主杠杆**：
+- `GLOBAL_LOSS_BSZ`（直接线性影响激活图 + logits）
+- `N_pool = NUM_SAMPLES_FOR_REFINED_MSE`（不影响单次峰值，只影响 batch 循环次数）
+- `kl_topk > 0` 会让 student 侧用 gather 瘦下来，显存略少
+
+**注意**：每次进 Stage 2.5 前下游 layer 还在 CPU，进入后需要瞬时搬 ~`2P(L-i)/L` bf16 的权重到 dev。7B 模型从 layer 0 开始 ≈ 14 GB 的 CPU→GPU 拷贝，~1 秒（PCIe 4.0）或更久，逐层递减。
+
+## Stage 3a/3b/3c/3d — 与版本 A 相同
+
+Stage 3c 的 stats 收集用 `gptq_reference_loss_type`，对 refined_mse 来讲 `enable_gptq_plus=0` 是硬性要求（argparse 校验），所以 `skip_ref_backward=True`，`gradient_loss` 这条路不跑。→ **比版本 A 的 3c 还少一次 backward**，峰值不变但常数时间更少。
+
+fisher 切片路径（`batch_layer_output_fisher`）在 `layer_refresh_loss_type in ("fisher_diag_mse", "refined_mse")` 时走得一模一样，显存一致。
+
+## Stage 3f — fasterquant + block refresh
+
+### 3f-1: fasterquant 初始化 — 与版本 A 相同
+
+### 3f-2: Block refresh（refined_mse，**禁止** slide_window）
+
+每个 block 尾做一次 `gradient_refresh_fn`：用 `BWD_BSZ` 样本做 forward+backward。比版本 A 额外新增的只是一阶项的 pool 查表 / mean 计算：
+
+| 对象（每 block） | 公式 | 4B, BWD_BSZ=32 |
+|------|------|------|
+| 单层 forward 图（与 A 相同） | `~10·BWD_BSZ·T·d·2` | 10 GB |
+| `override_weight`（fp32） | `4·rows·cols` | 0.2 GB |
+| **`fisher_batch`**（fp32 slice）— 与 A 完全相同 | `4·BWD_BSZ·T·FNG` | 0.25 GB |
+| **`delta²` 二阶项**（fp32） | `4·BWD_BSZ·T·d` | 0.65 GB |
+| **`refined_mse_exact_batch`** — pool 命中样本的精准 grad，cast 到 bf16 | `2·B_pool·T·d` | ~0.2 GB（B_pool ≤ 32） |
+| **`delta.index_select(0, pool_positions)`** 临时 | `2·B_pool·T·d` | ~0.2 GB |
+| **`delta[non_pool].mean(1)`** 临时 | `2·B_nonpool·d` | 0.002 GB（忽略） |
+| **`mean_grad`** 常驻（fp32 on dev） | `4·d` | 10 KB（忽略） |
+| 权重梯度 / snapshot / Adam state | `~20·rows·cols` | ~1 GB |
+
+**Block refresh 峰值（refined_mse） ≈ +12.3 GB**（比 fisher_diag_mse 多 ~0.4 GB，基本持平）
+
+**叠加到 fasterquant 的总峰值**（与 A 相比，只多 pool 相关 ≤0.5 GB）：
+**≈ 28–30 GB**（4B, BWD_BSZ=32）
+
+### 3f-3: slide_window ❌
+
+refined_mse + slide_window 在 argparse 层面被拒绝（next-layer grad pool 没实现，v1 不支持）。
+
+## Stage 4 — 与版本 A 相同
+
+---
+
+## 版本 C 各阶段峰值汇总（4B 默认 sweep 配置）
+
+| Stage | refined_mse |
+|-------|-------------|
+| 0 input capture | 12 GB |
+| 1 static precompute | 42 GB |
+| **2 fp_inps_final** | **12 GB（期间） + 4 GB 永久** |
+| **2.5 grad pool 采集**（i=0，峰值） | **36 GB** |
+| 2.5 grad pool 采集（i=L/2） | 28 GB |
+| 3c stats collection（BSZ=32） | 60 GB |
+| 3d Hessian accum（HA=128） | 66 GB |
+| 3f fasterquant + refresh | 28 GB |
+| 4 lm_eval | 19 GB |
+
+**全流程峰值 ≈ 66 GB**（Stage 3d 仍然是瓶颈，和版本 A 一致）—— A100-80G 可撑住。
+
+**相对版本 A（fisher_diag_mse）的增量**：
+- Stage 2 `fp_inps_final` 永久：**+4 GB**
+- Stage 2.5 grad pool 每层采集：**~30 GB 瞬时**（但不常驻，采完就释放下游 layer 权重）
+- Stage 3f block refresh 瞬时：**+0.5 GB**（index_select + cast）
+- Stage 3c 反而少一次 `gradient_loss` backward（`enable_gptq_plus=0` 要求）
+
+**关键区别 vs 版本 B (residual_kl)**：block refresh 里**不跑 `hidden2logits`**，因此没有 B 路径里那个致命的 `B·T·V` logits 爆炸。refined_mse 的显存特征基本是"A + 一次性 grad pool 采集"，block refresh 阶段对 B 显存压力远小于 residual_kl。
+
+---
+
+## 推荐配置（refined_mse）
+
+| 显卡 | BSZ | HA_BSZ | BWD_BSZ | GL_BSZ | N_pool |
+|------|-----|--------|---------|--------|--------|
+| A100-80G | 32 | 32–64 | 32 | 4 | 32 |
+| A100-40G | 16 | 16 | 16 | 2 | 32 |
+| 24G（3090/4090） | 8 | 8 | 8 | 1 | 16（减 pool 也能减 Stage 2.5 次数→省累计时间） |
+
+主要压显存杠杆：
+1. **GLOBAL_LOSS_BSZ** — 同时影响 Stage 1 precompute 和 Stage 2.5 的激活图 / logits 峰值
+2. **BSZ** / **HA_BSZ** — 同版本 A
+3. **NUM_SAMPLES_FOR_REFINED_MSE** — 不影响单次峰值，只影响 Stage 2.5 累计时间（采 batch 数 = `N_pool / (GL_BSZ // world)`）
+
+---
+
+## 跨版本推荐配置
 
 ### fisher_diag_mse（主推）
 
@@ -371,11 +522,11 @@ slide 会**再生成一对** logits 用于 next_layer 的 residual_kl loss：
 1. **residual_kl 的 BSZ/BWD_BSZ** — 影响 `B·T·V`，最凶
 2. **stats 的 BSZ** — 影响 `B·T·V`（logits），次凶
 3. **HA_BSZ** — 影响 `NG·B·T·d_ff`（weighted），down_proj 时很重
-4. **GL_BSZ** — 影响 `B·T·d·L`（全模型激活图）
-5. **slide_window** — 对 residual_kl 加倍 block refresh 峰值；fisher_diag_mse 影响适中
+4. **GL_BSZ** — 影响 `B·T·d·L`（全模型激活图），对 refined_mse 是 Stage 2.5 峰值的主杠杆
+5. **slide_window** — 对 residual_kl 加倍 block refresh 峰值；fisher_diag_mse 影响适中；refined_mse 不支持
 6. **NG** — 影响所有 `H` 和 `weighted`（倍数为 4）
 7. **LM_EVAL_BSZ** — 只影响 eval 阶段，隔离度好
-8. **BACKWARD_SAMPLES** — 不影响单次峰值，只影响 refresh 迭代总数
+8. **BACKWARD_SAMPLES / NUM_SAMPLES_FOR_REFINED_MSE** — 不影响单次峰值，只影响迭代 / Stage 2.5 累计时间
 
 ---
 
