@@ -504,6 +504,20 @@ def parse_gen():
         ),
     )
     parser.add_argument(
+        "--refresh_full_metrics",
+        action="store_true",
+        help=(
+            "Record the full per-refresh diagnostic set (trailing_grad / second_order / "
+            "first_order / regularizer abs_mean / row_l2 / abs_max / q99, plus slide_alpha "
+            "split losses). Each metric requires a torch op + .item() on GPU → "
+            "cudaStreamSynchronize, and in DP mode adds several scalar allreduces per "
+            "refresh; on a multi-layer sweep this dominates true_gradient_refresh wall "
+            "time. With this flag OFF (default) only `mean_refresh_loss` is kept, and the "
+            "per-refresh aggregation allreduce is packed into a single collective. Turn "
+            "ON for diagnosing loss spikes or validating new regularizer ideas."
+        ),
+    )
+    parser.add_argument(
         "--num_samples_for_refined_mse",
         type=int,
         default=32,

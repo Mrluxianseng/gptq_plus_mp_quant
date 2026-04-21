@@ -6,6 +6,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import os
+os.environ["HF_DATASETS_TRUST_REMOTE_CODE"] = "1"
 import logging
 
 import torch

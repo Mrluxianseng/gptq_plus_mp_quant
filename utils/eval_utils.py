@@ -215,7 +215,8 @@ def qa_eval(model, tokenizer, lm_eval_batch_size=32):
     for task_name in task_names:
         logging.info(f"Evaluating {task_name}...")
         hflm.batch_size_per_gpu = lm_eval_batch_size
-        result = lm_eval.simple_evaluate(hflm, tasks=[task_name], task_manager=task_manager)['results']
+        with log_utils.disable_logging_context():
+            result = lm_eval.simple_evaluate(hflm, tasks=[task_name], task_manager=task_manager)['results']
         result = result[task_name]
         acc = round(result.get('acc_norm,none', result['acc,none']) * 100, 2)
         results[task_name] = acc

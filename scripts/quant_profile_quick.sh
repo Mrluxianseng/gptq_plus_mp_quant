@@ -19,6 +19,15 @@ export HF_DATASETS_TRUST_REMOTE_CODE=${HF_DATASETS_TRUST_REMOTE_CODE:-1}
 # CUDA VMM expandable segments. Same rationale as sweep.
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 
+# nsys streams intermediate traces (.qdstrm) via $TMPDIR before converting to
+# .nsys-rep. On autodl / docker containers /tmp is often only ~32 GB total,
+# and 4-rank runs fill it in minutes → rank crashes mid-trace. Redirect to the
+# autodl data disk when it's mounted and the user hasn't overridden TMPDIR.
+if [[ -z "${TMPDIR:-}" && -d /root/autodl-tmp ]]; then
+    export TMPDIR=/root/autodl-tmp/tmp
+    mkdir -p "${TMPDIR}"
+fi
+
 if [[ $# -lt 1 ]]; then
     echo "Usage: $0 <MODEL_PATH> [NUM_GROUPS=4] [DEVICE=0] [extra ptq.py args ...]"
     echo "Example: TARGET_LAYERS=0,1 QUANT_STOP_LAYER=1 $0 ./modelzoo/Qwen3/Qwen3-0.6B"
@@ -44,7 +53,7 @@ fi
 # Quantization configuration (SWEEP-ALIGNED)
 GRAD_LR=${GRAD_LR:-0.00002}
 DATASET=${DATASET:-wikitext2}
-N_SAMPLES=${N_SAMPLES:-128}      # PROFILE-ONLY: smaller pool so nsys capture stays snappy
+N_SAMPLES=${N_SAMPLES:-512}      # PROFILE-ONLY: smaller pool so nsys capture stays snappy
 SEQ_LEN=${SEQ_LEN:-2048}
 BSZ=${BSZ:-128}
 FINAL_LAYER_STATS_BSZ=${FINAL_LAYER_STATS_BSZ:-8}
@@ -70,7 +79,7 @@ PRE_GRAD_LR=${PRE_GRAD_LR:-0.00003}
 PRE_FINAL_LAYER_GRAD_LR=${PRE_FINAL_LAYER_GRAD_LR:-0.3}
 PRE_GRAD_OPTIMIZER=${PRE_GRAD_OPTIMIZER:-adam}
 PRE_FINAL_LAYER_GRAD_OPTIMIZER=${PRE_FINAL_LAYER_GRAD_OPTIMIZER:-sgd}
-GRAD_REG_STRATEGY=${GRAD_REG_STRATEGY:-quant_error_gate_optimized}
+GRAD_REG_STRATEGY=${GRAD_REG_STRATEGY:-none}
 GRAD_REG_LAMBDA=${GRAD_REG_LAMBDA:-0.01}
 GRAD_GATE_FLOOR=${GRAD_GATE_FLOOR:-0.01}
 GRAD_GATE_SHARPNESS=${GRAD_GATE_SHARPNESS:-5.0}
@@ -355,8 +364,13 @@ EOF
             "${CMD[@]}"
     fi
 elif [[ "${NSYS}" == "1" ]]; then
-    echo "Warning: nsys not found; running with NVTX ranges enabled but without Nsight capture." >&2
-    "${CMD[@]}"
+    echo "================================================================" >&2
+    echo "ERROR: NSYS=1 but nsys binary not found." >&2
+    echo "  Searched: \$NSYS_BIN=${NSYS_BIN:-<unset>}, /usr/local/bin/nsys, PATH." >&2
+    echo "  Install Nsight Systems CLI, or export NSYS_BIN=/path/to/nsys." >&2
+    echo "  Or pass NSYS=0 to run with NVTX ranges only (no capture)." >&2
+    echo "================================================================" >&2
+    exit 1
 else
     "${CMD[@]}"
 fi

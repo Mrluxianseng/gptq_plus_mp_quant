@@ -715,6 +715,7 @@ class GPTQPlus:
         diagnostic_recorder=None,
         slide_refresh_start=0,
         slide_refresh_block_total=None,
+        refresh_full_metrics=False,
     ):
         profile_recorder = profile_recorder or self.profile_recorder
         # Alias the recorder so call sites can do `rec and rec.save_block(...)`.
@@ -1170,15 +1171,18 @@ class GPTQPlus:
 
                             refreshed_grad, refresh_meta = gradient_refresh_fn(weight_snapshot)
                             refreshed_grad = refreshed_grad.to(self.dev).float()
-                            trailing_grad_chunks = []
+                            # See the block_gd branch for the rationale behind
+                            # gating the trailing_grad stats on refresh_full_metrics.
+                            trailing_grad_chunks = [] if refresh_full_metrics else None
                             for block_state in block_states:
                                 state = block_state["state"]
                                 refreshed_grad_sub = refreshed_grad[state["row_start"]:state["row_end"], :]
                                 if actorder:
                                     refreshed_grad_sub = refreshed_grad_sub[:, state["perm"]]
-                                trailing_grad = refreshed_grad_sub[:, i2:]
-                                if trailing_grad.numel() > 0:
-                                    trailing_grad_chunks.append(trailing_grad)
+                                if refresh_full_metrics:
+                                    trailing_grad = refreshed_grad_sub[:, i2:]
+                                    if trailing_grad.numel() > 0:
+                                        trailing_grad_chunks.append(trailing_grad)
                                 state["gradients_sub"] = refreshed_grad_sub
                                 beta, beta_view, Z, GHinv = self._compute_gradient_terms(
                                     refreshed_grad_sub,
@@ -1195,7 +1199,7 @@ class GPTQPlus:
                             trailing_grad_abs_mean = None
                             trailing_grad_mean_row_l2 = None
                             trailing_grad_clipped_abs_mean = None
-                            if trailing_grad_chunks:
+                            if refresh_full_metrics and trailing_grad_chunks:
                                 trailing_grad_cat = torch.cat(trailing_grad_chunks, dim=0).float()
                                 trailing_grad_abs_mean = trailing_grad_cat.abs().mean().item()
                                 trailing_grad_mean_row_l2 = torch.linalg.norm(
@@ -1295,7 +1299,7 @@ class GPTQPlus:
                             else:
                                 applied_second_order_update = second_order_update
                                 state["W_sub"][:, i2:] -= total_outer_update
-                            if block_gd_mode and second_order_update.numel() > 0:
+                            if refresh_full_metrics and block_gd_mode and second_order_update.numel() > 0:
                                 block_second_order_chunks.append(applied_second_order_update)
 
                             # Diagnostic: W_sub trailing AFTER outer update.
@@ -1359,14 +1363,22 @@ class GPTQPlus:
                                 slide_alpha=slide_alpha,
                             )
                             refreshed_grad = refreshed_grad.to(self.dev).float()
-                            trailing_grad_chunks = []
-                            for state in subgroup_states:
-                                refreshed_grad_sub = refreshed_grad[state["row_start"]:state["row_end"], :]
-                                if actorder:
-                                    refreshed_grad_sub = refreshed_grad_sub[:, state["perm"]]
-                                trailing_grad = refreshed_grad_sub[:, i2:]
-                                if trailing_grad.numel() > 0:
-                                    trailing_grad_chunks.append(trailing_grad)
+                            # Diagnostic stats: disabled by default because each
+                            # metric costs a torch op + .item() (cudaStreamSync)
+                            # and the trailing tensors shrink only linearly across
+                            # blocks → early blocks pay 10-20 such syncs each.
+                            # Only `mean_refresh_loss` (from refresh_meta) survives
+                            # when refresh_full_metrics is off; everything else is
+                            # None and the log line shows "None" for those fields.
+                            trailing_grad_chunks = [] if refresh_full_metrics else None
+                            if refresh_full_metrics:
+                                for state in subgroup_states:
+                                    refreshed_grad_sub = refreshed_grad[state["row_start"]:state["row_end"], :]
+                                    if actorder:
+                                        refreshed_grad_sub = refreshed_grad_sub[:, state["perm"]]
+                                    trailing_grad = refreshed_grad_sub[:, i2:]
+                                    if trailing_grad.numel() > 0:
+                                        trailing_grad_chunks.append(trailing_grad)
 
                             trailing_grad_abs_mean = None
                             trailing_grad_mean_row_l2 = None
@@ -1385,11 +1397,14 @@ class GPTQPlus:
                             regularizer_mean_row_l2 = None
                             sine_regularizer_abs_mean = None
                             sine_regularizer_mean_row_l2 = None
-                            optimizer_updates_raw = []
-                            optimizer_updates = []
-                            gate_regularizer_updates = []
-                            sine_regularizer_updates = []
-                            if block_second_order_chunks:
+                            # These accumulators are pure stats; only populate them
+                            # when refresh_full_metrics is on. state["pending_optimizer_update"]
+                            # is always set below (algorithm depends on it).
+                            optimizer_updates_raw = [] if refresh_full_metrics else None
+                            optimizer_updates = [] if refresh_full_metrics else None
+                            gate_regularizer_updates = [] if refresh_full_metrics else None
+                            sine_regularizer_updates = [] if refresh_full_metrics else None
+                            if refresh_full_metrics and block_second_order_chunks:
                                 second_order_cat = torch.cat(block_second_order_chunks, dim=0).float()
                                 _so_abs = second_order_cat.abs()
                                 second_order_abs_mean = _so_abs.mean().item()
@@ -1403,7 +1418,7 @@ class GPTQPlus:
                                 # alone hides heavy-tailed distributions.
                                 second_order_abs_max = _so_abs.max().item()
                                 second_order_abs_q99 = _quantile_large(_so_abs, 0.99)
-                            if trailing_grad_chunks:
+                            if refresh_full_metrics and trailing_grad_chunks:
                                 trailing_grad_cat = torch.cat(trailing_grad_chunks, dim=0).float()
                                 trailing_grad_abs_mean = trailing_grad_cat.abs().mean().item()
                                 trailing_grad_mean_row_l2 = torch.linalg.norm(
@@ -1491,20 +1506,21 @@ class GPTQPlus:
                                             torch.tensor(float(refresh_meta.get("mean_refresh_loss", 0.0))),
                                         )
                                 state["pending_optimizer_update"] = optimizer_update
-                                if optimizer_update_raw.numel() > 0:
-                                    optimizer_updates_raw.append(optimizer_update_raw)
-                                if optimizer_update.numel() > 0:
-                                    optimizer_updates.append(optimizer_update)
-                                    gate_regularizer_updates.append(gate_regularizer_update)
-                                    sine_regularizer_updates.append(sine_regularizer_update)
-                            if optimizer_updates_raw:
+                                if refresh_full_metrics:
+                                    if optimizer_update_raw.numel() > 0:
+                                        optimizer_updates_raw.append(optimizer_update_raw)
+                                    if optimizer_update.numel() > 0:
+                                        optimizer_updates.append(optimizer_update)
+                                        gate_regularizer_updates.append(gate_regularizer_update)
+                                        sine_regularizer_updates.append(sine_regularizer_update)
+                            if refresh_full_metrics and optimizer_updates_raw:
                                 optimizer_update_raw_cat = torch.cat(optimizer_updates_raw, dim=0).float()
                                 first_order_raw_abs_mean = optimizer_update_raw_cat.abs().mean().item()
                                 first_order_raw_mean_row_l2 = torch.linalg.norm(
                                     optimizer_update_raw_cat,
                                     dim=1,
                                 ).mean().item()
-                            if optimizer_updates:
+                            if refresh_full_metrics and optimizer_updates:
                                 optimizer_update_cat = torch.cat(optimizer_updates, dim=0).float()
                                 _fo_abs = optimizer_update_cat.abs()
                                 first_order_abs_mean = _fo_abs.mean().item()
@@ -1518,14 +1534,14 @@ class GPTQPlus:
                                 # term produces the spikiest updates.
                                 first_order_abs_max = _fo_abs.max().item()
                                 first_order_abs_q99 = _quantile_large(_fo_abs, 0.99)
-                            if gate_regularizer_updates:
+                            if refresh_full_metrics and gate_regularizer_updates:
                                 regularizer_update_cat = torch.cat(gate_regularizer_updates, dim=0).float()
                                 regularizer_abs_mean = regularizer_update_cat.abs().mean().item()
                                 regularizer_mean_row_l2 = torch.linalg.norm(
                                     regularizer_update_cat,
                                     dim=1,
                                 ).mean().item()
-                            if sine_regularizer_updates:
+                            if refresh_full_metrics and sine_regularizer_updates:
                                 sine_regularizer_update_cat = torch.cat(sine_regularizer_updates, dim=0).float()
                                 sine_regularizer_abs_mean = sine_regularizer_update_cat.abs().mean().item()
                                 sine_regularizer_mean_row_l2 = torch.linalg.norm(
@@ -2331,6 +2347,8 @@ def collect_static_end_to_end_saliency_and_fisher(
     fsdp_cpu_offload=False,
     saliency_clip_percentile=0.99,
     profile_recorder=None,
+    capture_fp_final=False,
+    fp_final_store_dtype=torch.bfloat16,
 ):
     logging.info(
         "Collecting static end-to-end saliency/fisher caches from a single pre-quantization full-model backward pass. "
@@ -2620,6 +2638,23 @@ def collect_static_end_to_end_saliency_and_fisher(
 
         return forward_hook
 
+    # Optional forward-only capture of the last transformer block's output.
+    # When `capture_fp_final=True`, store each rank-local batch's (B, T, H)
+    # output on CPU in bf16, to be concatenated into the rank-local
+    # `fp_inps_final` buffer after the loop. This lets residual_kl /
+    # refined_residual_kl / refined_mse reuse the forward pass that's
+    # happening anyway here, eliminating the separate bs=1 Stage 2
+    # precompute in gptq_fwrd.
+    fp_final_cache = [] if capture_fp_final else None
+    if capture_fp_final:
+        def fp_final_forward_hook(module, inp, out):
+            out_tensor = out[0] if isinstance(out, (tuple, list)) else out
+            # `.detach()` — autograd still builds the graph for fisher/saliency
+            # grad hooks on the same out_tensor; we only copy the forward value.
+            fp_final_cache.append(
+                out_tensor.detach().to(fp_final_store_dtype).cpu()
+            )
+
     for layer_idx, (layer, module_dict) in enumerate(zip(layers, module_dicts)):
         if collect_fisher:
             handles.append(layer.register_forward_hook(make_layer_hook(layer_idx)))
@@ -2638,6 +2673,12 @@ def collect_static_end_to_end_saliency_and_fisher(
             handles.append(
                 layers[layer_idx].register_forward_hook(make_refined_rkl_layer_hook(layer_idx))
             )
+    if capture_fp_final:
+        # Register AFTER the refined-rkl/fisher hooks on layers[-1] so the
+        # forward order is fisher_hook → refined_rkl_hook → fp_final_hook.
+        # They're independent (different closures), order doesn't affect
+        # numerics.
+        handles.append(layers[-1].register_forward_hook(fp_final_forward_hook))
 
     with profile_recorder.section("pipeline.static_fisher.shard_setup") if profile_recorder else _NULL_CONTEXT:
         token_batches = [batch[0] for batch in dataloader]
@@ -2953,7 +2994,20 @@ def collect_static_end_to_end_saliency_and_fisher(
             refined_rkl_damp,
         )
 
-    return static_saliency, static_fisher, static_refined_A, static_refined_diag_A
+    # Concatenate the rank-local fp_inps_final shards if captured. Shape:
+    # (n_local, T, H) in fp_final_store_dtype on CPU. Consumer is free to
+    # move to GPU / cast to fp_inps dtype.
+    fp_inps_final = None
+    if capture_fp_final:
+        if not fp_final_cache:
+            raise RuntimeError(
+                "capture_fp_final=True but no last-layer outputs were recorded. "
+                "Make sure the forward pass ran at least once."
+            )
+        fp_inps_final = torch.cat(fp_final_cache, dim=0)
+        fp_final_cache.clear()
+
+    return static_saliency, static_fisher, static_refined_A, static_refined_diag_A, fp_inps_final
 
 
 def _pick_refined_A_for_batch(
@@ -3275,9 +3329,21 @@ def collect_layer_output_grad_for_refined_mse(
         )
     seq_len = inps.shape[1]
     hidden_size = inps.shape[2]
+    # `pin_memory=True` is what lets the per-batch D2H below actually overlap
+    # with the next iteration's forward+backward on the default stream —
+    # cudaMemcpyAsync requires a pinned host destination. The pool is
+    # freshly allocated per layer and freed at layer end, so this is extra
+    # short-lived pinned memory proportional to (n_pool * seq * H * 2B);
+    # Qwen3-4B at n_pool=32 → ~320 MB per layer. Well under the cgroup
+    # mlock limit on typical training hosts.
     grad_pool = torch.empty(
-        (N, seq_len, hidden_size), dtype=store_dtype, device="cpu"
+        (N, seq_len, hidden_size), dtype=store_dtype, device="cpu",
+        pin_memory=True,
     )
+    # Side stream dedicated to the grad_pool D2H copies. Keeps the default
+    # stream free to run the next iter's forward+backward while the copy
+    # drains in the background.
+    d2h_stream = torch.cuda.Stream(device=dev)
 
     # Drop act-quant on the current + downstream layers so the forward used
     # for the gradient measurement is pure FP. (Weights are still FP — this
@@ -3355,17 +3421,34 @@ def collect_layer_output_grad_for_refined_mse(
                                 kl_loss, out_i, retain_graph=False
                             )[0]
                         with layer_recorder.section("layer.refined_mse_grad_pool.batch.store") if layer_recorder else _NULL_CONTEXT:
-                            grad_pool[start:start + bsz] = (
-                                grad_out.detach().to(store_dtype).cpu()
-                            )
+                            # Cast to store dtype on the default stream so the
+                            # data is produced where backward just ran, then
+                            # fork the D2H onto d2h_stream. `wait_stream`
+                            # serialises the copy AFTER the cast finishes;
+                            # `record_stream` keeps grad_out_bf16's GPU
+                            # allocation alive until d2h_stream is done
+                            # reading from it (otherwise PyTorch's caching
+                            # allocator could reuse the memory for the next
+                            # iter's forward and corrupt the in-flight copy).
+                            grad_out_bf16 = grad_out.detach().to(store_dtype)
+                            d2h_stream.wait_stream(torch.cuda.current_stream())
+                            with torch.cuda.stream(d2h_stream):
+                                grad_pool[start:start + bsz].copy_(
+                                    grad_out_bf16, non_blocking=True
+                                )
+                                grad_out_bf16.record_stream(d2h_stream)
                         del out, out_i, h, logits_student, logits_teacher
-                        del kl_loss, grad_out, h_in
+                        del kl_loss, grad_out, h_in, grad_out_bf16
     finally:
         with layer_recorder.section("layer.refined_mse_grad_pool.restore_act_quant") if layer_recorder else _NULL_CONTEXT:
             for lay, bits_cfg in restore_bits:
                 quant_utils.enable_act_quant(lay, bits_cfg)
 
     with layer_recorder.section("layer.refined_mse_grad_pool.mean_reduce") if layer_recorder else _NULL_CONTEXT:
+        # Drain any in-flight async D2Hs before we read grad_pool on the CPU.
+        # `.float()` / `.mean()` below are plain CPU ops that bypass any CUDA
+        # stream ordering, so we need an explicit sync here.
+        d2h_stream.synchronize()
         mean_grad = grad_pool.float().mean(dim=(0, 1)).to(dev)
     return grad_pool, mean_grad
 
@@ -3943,6 +4026,33 @@ def collect_layer_grad_hessian_stats(
         and precomputed_layer_output_fisher is None
     )
     need_gradient_backward = not skip_gradient_backward
+
+    # Fast path: when every per-batch quantity is already in hand (saliency
+    # precomputed by collect_static_end_to_end_saliency_and_fisher, fisher
+    # either precomputed or unused, and the GPTQ+ reference gradient disabled
+    # via --enable_gptq_plus 0), the entire forward-loop in this function
+    # produces nothing the quantiser will read — every batch would just run a
+    # wasteful FP forward, load fp_hidden from CPU that nobody consumes, then
+    # discard. Skip the loop and return stubs directly. This removes the
+    # `grad_hessian.batch.*` NVTX ranges entirely, along with the allreduce of
+    # `mean_reference_loss` (which would otherwise fire with count=0 on every
+    # rank and still incur one NCCL sync). Matches the pre-fast-path results
+    # exactly: gradients_dict is zeros (GPTQ+ first-order is off, so they get
+    # zeroed by the slow path too), mean_reference_loss=0 (reference_losses
+    # was empty), saliency/fisher are pass-throughs.
+    if not (need_saliency_collection or need_layer_output_fisher_collection or need_gradient_backward):
+        with layer_recorder.section("layer.grad_hessian.fast_path") if layer_recorder else _NULL_CONTEXT:
+            gradients_dict = {}
+            for name in names:
+                module = full.get(name, full.get(name + ".module", None))
+                gradients_dict[name] = torch.zeros_like(module.weight.data, dtype=torch.float32)
+            return (
+                precomputed_saliency_dict,
+                gradients_dict,
+                0.0,
+                precomputed_layer_output_fisher,
+            )
+
     need_output_head = (
         need_saliency_collection
         or (need_gradient_backward and (
@@ -4284,14 +4394,21 @@ def run_pre_quant_gd(
                                 layer_recorder=layer_recorder,
                             )
                         )
-                    # DP aggregation via sum + count. The same code path handles both
-                    # stratified (equal counts per rank) and global-shuffle (possibly
-                    # uneven counts, even zero on some ranks).
+                    # DP aggregation — packed into one allreduce (grad tensor +
+                    # scalars) to avoid 3 back-to-back NCCL collectives per
+                    # module per pre-GD step.
                     with layer_recorder.section("layer.pre_quant_gd.module.allreduce") if layer_recorder else _NULL_CONTEXT:
                         if world > 1:
-                            dist_utils.allreduce_sum_(partial_grad_sum)
-                            global_count = dist_utils.allreduce_sum_scalar(partial_count)
-                            global_loss_sum = dist_utils.allreduce_sum_scalar(loss_sum)
+                            grad_flat = partial_grad_sum.reshape(-1)
+                            scalar_vec = torch.tensor(
+                                [float(partial_count), float(loss_sum)],
+                                dtype=grad_flat.dtype, device=grad_flat.device,
+                            )
+                            packed = torch.cat([grad_flat, scalar_vec])
+                            dist_utils.allreduce_sum_(packed)
+                            partial_grad_sum.copy_(packed[:grad_flat.numel()].view_as(partial_grad_sum))
+                            global_count = int(packed[grad_flat.numel()].item())
+                            global_loss_sum = packed[grad_flat.numel() + 1].item()
                         else:
                             global_count = partial_count
                             global_loss_sum = loss_sum
@@ -4445,6 +4562,16 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
         )
 
     with run_recorder.section("run.total") if run_recorder else _NULL_CONTEXT:
+        # `fp_inps_final` is the rank-local output of the LAST transformer
+        # block, needed as the teacher hidden for residual_kl /
+        # refined_residual_kl / refined_mse refresh losses. We capture it as
+        # a by-product of the static saliency/fisher forward pass to avoid a
+        # separate bs=1 Stage 2 precompute later. Populated on CPU in bf16;
+        # moved to match fp_inps's device/dtype once `inps` is captured below.
+        need_fp_inps_final = args.grad_refresh_loss in (
+            "residual_kl", "refined_residual_kl", "refined_mse",
+        )
+        fp_inps_final_cpu = None
         if global_loss_enabled:
             # Optional disk cache. The precompute result depends only on:
             #   model / dataset / nsamples / seq_len / rotate setting /
@@ -4460,12 +4587,17 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                 sal_clip_pct = getattr(args, "saliency_clip_percentile", 0.99)
                 sal_clip_tag = f"{sal_clip_pct:.4f}".rstrip("0").rstrip(".")
                 rkl_na = int(getattr(args, "refined_rkl_num_A", 1))
+                # `fpfinal` flag distinguishes caches built WITH the by-product
+                # fp_inps_final capture from older ones. Otherwise an old cache
+                # would load successfully but miss the fp_inps_final tensor,
+                # forcing the slow Stage 2 bs=1 precompute anyway.
+                fpfinal_tag = int(need_fp_inps_final)
                 static_cache_key = (
                     f"{args.model_name}_{dataset_id}_s{args.nsamples}_"
                     f"blk{args.seq_len}_rot{rotate_flag}_g{args.num_groups}_"
                     f"fng{args.fisher_num_groups}_ghtk{args.grad_hessian_topk}_"
                     f"glbsz{args.global_loss_bsz}_seed{args.seed}_"
-                    f"salclip{sal_clip_tag}_rklNA{rkl_na}"
+                    f"salclip{sal_clip_tag}_rklNA{rkl_na}_fpfinal{fpfinal_tag}"
                 )
                 static_cache_key += f"_world{dist_utils.get_world_size()}_rank{dist_utils.get_rank()}"
                 os.makedirs(static_cache_dir, exist_ok=True)
@@ -4490,6 +4622,11 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             "Cached static saliency/fisher at %s was built before refined_A "
                             "was added. Delete the cache and rerun to regenerate." % static_cache_file
                         )
+                    # fp_inps_final is only present when the cache was built
+                    # with capture_fp_final=True (cache_key has fpfinal1). The
+                    # fpfinal tag in the cache key guarantees we only load
+                    # caches that match the current need_fp_inps_final flag.
+                    fp_inps_final_cpu = _loaded.get("fp_inps_final", None)
             else:
                 want_refined = args.grad_refresh_loss == "refined_residual_kl"
                 # fisher is consumed by fisher_diag_mse (twofold: the refresh
@@ -4503,7 +4640,10 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                 with pipeline_recorder.section("pipeline.static_end_to_end_saliency_fisher") if pipeline_recorder else _NULL_CONTEXT:
                     # 4th return (`refined_diag_A`) is only used by
                     # analyze_grad_cosine today; main quant pipeline ignores it.
-                    static_saliency_by_layer, static_fisher_by_layer, static_refined_A_by_layer, _ = \
+                    # 5th return is the rank-local fp_inps_final on CPU in bf16
+                    # (None unless `capture_fp_final=True`); we skip the
+                    # separate Stage 2 bs=1 precompute when this is populated.
+                    static_saliency_by_layer, static_fisher_by_layer, static_refined_A_by_layer, _, fp_inps_final_cpu = \
                         collect_static_end_to_end_saliency_and_fisher(
                             model=model,
                             analyzer=analyzer,
@@ -4521,18 +4661,19 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             refined_rkl_damp=getattr(args, "refined_rkl_damp", 0.01),
                             refined_rkl_num_A=int(getattr(args, "refined_rkl_num_A", 1)),
                             profile_recorder=pipeline_recorder,
+                            capture_fp_final=need_fp_inps_final,
                         )
                 if static_cache_file is not None:
                     with pipeline_recorder.section("pipeline.static_cache.save") if pipeline_recorder else _NULL_CONTEXT:
                         logging.info("Saving static saliency/fisher cache to %s", static_cache_file)
-                        torch.save(
-                            {
-                                "saliency": static_saliency_by_layer,
-                                "fisher": static_fisher_by_layer,
-                                "refined_A": static_refined_A_by_layer,
-                            },
-                            static_cache_file,
-                        )
+                        _to_save = {
+                            "saliency": static_saliency_by_layer,
+                            "fisher": static_fisher_by_layer,
+                            "refined_A": static_refined_A_by_layer,
+                        }
+                        if fp_inps_final_cpu is not None:
+                            _to_save["fp_inps_final"] = fp_inps_final_cpu
+                        torch.save(_to_save, static_cache_file)
             logging.info(
                 "Collected frozen end-to-end saliency/Fisher caches before quantization with global_loss_bsz=%d. "
                 "These cached coefficients will be reused for Hessian estimation and fisher_diag_mse throughout quantization.",
@@ -4662,49 +4803,65 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                 )
         final_layer_idx = len(layers) - 1
 
-        # residual_kl / refined_residual_kl refresh losses need the FP output
-        # of the last transformer block per sample (input to final norm +
-        # lm_head). We compute it once here with a full FP forward over all
-        # layers and store a buffer `fp_inps_final` with the same
-        # (n_local, seq, hidden) shape as fp_inps. Any other refresh loss
-        # keeps `fp_inps_final = None` and pays nothing.
+        # residual_kl / refined_residual_kl / refined_mse need the FP output
+        # of the last transformer block per sample (teacher hidden at the
+        # input of final norm + lm_head). When `global_loss=1` we capture it
+        # as a by-product of the static saliency/fisher forward pass (stored
+        # in `fp_inps_final_cpu`, bf16 CPU) and just move it to match
+        # fp_inps's device/dtype here — no second forward pass. Fallback to
+        # the bs=1 per-layer precompute when global_loss is off or when the
+        # capture didn't run (e.g. loaded an older cache).
         fp_inps_final = None
         if args.grad_refresh_loss in ("residual_kl", "refined_residual_kl", "refined_mse"):
-            with pipeline_recorder.section("pipeline.fp_final_precompute") if pipeline_recorder else _NULL_CONTEXT:
-                logging.info(
-                    "Precomputing FP final-layer hidden states for %s "
-                    "(nsamples_local=%d, layers=%d).",
-                    args.grad_refresh_loss, inps.shape[0], len(layers),
-                )
-                # Work on a scratch copy so we don't disturb the main `fp_inps`
-                # buffer (which is still at the layer-0 input stage).
-                scratch = inps.detach().clone().to(dev)
-                for idx in range(len(layers)):
-                    lay = layers[idx].to(dev)
-                    bits_cfg = quant_utils.disable_act_quant(lay)
-                    # Per-sample forward matches the per-layer fp_reference_forward
-                    # pattern; batching here would change numerics (cuBLAS kernel
-                    # selection) and has been shown to cause drift.
-                    for j in range(scratch.shape[0]):
-                        scratch[j] = lay(
-                            scratch[j].unsqueeze(0),
-                            attention_mask=attention_mask,
-                            position_ids=position_ids,
-                            position_embeddings=position_embeddings,
-                        )[0].squeeze(0)
-                    quant_utils.enable_act_quant(lay, bits_cfg)
-                    # Return each layer to its original (CPU) residency so the
-                    # main quant loop's `layers[i].to(dev)` starts from the same
-                    # state as if this precompute never happened.
-                    layers[idx] = lay.to(orig_device)
-                # Match the storage convention of `fp_inps` so downstream index
-                # expressions behave identically (`fp_inps_final[batch]` / CPU-
-                # to-GPU handoff inside collect_true_weight_gradient).
-                if fp_inps.device != scratch.device:
-                    fp_inps_final = scratch.to(fp_inps.device)
-                else:
-                    fp_inps_final = scratch
-                del scratch
+            if fp_inps_final_cpu is not None:
+                with pipeline_recorder.section("pipeline.fp_final_from_static") if pipeline_recorder else _NULL_CONTEXT:
+                    logging.info(
+                        "Reusing fp_inps_final captured during static saliency/fisher "
+                        "(shape=%s, %s → %s/%s).",
+                        tuple(fp_inps_final_cpu.shape),
+                        fp_inps_final_cpu.dtype,
+                        fp_inps.device, fp_inps.dtype,
+                    )
+                    fp_inps_final = fp_inps_final_cpu.to(
+                        device=fp_inps.device, dtype=fp_inps.dtype,
+                    )
+                    fp_inps_final_cpu = None
+            else:
+                with pipeline_recorder.section("pipeline.fp_final_precompute") if pipeline_recorder else _NULL_CONTEXT:
+                    logging.info(
+                        "Precomputing FP final-layer hidden states for %s "
+                        "(nsamples_local=%d, layers=%d).",
+                        args.grad_refresh_loss, inps.shape[0], len(layers),
+                    )
+                    # Work on a scratch copy so we don't disturb the main `fp_inps`
+                    # buffer (which is still at the layer-0 input stage).
+                    scratch = inps.detach().clone().to(dev)
+                    for idx in range(len(layers)):
+                        lay = layers[idx].to(dev)
+                        bits_cfg = quant_utils.disable_act_quant(lay)
+                        # Per-sample forward matches the per-layer fp_reference_forward
+                        # pattern; batching here would change numerics (cuBLAS kernel
+                        # selection) and has been shown to cause drift.
+                        for j in range(scratch.shape[0]):
+                            scratch[j] = lay(
+                                scratch[j].unsqueeze(0),
+                                attention_mask=attention_mask,
+                                position_ids=position_ids,
+                                position_embeddings=position_embeddings,
+                            )[0].squeeze(0)
+                        quant_utils.enable_act_quant(lay, bits_cfg)
+                        # Return each layer to its original (CPU) residency so the
+                        # main quant loop's `layers[i].to(dev)` starts from the same
+                        # state as if this precompute never happened.
+                        layers[idx] = lay.to(orig_device)
+                    # Match the storage convention of `fp_inps` so downstream index
+                    # expressions behave identically (`fp_inps_final[batch]` / CPU-
+                    # to-GPU handoff inside collect_true_weight_gradient).
+                    if fp_inps.device != scratch.device:
+                        fp_inps_final = scratch.to(fp_inps.device)
+                    else:
+                        fp_inps_final = scratch
+                    del scratch
 
         if dp_global_shuffle:
             # Every rank sees all global sample ids; `collect_true_weight_gradient`
@@ -4719,6 +4876,13 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                 list(range(n_local)) if args.final_layer_full_backward else None
             )
         layer_indices = range(quant_stop_layer + 1) if quant_stop_layer is not None else range(len(layers))
+        # Side stream + event used to move this layer's downstream blocks back
+        # to CPU asynchronously after `collect_layer_output_grad_for_refined_mse`.
+        # The sync is deferred to the start of the NEXT layer's refined_mse
+        # block (when we need those CPU tensors again). Lazy-initialised so
+        # non-refined_mse runs pay nothing.
+        refined_mse_d2h_stream = None
+        refined_mse_d2h_event = None
         pbar = tqdm(layer_indices, ncols=120, desc="Quantizing Layers", position=0)
         for i in pbar:
             layer = layers[i].to(dev)
@@ -4817,6 +4981,15 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             )
                         rng = random.Random(args.seed + i)
                         sample_ids_local = sorted(rng.sample(range(n_local), n_pool))
+                        # Before reusing any downstream CPU tensor, make sure the
+                        # previous layer's async D2H has drained — otherwise the
+                        # H2D we're about to do might read stale / half-written
+                        # memory. `.synchronize()` blocks the current stream on
+                        # the event; does nothing if the event already fired.
+                        if refined_mse_d2h_event is not None:
+                            with layer_recorder.section("layer.refined_mse_grad_pool.prev_d2h_sync") if layer_recorder else _NULL_CONTEXT:
+                                refined_mse_d2h_event.synchronize()
+                                refined_mse_d2h_event = None
                         # Downstream transformer blocks live on CPU during the main
                         # quant loop; move them to dev for the end-to-end backward,
                         # restore after. pre_block / norm / lm_head are already on
@@ -4846,10 +5019,28 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                                     layer_recorder=layer_recorder,
                                 )
                         finally:
+                            # Launch the downstream D2H on a side stream and
+                            # defer the sync to the top of the NEXT layer's
+                            # refined_mse block (see prev_d2h_sync above).
+                            # This lets the current layer's subsequent work
+                            # (fp_reference_forward → stats → Hessian accum →
+                            # fasterquant) run in parallel with the D2H on
+                            # the default stream. The overlap is real only
+                            # once the offloaded layer params are backed by
+                            # pinned CPU memory (cudaMemcpyAsync requires
+                            # pinned dest); without pinning it's a no-op but
+                            # costs nothing. We also drop the prior
+                            # `cleanup_memory()` call, which did a global
+                            # `torch.cuda.synchronize()` + `empty_cache()`
+                            # and alone took 100-500 ms per layer.
                             with layer_recorder.section("layer.refined_mse_grad_pool.downstream_to_cpu") if layer_recorder else _NULL_CONTEXT:
-                                for k in range(i + 1, len(layers)):
-                                    layers[k] = layers[k].to(orig_device)
-                                memory_utils.cleanup_memory()
+                                if refined_mse_d2h_stream is None:
+                                    refined_mse_d2h_stream = torch.cuda.Stream(device=dev)
+                                with torch.cuda.stream(refined_mse_d2h_stream):
+                                    for k in range(i + 1, len(layers)):
+                                        layers[k] = layers[k].to(orig_device, non_blocking=True)
+                                refined_mse_d2h_event = torch.cuda.Event()
+                                refined_mse_d2h_event.record(refined_mse_d2h_stream)
                         layer_refined_mse_pool_ids = torch.tensor(
                             sample_ids_local, dtype=torch.long
                         )
@@ -5219,19 +5410,35 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             layer_recorder=layer_recorder,
                         )
                     )
-                    # DP aggregation via sum + count. Works uniformly whether
-                    # each rank got exactly `backward_samples_local` (stratified)
-                    # or a binomial-distributed subset (global shuffle, and
-                    # occasionally zero).
+                    # DP aggregation. When world_size > 1 we pack the grad sum
+                    # and all scalar aggregates into a single contiguous tensor
+                    # and do one all_reduce instead of 3-5 back-to-back NCCL
+                    # collectives. Each collective costs one cudaStreamSynchronize
+                    # on every rank; packing cuts 20-40% off true_gradient_refresh
+                    # wall time in multi-rank runs.
                     if dp_world > 1:
-                        dist_utils.allreduce_sum_(partial_grad_sum)
-                        global_count = dist_utils.allreduce_sum_scalar(partial_count)
-                        global_loss_sum = dist_utils.allreduce_sum_scalar(loss_sum)
-                        for k in ("loss_sum_current", "loss_sum_next"):
-                            if k in grad_extras:
-                                grad_extras[k] = dist_utils.allreduce_sum_scalar(
-                                    grad_extras[k]
-                                )
+                        extra_scalar_keys = [
+                            k for k in ("loss_sum_current", "loss_sum_next")
+                            if k in grad_extras
+                        ]
+                        # Layout: [grad_flat | count | loss_sum | extra_scalar_keys...]
+                        # fp32 is enough: partial_count fits exactly (< 2^24), and
+                        # a single-collective sum matches the precision of the
+                        # original per-tensor allreduces (NCCL uses fp32 paths too).
+                        grad_flat = partial_grad_sum.reshape(-1)
+                        scalar_vec = torch.tensor(
+                            [float(partial_count), float(loss_sum)]
+                            + [float(grad_extras[k]) for k in extra_scalar_keys],
+                            dtype=grad_flat.dtype, device=grad_flat.device,
+                        )
+                        packed = torch.cat([grad_flat, scalar_vec])
+                        dist_utils.allreduce_sum_(packed)
+                        partial_grad_sum.copy_(packed[:grad_flat.numel()].view_as(partial_grad_sum))
+                        scalar_out = packed[grad_flat.numel():]
+                        global_count = int(scalar_out[0].item())
+                        global_loss_sum = scalar_out[1].item()
+                        for idx, k in enumerate(extra_scalar_keys, start=2):
+                            grad_extras[k] = scalar_out[idx].item()
                     else:
                         global_count = partial_count
                         global_loss_sum = loss_sum
@@ -5417,6 +5624,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         diagnostic_recorder=diagnostic_registry.get_or_create(i, name),
                         slide_refresh_start=slide_refresh_cursor,
                         slide_refresh_block_total=slide_refresh_block_total,
+                        refresh_full_metrics=bool(getattr(args, "refresh_full_metrics", False)),
                     )
                     slide_refresh_cursor += slide_refreshes_per_module[name]
                     # DP correctness check (debug only): fasterquant is meant
@@ -5466,6 +5674,14 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
             if quant_stop_layer is not None and i >= quant_stop_layer:
                 logging.info("Stopping quantization after transformer layer %d due to --quant_stop_layer.", i)
                 break
+
+        # Drain any pending async D2H from the final layer before
+        # restore_modules starts moving tensors around. `cleanup_memory` below
+        # would catch this via `torch.cuda.synchronize()`, but explicit sync
+        # keeps the NVTX trace readable.
+        if refined_mse_d2h_event is not None:
+            refined_mse_d2h_event.synchronize()
+            refined_mse_d2h_event = None
 
         with pipeline_recorder.section("pipeline.restore_modules") if pipeline_recorder else _NULL_CONTEXT:
             for module in per_layer_runtime_modules:

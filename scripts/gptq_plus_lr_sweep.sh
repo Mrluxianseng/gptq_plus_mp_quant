@@ -12,6 +12,12 @@ export HF_DATASETS_OFFLINE=${HF_DATASETS_OFFLINE:-1}
 export TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-1}
 export HF_DATASETS_TRUST_REMOTE_CODE=${HF_DATASETS_TRUST_REMOTE_CODE:-1}
 
+# CUDA VMM expandable segments. Kills the cudaMalloc staircase we hit when
+# down_proj's 485MB H matrix / refresh buffers can't reuse the smaller slabs
+# cached from q/k/v/o/gate/up_proj. Supported on CUDA >= 11.3 + Ampere+; older
+# setups just ignore it. Caller can override by exporting the env var first.
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+
 if [[ $# -lt 3 ]]; then
     echo "Usage: $0 <MODEL_PATH> <NUM_GROUPS> <DEVICE> [extra ptq.py args ...]"
     echo "Example: $0 ./modelzoo/Qwen3/Qwen3-0.6B 4 0 --lm_eval_batch_size 16"
@@ -24,7 +30,7 @@ DEVICE=${3}
 shift 3
 
 # Sweep configuration. Override from the shell when needed.
-GRAD_LRS_STR=${GRAD_LRS:-"0.00001"}
+GRAD_LRS_STR=${GRAD_LRS:-"0.00001 0.00002 0.00003 0.00004 0.00005 0.00007 0.0001"}
 DATASET=${DATASET:-wikitext2} # wikitext2 / neuralmagic / ultrachat_2k / numinamath
 N_SAMPLES=${N_SAMPLES:-512}
 SEQ_LEN=${SEQ_LEN:-2048}
@@ -46,7 +52,7 @@ GRAD_CLIP=${GRAD_CLIP:-5e-5}
 # relative to earlier blocks. Empty / "none" → reuse GRAD_CLIP for every layer.
 FINAL_LAYER_GRAD_CLIP=${FINAL_LAYER_GRAD_CLIP:-5e-4}
 # --grad_refresh_loss {kl,hidden_mse,fisher_diag_mse,residual_kl,refined_residual_kl,refined_mse}
-GRAD_REFRESH_LOSS=${GRAD_REFRESH_LOSS:-refined_residual_kl}
+GRAD_REFRESH_LOSS=${GRAD_REFRESH_LOSS:-refined_mse}
 # refined_residual_kl knobs (only used when GRAD_REFRESH_LOSS=refined_residual_kl)
 REFINED_RKL_NUM_A=${REFINED_RKL_NUM_A:-1}
 REFINED_RKL_DAMP=${REFINED_RKL_DAMP:-0.01}
@@ -54,7 +60,7 @@ REFINED_RKL_DAMP=${REFINED_RKL_DAMP:-0.01}
 # random pool size (rank-local) used for end-to-end grad collection before
 # that layer's quant loop opens. Must divide GLOBAL_LOSS_BSZ / world.
 NUM_SAMPLES_FOR_REFINED_MSE=${NUM_SAMPLES_FOR_REFINED_MSE:-32}
-FINAL_LAYER_GRAD_LR=${FINAL_LAYER_GRAD_LR:-0.000003}
+FINAL_LAYER_GRAD_LR=${FINAL_LAYER_GRAD_LR:-0.000001}
 PRE_GD_STEPS=${PRE_GD_STEPS:-10}
 PRE_GRAD_LR=${PRE_GRAD_LR:-0.00003}
 PRE_FINAL_LAYER_GRAD_LR=${PRE_FINAL_LAYER_GRAD_LR:-0.3}
@@ -62,10 +68,10 @@ PRE_GRAD_OPTIMIZER=${PRE_GRAD_OPTIMIZER:-adam}
 PRE_FINAL_LAYER_GRAD_OPTIMIZER=${PRE_FINAL_LAYER_GRAD_OPTIMIZER:-sgd}
 #--grad_reg_strategy {none,l2,hessian,quant_error_gate,quant_error_gate_optimized}
 GRAD_REG_STRATEGY=${GRAD_REG_STRATEGY:-none}
-GRAD_REG_LAMBDA=${GRAD_REG_LAMBDA:-0.01}
+GRAD_REG_LAMBDA=${GRAD_REG_LAMBDA:-0.1}
 GRAD_GATE_FLOOR=${GRAD_GATE_FLOOR:-0.01}
 GRAD_GATE_SHARPNESS=${GRAD_GATE_SHARPNESS:-5.0}
-GRAD_GATE_SINE_AMP=${GRAD_GATE_SINE_AMP:-0.0005}
+GRAD_GATE_SINE_AMP=${GRAD_GATE_SINE_AMP:-0.00005}
 GRAD_HESSIAN_TOPK=${GRAD_HESSIAN_TOPK:-20}
 SALIENCY_CLIP_PERCENTILE=${SALIENCY_CLIP_PERCENTILE:-1.0}
 PROJ_LR_SCALE=${PROJ_LR_SCALE:-1.0}
@@ -75,7 +81,7 @@ FISHER_NUM_GROUPS=${FISHER_NUM_GROUPS:-512}
 PRE_CLIP=${PRE_CLIP:-0}
 GLOBAL_LOSS=${GLOBAL_LOSS:-1}
 GLOBAL_LOSS_BSZ=${GLOBAL_LOSS_BSZ:-8}
-LOSS_SLIDE_WINDOW=${LOSS_SLIDE_WINDOW:-1}
+LOSS_SLIDE_WINDOW=${LOSS_SLIDE_WINDOW:-0}
 DP_GLOBAL_SHUFFLE=${DP_GLOBAL_SHUFFLE:-1}
 # --grad_lr_layer_schedule {none, cosine, linear, sqrt}
 GRAD_LR_LAYER_SCHEDULE=${GRAD_LR_LAYER_SCHEDULE:-cosine}
