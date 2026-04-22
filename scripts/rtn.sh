@@ -5,7 +5,7 @@ MODEL_PATH=${1}     # ./modelzoo/Qwen3/Qwen3-0.6B
 DEVICE=${2}         # 0
 
 MODEL_NAME=$(basename ${MODEL_PATH})
-N_SAMPLES=1024
+N_SAMPLES=512
 SEQ_LEN=2048
 
 # Set environment variables

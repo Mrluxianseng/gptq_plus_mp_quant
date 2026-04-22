@@ -30,7 +30,7 @@ DEVICE=${3}
 shift 3
 
 # Sweep configuration. Override from the shell when needed.
-GRAD_LRS_STR=${GRAD_LRS:-"0.00001 0.00002 0.00003 0.00004 0.00005 0.00007 0.0001"}
+GRAD_LRS_STR=${GRAD_LRS:-"0.000003 0.000005 0.000007 0.00001 0.00003 0.00005 0.00007 0.0001 0.0003 0.0005"}
 DATASET=${DATASET:-wikitext2} # wikitext2 / neuralmagic / ultrachat_2k / numinamath
 N_SAMPLES=${N_SAMPLES:-512}
 SEQ_LEN=${SEQ_LEN:-2048}
@@ -52,7 +52,7 @@ GRAD_CLIP=${GRAD_CLIP:-5e-5}
 # relative to earlier blocks. Empty / "none" → reuse GRAD_CLIP for every layer.
 FINAL_LAYER_GRAD_CLIP=${FINAL_LAYER_GRAD_CLIP:-5e-4}
 # --grad_refresh_loss {kl,hidden_mse,fisher_diag_mse,residual_kl,refined_residual_kl,refined_mse}
-GRAD_REFRESH_LOSS=${GRAD_REFRESH_LOSS:-refined_mse}
+GRAD_REFRESH_LOSS=${GRAD_REFRESH_LOSS:-refined_residual_kl}
 # refined_residual_kl knobs (only used when GRAD_REFRESH_LOSS=refined_residual_kl)
 REFINED_RKL_NUM_A=${REFINED_RKL_NUM_A:-1}
 REFINED_RKL_DAMP=${REFINED_RKL_DAMP:-0.01}
@@ -87,7 +87,7 @@ DP_GLOBAL_SHUFFLE=${DP_GLOBAL_SHUFFLE:-1}
 GRAD_LR_LAYER_SCHEDULE=${GRAD_LR_LAYER_SCHEDULE:-cosine}
 ALPHA=${ALPHA:-0.0}
 KL_TOPK=${KL_TOPK:-20}
-LM_EVAL_BATCH_SIZE=${LM_EVAL_BATCH_SIZE:-32}
+LM_EVAL_BATCH_SIZE=${LM_EVAL_BATCH_SIZE:-128}
 ENABLE_QA_EVAL=${ENABLE_QA_EVAL:-1}
 BASE_EXP=${BASE_EXP:-gptq_plus_lr_sweep}
 OUTPUT_ROOT=${OUTPUT_ROOT:-./outputs}
@@ -120,7 +120,7 @@ export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-0}
 # RDZV port decouples from DEVICE so the commas don't end up in the endpoint.
 IFS=',' read -r -a _DEVICE_LIST <<< "${DEVICE}"
 N_GPUS=${N_GPUS:-${#_DEVICE_LIST[@]}}
-RDZV_PORT=${RDZV_PORT:-29400}
+RDZV_PORT=${RDZV_PORT:-29500}
 
 sanitize_float() {
     local value="${1}"
