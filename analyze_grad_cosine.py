@@ -841,6 +841,8 @@ def quantize_and_measure(args, analyzer, trainloader, dev, target_layers, measur
                             (
                                 refined_mse_grad_pool_i,
                                 refined_mse_mean_grad_i,
+                                _unused_grad_pool_next,
+                                _unused_mean_grad_next,
                             ) = collect_layer_output_grad_for_refined_mse(
                                 analyzer=analyzer,
                                 layer=layer,

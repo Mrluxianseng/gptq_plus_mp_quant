@@ -30,7 +30,7 @@ DEVICE=${3}
 shift 3
 
 # Sweep configuration. Override from the shell when needed.
-GRAD_LRS_STR=${GRAD_LRS:-"0.000003 0.000005 0.000007 0.00001 0.00003 0.00005 0.00007 0.0001 0.0003 0.0005"}
+GRAD_LRS_STR=${GRAD_LRS:-"0.00003"}
 DATASET=${DATASET:-wikitext2} # wikitext2 / neuralmagic / ultrachat_2k / numinamath
 N_SAMPLES=${N_SAMPLES:-512}
 SEQ_LEN=${SEQ_LEN:-2048}
@@ -51,8 +51,8 @@ GRAD_CLIP=${GRAD_CLIP:-5e-5}
 # final layer's grads flow through lm_head + final norm and often blow up
 # relative to earlier blocks. Empty / "none" → reuse GRAD_CLIP for every layer.
 FINAL_LAYER_GRAD_CLIP=${FINAL_LAYER_GRAD_CLIP:-5e-4}
-# --grad_refresh_loss {kl,hidden_mse,fisher_diag_mse,residual_kl,refined_residual_kl,refined_mse}
-GRAD_REFRESH_LOSS=${GRAD_REFRESH_LOSS:-refined_residual_kl}
+# --grad_refresh_loss {kl,hidden_mse,fisher_diag_mse,residual_kl,refined_residual_kl,refined_mse,refined_mix}
+GRAD_REFRESH_LOSS=${GRAD_REFRESH_LOSS:-refined_mse}
 # refined_residual_kl knobs (only used when GRAD_REFRESH_LOSS=refined_residual_kl)
 REFINED_RKL_NUM_A=${REFINED_RKL_NUM_A:-1}
 REFINED_RKL_DAMP=${REFINED_RKL_DAMP:-0.01}
@@ -60,6 +60,12 @@ REFINED_RKL_DAMP=${REFINED_RKL_DAMP:-0.01}
 # random pool size (rank-local) used for end-to-end grad collection before
 # that layer's quant loop opens. Must divide GLOBAL_LOSS_BSZ / world.
 NUM_SAMPLES_FOR_REFINED_MSE=${NUM_SAMPLES_FOR_REFINED_MSE:-32}
+# refined_mix knobs (only used when GRAD_REFRESH_LOSS=refined_mix). Front
+# [0, SPLIT) layers use refined_mse, [SPLIT, N-1) use refined_residual_kl, and
+# the final layer stays on kl. RKL_LR_RATIO multiplies GRAD_LR / PRE_GRAD_LR on
+# the back half only (not swept). Empty SPLIT = default to N // 2 at runtime.
+REFINED_MIX_SPLIT_LAYER=${REFINED_MIX_SPLIT_LAYER:-}
+REFINED_MIX_RKL_LR_RATIO=${REFINED_MIX_RKL_LR_RATIO:-0.167}
 FINAL_LAYER_GRAD_LR=${FINAL_LAYER_GRAD_LR:-0.000001}
 PRE_GD_STEPS=${PRE_GD_STEPS:-10}
 PRE_GRAD_LR=${PRE_GRAD_LR:-0.00003}
@@ -67,8 +73,8 @@ PRE_FINAL_LAYER_GRAD_LR=${PRE_FINAL_LAYER_GRAD_LR:-0.3}
 PRE_GRAD_OPTIMIZER=${PRE_GRAD_OPTIMIZER:-adam}
 PRE_FINAL_LAYER_GRAD_OPTIMIZER=${PRE_FINAL_LAYER_GRAD_OPTIMIZER:-sgd}
 #--grad_reg_strategy {none,l2,hessian,quant_error_gate,quant_error_gate_optimized}
-GRAD_REG_STRATEGY=${GRAD_REG_STRATEGY:-none}
-GRAD_REG_LAMBDA=${GRAD_REG_LAMBDA:-0.1}
+GRAD_REG_STRATEGY=${GRAD_REG_STRATEGY:-l2}
+GRAD_REG_LAMBDA=${GRAD_REG_LAMBDA:-50.0}
 GRAD_GATE_FLOOR=${GRAD_GATE_FLOOR:-0.01}
 GRAD_GATE_SHARPNESS=${GRAD_GATE_SHARPNESS:-5.0}
 GRAD_GATE_SINE_AMP=${GRAD_GATE_SINE_AMP:-0.00005}
@@ -217,6 +223,14 @@ if [[ -n "${STATIC_CACHE_PATH}" ]]; then
     FSDP_ARGS+=(--static_cache_path "${STATIC_CACHE_PATH}")
 fi
 
+MIX_ARGS=()
+if [[ "${GRAD_REFRESH_LOSS}" == "refined_mix" ]]; then
+    if [[ -n "${REFINED_MIX_SPLIT_LAYER}" ]]; then
+        MIX_ARGS+=(--refined_mix_split_layer "${REFINED_MIX_SPLIT_LAYER}")
+    fi
+    MIX_ARGS+=(--refined_mix_rkl_lr_ratio "${REFINED_MIX_RKL_LR_RATIO}")
+fi
+
 # ---------------------------------------------------------------
 # Auto two-stage when FSDP_PRECOMPUTE=1:
 #   Stage 1 — FSDP precompute only (write saliency/fisher cache, exit).
@@ -301,6 +315,18 @@ for grad_lr in "${GRAD_LRS[@]}"; do
             refined_mse_suffix="_nRM${NUM_SAMPLES_FOR_REFINED_MSE}"
         fi
     fi
+    refined_mix_suffix=""
+    if [[ "${GRAD_REFRESH_LOSS}" == "refined_mix" ]]; then
+        if [[ -n "${REFINED_MIX_SPLIT_LAYER}" ]]; then
+            refined_mix_suffix="_split${REFINED_MIX_SPLIT_LAYER}"
+        fi
+        if [[ "${REFINED_MIX_RKL_LR_RATIO}" != "1.0" ]]; then
+            refined_mix_suffix="${refined_mix_suffix}_rklr$(sanitize_float "${REFINED_MIX_RKL_LR_RATIO}")"
+        fi
+        if [[ "${NUM_SAMPLES_FOR_REFINED_MSE}" != "32" ]]; then
+            refined_mix_suffix="${refined_mix_suffix}_nRM${NUM_SAMPLES_FOR_REFINED_MSE}"
+        fi
+    fi
     grad_hessian_suffix=""
     if [[ "${GRAD_HESSIAN_TOPK}" != "-1" ]]; then
         grad_hessian_suffix="_ghtk${GRAD_HESSIAN_TOPK}"
@@ -319,7 +345,7 @@ for grad_lr in "${GRAD_LRS[@]}"; do
             pre_gd_suffix="${pre_gd_suffix}_flopt${PRE_FINAL_LAYER_GRAD_OPTIMIZER}"
         fi
     fi
-    exp_name="${BASE_EXP}_block_gd_${GRAD_OPTIMIZER}${refresh_suffix}${refined_rkl_suffix}${refined_mse_suffix}${reg_suffix}${grad_hessian_suffix}${fisher_groups_suffix}_lr${grad_lr_tag}_fllr${final_layer_grad_lr_tag}_s${second_order_tag}${pre_gd_suffix}${PRE_CLIP_TAG}${BLOCK_ATOMIC_TAG}${FINAL_LAYER_FULL_BACKWARD_TAG}${GLOBAL_LOSS_TAG}${LOSS_SLIDE_WINDOW_TAG}${DP_GLOBAL_SHUFFLE_TAG}${GRAD_LR_LAYER_SCHEDULE_TAG}"
+    exp_name="${BASE_EXP}_block_gd_${GRAD_OPTIMIZER}${refresh_suffix}${refined_rkl_suffix}${refined_mse_suffix}${refined_mix_suffix}${reg_suffix}${grad_hessian_suffix}${fisher_groups_suffix}_lr${grad_lr_tag}_fllr${final_layer_grad_lr_tag}_s${second_order_tag}${pre_gd_suffix}${PRE_CLIP_TAG}${BLOCK_ATOMIC_TAG}${FINAL_LAYER_FULL_BACKWARD_TAG}${GLOBAL_LOSS_TAG}${LOSS_SLIDE_WINDOW_TAG}${DP_GLOBAL_SHUFFLE_TAG}${GRAD_LR_LAYER_SCHEDULE_TAG}"
 
     echo "============================================================"
     echo "Running GPTQ+ LR sweep"
@@ -336,6 +362,11 @@ for grad_lr in "${GRAD_LRS[@]}"; do
     if [[ "${GRAD_REFRESH_LOSS}" == "refined_residual_kl" ]]; then
         echo "  rkl_NA : ${REFINED_RKL_NUM_A}"
         echo "  rkl_dmp: ${REFINED_RKL_DAMP}"
+    fi
+    if [[ "${GRAD_REFRESH_LOSS}" == "refined_mix" ]]; then
+        echo "  mix_sp : ${REFINED_MIX_SPLIT_LAYER:-<N//2>}"
+        echo "  mix_rlr: ${REFINED_MIX_RKL_LR_RATIO}"
+        echo "  nRM    : ${NUM_SAMPLES_FOR_REFINED_MSE}"
     fi
     echo "  reg    : ${GRAD_REG_STRATEGY}"
     echo "  reg_l  : ${GRAD_REG_LAMBDA}"
@@ -385,6 +416,7 @@ for grad_lr in "${GRAD_LRS[@]}"; do
         --g_update_mode block_gd --grad_lr "${grad_lr}" --grad_optimizer "${GRAD_OPTIMIZER}" --grad_refresh_loss "${GRAD_REFRESH_LOSS}" \
         --refined_rkl_num_A "${REFINED_RKL_NUM_A}" --refined_rkl_damp "${REFINED_RKL_DAMP}" \
         --num_samples_for_refined_mse "${NUM_SAMPLES_FOR_REFINED_MSE}" \
+        "${MIX_ARGS[@]}" \
         --rotate \
         "${GLOBAL_LOSS_ARGS[@]}" \
         "${LOSS_SLIDE_WINDOW_ARGS[@]}" \

@@ -55,9 +55,23 @@ def normalize_quant_module_name(name: str) -> str:
     return name[:-7] if name.endswith(".module") else name
 
 
-def get_effective_refresh_loss_type(layer_idx: int, final_layer_idx: int, default_refresh_loss_type: str) -> str:
+def get_effective_refresh_loss_type(
+    layer_idx: int,
+    final_layer_idx: int,
+    default_refresh_loss_type: str,
+    refined_mix_split_layer=None,
+) -> str:
     if layer_idx == final_layer_idx:
         return "kl"
+    if default_refresh_loss_type == "refined_mix":
+        if refined_mix_split_layer is None:
+            raise ValueError(
+                "refined_mix requires refined_mix_split_layer to be provided."
+            )
+        return (
+            "refined_mse" if layer_idx < refined_mix_split_layer
+            else "refined_residual_kl"
+        )
     return default_refresh_loss_type
 
 
@@ -2349,6 +2363,8 @@ def collect_static_end_to_end_saliency_and_fisher(
     profile_recorder=None,
     capture_fp_final=False,
     fp_final_store_dtype=torch.bfloat16,
+    fisher_layer_ids=None,
+    refined_rkl_layer_ids=None,
 ):
     logging.info(
         "Collecting static end-to-end saliency/fisher caches from a single pre-quantization full-model backward pass. "
@@ -2656,7 +2672,7 @@ def collect_static_end_to_end_saliency_and_fisher(
             )
 
     for layer_idx, (layer, module_dict) in enumerate(zip(layers, module_dicts)):
-        if collect_fisher:
+        if collect_fisher and (fisher_layer_ids is None or layer_idx in fisher_layer_ids):
             handles.append(layer.register_forward_hook(make_layer_hook(layer_idx)))
         for module_name, module in module_dict.items():
             handles.append(module.register_forward_hook(make_module_hook(layer_idx, module_name)))
@@ -2670,6 +2686,8 @@ def collect_static_end_to_end_saliency_and_fisher(
         last_idx = len(layers) - 1
         handles.append(layers[last_idx].register_forward_hook(make_refined_rkl_last_hook()))
         for layer_idx in range(last_idx):
+            if refined_rkl_layer_ids is not None and layer_idx not in refined_rkl_layer_ids:
+                continue
             handles.append(
                 layers[layer_idx].register_forward_hook(make_refined_rkl_layer_hook(layer_idx))
             )
@@ -2956,9 +2974,17 @@ def collect_static_end_to_end_saliency_and_fisher(
                 layer_saliency[module_name] = torch.cat(saliency_data[layer_idx][module_name], dim=0)
             static_saliency.append(layer_saliency)
             if collect_fisher:
-                if not fisher_data[layer_idx]:
-                    raise ValueError(f"Failed to collect static end-to-end Fisher for layer={layer_idx}.")
-                static_fisher.append(torch.cat(fisher_data[layer_idx], dim=0))
+                want_fisher_this_layer = (
+                    fisher_layer_ids is None or layer_idx in fisher_layer_ids
+                )
+                if want_fisher_this_layer:
+                    if not fisher_data[layer_idx]:
+                        raise ValueError(f"Failed to collect static end-to-end Fisher for layer={layer_idx}.")
+                    static_fisher.append(torch.cat(fisher_data[layer_idx], dim=0))
+                else:
+                    # Caller opted out of fisher for this layer (e.g. refined_mix
+                    # back half uses refined_residual_kl, which doesn't need fisher).
+                    static_fisher.append(None)
             else:
                 static_fisher.append(None)
 
@@ -3294,6 +3320,7 @@ def collect_layer_output_grad_for_refined_mse(
     dev,
     store_dtype=torch.bfloat16,
     layer_recorder=None,
+    collect_next=False,
 ):
     """Capture g = ∂(top-k KL vs teacher) / ∂(out_of_layer_idx) for a per-layer
     random sample pool. Used only by refresh_loss_type='refined_mse' to supply
@@ -3311,13 +3338,25 @@ def collect_layer_output_grad_for_refined_mse(
     `analyzer.get_layernorm_before_head()` + `analyzer.get_lm_head()` to
     `dev` before invoking, and must restore original residency afterwards.
 
+    When `collect_next=True` this additionally captures ∂KL/∂(out_of_layer_{
+    idx+1}) on the same single backward pass (same samples, same forward
+    graph) and returns it as `grad_pool_next` / `mean_grad_next`. Used by
+    loss_slide_window + refined_mse to supply the first-order term for the
+    next-layer refresh loss without paying for a second forward.
+    `collect_next` requires `layer_idx + 1 < len(layers)`.
+
     Returns
     -------
     grad_pool : Tensor of shape (N, seq, H) dtype=store_dtype on CPU
-        Per-sample per-token gradient at the layer's output.
+        Per-sample per-token gradient at the current layer's output.
     mean_grad : Tensor of shape (H,) fp32 on `dev`
-        Mean over (sample, seq) dims of the pool. Broadcast in refresh loss
+        Mean over (sample, seq) dims of `grad_pool`. Broadcast in refresh loss
         for batch rows that don't hit the pool.
+    grad_pool_next : Tensor of shape (N, seq, H) dtype=store_dtype on CPU, or
+        None when `collect_next=False`. Per-sample per-token gradient at the
+        next layer's output.
+    mean_grad_next : Tensor of shape (H,) fp32 on `dev`, or None when
+        `collect_next=False`. Mean over (sample, seq) dims of `grad_pool_next`.
     """
     N = len(sample_ids_local)
     if N == 0:
@@ -3326,6 +3365,11 @@ def collect_layer_output_grad_for_refined_mse(
         raise ValueError(
             f"num_samples_for_refined_mse ({N}) must be divisible by "
             f"backward_bsz ({backward_bsz})."
+        )
+    if collect_next and layer_idx + 1 >= len(layers):
+        raise ValueError(
+            f"collect_next=True requires a downstream layer (layer_idx="
+            f"{layer_idx}, len(layers)={len(layers)})."
         )
     seq_len = inps.shape[1]
     hidden_size = inps.shape[2]
@@ -3340,9 +3384,17 @@ def collect_layer_output_grad_for_refined_mse(
         (N, seq_len, hidden_size), dtype=store_dtype, device="cpu",
         pin_memory=True,
     )
+    grad_pool_next = None
+    if collect_next:
+        grad_pool_next = torch.empty(
+            (N, seq_len, hidden_size), dtype=store_dtype, device="cpu",
+            pin_memory=True,
+        )
     # Side stream dedicated to the grad_pool D2H copies. Keeps the default
     # stream free to run the next iter's forward+backward while the copy
-    # drains in the background.
+    # drains in the background. A single side stream is enough for both pools
+    # — they're written from the same backward, so ordering their copies on
+    # one stream is fine.
     d2h_stream = torch.cuda.Stream(device=dev)
 
     # Drop act-quant on the current + downstream layers so the forward used
@@ -3389,6 +3441,7 @@ def collect_layer_output_grad_for_refined_mse(
                             )
                             out_i = out[0] if isinstance(out, (tuple, list)) else out
                             h = out_i
+                        out_next = None
                         with layer_recorder.section("layer.refined_mse_grad_pool.batch.forward_downstream") if layer_recorder else _NULL_CONTEXT:
                             for k in range(layer_idx + 1, len(layers)):
                                 out_k = layers[k](
@@ -3398,6 +3451,8 @@ def collect_layer_output_grad_for_refined_mse(
                                     position_embeddings=b_pos_emb,
                                 )
                                 h = out_k[0] if isinstance(out_k, (tuple, list)) else out_k
+                                if collect_next and k == layer_idx + 1:
+                                    out_next = h
                         with layer_recorder.section("layer.refined_mse_grad_pool.batch.logits_student") if layer_recorder else _NULL_CONTEXT:
                             logits_student = hidden2logits(h, analyzer)
                         with layer_recorder.section("layer.refined_mse_grad_pool.batch.logits_teacher") if layer_recorder else _NULL_CONTEXT:
@@ -3417,9 +3472,18 @@ def collect_layer_output_grad_for_refined_mse(
                                 reduction="none",
                             ).sum(dim=-1).mean()
                         with layer_recorder.section("layer.refined_mse_grad_pool.batch.backward") if layer_recorder else _NULL_CONTEXT:
-                            grad_out = torch.autograd.grad(
-                                kl_loss, out_i, retain_graph=False
-                            )[0]
+                            if collect_next:
+                                # One backward pass, two gradient outputs — cheaper
+                                # than calling `autograd.grad(..., retain_graph=True)`
+                                # twice.
+                                grad_out, grad_out_next = torch.autograd.grad(
+                                    kl_loss, [out_i, out_next], retain_graph=False
+                                )
+                            else:
+                                grad_out = torch.autograd.grad(
+                                    kl_loss, out_i, retain_graph=False
+                                )[0]
+                                grad_out_next = None
                         with layer_recorder.section("layer.refined_mse_grad_pool.batch.store") if layer_recorder else _NULL_CONTEXT:
                             # Cast to store dtype on the default stream so the
                             # data is produced where backward just ran, then
@@ -3431,14 +3495,29 @@ def collect_layer_output_grad_for_refined_mse(
                             # allocator could reuse the memory for the next
                             # iter's forward and corrupt the in-flight copy).
                             grad_out_bf16 = grad_out.detach().to(store_dtype)
+                            grad_out_next_bf16 = (
+                                grad_out_next.detach().to(store_dtype)
+                                if grad_out_next is not None else None
+                            )
                             d2h_stream.wait_stream(torch.cuda.current_stream())
                             with torch.cuda.stream(d2h_stream):
                                 grad_pool[start:start + bsz].copy_(
                                     grad_out_bf16, non_blocking=True
                                 )
                                 grad_out_bf16.record_stream(d2h_stream)
+                                if grad_out_next_bf16 is not None:
+                                    grad_pool_next[start:start + bsz].copy_(
+                                        grad_out_next_bf16, non_blocking=True
+                                    )
+                                    grad_out_next_bf16.record_stream(d2h_stream)
                         del out, out_i, h, logits_student, logits_teacher
                         del kl_loss, grad_out, h_in, grad_out_bf16
+                        if out_next is not None:
+                            del out_next
+                        if grad_out_next is not None:
+                            del grad_out_next
+                        if grad_out_next_bf16 is not None:
+                            del grad_out_next_bf16
     finally:
         with layer_recorder.section("layer.refined_mse_grad_pool.restore_act_quant") if layer_recorder else _NULL_CONTEXT:
             for lay, bits_cfg in restore_bits:
@@ -3450,7 +3529,10 @@ def collect_layer_output_grad_for_refined_mse(
         # stream ordering, so we need an explicit sync here.
         d2h_stream.synchronize()
         mean_grad = grad_pool.float().mean(dim=(0, 1)).to(dev)
-    return grad_pool, mean_grad
+        mean_grad_next = None
+        if grad_pool_next is not None:
+            mean_grad_next = grad_pool_next.float().mean(dim=(0, 1)).to(dev)
+    return grad_pool, mean_grad, grad_pool_next, mean_grad_next
 
 
 def apply_dense_optimizer_step(
@@ -3625,6 +3707,8 @@ def collect_true_weight_gradient(
     refined_mse_pool_ids=None,
     refined_mse_grad_pool=None,
     refined_mse_mean_grad=None,
+    next_refined_mse_grad_pool=None,
+    next_refined_mse_mean_grad=None,
     layer_recorder=None,
 ):
     """Compute the refresh gradient as a per-rank partial sum + count.
@@ -3749,6 +3833,15 @@ def collect_true_weight_gradient(
                 refresh_loss_type == "refined_residual_kl"
                 and fp_inps_final is not None
                 and has_next_refined_A
+            )
+            or (
+                # refined_mse: needs both the next-layer fisher (second order)
+                # and the next-layer grad pool (first order). At layer 0 the
+                # pool tensor is None but mean_grad is zeros(H), which is a
+                # valid degenerate state (first_order collapses to 0).
+                refresh_loss_type == "refined_mse"
+                and next_layer_output_fisher is not None
+                and next_refined_mse_mean_grad is not None
             )
         )
     )
@@ -3878,13 +3971,17 @@ def collect_true_weight_gradient(
                                     else None
                                 )
                         # refined_mse: pick per-batch exact-grad slice + positions.
-                        # Slide-window path is explicitly disallowed at argparse
-                        # time for refined_mse, so we only assemble the current-
-                        # layer inputs here; the next-layer call below receives
-                        # `None`s if it ever fires (it won't in practice).
+                        # When loss_slide_window is active under refined_mse, the
+                        # next-layer pool uses the SAME sample ids as the current-
+                        # layer pool (they were captured in one backward pass), so
+                        # `pool_positions` / `batch_row_list` are identical across
+                        # current and next. We just index a second (B_pool, seq, H)
+                        # slice from the next-layer pool here to avoid redoing the
+                        # lookup inside the slide branch.
                         with layer_recorder.section("layer.true_weight_grad.batch.refined_mse_pool_lookup") if layer_recorder else _NULL_CONTEXT:
                             refined_mse_pool_positions = None
                             refined_mse_exact_batch = None
+                            refined_mse_exact_batch_next = None
                             if refresh_loss_type == "refined_mse" and refined_mse_pool_lookup:
                                 pool_pos_list = []
                                 batch_row_list = []
@@ -3901,6 +3998,11 @@ def collect_true_weight_gradient(
                                     refined_mse_pool_positions = torch.tensor(
                                         batch_row_list, dtype=torch.long, device=dev
                                     )
+                                    if next_refined_mse_grad_pool is not None:
+                                        refined_mse_exact_batch_next = (
+                                            next_refined_mse_grad_pool[pool_pos_list]
+                                            .to(dev, dtype=out_hidden.dtype)
+                                        )
                         with layer_recorder.section("layer.true_weight_grad.batch.refresh_loss_current") if layer_recorder else _NULL_CONTEXT:
                             refresh_loss_current = compute_refresh_loss(
                                 refresh_loss_type,
@@ -3929,9 +4031,9 @@ def collect_true_weight_gradient(
                                 )
                                 next_out_hidden = next_out[0] if isinstance(next_out, (tuple, list)) else next_out
                                 fp_hidden_next = fp_inps_next[batch_indices].to(dev)
-                                # For fisher_diag_mse the next-layer loss needs the
-                                # next-layer fisher diagonal; for residual_kl it reuses
-                                # the same fp_inps_final as the current-layer loss.
+                                # fisher_diag_mse / refined_mse: next-layer
+                                # loss needs the next-layer fisher diagonal.
+                                # residual_kl: doesn't — reuses fp_inps_final.
                                 fisher_batch_next = (
                                     None if next_layer_output_fisher is None
                                     else next_layer_output_fisher[batch_indices].to(dev).float()
@@ -3946,6 +4048,18 @@ def collect_true_weight_gradient(
                                     layer_output_fisher=fisher_batch_next,
                                     fp_final_hidden=fp_final_batch,
                                     refined_A=next_refined_A_batch,
+                                    layer_output_grad_exact=(
+                                        refined_mse_exact_batch_next
+                                        if refresh_loss_type == "refined_mse" else None
+                                    ),
+                                    layer_output_grad_mean=(
+                                        next_refined_mse_mean_grad
+                                        if refresh_loss_type == "refined_mse" else None
+                                    ),
+                                    pool_positions=(
+                                        refined_mse_pool_positions
+                                        if refresh_loss_type == "refined_mse" else None
+                                    ),
                                     profile_recorder=layer_recorder,
                                 )
                             with layer_recorder.section("layer.true_weight_grad.batch.blend") if layer_recorder else _NULL_CONTEXT:
@@ -4514,12 +4628,37 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
     skip_ref_backward = args.alpha == 0
     effective_pre_gd_steps = args.pre_gd_steps if preclip_enabled else 0
     global_loss_enabled = bool(getattr(args, "global_loss", False))
+    # refined_mix mode: layers [0, split) use refined_mse, [split, N-1) use
+    # refined_residual_kl, final layer always kl. `split` is resolved here
+    # once so the per-layer helper calls and the precompute layer-id sets
+    # see a single consistent value.
+    mix_mode = args.grad_refresh_loss == "refined_mix"
+    if mix_mode:
+        split_override = getattr(args, "refined_mix_split_layer", None)
+        refined_mix_split_layer = (
+            int(split_override) if split_override is not None else len(layers) // 2
+        )
+        if not (1 <= refined_mix_split_layer <= len(layers) - 1):
+            raise ValueError(
+                f"refined_mix_split_layer ({refined_mix_split_layer}) must be in "
+                f"[1, {len(layers) - 1}] so each half has at least one non-final layer."
+            )
+        logging.info(
+            "refined_mix enabled: layers [0, %d) use refined_mse, [%d, %d) use "
+            "refined_residual_kl, layer %d uses kl (final). rkl_lr_ratio=%.4f.",
+            refined_mix_split_layer, refined_mix_split_layer, len(layers) - 1,
+            len(layers) - 1,
+            float(getattr(args, "refined_mix_rkl_lr_ratio", 1.0)),
+        )
+    else:
+        refined_mix_split_layer = None
     # Per-sub-A sample window for refined_residual_kl (num_A > 1). Computed
     # once here so the per-layer callers (run_pre_quant_gd,
     # collect_layer_grad_hessian_stats, refresh_fn) can route samples to the
-    # right sub-A. Zero means single-A (no per-sample routing).
+    # right sub-A. Zero means single-A (no per-sample routing). Also activates
+    # under refined_mix, because the back half uses refined_residual_kl.
     refined_rkl_num_A = int(getattr(args, "refined_rkl_num_A", 1))
-    if refined_rkl_num_A > 1 and args.grad_refresh_loss == "refined_residual_kl":
+    if refined_rkl_num_A > 1 and args.grad_refresh_loss in ("refined_residual_kl", "refined_mix"):
         if args.nsamples % refined_rkl_num_A != 0:
             raise ValueError(
                 f"refined_rkl: nsamples ({args.nsamples}) must be divisible by "
@@ -4569,7 +4708,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
         # separate bs=1 Stage 2 precompute later. Populated on CPU in bf16;
         # moved to match fp_inps's device/dtype once `inps` is captured below.
         need_fp_inps_final = args.grad_refresh_loss in (
-            "residual_kl", "refined_residual_kl", "refined_mse",
+            "residual_kl", "refined_residual_kl", "refined_mse", "refined_mix",
         )
         fp_inps_final_cpu = None
         if global_loss_enabled:
@@ -4592,12 +4731,19 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                 # would load successfully but miss the fp_inps_final tensor,
                 # forcing the slow Stage 2 bs=1 precompute anyway.
                 fpfinal_tag = int(need_fp_inps_final)
+                # refined_mix: the precompute only collects fisher for the front
+                # half and A for the back half, so the resulting cache is NOT
+                # interchangeable with a non-mix run. Tag the key with the split
+                # layer to keep them segregated. Non-mix runs keep the key
+                # byte-identical to previous versions (empty tag).
+                mix_tag = f"_mixsplit{refined_mix_split_layer}" if mix_mode else ""
                 static_cache_key = (
                     f"{args.model_name}_{dataset_id}_s{args.nsamples}_"
                     f"blk{args.seq_len}_rot{rotate_flag}_g{args.num_groups}_"
                     f"fng{args.fisher_num_groups}_ghtk{args.grad_hessian_topk}_"
                     f"glbsz{args.global_loss_bsz}_seed{args.seed}_"
                     f"salclip{sal_clip_tag}_rklNA{rkl_na}_fpfinal{fpfinal_tag}"
+                    f"{mix_tag}"
                 )
                 static_cache_key += f"_world{dist_utils.get_world_size()}_rank{dist_utils.get_rank()}"
                 os.makedirs(static_cache_dir, exist_ok=True)
@@ -4617,7 +4763,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     # stale, the reloaded list will be empty/missing and we'd fail
                     # below — force the user to rebuild the cache.
                     static_refined_A_by_layer = _loaded.get("refined_A", None)
-                    if args.grad_refresh_loss == "refined_residual_kl" and not static_refined_A_by_layer:
+                    if args.grad_refresh_loss in ("refined_residual_kl", "refined_mix") and not static_refined_A_by_layer:
                         raise RuntimeError(
                             "Cached static saliency/fisher at %s was built before refined_A "
                             "was added. Delete the cache and rerun to regenerate." % static_cache_file
@@ -4628,15 +4774,33 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     # caches that match the current need_fp_inps_final flag.
                     fp_inps_final_cpu = _loaded.get("fp_inps_final", None)
             else:
-                want_refined = args.grad_refresh_loss == "refined_residual_kl"
+                want_refined = args.grad_refresh_loss in (
+                    "refined_residual_kl", "refined_mix",
+                )
                 # fisher is consumed by fisher_diag_mse (twofold: the refresh
                 # loss itself, and the slide-window blend reads the next
                 # layer's fisher) AND by refined_mse (as its second-order term
                 # — the first-order g·Δy is stacked on top). Everything else
                 # (kl / hidden_mse / residual_kl / refined_residual_kl) does
                 # not touch the static fisher cache, so skipping the collect
-                # halves CPU RAM for those configurations.
-                want_fisher = args.grad_refresh_loss in ("fisher_diag_mse", "refined_mse")
+                # halves CPU RAM for those configurations. For refined_mix we
+                # still want fisher — but only for the front-half layers; see
+                # `fisher_layer_ids` below.
+                want_fisher = args.grad_refresh_loss in (
+                    "fisher_diag_mse", "refined_mse", "refined_mix",
+                )
+                # refined_mix layer-id filters: front half uses refined_mse →
+                # needs fisher; back half (except final) uses refined_residual_kl
+                # → needs A. Outside mix mode, pass None = collect on every
+                # layer for the corresponding stat type.
+                if mix_mode:
+                    fisher_layer_ids = set(range(refined_mix_split_layer))
+                    refined_rkl_layer_ids = set(
+                        range(refined_mix_split_layer, len(layers) - 1)
+                    )
+                else:
+                    fisher_layer_ids = None
+                    refined_rkl_layer_ids = None
                 with pipeline_recorder.section("pipeline.static_end_to_end_saliency_fisher") if pipeline_recorder else _NULL_CONTEXT:
                     # 4th return (`refined_diag_A`) is only used by
                     # analyze_grad_cosine today; main quant pipeline ignores it.
@@ -4662,6 +4826,8 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             refined_rkl_num_A=int(getattr(args, "refined_rkl_num_A", 1)),
                             profile_recorder=pipeline_recorder,
                             capture_fp_final=need_fp_inps_final,
+                            fisher_layer_ids=fisher_layer_ids,
+                            refined_rkl_layer_ids=refined_rkl_layer_ids,
                         )
                 if static_cache_file is not None:
                     with pipeline_recorder.section("pipeline.static_cache.save") if pipeline_recorder else _NULL_CONTEXT:
@@ -4812,7 +4978,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
         # the bs=1 per-layer precompute when global_loss is off or when the
         # capture didn't run (e.g. loaded an older cache).
         fp_inps_final = None
-        if args.grad_refresh_loss in ("residual_kl", "refined_residual_kl", "refined_mse"):
+        if args.grad_refresh_loss in ("residual_kl", "refined_residual_kl", "refined_mse", "refined_mix"):
             if fp_inps_final_cpu is not None:
                 with pipeline_recorder.section("pipeline.fp_final_from_static") if pipeline_recorder else _NULL_CONTEXT:
                     logging.info(
@@ -4904,6 +5070,29 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                 i,
                 final_layer_idx,
                 args.grad_refresh_loss,
+                refined_mix_split_layer=refined_mix_split_layer,
+            )
+            # Slide-window blends layer i's loss with layer i+1's loss. For
+            # refined_mix, i = split-1 sits right at the loss-type boundary
+            # (refined_mse → refined_residual_kl), and the two losses rely on
+            # incompatible per-layer state (refined_mse needs fisher + g pool;
+            # refined_residual_kl needs A + fp_inps_final). Blending them would
+            # require a cross-type plumbing we explicitly don't do in v1.
+            # Detect this once here and suppress slide_window both when
+            # collecting the next-layer grad pool and when mixing refresh
+            # losses. For non-mix runs this is always True (next layer shares
+            # the same loss type), so behaviour is unchanged.
+            if i + 1 <= final_layer_idx:
+                next_layer_refresh_loss_type = get_effective_refresh_loss_type(
+                    i + 1,
+                    final_layer_idx,
+                    args.grad_refresh_loss,
+                    refined_mix_split_layer=refined_mix_split_layer,
+                )
+            else:
+                next_layer_refresh_loss_type = None
+            next_layer_same_type = (
+                next_layer_refresh_loss_type == layer_refresh_loss_type
             )
             gptq_reference_loss_type = get_effective_gptq_reference_loss_type(
                 global_loss_enabled,
@@ -4954,9 +5143,27 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
             # add a first-order term `g · Δy` on top of fisher_diag_mse. At
             # layer 0 the model output equals the teacher, so g ≡ 0; we skip
             # the backward and plant zeros.
+            # With loss_slide_window on, we additionally capture ∂KL/∂(layer_{
+            # i+1} output) on the SAME single backward pass (same sample pool)
+            # so the next-layer refresh loss can add its own first-order term.
+            # Gated to `i <= final_layer_idx - 2` (same as slide_window itself).
             layer_refined_mse_pool_ids = None
             layer_refined_mse_grad_pool = None
             layer_refined_mse_mean_grad = None
+            layer_refined_mse_grad_pool_next = None
+            layer_refined_mse_mean_grad_next = None
+            slide_window_enabled = (
+                getattr(args, "loss_slide_window", False)
+                and args.g_update_mode == "block_gd"
+                and i <= final_layer_idx - 2
+                and next_layer_same_type
+            )
+            collect_next_refined_mse = (
+                layer_refresh_loss_type == "refined_mse"
+                and slide_window_enabled
+                and global_loss_enabled
+                and static_fisher_by_layer[i + 1] is not None
+            )
             if layer_refresh_loss_type == "refined_mse":
                 with layer_recorder.section("layer.refined_mse_grad_pool.total") if layer_recorder else _NULL_CONTEXT:
                     hidden_size = model.config.hidden_size
@@ -4965,6 +5172,14 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         layer_refined_mse_mean_grad = torch.zeros(
                             hidden_size, dtype=torch.float32, device=dev
                         )
+                        # Layer-0 slide-window next-layer pool is also zero
+                        # (student == teacher at layer 0 → KL = 0 → g_{i+1}
+                        # ≡ 0 too). Plant zeros so the non-pool broadcast in
+                        # compute_refresh_loss still works.
+                        if collect_next_refined_mse:
+                            layer_refined_mse_mean_grad_next = torch.zeros(
+                                hidden_size, dtype=torch.float32, device=dev
+                            )
                     else:
                         n_pool = int(args.num_samples_for_refined_mse)
                         if n_pool > n_local:
@@ -5002,6 +5217,8 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                                 (
                                     layer_refined_mse_grad_pool,
                                     layer_refined_mse_mean_grad,
+                                    layer_refined_mse_grad_pool_next,
+                                    layer_refined_mse_mean_grad_next,
                                 ) = collect_layer_output_grad_for_refined_mse(
                                     analyzer=analyzer,
                                     layer=layer,
@@ -5016,6 +5233,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                                     backward_bsz=rm_bwd_bsz,
                                     kl_topk=args.kl_topk,
                                     dev=dev,
+                                    collect_next=collect_next_refined_mse,
                                     layer_recorder=layer_recorder,
                                 )
                         finally:
@@ -5044,12 +5262,21 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         layer_refined_mse_pool_ids = torch.tensor(
                             sample_ids_local, dtype=torch.long
                         )
-                        logging.info(
-                            "refined_mse: collected per-layer grad pool layer=%d N=%d "
-                            "bwd_bsz=%d |mean_grad|=%.3e",
-                            i, n_pool, rm_bwd_bsz,
-                            layer_refined_mse_mean_grad.norm(p=2).item(),
-                        )
+                        if collect_next_refined_mse:
+                            logging.info(
+                                "refined_mse: collected per-layer grad pool layer=%d N=%d "
+                                "bwd_bsz=%d |mean_grad|=%.3e |mean_grad_next|=%.3e",
+                                i, n_pool, rm_bwd_bsz,
+                                layer_refined_mse_mean_grad.norm(p=2).item(),
+                                layer_refined_mse_mean_grad_next.norm(p=2).item(),
+                            )
+                        else:
+                            logging.info(
+                                "refined_mse: collected per-layer grad pool layer=%d N=%d "
+                                "bwd_bsz=%d |mean_grad|=%.3e",
+                                i, n_pool, rm_bwd_bsz,
+                                layer_refined_mse_mean_grad.norm(p=2).item(),
+                            )
 
             with layer_recorder.section("layer.fp_reference_forward") if layer_recorder else _NULL_CONTEXT:
                 bits_config = quant_utils.disable_act_quant(layer)
@@ -5065,20 +5292,23 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
 
             # --- Loss-slide-window setup: precompute reference output of the
             # next FP transformer block, so the per-block refresh can blend the
-            # current-layer loss with the next-layer loss. Supported under two
-            # refresh types:
+            # current-layer loss with the next-layer loss. Supported under:
             #   * fisher_diag_mse — needs `static_fisher_by_layer[i+1]` (so
             #     global_loss must be on).
             #   * residual_kl    — reuses the already-precomputed fp_inps_final
             #     (no next-layer fisher needed).
             #   * refined_residual_kl — reuses fp_inps_final and additionally
             #     needs the next-layer A matrix from static_refined_A_by_layer.
+            #   * refined_mse    — needs `static_fisher_by_layer[i+1]` (the
+            #     second-order term) AND the next-layer grad pool collected
+            #     above (first-order term).
             # Skipped at and past the second-to-last layer per the spec.
             slide_active_layer = False
             if (
                 getattr(args, "loss_slide_window", False)
                 and args.g_update_mode == "block_gd"
                 and i <= final_layer_idx - 2
+                and next_layer_same_type
             ):
                 if (
                     layer_refresh_loss_type == "fisher_diag_mse"
@@ -5099,6 +5329,17 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     and any(s is not None for s in static_refined_A_by_layer[i + 1])
                 ):
                     slide_active_layer = True
+                elif (
+                    layer_refresh_loss_type == "refined_mse"
+                    and global_loss_enabled
+                    and static_fisher_by_layer[i + 1] is not None
+                    and layer_refined_mse_mean_grad_next is not None
+                ):
+                    # layer 0: grad_pool_next is None but mean_grad_next is
+                    # zeros(H) — that's the correct degenerate state (first-
+                    # order term collapses to 0, loss reduces to next-layer
+                    # fisher_diag_mse).
+                    slide_active_layer = True
             slide_next_layer = None
             slide_fp_inps_next = None
             slide_next_layer_output_fisher = None
@@ -5108,10 +5349,11 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                 with layer_recorder.section("layer.slide_window.next_fp_reference") if layer_recorder else _NULL_CONTEXT:
                     slide_next_layer = layers[i + 1].to(dev)
                     slide_next_bits_config = quant_utils.disable_act_quant(slide_next_layer)
-                    # Only fisher_diag_mse needs the next-layer fisher; refined
-                    # _residual_kl needs the next-layer A. residual_kl needs
-                    # neither — loss routes through fp_inps_final only.
-                    if layer_refresh_loss_type == "fisher_diag_mse":
+                    # fisher_diag_mse and refined_mse both need the next-layer
+                    # fisher (they share the fisher-diag second-order term);
+                    # refined_residual_kl needs the next-layer A. residual_kl
+                    # needs neither — loss routes through fp_inps_final only.
+                    if layer_refresh_loss_type in ("fisher_diag_mse", "refined_mse"):
                         slide_next_layer_output_fisher = static_fisher_by_layer[i + 1]
                     elif layer_refresh_loss_type == "refined_residual_kl":
                         # Load the next layer's full A list onto dev for
@@ -5196,6 +5438,16 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     if i == final_layer_idx and args.pre_final_layer_grad_lr is not None
                     else args.pre_grad_lr * grad_lr_layer_scale
                 )
+                # refined_mix: back-half layers use refined_residual_kl and get
+                # their own LR relative to the front half. Multiply by the
+                # configured ratio once here so both pre_gd and block_gd see
+                # the same LR cadence. Final layer keeps its dedicated override.
+                if (
+                    mix_mode
+                    and i != final_layer_idx
+                    and layer_refresh_loss_type == "refined_residual_kl"
+                ):
+                    pre_grad_lr *= float(getattr(args, "refined_mix_rkl_lr_ratio", 1.0))
                 # Final-layer gradients come through lm_head + final norm and are
                 # often orders of magnitude larger; allow an independent clip.
                 effective_grad_clip = (
@@ -5368,6 +5620,8 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                 slide_fp_inps_next=None,
                 slide_next_layer_output_fisher=None,
                 slide_next_refined_A_list=None,
+                slide_next_refined_mse_grad_pool=None,
+                slide_next_refined_mse_mean_grad=None,
             ):
                 def refresh_fn(weight_snapshot, slide_alpha=1.0):
                     if args.final_layer_full_backward and i == final_layer_idx:
@@ -5407,6 +5661,8 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             refined_mse_pool_ids=layer_refined_mse_pool_ids,
                             refined_mse_grad_pool=layer_refined_mse_grad_pool,
                             refined_mse_mean_grad=layer_refined_mse_mean_grad,
+                            next_refined_mse_grad_pool=slide_next_refined_mse_grad_pool,
+                            next_refined_mse_mean_grad=slide_next_refined_mse_mean_grad,
                             layer_recorder=layer_recorder,
                         )
                     )
@@ -5534,6 +5790,17 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         if i == final_layer_idx and args.final_layer_grad_lr is not None
                         else args.grad_lr * grad_lr_layer_scale
                     )
+                    # refined_mix: back-half layers (refined_residual_kl) use
+                    # `grad_lr * refined_mix_rkl_lr_ratio`. Final-layer override
+                    # wins (final layer is forced to kl and typically has its
+                    # own tuned lr), so the ratio only applies when we're NOT
+                    # on the final layer and the effective loss is refined_rkl.
+                    if (
+                        mix_mode
+                        and i != final_layer_idx
+                        and layer_refresh_loss_type == "refined_residual_kl"
+                    ):
+                        base_grad_lr *= float(getattr(args, "refined_mix_rkl_lr_ratio", 1.0))
                     effective_grad_reg_strategy = "none" if i == final_layer_idx else args.grad_reg_strategy
                     # Final-layer gradients come through lm_head + final norm and
                     # are often orders of magnitude larger; allow an independent
@@ -5609,6 +5876,8 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             slide_fp_inps_next=slide_fp_inps_next,
                             slide_next_layer_output_fisher=slide_next_layer_output_fisher,
                             slide_next_refined_A_list=slide_next_refined_A_list,
+                            slide_next_refined_mse_grad_pool=layer_refined_mse_grad_pool_next,
+                            slide_next_refined_mse_mean_grad=layer_refined_mse_mean_grad_next,
                         ) if args.g_update_mode in {"block_backward", "block_gd"} else None,
                         grad_lr=effective_grad_lr,
                         grad_optimizer=effective_grad_optimizer,
@@ -5669,6 +5938,10 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     del layer_refined_mse_mean_grad
                 if layer_refined_mse_pool_ids is not None:
                     del layer_refined_mse_pool_ids
+                if layer_refined_mse_grad_pool_next is not None:
+                    del layer_refined_mse_grad_pool_next
+                if layer_refined_mse_mean_grad_next is not None:
+                    del layer_refined_mse_mean_grad_next
                 memory_utils.cleanup_memory()
 
             if quant_stop_layer is not None and i >= quant_stop_layer:

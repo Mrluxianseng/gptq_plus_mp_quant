@@ -128,7 +128,7 @@ def parse_gen():
         "--grad_refresh_loss",
         type=str,
         default="kl",
-        choices=["kl", "hidden_mse", "fisher_diag_mse", "residual_kl", "refined_residual_kl", "refined_mse"],
+        choices=["kl", "hidden_mse", "fisher_diag_mse", "residual_kl", "refined_residual_kl", "refined_mse", "refined_mix"],
         help=(
             "Loss used to compute the true refresh gradient in block_backward/block_gd. "
             "'residual_kl' assumes the current-layer output delta flows through the "
@@ -140,7 +140,11 @@ def parse_gen():
             "'refined_mse' adds a first-order term g·Δy (where g = ∂KL/∂layer_output, "
             "collected end-to-end per layer just before its quant loop opens) on top of "
             "fisher_diag_mse's second-order term — the full Taylor expansion of end-to-end "
-            "KL in the layer output."
+            "KL in the layer output. "
+            "'refined_mix' splits the layer stack: [0, split) use refined_mse, [split, N-1) "
+            "use refined_residual_kl, and the final layer keeps its forced kl. Back-half "
+            "layers skip the per-layer end-to-end grad pool collection (they don't need g); "
+            "precompute only collects fisher for the front half and A for the back half."
         ),
     )
     parser.add_argument(
@@ -533,6 +537,26 @@ def parse_gen():
         ),
     )
     parser.add_argument(
+        "--refined_mix_split_layer",
+        type=int,
+        default=None,
+        help=(
+            "refined_mix only: layers [0, split) use refined_mse, [split, N-1) use "
+            "refined_residual_kl, final layer always kl. Default (None) resolves to "
+            "N // 2 at runtime where N is the number of transformer blocks."
+        ),
+    )
+    parser.add_argument(
+        "--refined_mix_rkl_lr_ratio",
+        type=float,
+        default=1.0,
+        help=(
+            "refined_mix only: multiplier applied to --grad_lr and --pre_grad_lr for "
+            "the refined_residual_kl half of layers. 1.0 = same LR for both halves. "
+            "The final layer keeps --final_layer_grad_lr independently."
+        ),
+    )
+    parser.add_argument(
         "--measure_losses",
         type=str,
         default="fisher_diag_mse,residual_kl,refined_residual_kl,refined_diag_residual_kl",
@@ -620,15 +644,30 @@ def parse_gen():
     if getattr(args, "loss_slide_window", False):
         if args.g_update_mode != "block_gd":
             raise ValueError("--loss_slide_window requires --g_update_mode=block_gd.")
-        if args.grad_refresh_loss not in ("fisher_diag_mse", "residual_kl", "refined_residual_kl"):
+        if args.grad_refresh_loss not in ("fisher_diag_mse", "residual_kl", "refined_residual_kl", "refined_mse", "refined_mix"):
             raise ValueError(
                 "--loss_slide_window requires --grad_refresh_loss in "
-                "{fisher_diag_mse, residual_kl, refined_residual_kl}."
+                "{fisher_diag_mse, residual_kl, refined_residual_kl, refined_mse, refined_mix}."
             )
         if args.grad_refresh_loss == "fisher_diag_mse" and not args.global_loss:
             raise ValueError(
                 "--loss_slide_window + fisher_diag_mse requires --global_loss "
                 "(so next-layer fisher is cached)."
+            )
+        if args.grad_refresh_loss == "refined_mse" and not args.global_loss:
+            raise ValueError(
+                "--loss_slide_window + refined_mse requires --global_loss "
+                "(next-layer fisher + fp_inps_final are both cached under the "
+                "global-loss precompute path)."
+            )
+        # refined_mix uses both halves' stats; --global_loss is required for
+        # either half's slide-window dependency (fisher[i+1] / A[i+1] /
+        # fp_inps_final). The per-type --global_loss check below also catches
+        # this, but surface it next to the other slide_window guards for
+        # locality.
+        if args.grad_refresh_loss == "refined_mix" and not args.global_loss:
+            raise ValueError(
+                "--loss_slide_window + refined_mix requires --global_loss."
             )
     # residual_kl + slide_window is supported: the next-layer loss computes
     # δ_next = next_layer(out_hidden) - fp_inps_next, then runs the same
@@ -665,11 +704,6 @@ def parse_gen():
                 "--grad_refresh_loss=refined_mse requires --global_loss (fp_inps_final "
                 "is only cached under the global-loss precompute path)."
             )
-        if getattr(args, "loss_slide_window", False):
-            raise ValueError(
-                "--loss_slide_window is not supported with --grad_refresh_loss=refined_mse "
-                "in v1 (next-layer grad pool would also need collecting; deferred)."
-            )
         if int(getattr(args, "enable_gptq_plus", 1)) != 0:
             raise ValueError(
                 "--grad_refresh_loss=refined_mse requires --enable_gptq_plus 0 in v1. "
@@ -699,6 +733,50 @@ def parse_gen():
                 f"--num_samples_for_refined_mse ({args.num_samples_for_refined_mse}) "
                 f"must be divisible by per-rank backward bsz ({_bwd_bsz_local} = "
                 f"global_loss_bsz // world)."
+            )
+    # refined_mix validation: front half behaves as refined_mse, back half as
+    # refined_residual_kl, final layer forced to kl. Inherits the union of
+    # refined_mse's and refined_residual_kl's constraints.
+    if args.grad_refresh_loss == "refined_mix":
+        if not args.global_loss:
+            raise ValueError(
+                "--grad_refresh_loss=refined_mix requires --global_loss (both halves "
+                "need the precompute pass: fisher for refined_mse, A for refined_residual_kl, "
+                "and fp_inps_final for both)."
+            )
+        if int(getattr(args, "enable_gptq_plus", 1)) != 0:
+            raise ValueError(
+                "--grad_refresh_loss=refined_mix requires --enable_gptq_plus 0 (inherits "
+                "the refined_mse v1 limitation on the front half — see refined_mse for details)."
+            )
+        if args.num_samples_for_refined_mse <= 0:
+            raise ValueError(
+                f"--num_samples_for_refined_mse must be positive. "
+                f"Got {args.num_samples_for_refined_mse}."
+            )
+        _dp_world_r = int(os.environ.get("WORLD_SIZE", "1"))
+        _n_local = args.nsamples // _dp_world_r
+        if args.num_samples_for_refined_mse > _n_local:
+            raise ValueError(
+                f"--num_samples_for_refined_mse ({args.num_samples_for_refined_mse}) "
+                f"must be <= nsamples // world ({_n_local})."
+            )
+        _bwd_bsz_local = args.global_loss_bsz // _dp_world_r
+        if _bwd_bsz_local <= 0 or args.num_samples_for_refined_mse % _bwd_bsz_local != 0:
+            raise ValueError(
+                f"--num_samples_for_refined_mse ({args.num_samples_for_refined_mse}) "
+                f"must be divisible by per-rank backward bsz ({_bwd_bsz_local} = "
+                f"global_loss_bsz // world)."
+            )
+        if args.refined_mix_split_layer is not None and args.refined_mix_split_layer < 1:
+            raise ValueError(
+                f"--refined_mix_split_layer ({args.refined_mix_split_layer}) must be >= 1 "
+                "(upper bound is checked against len(layers) at runtime)."
+            )
+        if args.refined_mix_rkl_lr_ratio <= 0:
+            raise ValueError(
+                f"--refined_mix_rkl_lr_ratio must be positive. "
+                f"Got {args.refined_mix_rkl_lr_ratio}."
             )
     if args.nsamples % args.backward_samples != 0:
         raise ValueError(
