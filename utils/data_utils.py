@@ -57,8 +57,8 @@ def _get_neuralmagic(tokenizer, split):
     return data['text']
 
 
-def _get_ultrachat_2k(tokenizer, split):
-    assert split in ['train', 'test'], f"Unknown split {split} for ultrachat_2k"
+def _get_numinamath(tokenizer, split):
+    assert split in ['train', 'test'], f"Unknown split {split} for numinamath"
 
     def preprocess_fn(example):
         example["messages"] = [
@@ -86,8 +86,8 @@ def _get_ultrachat_2k(tokenizer, split):
     return data['text']
 
 
-def _get_numinamath(tokenizer, split):
-    assert split in ['train', 'test'], f"Unknown split {split} for numinamath"
+def _get_ultrachat_2k(tokenizer, split):
+    assert split in ['train', 'test'], f"Unknown split {split} for ultrachat_2k"
 
     def preprocess_fn(example):
         if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template is not None:
