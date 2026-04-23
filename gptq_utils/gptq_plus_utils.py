@@ -69,7 +69,7 @@ def get_effective_refresh_loss_type(
                 "refined_mix requires refined_mix_split_layer to be provided."
             )
         return (
-            "refined_mse" if layer_idx < refined_mix_split_layer
+            "fisher_diag_mse" if layer_idx < refined_mix_split_layer
             else "refined_residual_kl"
         )
     return default_refresh_loss_type
@@ -4644,7 +4644,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                 f"[1, {len(layers) - 1}] so each half has at least one non-final layer."
             )
         logging.info(
-            "refined_mix enabled: layers [0, %d) use refined_mse, [%d, %d) use "
+            "refined_mix enabled: layers [0, %d) use fisher_diag_mse, [%d, %d) use "
             "refined_residual_kl, layer %d uses kl (final). rkl_lr_ratio=%.4f.",
             refined_mix_split_layer, refined_mix_split_layer, len(layers) - 1,
             len(layers) - 1,

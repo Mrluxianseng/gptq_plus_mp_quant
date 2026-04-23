@@ -298,6 +298,10 @@ def run_cosine_measurement(
     refined_mse_pool_ids=None,
     refined_mse_grad_pool=None,
     refined_mse_mean_grad=None,
+    fp_weights=None,
+    hessians=None,
+    reg_strategy="none",
+    reg_lambda=0.0,
 ):
     if measure_samples % measure_batch_size != 0:
         raise ValueError(
@@ -366,6 +370,48 @@ def run_cosine_measurement(
     name_to_weight = {n: m.weight for n, m in name_to_module.items()}
     target_params = list(name_to_weight.values())
 
+    # Precompute per-module regularization gradient once (independent of batch).
+    # reg_grad shape matches weight: (out_features, in_features), fp32 on dev.
+    # l2:      reg_grad = λ · (W_q - W_fp)
+    # hessian: reg_grad = λ · (W_q - W_fp) · H, with H = inp.T @ inp (num_groups=1).
+    # We do NOT multiply by grad_lr — cosine is scale-invariant, and for the
+    # combined `surrogate + reg` the raw-gradient sum is what measures how reg
+    # reshapes the effective direction.
+    if reg_strategy not in ("none", "l2", "hessian"):
+        raise ValueError(
+            f"run_cosine_measurement: reg_strategy must be one of "
+            f"{{none, l2, hessian}}, got {reg_strategy!r}."
+        )
+    reg_enabled = reg_strategy != "none" and reg_lambda > 0
+    reg_grads = {}
+    reg_grad_norm = {n: float("nan") for n in name_to_weight}
+    if reg_enabled:
+        if fp_weights is None:
+            raise RuntimeError("reg_strategy != none requires fp_weights to be provided.")
+        if reg_strategy == "hessian" and hessians is None:
+            raise RuntimeError("reg_strategy == hessian requires hessians to be provided.")
+        for canon, mod in name_to_module.items():
+            if canon not in fp_weights:
+                raise RuntimeError(
+                    f"fp_weights missing entry for canonical name {canon!r}. "
+                    f"Have: {sorted(fp_weights.keys())}."
+                )
+            W_q = mod.weight.detach().float()
+            W_fp = fp_weights[canon].to(dev).float()
+            diff = W_q - W_fp
+            if reg_strategy == "l2":
+                rg = reg_lambda * diff
+            else:  # hessian
+                if canon not in hessians:
+                    raise RuntimeError(
+                        f"hessians missing entry for canonical name {canon!r}. "
+                        f"Have: {sorted(hessians.keys())}."
+                    )
+                H = hessians[canon].to(dev).float()  # (in, in)
+                rg = reg_lambda * diff.matmul(H)
+            reg_grads[canon] = rg
+            reg_grad_norm[canon] = rg.flatten().norm(p=2).item()
+
     per_batch_fisher_cos = {n: [] for n in name_to_weight}
     per_batch_residual_cos = {n: [] for n in name_to_weight}
     per_batch_refined_cos = {n: [] for n in name_to_weight}
@@ -377,6 +423,24 @@ def run_cosine_measurement(
     per_batch_refined_norm = {n: [] for n in name_to_weight}
     per_batch_refined_diag_norm = {n: [] for n in name_to_weight}
     per_batch_refined_mse_norm = {n: [] for n in name_to_weight}
+    # Per-batch cos(true, reg_grad). Varies per batch because `grads_true`
+    # changes even though reg_grad is constant; same value shared across all
+    # loss types within a (layer, module, batch) cell.
+    per_batch_reg_cos = {n: [] for n in name_to_weight}
+    # Per-batch cos(true, surrogate + reg) and norm(surrogate + reg), one
+    # series per (module, loss) pair.
+    per_batch_combined_cos = {
+        loss: {n: [] for n in name_to_weight}
+        for loss in ("fisher_diag_mse", "residual_kl",
+                     "refined_residual_kl", "refined_diag_residual_kl",
+                     "refined_mse")
+    }
+    per_batch_combined_norm = {
+        loss: {n: [] for n in name_to_weight}
+        for loss in ("fisher_diag_mse", "residual_kl",
+                     "refined_residual_kl", "refined_diag_residual_kl",
+                     "refined_mse")
+    }
 
     def _call_layer(h_in):
         return _layer_out(layer(
@@ -396,7 +460,12 @@ def run_cosine_measurement(
             start = b * measure_batch_size
             end = start + measure_batch_size
             inp_batch = inps[start:end].to(dev)
-            fp_batch = fp_inps[start:end].to(dev)
+            # `fp_inps` is expected to already hold the FP OUTPUT of the target
+            # layer (i.e. fp_inps[target+1] after the caller advanced the FP
+            # rolling buffer). Use it directly as `fp_hidden` to match production
+            # block_gd semantics — there `fp_hidden = fp_inps[batch_indices]`, not
+            # a fresh forward of fp input through the (now-quantized) target.
+            fp_hidden_cached = fp_inps[start:end].to(dev)
             # Keep fp_final in model dtype (bf16) so hidden2logits can run through
             # the bf16 norm + lm_head without a dtype mismatch.
             fp_final_batch = fp_inps_final[start:end].to(dev)
@@ -430,12 +499,10 @@ def run_cosine_measurement(
             if want_fisher:
                 _zero_grads(target_params)
                 out_hidden = _call_layer(inp_batch)
-                with torch.no_grad():
-                    fp_hidden = _call_layer(fp_batch)
                 fisher_loss = compute_refresh_loss(
                     refresh_loss_type="fisher_diag_mse",
                     out_hidden=out_hidden,
-                    fp_hidden=fp_hidden,
+                    fp_hidden=fp_hidden_cached,
                     analyzer=analyzer,
                     kl_topk=kl_topk,
                     layer_output_fisher=fisher_batch,
@@ -443,19 +510,17 @@ def run_cosine_measurement(
                 )
                 fisher_loss.backward()
                 grads_fisher = _capture_grads(name_to_weight, grad_clip=grad_clip)
-                del out_hidden, fp_hidden, fisher_loss
+                del out_hidden, fisher_loss
 
             # ---------- (3) residual_kl ----------
             grads_residual = None
             if want_residual:
                 _zero_grads(target_params)
                 out_hidden = _call_layer(inp_batch)
-                with torch.no_grad():
-                    fp_hidden = _call_layer(fp_batch)
                 residual_loss = compute_refresh_loss(
                     refresh_loss_type="residual_kl",
                     out_hidden=out_hidden,
-                    fp_hidden=fp_hidden,
+                    fp_hidden=fp_hidden_cached,
                     analyzer=analyzer,
                     kl_topk=kl_topk,
                     layer_output_fisher=None,
@@ -463,7 +528,7 @@ def run_cosine_measurement(
                 )
                 residual_loss.backward()
                 grads_residual = _capture_grads(name_to_weight, grad_clip=grad_clip)
-                del out_hidden, fp_hidden, residual_loss
+                del out_hidden, residual_loss
 
             # ---------- (4) refined_residual_kl ----------
             grads_refined = None
@@ -486,12 +551,10 @@ def run_cosine_measurement(
                 refined_A_dev = refined_A_slot.to(dev)
                 _zero_grads(target_params)
                 out_hidden = _call_layer(inp_batch)
-                with torch.no_grad():
-                    fp_hidden = _call_layer(fp_batch)
                 refined_loss = compute_refresh_loss(
                     refresh_loss_type="refined_residual_kl",
                     out_hidden=out_hidden,
-                    fp_hidden=fp_hidden,
+                    fp_hidden=fp_hidden_cached,
                     analyzer=analyzer,
                     kl_topk=kl_topk,
                     layer_output_fisher=None,
@@ -500,7 +563,7 @@ def run_cosine_measurement(
                 )
                 refined_loss.backward()
                 grads_refined = _capture_grads(name_to_weight, grad_clip=grad_clip)
-                del out_hidden, fp_hidden, refined_loss, refined_A_dev
+                del out_hidden, refined_loss, refined_A_dev
 
             # ---------- (5) refined_diag_residual_kl ----------
             grads_refined_diag = None
@@ -521,12 +584,10 @@ def run_cosine_measurement(
                 refined_diag_dev = refined_diag_slot.to(dev)
                 _zero_grads(target_params)
                 out_hidden = _call_layer(inp_batch)
-                with torch.no_grad():
-                    fp_hidden = _call_layer(fp_batch)
                 refined_diag_loss = compute_refresh_loss(
                     refresh_loss_type="refined_diag_residual_kl",
                     out_hidden=out_hidden,
-                    fp_hidden=fp_hidden,
+                    fp_hidden=fp_hidden_cached,
                     analyzer=analyzer,
                     kl_topk=kl_topk,
                     layer_output_fisher=None,
@@ -535,7 +596,7 @@ def run_cosine_measurement(
                 )
                 refined_diag_loss.backward()
                 grads_refined_diag = _capture_grads(name_to_weight, grad_clip=grad_clip)
-                del out_hidden, fp_hidden, refined_diag_loss, refined_diag_dev
+                del out_hidden, refined_diag_loss, refined_diag_dev
 
             # ---------- (6) refined_mse ----------
             grads_refined_mse = None
@@ -562,12 +623,10 @@ def run_cosine_measurement(
                     pool_positions = None
                 _zero_grads(target_params)
                 out_hidden = _call_layer(inp_batch)
-                with torch.no_grad():
-                    fp_hidden = _call_layer(fp_batch)
                 refined_mse_loss = compute_refresh_loss(
                     refresh_loss_type="refined_mse",
                     out_hidden=out_hidden,
-                    fp_hidden=fp_hidden,
+                    fp_hidden=fp_hidden_cached,
                     analyzer=analyzer,
                     kl_topk=kl_topk,
                     layer_output_fisher=fisher_batch,
@@ -578,7 +637,7 @@ def run_cosine_measurement(
                 )
                 refined_mse_loss.backward()
                 grads_refined_mse = _capture_grads(name_to_weight, grad_clip=grad_clip)
-                del out_hidden, fp_hidden, refined_mse_loss
+                del out_hidden, refined_mse_loss
                 if layer_output_grad_exact is not None:
                     del layer_output_grad_exact
 
@@ -588,6 +647,20 @@ def run_cosine_measurement(
             cos_rf = _cosine_per_linear(grads_true, grads_refined) if grads_refined is not None else None
             cos_rfd = _cosine_per_linear(grads_true, grads_refined_diag) if grads_refined_diag is not None else None
             cos_rm = _cosine_per_linear(grads_true, grads_refined_mse) if grads_refined_mse is not None else None
+            # cos(true, reg_grad) per module. Constant reg_grad but varying
+            # true_grad → recompute per batch.
+            cos_reg = (
+                _cosine_per_linear(grads_true, reg_grads)
+                if reg_enabled else None
+            )
+            # (loss_name, grads_surrogate) pairs for the combined metric loop.
+            _combined_pairs = [
+                ("fisher_diag_mse", grads_fisher),
+                ("residual_kl", grads_residual),
+                ("refined_residual_kl", grads_refined),
+                ("refined_diag_residual_kl", grads_refined_diag),
+                ("refined_mse", grads_refined_mse),
+            ]
             for n in name_to_weight:
                 if cos_f is not None:
                     per_batch_fisher_cos[n].append(cos_f[n])
@@ -611,6 +684,27 @@ def run_cosine_measurement(
                     per_batch_refined_norm[n].append(grads_refined[n].flatten().norm(p=2).item())
                 if grads_refined_diag is not None:
                     per_batch_refined_diag_norm[n].append(grads_refined_diag[n].flatten().norm(p=2).item())
+                if cos_reg is not None:
+                    per_batch_reg_cos[n].append(cos_reg[n])
+                # Combined surrogate + reg_grad metrics. Compute per (loss, module).
+                # reg_grads[n] is fp32 on dev; grads_surrogate[n] is also fp32 (via
+                # `_capture_grads`). The sum is the "effective" gradient seen if
+                # we added reg on top of the surrogate signal.
+                if reg_enabled:
+                    for loss_name, g_sur in _combined_pairs:
+                        if g_sur is None:
+                            continue
+                        combined = g_sur[n] + reg_grads[n]
+                        per_batch_combined_cos[loss_name][n].append(
+                            F.cosine_similarity(
+                                grads_true[n].flatten().unsqueeze(0),
+                                combined.flatten().unsqueeze(0),
+                                dim=1,
+                            ).item()
+                        )
+                        per_batch_combined_norm[loss_name][n].append(
+                            combined.flatten().norm(p=2).item()
+                        )
                 if grads_refined_mse is not None:
                     per_batch_refined_mse_norm[n].append(grads_refined_mse[n].flatten().norm(p=2).item())
             del grads_true
@@ -637,7 +731,23 @@ def run_cosine_measurement(
             # we can judge both direction (cosine) and magnitude (norm ratio).
             "true_kl_grad_norm_mean": tn.mean().item(),
             "per_batch_true_kl_grad_norm": tn.tolist(),
+            # Regularizer meta. Present on every entry for consistency — reg
+            # disabled gives `nan` cosines / norms so downstream table code can
+            # print them uniformly.
+            "reg_strategy": reg_strategy,
+            "reg_lambda": float(reg_lambda),
+            "reg_enabled": bool(reg_enabled),
+            "reg_grad_norm": reg_grad_norm[n],
         }
+        if reg_enabled and per_batch_reg_cos[n]:
+            rc = torch.tensor(per_batch_reg_cos[n])
+            entry["reg_cos_mean"] = rc.mean().item()
+            entry["reg_cos_std"] = rc.std(unbiased=False).item() if len(rc) > 1 else 0.0
+            entry["per_batch_reg_cos"] = rc.tolist()
+        else:
+            entry["reg_cos_mean"] = float("nan")
+            entry["reg_cos_std"] = float("nan")
+            entry["per_batch_reg_cos"] = []
         if want_fisher and per_batch_fisher_cos[n]:
             fs = torch.tensor(per_batch_fisher_cos[n])
             fn = torch.tensor(per_batch_fisher_norm[n])
@@ -678,6 +788,26 @@ def run_cosine_measurement(
             entry["per_batch_refined_mse"] = rm.tolist()
             entry["refined_mse_grad_norm_mean"] = rmn.mean().item()
             entry["per_batch_refined_mse_grad_norm"] = rmn.tolist()
+        # Combined (surrogate + reg_grad) metrics, one set per loss that ran.
+        if reg_enabled:
+            for loss_name in (
+                "fisher_diag_mse", "residual_kl",
+                "refined_residual_kl", "refined_diag_residual_kl",
+                "refined_mse",
+            ):
+                cos_list = per_batch_combined_cos[loss_name][n]
+                norm_list = per_batch_combined_norm[loss_name][n]
+                if not cos_list:
+                    continue
+                cc = torch.tensor(cos_list)
+                nn_ = torch.tensor(norm_list)
+                entry[f"{loss_name}_combined_cos_mean"] = cc.mean().item()
+                entry[f"{loss_name}_combined_cos_std"] = (
+                    cc.std(unbiased=False).item() if len(cc) > 1 else 0.0
+                )
+                entry[f"per_batch_{loss_name}_combined_cos"] = cc.tolist()
+                entry[f"{loss_name}_combined_grad_norm_mean"] = nn_.mean().item()
+                entry[f"per_batch_{loss_name}_combined_grad_norm"] = nn_.tolist()
         results[n] = entry
     return results
 
@@ -768,9 +898,98 @@ def quantize_and_measure(args, analyzer, trainloader, dev, target_layers, measur
     for i in pbar:
         layer = layers[i].to(dev)
         full = analyzer.get_quantizable_modules(layer)
+        is_target = i in target_layers
 
-        # ---------- MEASUREMENT (before quantization) ----------
-        if i in target_layers:
+        # ---------- (A) Cache FP weights BEFORE any quantization mutation ----------
+        # Only when this layer is a measurement target. We need (W_q - W_fp) later
+        # for the regularization gradient. Stored on CPU to keep GPU footprint flat.
+        fp_weights = None
+        if is_target:
+            fp_weights = {}
+            for raw_name, mod in full.items():
+                canon = raw_name[:-7] if raw_name.endswith(".module") else raw_name
+                fp_weights[canon] = mod.weight.detach().clone().cpu()
+
+        # ---------- (B) FP forward advance (fp_inps: target-input → target-output) ----------
+        bits_config = quant_utils.disable_act_quant(layer)
+        fp_inputs_cache.add_hook(full)
+        for j in range(args.nsamples):
+            fp_inps[j] = layer(
+                fp_inps[j].unsqueeze(0).to(dev),
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                position_embeddings=position_embeddings,
+            )[0].to(fp_inps.device)
+        fp_inputs_cache.clear_hook()
+        quant_utils.enable_act_quant(layer, bits_config)
+
+        # ---------- (C) GPTAQ quantization + (optional) H capture ----------
+        hessians = {} if is_target else None
+        for names in sequential:
+            subset = {n: full.get(n, full.get(n + ".module", None)) for n in names}
+            gptq = {}
+            for name in subset:
+                layer_weight_bits = args.w_bits
+                layer_weight_sym = not args.w_asym
+                if "lm_head" in name:
+                    continue
+                gptq[name] = GPTAQ(subset[name])
+                gptq[name].quantizer = quant_utils.WeightQuantizer()
+                gptq[name].quantizer.configure(
+                    layer_weight_bits,
+                    perchannel=True,
+                    sym=layer_weight_sym,
+                    mse=args.w_clip,
+                )
+                gptq[name].fp_inp = fp_inputs_cache.fp_cache[name]
+
+            def add_batch(name):
+                def tmp(_, inp, out):
+                    gptq[name].add_batch(inp[0].data, out.data)
+                return tmp
+
+            first_module_name = list(subset.keys())[0]
+            handle = subset[first_module_name].register_forward_hook(
+                add_batch(first_module_name)
+            )
+            for j in range(args.nsamples):
+                _ = layer(
+                    inps[j].unsqueeze(0).to(dev),
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    position_embeddings=position_embeddings,
+                )[0]
+            handle.remove()
+
+            for name in subset:
+                if name != first_module_name:
+                    gptq[name].H = gptq[first_module_name].H
+                    gptq[name].dXXT = gptq[first_module_name].dXXT
+
+            # Capture raw H = inp.T @ inp BEFORE fasterquant mutates it
+            # (Cholesky / damping overwrite in-place). Stored on CPU.
+            # num_groups=1 for the regularization is by design — see plan.
+            if is_target:
+                for name in subset:
+                    if name not in gptq:
+                        # lm_head (etc.) is skipped during GPTAQ init; no H to
+                        # capture. We also don't quantize/measure it.
+                        continue
+                    hessians[name] = gptq[name].H.detach().clone().cpu()
+
+            for name in subset:
+                pbar.set_postfix(module=f"layers.{i}." + name)
+                gptq[name].fasterquant(
+                    percdamp=args.percdamp,
+                    groupsize=args.w_groupsize,
+                    actorder=args.act_order,
+                    static_groups=args.act_order,
+                )
+                quantizers["model.layers.%d.%s" % (i, name)] = gptq[name].quantizer
+                gptq[name].free()
+
+        # ---------- (D) MEASUREMENT (after target layer is fully quantized) ----------
+        if is_target:
             # Downstream layers to dev for tail forward.
             for k in range(i + 1, len(layers)):
                 layers[k].to(dev)
@@ -800,11 +1019,10 @@ def quantize_and_measure(args, analyzer, trainloader, dev, target_layers, measur
                         else getattr(args, "grad_clip", None)
                     )
                     # refined_mse: collect per-layer grad pool at the same
-                    # upstream-quantized state the production refresh sees. The
-                    # helper disables act-quant on layer + downstream and runs
-                    # end-to-end KL → backward to out_of_layer_idx. Layer 0 is
-                    # already dropped from target_layers (delta=0, g=0), but
-                    # handle it robustly in case someone overrides.
+                    # upstream-quantized state we are measuring in. With the
+                    # post-quantization measurement reorder, the pool g_i is
+                    # collected against the already-quantized target layer —
+                    # consistent with `grads_true` below.
                     refined_mse_pool_ids_i = None
                     refined_mse_grad_pool_i = None
                     refined_mse_mean_grad_i = None
@@ -867,7 +1085,7 @@ def quantize_and_measure(args, analyzer, trainloader, dev, target_layers, measur
                         layer_idx=i,
                         layers=layers,
                         inps=inps,
-                        fp_inps=fp_inps,
+                        fp_inps=fp_inps,  # already rolled forward to fp_inps[i+1]
                         fp_inps_final=fp_inps_final,
                         fisher_tensor=static_fisher_by_layer[i],
                         refined_A_list=refined_A_list_i,
@@ -885,6 +1103,10 @@ def quantize_and_measure(args, analyzer, trainloader, dev, target_layers, measur
                         refined_mse_pool_ids=refined_mse_pool_ids_i,
                         refined_mse_grad_pool=refined_mse_grad_pool_i,
                         refined_mse_mean_grad=refined_mse_mean_grad_i,
+                        fp_weights=fp_weights,
+                        hessians=hessians,
+                        reg_strategy=args.grad_reg_strategy,
+                        reg_lambda=args.grad_reg_lambda,
                     )
                 def _fmt_entry(name, r):
                     cos_bits = []
@@ -898,6 +1120,18 @@ def quantize_and_measure(args, analyzer, trainloader, dev, target_layers, measur
                         cos_bits.append(f"refined_diag_res_kl={r['refined_diag_residual_kl_mean']:.4f}")
                     if "refined_mse_mean" in r:
                         cos_bits.append(f"refined_mse={r['refined_mse_mean']:.4f}")
+                    if r.get("reg_enabled"):
+                        cos_bits.append(f"reg={r['reg_cos_mean']:.4f}")
+                        for loss_key, loss_short in (
+                            ("fisher_diag_mse", "fisher+reg"),
+                            ("residual_kl", "res_kl+reg"),
+                            ("refined_residual_kl", "refined_res_kl+reg"),
+                            ("refined_diag_residual_kl", "refined_diag_res_kl+reg"),
+                            ("refined_mse", "refined_mse+reg"),
+                        ):
+                            key = f"{loss_key}_combined_cos_mean"
+                            if key in r:
+                                cos_bits.append(f"{loss_short}={r[key]:.4f}")
                     norm_bits = [f"true={r['true_kl_grad_norm_mean']:.3e}"]
                     if "fisher_grad_norm_mean" in r:
                         norm_bits.append(f"fisher={r['fisher_grad_norm_mean']:.3e}")
@@ -909,6 +1143,8 @@ def quantize_and_measure(args, analyzer, trainloader, dev, target_layers, measur
                         norm_bits.append(f"refined_diag_res_kl={r['refined_diag_residual_kl_grad_norm_mean']:.3e}")
                     if "refined_mse_grad_norm_mean" in r:
                         norm_bits.append(f"refined_mse={r['refined_mse_grad_norm_mean']:.3e}")
+                    if r.get("reg_enabled"):
+                        norm_bits.append(f"reg={r['reg_grad_norm']:.3e}")
                     return f"{name} cos[{' '.join(cos_bits)}] norm[{' '.join(norm_bits)}]"
                 logging.info(
                     "Layer %d cosine+grad-norm (batch-avg): %s",
@@ -918,73 +1154,13 @@ def quantize_and_measure(args, analyzer, trainloader, dev, target_layers, measur
             finally:
                 for k in range(i + 1, len(layers)):
                     layers[k] = layers[k].to(orig_device)
+                # Release per-target scratch.
+                del fp_weights
+                if hessians is not None:
+                    del hessians
                 memory_utils.cleanup_memory()
 
-        # ---------- GPTAQ quantization (copy of gptaq_utils.gptq_fwrd body) ----------
-        bits_config = quant_utils.disable_act_quant(layer)
-        fp_inputs_cache.add_hook(full)
-        for j in range(args.nsamples):
-            fp_inps[j] = layer(
-                fp_inps[j].unsqueeze(0).to(dev),
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                position_embeddings=position_embeddings,
-            )[0].to(fp_inps.device)
-        fp_inputs_cache.clear_hook()
-        quant_utils.enable_act_quant(layer, bits_config)
-
-        for names in sequential:
-            subset = {n: full.get(n, full.get(n + ".module", None)) for n in names}
-            gptq = {}
-            for name in subset:
-                layer_weight_bits = args.w_bits
-                layer_weight_sym = not args.w_asym
-                if "lm_head" in name:
-                    continue
-                gptq[name] = GPTAQ(subset[name])
-                gptq[name].quantizer = quant_utils.WeightQuantizer()
-                gptq[name].quantizer.configure(
-                    layer_weight_bits,
-                    perchannel=True,
-                    sym=layer_weight_sym,
-                    mse=args.w_clip,
-                )
-                gptq[name].fp_inp = fp_inputs_cache.fp_cache[name]
-
-            def add_batch(name):
-                def tmp(_, inp, out):
-                    gptq[name].add_batch(inp[0].data, out.data)
-                return tmp
-
-            first_module_name = list(subset.keys())[0]
-            handle = subset[first_module_name].register_forward_hook(
-                add_batch(first_module_name)
-            )
-            for j in range(args.nsamples):
-                _ = layer(
-                    inps[j].unsqueeze(0).to(dev),
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    position_embeddings=position_embeddings,
-                )[0]
-            handle.remove()
-
-            for name in subset:
-                if name != first_module_name:
-                    gptq[name].H = gptq[first_module_name].H
-                    gptq[name].dXXT = gptq[first_module_name].dXXT
-
-            for name in subset:
-                pbar.set_postfix(module=f"layers.{i}." + name)
-                gptq[name].fasterquant(
-                    percdamp=args.percdamp,
-                    groupsize=args.w_groupsize,
-                    actorder=args.act_order,
-                    static_groups=args.act_order,
-                )
-                quantizers["model.layers.%d.%s" % (i, name)] = gptq[name].quantizer
-                gptq[name].free()
-
+        # ---------- (E) Advance inps with the now-quantized layer ----------
         for j in range(args.nsamples):
             inps[j] = layer(
                 inps[j].unsqueeze(0).to(dev),
@@ -1035,6 +1211,28 @@ def main(args):
             f"{sorted(_VALID_MEASURE_LOSSES)}"
         )
     logging.info("Will measure surrogate losses: %s", sorted(measure_losses))
+
+    # Regularization: only the additive variants (l2 / hessian) are supported
+    # here. `quant_error_gate` / `quant_error_gate_optimized` are gates on the
+    # optimizer update (multiplicative), not additive first-order gradients, so
+    # "cos(true, reg_grad)" is not defined for them. Reject early.
+    if getattr(args, "grad_reg_strategy", "none") in (
+        "quant_error_gate", "quant_error_gate_optimized",
+    ):
+        raise ValueError(
+            f"analyze_grad_cosine only supports grad_reg_strategy in "
+            f"{{none, l2, hessian}}. Got {args.grad_reg_strategy!r}. Gate "
+            f"variants multiply the optimizer update, not the gradient, and "
+            f"have no additive-gradient interpretation."
+        )
+    if getattr(args, "grad_reg_lambda", 0.0) < 0:
+        raise ValueError(
+            f"--grad_reg_lambda must be >= 0, got {args.grad_reg_lambda}."
+        )
+    logging.info(
+        "Regularization for cosine analysis: strategy=%s lambda=%s",
+        args.grad_reg_strategy, args.grad_reg_lambda,
+    )
 
     if args.rotate:
         rotation_utils.fuse_layer_norms(analyzer)
@@ -1093,6 +1291,101 @@ def main(args):
         out_pt = os.path.join(out_dir, "grad_cosine_results.pt")
         torch.save({"results": cosine_results, "args": vars(args)}, out_pt)
         logging.info("Saved cosine results to %s", out_pt)
+
+        # ---------- TSV table (long format) ----------
+        # Columns: layer  module  loss  cos_no_reg  cos_reg  cos_with_reg
+        #          norm_true  norm_loss  norm_reg  norm_with_reg
+        # One row per (layer, module, loss). `cos_reg` and `norm_reg` repeat
+        # across loss rows within the same (layer, module) — they depend on
+        # the weight diff and H, not the loss.
+        out_tsv = os.path.join(out_dir, "grad_cosine_table.txt")
+        # Match the measure-loss order the user asked for on the CLI
+        # (deterministic iteration instead of set order).
+        cli_order = []
+        if getattr(args, "measure_losses", None):
+            seen = set()
+            for chunk in args.measure_losses.split(","):
+                name = chunk.strip()
+                if name and name not in seen and name in _VALID_MEASURE_LOSSES:
+                    cli_order.append(name)
+                    seen.add(name)
+        _LOSS_COL_SPEC = [
+            ("fisher_diag_mse", "fisher_mean", "fisher_grad_norm_mean"),
+            ("residual_kl", "residual_kl_mean", "residual_kl_grad_norm_mean"),
+            ("refined_residual_kl", "refined_residual_kl_mean",
+             "refined_residual_kl_grad_norm_mean"),
+            ("refined_diag_residual_kl", "refined_diag_residual_kl_mean",
+             "refined_diag_residual_kl_grad_norm_mean"),
+            ("refined_mse", "refined_mse_mean", "refined_mse_grad_norm_mean"),
+        ]
+        _LOSS_BY_NAME = {name: (cos_key, norm_key) for name, cos_key, norm_key in _LOSS_COL_SPEC}
+        if cli_order:
+            ordered_losses = cli_order
+        else:
+            ordered_losses = [name for name, _, _ in _LOSS_COL_SPEC]
+
+        def _fmt_cos(x):
+            return "nan" if x is None or not isinstance(x, (int, float)) or x != x else f"{x:.6f}"
+
+        def _fmt_norm(x):
+            if x is None or not isinstance(x, (int, float)) or x != x:
+                return "nan"
+            return f"{x:.6e}"
+
+        header_lines = [
+            f"# analyze_grad_cosine results",
+            f"# model={args.model}  exp={args.exp}",
+            f"# reg_strategy={args.grad_reg_strategy}  reg_lambda={args.grad_reg_lambda}",
+            f"# measure_losses={args.measure_losses}  target_layers={args.target_layers}",
+            f"# measure_samples={args.measure_samples}  measure_batch_size={args.measure_batch_size}",
+            f"# columns: cos_* are batch-mean cosine(true_KL_grad, ·); "
+            f"norm_* are batch-mean L2 norm of the flattened grad.",
+            f"# cos_reg/norm_reg repeat across loss rows within the same (layer, module).",
+            f"# cos_with_reg = cos(true, surrogate + reg_grad); "
+            f"norm_with_reg = ||surrogate + reg_grad||_2.",
+        ]
+        cols = [
+            "layer", "module", "loss",
+            "cos_no_reg", "cos_reg", "cos_with_reg",
+            "norm_true", "norm_loss", "norm_reg", "norm_with_reg",
+        ]
+        rows = []
+        for layer_idx in sorted(cosine_results.keys()):
+            per_layer = cosine_results[layer_idx]
+            for module_name in per_layer:
+                r = per_layer[module_name]
+                reg_enabled = bool(r.get("reg_enabled", False))
+                reg_cos = r.get("reg_cos_mean", float("nan")) if reg_enabled else float("nan")
+                reg_norm = r.get("reg_grad_norm", float("nan")) if reg_enabled else float("nan")
+                norm_true = r.get("true_kl_grad_norm_mean", float("nan"))
+                for loss_name in ordered_losses:
+                    if loss_name not in _LOSS_BY_NAME:
+                        continue
+                    cos_key, norm_key = _LOSS_BY_NAME[loss_name]
+                    cos_no_reg = r.get(cos_key, float("nan"))
+                    norm_loss = r.get(norm_key, float("nan"))
+                    combined_cos_key = f"{loss_name}_combined_cos_mean"
+                    combined_norm_key = f"{loss_name}_combined_grad_norm_mean"
+                    cos_with = r.get(combined_cos_key, float("nan")) if reg_enabled else float("nan")
+                    norm_with = r.get(combined_norm_key, float("nan")) if reg_enabled else float("nan")
+                    # Skip rows where this loss wasn't measured at this layer
+                    # (keeps the table tight instead of filling with NaN).
+                    if cos_key not in r:
+                        continue
+                    rows.append([
+                        str(layer_idx), module_name, loss_name,
+                        _fmt_cos(cos_no_reg), _fmt_cos(reg_cos), _fmt_cos(cos_with),
+                        _fmt_norm(norm_true), _fmt_norm(norm_loss),
+                        _fmt_norm(reg_norm), _fmt_norm(norm_with),
+                    ])
+        with open(out_tsv, "w") as f:
+            for line in header_lines:
+                f.write(line + "\n")
+            f.write("\t".join(cols) + "\n")
+            for row in rows:
+                f.write("\t".join(row) + "\n")
+        logging.info("Wrote cosine table to %s (%d rows)", out_tsv, len(rows))
+
         logging.info("==== cosine summary (batch-avg) ====")
         def _summary_entry(r):
             out = {"gnorm_true": f"{r['true_kl_grad_norm_mean']:.3e}"}

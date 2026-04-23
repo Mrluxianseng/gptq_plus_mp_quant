@@ -54,7 +54,7 @@
 - SECOND_ORDER_SCALE：调整gptq式二阶更新的scale，固定为1就行
 - FISHER_NUM_GROUPS：每layer输出空间的fisher系数保留多少组（组内共享系数）
 - NUM_SAMPLES_FOR_REFINED_MSE：`GRAD_REFRESH_LOSS=refined_mse` 时才用。每 layer 端到端反传采集 grad 的 per-rank pool 大小，默认 32。需要 `<= nsamples // world` 且 `% (global_loss_bsz // world) == 0`。和 `LOSS_SLIDE_WINDOW=1` 共同开启时，同一次反传会追加采集下一层输出的 grad pool（同一批样本、同一个 graph），供 slide-window 里的下一层 refresh loss 用，不另外跑 forward。
-- REFINED_MIX_SPLIT_LAYER：`GRAD_REFRESH_LOSS=refined_mix` 时才用。前 `SPLIT` 层用 refined_mse，后 `N-1-SPLIT` 层用 refined_residual_kl，final layer 照旧 kl。空值 = 运行时取 `N // 2`。改这个值会让 cache key 变（后缀 `_mixsplit{N}`），需要重新 precompute。
+- REFINED_MIX_SPLIT_LAYER：`GRAD_REFRESH_LOSS=refined_mix` 时才用。前 `SPLIT` 层用 fisher_diag_mse，后 `N-1-SPLIT` 层用 refined_residual_kl，final layer 照旧 kl。空值 = 运行时取 `N // 2`。改这个值会让 cache key 变（后缀 `_mixsplit{N}`），需要重新 precompute。
 - REFINED_MIX_RKL_LR_RATIO：`GRAD_REFRESH_LOSS=refined_mix` 时才用。后半段 layer (refined_residual_kl) 的 `GRAD_LR` 和 `PRE_GRAD_LR` 都乘上这个标量，默认 1.0（两段同 lr）。Final layer 不走这个比例，用 `FINAL_LAYER_GRAD_LR` 独立控制。
 - PRE_CLIP：弃用，固定为0
 - GLOBAL_LOSS：调整gptq的hessian估计以及fisher mse loss的fisher系数使用端到端的kl loss，固定为1就行
@@ -142,7 +142,7 @@ FSDP_PRECOMPUTE=0 \
 
 - refined_res_kl：在res_kl中，我们近似认为 $x+Δx+f(x+Δx)$ 约等于 $x+Δx+f(x)$ ，现在我们多近似一阶： $x+Δx+f(x+Δx)$ 约等于 $x+Δx+f(x)+Δx \cdot \nabla f(x)$ 。而这个 $\nabla f(x)$ 我们用一个常量Jacobi矩阵J去近似。在量化开始前预计算全模型反向传播时，对于每一layer，假设输出隐向量梯度为dx，假设最后一层输出隐向量梯度为dy，则有： $dx=(I+J)dy$ 即 $dx-dy = Jdy$ ，这个可以用最小二乘法直接拟合，从而得到每一层的J矩阵并存在cpu。除此之外定义num_A表示可以保存多少个样本的J矩阵。刚刚假设所有样本共用一个，现在改成总共有num_A个分组共用。
 
-- refined_mix：前一半 transformer layer 用 refined_mse，后一半用 refined_res_kl，最后一层沿用现有规则强制 kl。直觉是前半段层输出一阶项 $g$ 数值小、采样噪声占优，refined_mse 的"每层实采 NUM_SAMPLES_FOR_REFINED_MSE 个样本做端到端 backward"很贵且边际收益有限；而后半段层 $g$ 变大、refined_res_kl 的线性 Jacobi 近似误差反而更明显，所以用 refined_mse 更精细。两种 loss 的预计算只各收自己需要的那一半（fisher 只收前半层、A 只拟合后半层，和 refined_mse / refined_res_kl 的 precompute 是同一次端到端 backward，只是 hook 挂的 layer 不同），相应 CPU RAM 约各省一半。切换边界 layer `i = split - 1` 上 `loss_slide_window` 自动禁用（下一层 loss type 变了、pool / A 形态对不上）。详见 [refined_mix 详解](#refined_mix-详解)。要求 `--global_loss` + `--enable_gptq_plus 0`（继承 refined_mse 的 v1 限制）。
+- refined_mix：前一半 transformer layer 用 fisher_diag_mse，后一半用 refined_res_kl，最后一层沿用现有规则强制 kl。直觉是前半段层输出一阶项 $g$ 数值小、对损失的贡献有限，在 fisher_diag_mse 的纯二阶近似上再补一阶得不偿失（而且 refined_mse 每层都要做一次端到端 backward，开销贵）；后半段层 $g$ 变大、refined_res_kl 的线性 Jacobi 近似误差反而更明显，所以用 refined_res_kl。两种 loss 的预计算只各收自己需要的那一半（fisher 只收前半层、A 只拟合后半层，和 fisher_diag_mse / refined_res_kl 的 precompute 是同一次端到端 backward，只是 hook 挂的 layer 不同），相应 CPU RAM 约各省一半。前半段完全不做"每层端到端 backward 采 grad pool"那一步（fisher_diag_mse 不需要一阶项）。切换边界 layer `i = split - 1` 上 `loss_slide_window` 自动禁用（下一层 loss type 变了、pool / A 形态对不上）。详见 [refined_mix 详解](#refined_mix-详解)。要求 `--global_loss`。
 
 可以做一下实验看一下这个loss（包括fisher mse loss）的梯度对真正kl loss的梯度的近似水平好不好，可以通过cosine相关性来测一下。
 
@@ -244,12 +244,12 @@ layer 0 上游还没量化，student == teacher，KL=0，$g_i\equiv 0$。代码�
 
 ### 想法
 
-前半段 transformer layer 的端到端梯度 $g_i$ 本身数值小、采样噪声大，refined_mse 的一阶项收益有限但每层都要付"搬下游 layer 到 GPU → 端到端 backward NUM_SAMPLES_FOR_REFINED_MSE 个样本 → 搬回 CPU"的开销；后半段 layer 的 $g_i$ 变大、refined_res_kl 的线性 Jacobi 近似开始失真，这时补一个一阶 $g\cdot\Delta y$ 更值得。refined_mix 就按深度切一刀，两段各用"当前更合适"的那一种。
+前半段 transformer layer 的端到端梯度 $g_i$ 本身数值小、对损失的贡献有限，refined_mse 的一阶项收益不大但每层都要付"搬下游 layer 到 GPU → 端到端 backward NUM_SAMPLES_FOR_REFINED_MSE 个样本 → 搬回 CPU"的开销；因此前半段用纯二阶的 fisher_diag_mse 就够了，彻底省掉这一次 backward。后半段 layer 的 $g_i$ 变大、refined_res_kl 的线性 Jacobi 近似开始失真，这时换成 refined_res_kl 更合适（它用一次预拟合的 A 矩阵全局替代端到端反传）。refined_mix 就按深度切一刀，两段各用"当前更合适"的那一种。
 
 ### 分层规则
 
 - 默认切分点 `split = N // 2`（N 是 transformer block 总数，不含 lm_head），可用 `--refined_mix_split_layer` 覆盖。
-- layer `i ∈ [0, split)`：`refined_mse`
+- layer `i ∈ [0, split)`：`fisher_diag_mse`
 - layer `i ∈ [split, N-1)`：`refined_residual_kl`
 - layer `i = N-1`（final layer）：沿用 [get_effective_refresh_loss_type](gptq_utils/gptq_plus_utils.py#L58) 的现有规则，强制 `kl`
 
@@ -258,18 +258,18 @@ layer 0 上游还没量化，student == teacher，KL=0，$g_i\equiv 0$。代码�
 `collect_static_end_to_end_saliency_and_fisher` 的那次端到端 backward 照常跑一次，但：
 
 - fisher 的 grad² 捕获 hook 只挂在 `[0, split)` 的前半段 layer 上 —— 后半段 layer 的 `fisher_data[i]` 留空，aggregate 阶段直接填 `None`。refined_res_kl 不读 fisher，所以后半没这份 stats 不影响正确性。
-- refined_res_kl 的 per-layer dy·delta 捕获 hook 只挂在 `[split, N-1)` 的后半段 layer 上（last-layer 的 dy 捕获 hook 仍然挂，它只是公共 buffer 源）。前半段 `static_refined_A[i]` 全 None，主循环里 `layer_refined_A_list=None`，refined_mse 分支不读 A，也不影响。
+- refined_res_kl 的 per-layer dy·delta 捕获 hook 只挂在 `[split, N-1)` 的后半段 layer 上（last-layer 的 dy 捕获 hook 仍然挂，它只是公共 buffer 源）。前半段 `static_refined_A[i]` 全 None，主循环里 `layer_refined_A_list=None`，fisher_diag_mse 分支不读 A，也不影响。
 - **节省估算**（以 Qwen3-4B，28 层，H=2560，seq=2048，512 samples，fisher_num_groups=512 为例）：fisher 每层 CPU bf16 ≈ 1 GB × 28 = 28 GB，砍一半省约 14 GB。A 的 CPU fp32 accumulator 峰值 `2 × H² × 4B × L/2` 省一半约 1.5 GB，加上 bf16 A stack 省约 185 MB。
 - Cache key 在 mix 模式下追加 `_mixsplit{N}` 后缀，避免和非 mix run 的 cache 混用。
 
-### 后半段 layer 不再跑 refined_mse 的端到端 backward
+### 前半段完全不做每层端到端 backward
 
-主循环里 refined_mse 的 grad pool 采集（[gptq_plus_utils.py:5144](gptq_utils/gptq_plus_utils.py#L5144)）是按 `layer_refresh_loss_type == "refined_mse"` 分派的——mix 模式下后半段 layer 的 `layer_refresh_loss_type` 变成 `refined_residual_kl`，这一大段（搬下游 layer → 端到端 FP forward + backward → collect pool → 搬回 CPU）自动跳过。所以**"把后半段的每层端到端 backward 全部省掉"** 不需要额外代码，只是 loss type 路由的副产品。
+主循环里 refined_mse 的 grad pool 采集（[gptq_plus_utils.py:5144](gptq_utils/gptq_plus_utils.py#L5144)）是按 `layer_refresh_loss_type == "refined_mse"` 分派的——mix 模式下前半段 layer 的 `layer_refresh_loss_type` 是 `fisher_diag_mse`、后半段是 `refined_residual_kl`，两者都不触发这一大段（搬下游 layer → 端到端 FP forward + backward → collect pool → 搬回 CPU）。所以 **"mix 模式下整个训练流程完全没有每层端到端 backward"** 是 loss type 路由的副产品，不需要额外代码。
 
 ### 切换边界 layer 的 slide_window 行为
 
 - 打开 `--loss_slide_window` 时，layer `i` 会同时计算自身的 loss 和 layer `i+1` 的 loss，按 `slide_alpha: 1→0` 线性混合。
-- mix 下 `i = split - 1` 那一层，当前 loss 是 refined_mse、下一层 loss 是 refined_residual_kl，两者依赖的 per-layer state 完全不同（refined_mse 要 fisher[i+1] + grad_pool_next；refined_residual_kl 要 A[i+1] + fp_inps_final），也无法跨类型线性混合。所以这一层的 slide_window 自动关闭（`next_layer_same_type` 判空）。其他 layer 的 slide_window 照常。
+- mix 下 `i = split - 1` 那一层，当前 loss 是 fisher_diag_mse、下一层 loss 是 refined_residual_kl，两者依赖的 per-layer state 完全不同（fisher_diag_mse 要 fisher[i+1]；refined_residual_kl 要 A[i+1] + fp_inps_final），也无法跨类型线性混合。所以这一层的 slide_window 自动关闭（`next_layer_same_type` 判空）。其他 layer 的 slide_window 照常。
 
 ### 学习率两段制
 
@@ -278,9 +278,8 @@ layer 0 上游还没量化，student == teacher，KL=0，$g_i\equiv 0$。代码�
 ### 约束
 
 - 必须 `--global_loss`（两半都依赖 precompute 的产物）
-- 必须 `--enable_gptq_plus 0`（继承 refined_mse 的 v1 限制，理由见 [refined_mse 详解](#为什么要求-enable_gptq_plus0v1-限制)）
-- `--num_samples_for_refined_mse` 的所有整除约束保留（只对前半段有效但按全局校验）
 - `--refined_rkl_num_A > 1` 时仍需 `nsamples % num_A == 0`
+- 和 refined_mse 不同，**不需要** `--enable_gptq_plus 0`（前半走 fisher_diag_mse，后半走 refined_residual_kl，都没有 refined_mse 那条 pool-dependent 的 reference-loss 路径限制）
 
 ## loss slide window
 

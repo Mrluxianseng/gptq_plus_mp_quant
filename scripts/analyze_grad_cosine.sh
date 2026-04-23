@@ -29,6 +29,14 @@ if [[ -n "${FINAL_LAYER_GRAD_CLIP}" && "${FINAL_LAYER_GRAD_CLIP}" != "none" ]]; 
     FINAL_LAYER_GRAD_CLIP_ARGS=(--final_layer_grad_clip "${FINAL_LAYER_GRAD_CLIP}")
 fi
 
+# Regularizer added to the surrogate gradient before cosine measurement.
+# Supported: none (default) / l2 / hessian. l2 gives reg_grad = λ·(W_q - W_fp);
+# hessian uses reg_grad = λ·(W_q - W_fp)·H where H = inp.T@inp (num_groups=1).
+# Gate variants (quant_error_gate*) are rejected — they're multiplicative on
+# the optimizer update, not additive on the gradient.
+GRAD_REG_STRATEGY=${GRAD_REG_STRATEGY:-none}
+GRAD_REG_LAMBDA=${GRAD_REG_LAMBDA:-0.0}
+
 export CUDA_VISIBLE_DEVICES=${DEVICE}
 
 python -m torch.distributed.run \
@@ -45,4 +53,6 @@ python -m torch.distributed.run \
     --measure_samples ${MEASURE_SAMPLES} --measure_batch_size ${MEASURE_BSZ} \
     --measure_losses "${MEASURE_LOSSES}" \
     --grad_clip "${GRAD_CLIP}" \
+    --grad_reg_strategy "${GRAD_REG_STRATEGY}" \
+    --grad_reg_lambda "${GRAD_REG_LAMBDA}" \
     "${FINAL_LAYER_GRAD_CLIP_ARGS[@]}"

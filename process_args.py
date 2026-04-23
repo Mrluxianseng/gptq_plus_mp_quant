@@ -141,10 +141,11 @@ def parse_gen():
             "collected end-to-end per layer just before its quant loop opens) on top of "
             "fisher_diag_mse's second-order term — the full Taylor expansion of end-to-end "
             "KL in the layer output. "
-            "'refined_mix' splits the layer stack: [0, split) use refined_mse, [split, N-1) "
-            "use refined_residual_kl, and the final layer keeps its forced kl. Back-half "
-            "layers skip the per-layer end-to-end grad pool collection (they don't need g); "
-            "precompute only collects fisher for the front half and A for the back half."
+            "'refined_mix' splits the layer stack: [0, split) use fisher_diag_mse, "
+            "[split, N-1) use refined_residual_kl, and the final layer keeps its forced kl. "
+            "Front-half layers skip the per-layer end-to-end grad pool collection entirely "
+            "(fisher_diag_mse only reads the precomputed per-layer fisher); precompute only "
+            "collects fisher for the front half and A for the back half."
         ),
     )
     parser.add_argument(
@@ -541,7 +542,7 @@ def parse_gen():
         type=int,
         default=None,
         help=(
-            "refined_mix only: layers [0, split) use refined_mse, [split, N-1) use "
+            "refined_mix only: layers [0, split) use fisher_diag_mse, [split, N-1) use "
             "refined_residual_kl, final layer always kl. Default (None) resolves to "
             "N // 2 at runtime where N is the number of transformer blocks."
         ),
@@ -734,39 +735,19 @@ def parse_gen():
                 f"must be divisible by per-rank backward bsz ({_bwd_bsz_local} = "
                 f"global_loss_bsz // world)."
             )
-    # refined_mix validation: front half behaves as refined_mse, back half as
-    # refined_residual_kl, final layer forced to kl. Inherits the union of
-    # refined_mse's and refined_residual_kl's constraints.
+    # refined_mix validation: front half uses fisher_diag_mse (no per-layer
+    # end-to-end backward, no pool), back half uses refined_residual_kl (A
+    # precomputed once, fp_inps_final as teacher), final layer forced to kl.
+    # Both halves need the static precompute pass, so --global_loss is
+    # required. No refined_mse-style enable_gptq_plus=0 limit here because
+    # neither half routes the reference-loss backward through refined_mse's
+    # pool-dependent code path.
     if args.grad_refresh_loss == "refined_mix":
         if not args.global_loss:
             raise ValueError(
-                "--grad_refresh_loss=refined_mix requires --global_loss (both halves "
-                "need the precompute pass: fisher for refined_mse, A for refined_residual_kl, "
-                "and fp_inps_final for both)."
-            )
-        if int(getattr(args, "enable_gptq_plus", 1)) != 0:
-            raise ValueError(
-                "--grad_refresh_loss=refined_mix requires --enable_gptq_plus 0 (inherits "
-                "the refined_mse v1 limitation on the front half — see refined_mse for details)."
-            )
-        if args.num_samples_for_refined_mse <= 0:
-            raise ValueError(
-                f"--num_samples_for_refined_mse must be positive. "
-                f"Got {args.num_samples_for_refined_mse}."
-            )
-        _dp_world_r = int(os.environ.get("WORLD_SIZE", "1"))
-        _n_local = args.nsamples // _dp_world_r
-        if args.num_samples_for_refined_mse > _n_local:
-            raise ValueError(
-                f"--num_samples_for_refined_mse ({args.num_samples_for_refined_mse}) "
-                f"must be <= nsamples // world ({_n_local})."
-            )
-        _bwd_bsz_local = args.global_loss_bsz // _dp_world_r
-        if _bwd_bsz_local <= 0 or args.num_samples_for_refined_mse % _bwd_bsz_local != 0:
-            raise ValueError(
-                f"--num_samples_for_refined_mse ({args.num_samples_for_refined_mse}) "
-                f"must be divisible by per-rank backward bsz ({_bwd_bsz_local} = "
-                f"global_loss_bsz // world)."
+                "--grad_refresh_loss=refined_mix requires --global_loss (the precompute "
+                "pass fits fisher for the fisher_diag_mse front half, A for the "
+                "refined_residual_kl back half, and captures fp_inps_final for the back half)."
             )
         if args.refined_mix_split_layer is not None and args.refined_mix_split_layer < 1:
             raise ValueError(
