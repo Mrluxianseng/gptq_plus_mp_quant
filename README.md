@@ -52,7 +52,6 @@
 - PROJ_LR_SCALE：调整o_proj层用的学习率
 - DOWN_PROJ_LR_SCALE：调整down_proj层用的学习率（这个层一般比较爆炸）
 - SECOND_ORDER_SCALE：调整gptq式二阶更新的scale，固定为1就行
-- FISHER_NUM_GROUPS：每layer输出空间的fisher系数保留多少组（组内共享系数）
 - NUM_SAMPLES_FOR_REFINED_MSE：`GRAD_REFRESH_LOSS=refined_mse` 时才用。每 layer 端到端反传采集 grad 的 per-rank pool 大小，默认 32。需要 `<= nsamples // world` 且 `% (global_loss_bsz // world) == 0`。和 `LOSS_SLIDE_WINDOW=1` 共同开启时，同一次反传会追加采集下一层输出的 grad pool（同一批样本、同一个 graph），供 slide-window 里的下一层 refresh loss 用，不另外跑 forward。
 - REFINED_MIX_SPLIT_LAYER：`GRAD_REFRESH_LOSS=refined_mix` 时才用。前 `SPLIT` 层用 fisher_diag_mse，后 `N-1-SPLIT` 层用 refined_residual_kl，final layer 照旧 kl。空值 = 运行时取 `N // 2`。改这个值会让 cache key 变（后缀 `_mixsplit{N}`），需要重新 precompute。
 - REFINED_MIX_RKL_LR_RATIO：`GRAD_REFRESH_LOSS=refined_mix` 时才用。后半段 layer (refined_residual_kl) 的 `GRAD_LR` 和 `PRE_GRAD_LR` 都乘上这个标量，默认 1.0（两段同 lr）。Final layer 不走这个比例，用 `FINAL_LAYER_GRAD_LR` 独立控制。
@@ -71,7 +70,7 @@
 - ENABLE_GPTQ_PLUS：GPTQ+一阶项开关，完全等价于把alpha调成0。设0时只关掉fasterquant内循环/外更新里的GHinv一阶项（GHinv/Z/beta全部变0），其他所有机制（block_gd梯度下降、loss_slide_window、pre_gd_steps、fisher预计算、residual_kl的fp_inps_final预计算）照常运行，与alpha的语义解耦。作为性能优化，stats阶段会跳过reference loss的backward（因为它算出来的权重梯度会被beta=0乘掉，无用）。做纯GPTQ一阶/二阶对照实验时设为0即可。
 - FSDP_PRECOMPUTE：在`collect_static_end_to_end_saliency_and_fisher`里用FSDP2把模型权重+梯度分片到各个rank上，给单卡放不下整模型backward的大模型用。权重dtype保持不变，grad dtype fp32；因为precompute里所有param都会被冻结（`requires_grad=False`），所以FSDP的reduce_scatter路径不触发，只走param的all_gather。**precompute结束后会自动unwrap FSDP**（用进FSDP前的CPU快照把DTensor param复原成普通Tensor，并摘掉forward/backward hooks），所以同一个run可以直接接着跑正常的per-layer量化，不需要分两阶段跑。但unwrap靠的是CPU snapshot，需要一份完整模型大小的额外CPU RAM：4B≈+8GB、7B≈+14GB、13B≈+26GB可以直接跑；**70B需要+140GB CPU RAM，大概率爆cgroup，这种情况必须走两阶段**（`EXIT_AFTER_PRECOMPUTE=1 STATIC_CACHE_PATH=...`先存盘退出，再换一次run读盘量化）。
 - FSDP_CPU_OFFLOAD：开了FSDP后，把param的shard放在pinned CPU内存里，每次forward前all_gather到GPU、forward后释放。进一步省GPU显存，代价是多一轮CPU↔GPU带宽。
-- STATIC_CACHE_PATH：precompute结果的磁盘缓存目录。key绑定`model/dataset/nsamples/seq_len/rotate/num_groups/fisher_num_groups/grad_hessian_topk/global_loss_bsz/seed/world_size/rank`，每rank存自己的分片（`_world{W}_rank{R}.pt`）。cache命中时跳过precompute直接读盘，在sweep不同lr之间复用同一份saliency/fisher、或者70B走两阶段工作流时用。要复用cache必须用相同的world_size和rank分配，否则cache miss重算。
+- STATIC_CACHE_PATH：precompute结果的磁盘缓存目录。key绑定`model/dataset/nsamples/seq_len/rotate/num_groups/full_fisher/grad_hessian_topk/global_loss_bsz/seed/world_size/rank`，每rank存自己的分片（`_world{W}_rank{R}.pt`）。cache命中时跳过precompute直接读盘，在sweep不同lr之间复用同一份saliency/fisher、或者70B走两阶段工作流时用。要复用cache必须用相同的world_size和rank分配，否则cache miss重算。
 - EXIT_AFTER_PRECOMPUTE：precompute完成+结果存盘后直接退出（跳过量化和eval），专门给70B的两阶段流程用。默认0。
 - BASE_EXP：实验名
 - OUTPUT_ROOT：实验日志输出
@@ -118,7 +117,7 @@ FSDP_PRECOMPUTE=0 \
   bash scripts/gptq_plus_lr_sweep.sh /path/to/Llama-2-70b-hf 4 0,1,2,3,4,5,6,7
 ```
 
-两阶段必须用相同的`N_SAMPLES / SEQ_LEN / NUM_GROUPS / FISHER_NUM_GROUPS / GRAD_HESSIAN_TOPK / SALIENCY_CLIP_PERCENTILE / GLOBAL_LOSS_BSZ / 种子 / rotate开关 / world_size`，否则cache key对不上会重算precompute。
+两阶段必须用相同的`N_SAMPLES / SEQ_LEN / NUM_GROUPS / GRAD_HESSIAN_TOPK / SALIENCY_CLIP_PERCENTILE / GLOBAL_LOSS_BSZ / 种子 / rotate开关 / world_size`，否则cache key对不上会重算precompute。
 
 # 核心的消融/创新点
 
@@ -156,7 +155,7 @@ $$
 L(y_i^{\text{fp}}+\Delta y_i) \;\approx\; L(y_i^{\text{fp}}) \;+\; g_i^{T}\Delta y_i \;+\; \tfrac{1}{2}\,\Delta y_i^{T} H_i\, \Delta y_i
 $$
 
-其中 $g_i = \left.\partial L/\partial y_i\right|\_{y_i=y_i^{\text{fp}}}$ ，$H_i$ 是 $L$ 在 $y_i^{\text{fp}}$ 处的 Hessian。 $L(y_i^{\text{fp}})$ 对当前层权重不依赖、求梯度为 0，舍去。 $H_i$ 用 **empirical Fisher** 的对角近似（和 fisher_diag_mse 完全复用，按 `fisher_num_groups` 切 group）。忽略一阶项就是 fisher_diag_mse；refined_mse 把一阶项加回来。
+其中 $g_i = \left.\partial L/\partial y_i\right|_{y_i=y_i^{\text{fp}}}$ ，$H_i$ 是 $L$ 在 $y_i^{\text{fp}}$ 处的 Hessian。 $L(y_i^{\text{fp}})$ 对当前层权重不依赖、求梯度为 0，舍去。 $H_i$ 用预计算的 **empirical Fisher 矩阵** `E[g g^T]`（不再按 token 保存，也不再按 `fisher_num_groups` 分组）。忽略一阶项就是 Fisher 矩阵二次型；refined_mse 把一阶项加回来。
 
 一阶项 $g_i$ 取决于"从当前 layer $i$ 输出到端到端 KL 的反传"。在 fp 模型上 $g_i\equiv 0$（student 完全等于 teacher，KL=0，梯度处处为 0）——所以**必须在量化进行到 layer $i$ 的那一刻、上游 $0..i-1$ 已经量化的状态下**去采 $g_i$ ，才能拿到非零值。这一点是 refined_res_kl 在预处理一次就把 A 矩阵全收完的做法做不到的。
 
@@ -259,7 +258,7 @@ layer 0 上游还没量化，student == teacher，KL=0，$g_i\equiv 0$。代码�
 
 - fisher 的 grad² 捕获 hook 只挂在 `[0, split)` 的前半段 layer 上 —— 后半段 layer 的 `fisher_data[i]` 留空，aggregate 阶段直接填 `None`。refined_res_kl 不读 fisher，所以后半没这份 stats 不影响正确性。
 - refined_res_kl 的 per-layer dy·delta 捕获 hook 只挂在 `[split, N-1)` 的后半段 layer 上（last-layer 的 dy 捕获 hook 仍然挂，它只是公共 buffer 源）。前半段 `static_refined_A[i]` 全 None，主循环里 `layer_refined_A_list=None`，fisher_diag_mse 分支不读 A，也不影响。
-- **节省估算**（以 Qwen3-4B，28 层，H=2560，seq=2048，512 samples，fisher_num_groups=512 为例）：fisher 每层 CPU bf16 ≈ 1 GB × 28 = 28 GB，砍一半省约 14 GB。A 的 CPU fp32 accumulator 峰值 `2 × H² × 4B × L/2` 省一半约 1.5 GB，加上 bf16 A stack 省约 185 MB。
+- Fisher 现在按每层保存 bf16 矩阵 `H×H`，不再保存 per-token fisher，也不再使用 `fisher_num_groups`。以 Qwen3-4B `H=2560` 为例，每层约 12.5 MB；只收前半层时约减半。A 的 CPU fp32 accumulator 峰值 `2 × H² × 4B × L/2` 省一半约 1.5 GB，加上 bf16 A stack 省约 185 MB。
 - Cache key 在 mix 模式下追加 `_mixsplit{N}` 后缀，避免和非 mix run 的 cache 混用。
 
 ### 前半段完全不做每层端到端 backward

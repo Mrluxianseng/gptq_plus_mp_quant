@@ -89,7 +89,6 @@ SALIENCY_CLIP_PERCENTILE=${SALIENCY_CLIP_PERCENTILE:-1.0}
 PROJ_LR_SCALE=${PROJ_LR_SCALE:-1.0}
 DOWN_PROJ_LR_SCALE=${DOWN_PROJ_LR_SCALE:-1.0}
 SECOND_ORDER_SCALE=${SECOND_ORDER_SCALE:-1.0}
-FISHER_NUM_GROUPS=${FISHER_NUM_GROUPS:-512}
 PRE_CLIP=${PRE_CLIP:-0}
 GLOBAL_LOSS=${GLOBAL_LOSS:-1}
 GLOBAL_LOSS_BSZ=${GLOBAL_LOSS_BSZ:-8}
@@ -222,7 +221,6 @@ echo "============================================================"
 echo "GPTQ+ quant profile quick"
 echo "  model  : ${MODEL_PATH}"
 echo "  device : ${DEVICE} (N_GPUS=${N_GPUS})"
-echo "  groups : ${NUM_GROUPS} (fng=${FISHER_NUM_GROUPS})"
 echo "  target : layers=${TARGET_LAYERS} modules=${TARGET_MODULES} stop=${QUANT_STOP_LAYER}"
 echo "  nsys   : ${NSYS} output=${NSYS_OUTPUT}  wall=${WALL_PROFILE}"
 echo "  gpplus : ${ENABLE_GPTQ_PLUS}"
@@ -260,7 +258,7 @@ CMD=(
     --output_dir "${OUTPUT_ROOT}"
     --cache_dir "${CACHE_DIR}"
     --dataset "${DATASET}" --nsamples "${N_SAMPLES}" --seq_len "${SEQ_LEN}"
-    --w_method gptq_plus --w_bits 4 --w_clip --num_groups "${NUM_GROUPS}" --fisher_num_groups "${FISHER_NUM_GROUPS}" --act_order
+    --w_method gptq_plus --w_bits 4 --w_clip --num_groups "${NUM_GROUPS}"  --act_order
     --kl_topk "${KL_TOPK}" --bsz "${BSZ}" --final_layer_stats_bsz "${FINAL_LAYER_STATS_BSZ}" --alpha "${ALPHA}" --blocksize "${BLOCKSIZE}"
     --enable_gptq_plus "${ENABLE_GPTQ_PLUS}"
     ${HESSIAN_ACCUM_BSZ:+--hessian_accum_bsz "${HESSIAN_ACCUM_BSZ}"}

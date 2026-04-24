@@ -48,7 +48,7 @@ python -m torch.distributed.run \
     --rotate \
     --skip_eval \
     --kl_topk 20 --grad_hessian_topk 20 \
-    --num_groups 4 --fisher_num_groups 512 --bsz 32 --global_loss_bsz 2 \
+    --num_groups 4  --bsz 32 --global_loss_bsz 2 \
     --target_layers ${TARGET_LAYERS} \
     --measure_samples ${MEASURE_SAMPLES} --measure_batch_size ${MEASURE_BSZ} \
     --measure_losses "${MEASURE_LOSSES}" \

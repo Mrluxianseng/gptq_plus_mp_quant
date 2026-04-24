@@ -46,7 +46,6 @@ GRAD_HESSIAN_TOPK=${GRAD_HESSIAN_TOPK:-20}
 PROJ_LR_SCALE=${PROJ_LR_SCALE:-1.0}
 DOWN_PROJ_LR_SCALE=${DOWN_PROJ_LR_SCALE:-1.0}
 SECOND_ORDER_SCALE=${SECOND_ORDER_SCALE:-1.0}
-FISHER_NUM_GROUPS=${FISHER_NUM_GROUPS:-512}
 PRE_CLIP=${PRE_CLIP:-0}
 GLOBAL_LOSS=${GLOBAL_LOSS:-1}
 GLOBAL_LOSS_BSZ=${GLOBAL_LOSS_BSZ:-16}
@@ -138,10 +137,6 @@ for final_layer_grad_lr in "${FINAL_LAYER_GRAD_LRS[@]}"; do
     if [[ "${GRAD_HESSIAN_TOPK}" != "-1" ]]; then
         grad_hessian_suffix="_ghtk${GRAD_HESSIAN_TOPK}"
     fi
-    fisher_groups_suffix=""
-    if [[ "${FISHER_NUM_GROUPS}" != "${NUM_GROUPS}" ]]; then
-        fisher_groups_suffix="_fng${FISHER_NUM_GROUPS}"
-    fi
     pre_gd_suffix=""
     if [[ "${PRE_GD_STEPS}" != "0" ]]; then
         pre_gd_suffix="_pregd${PRE_GD_STEPS}_lr$(sanitize_float "${PRE_GRAD_LR}")_opt${PRE_GRAD_OPTIMIZER}"
@@ -152,7 +147,7 @@ for final_layer_grad_lr in "${FINAL_LAYER_GRAD_LRS[@]}"; do
             pre_gd_suffix="${pre_gd_suffix}_flopt${PRE_FINAL_LAYER_GRAD_OPTIMIZER}"
         fi
     fi
-    exp_name="${BASE_EXP}_block_gd_${GRAD_OPTIMIZER}${refresh_suffix}${reg_suffix}${grad_hessian_suffix}${fisher_groups_suffix}_lr${grad_lr_tag}_fllr${final_layer_grad_lr_tag}_s${second_order_tag}${pre_gd_suffix}${PRE_CLIP_TAG}${BLOCK_ATOMIC_TAG}${FINAL_LAYER_FULL_BACKWARD_TAG}${GLOBAL_LOSS_TAG}"
+    exp_name="${BASE_EXP}_block_gd_${GRAD_OPTIMIZER}${refresh_suffix}${reg_suffix}${grad_hessian_suffix}_lr${grad_lr_tag}_fllr${final_layer_grad_lr_tag}_s${second_order_tag}${pre_gd_suffix}${PRE_CLIP_TAG}${BLOCK_ATOMIC_TAG}${FINAL_LAYER_FULL_BACKWARD_TAG}${GLOBAL_LOSS_TAG}"
 
     echo "============================================================"
     echo "Running GPTQ+ Final-Layer LR sweep"
@@ -171,7 +166,6 @@ for final_layer_grad_lr in "${FINAL_LAYER_GRAD_LRS[@]}"; do
     echo "  gate_k : ${GRAD_GATE_SHARPNESS}"
     echo "  gate_a : ${GRAD_GATE_SINE_AMP}"
     echo "  gh_topk: ${GRAD_HESSIAN_TOPK}"
-    echo "  fng    : ${FISHER_NUM_GROUPS}"
     echo "  proj_s : ${PROJ_LR_SCALE}"
     echo "  down_s : ${DOWN_PROJ_LR_SCALE}"
     echo "  preclip: ${PRE_CLIP}"
@@ -203,7 +197,7 @@ for final_layer_grad_lr in "${FINAL_LAYER_GRAD_LRS[@]}"; do
         --model "${MODEL_PATH}" \
         --exp "${exp_name}" \
         --dataset neuralmagic --nsamples "${N_SAMPLES}" --seq_len "${SEQ_LEN}" \
-        --w_method gptq_plus --w_bits 4 --w_clip --num_groups "${NUM_GROUPS}" --fisher_num_groups "${FISHER_NUM_GROUPS}" --act_order \
+        --w_method gptq_plus --w_bits 4 --w_clip --num_groups "${NUM_GROUPS}"  --act_order \
         --kl_topk "${KL_TOPK}" --bsz "${BSZ}" --final_layer_stats_bsz "${FINAL_LAYER_STATS_BSZ}" --alpha "${ALPHA}" --blocksize "${BLOCKSIZE}" \
         --backward_samples "${BACKWARD_SAMPLES}" --backward_bsz "${BACKWARD_BSZ}" --final_layer_backward_bsz "${FINAL_LAYER_BACKWARD_BSZ}" \
         --g_update_mode block_gd --grad_lr "${GRAD_LR}" --grad_optimizer "${GRAD_OPTIMIZER}" --grad_refresh_loss "${GRAD_REFRESH_LOSS}" \

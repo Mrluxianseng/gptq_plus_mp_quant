@@ -2347,7 +2347,6 @@ def collect_static_end_to_end_saliency_and_fisher(
     dataloader,
     dev,
     saliency_num_groups,
-    fisher_num_groups,
     grad_hessian_topk,
     batch_size,
     collect_fisher=True,
@@ -2444,7 +2443,7 @@ def collect_static_end_to_end_saliency_and_fisher(
         {module_name: [] for module_name in module_dict.keys()}
         for module_dict in module_dicts
     ]
-    fisher_data = [[] for _ in layers]
+    fisher_data = [None for _ in layers]
     # Any refined-rkl variant reuses the same num_A / samples_per_A partitioning
     # and the shared dy capture at the last transformer block's output.
     _collect_any_refined = collect_refined_rkl or collect_refined_diag_rkl
@@ -2555,21 +2554,12 @@ def collect_static_end_to_end_saliency_and_fisher(
             out_tensor.retain_grad()
 
             def grad_hook(grad):
-                bsz_local, seq_len_local, hidden_dim = grad.shape
-                if hidden_dim % fisher_num_groups != 0:
-                    raise ValueError(
-                        f"Layer output dim ({hidden_dim}) must be divisible by fisher_num_groups ({fisher_num_groups})."
-                    )
-                group_size = hidden_dim // fisher_num_groups
-                grad_squared = grad.float().pow(2).view(
-                    bsz_local,
-                    seq_len_local,
-                    fisher_num_groups,
-                    group_size,
-                )
-                # Cache as bf16 on CPU to halve RAM footprint. Consumers .float()
-                # on `.to(dev)` so compute stays fp32 and numerics are unchanged.
-                fisher_data[layer_idx].append(grad_squared.mean(dim=-1).detach().to(torch.bfloat16).cpu())
+                grad_flat = grad.detach().float().reshape(-1, grad.shape[-1])
+                fisher_block = (grad_flat.t() @ grad_flat).cpu()
+                if fisher_data[layer_idx] is None:
+                    fisher_data[layer_idx] = fisher_block
+                else:
+                    fisher_data[layer_idx].add_(fisher_block)
 
             out_tensor.register_hook(grad_hook)
 
@@ -2978,9 +2968,13 @@ def collect_static_end_to_end_saliency_and_fisher(
                     fisher_layer_ids is None or layer_idx in fisher_layer_ids
                 )
                 if want_fisher_this_layer:
-                    if not fisher_data[layer_idx]:
+                    if fisher_data[layer_idx] is None:
                         raise ValueError(f"Failed to collect static end-to-end Fisher for layer={layer_idx}.")
-                    static_fisher.append(torch.cat(fisher_data[layer_idx], dim=0))
+                    fisher_sum = fisher_data[layer_idx].to(dev)
+                    dist_utils.allreduce_sum_(fisher_sum)
+                    local_tokens = sum(int(chunk.shape[0] * chunk.shape[1]) for chunk in saliency_data[layer_idx][next(iter(module_dict.keys()))])
+                    total_tokens = dist_utils.allreduce_sum_scalar(local_tokens)
+                    static_fisher.append((fisher_sum / float(total_tokens)).to(torch.bfloat16).cpu())
                 else:
                     # Caller opted out of fisher for this layer (e.g. refined_mix
                     # back half uses refined_residual_kl, which doesn't need fisher).
@@ -3238,23 +3232,19 @@ def compute_refresh_loss(
             "(fisher_diag_mse / refined_mse)."
         )
     with profile_recorder.section("compute_refresh_loss.fisher_diag_mse.total") if profile_recorder else _NULL_CONTEXT:
-        with profile_recorder.section("compute_refresh_loss.fisher_diag_mse.reshape") if profile_recorder else _NULL_CONTEXT:
-            num_groups = layer_output_fisher.shape[-1]
-            if delta.shape[-1] % num_groups != 0:
+        with profile_recorder.section("compute_refresh_loss.fisher_diag_mse.quadratic") if profile_recorder else _NULL_CONTEXT:
+            if layer_output_fisher.dim() != 2 or layer_output_fisher.shape[0] != layer_output_fisher.shape[1]:
                 raise ValueError(
-                    f"Output hidden dim ({delta.shape[-1]}) must be divisible by layer-output Fisher groups ({num_groups})."
+                    f"Expected layer-output Fisher matrix with shape (H, H), got {tuple(layer_output_fisher.shape)}."
                 )
             hidden_size = delta.shape[-1]
-            group_size = hidden_size // num_groups
-            delta_grouped = delta.view(delta.shape[0], delta.shape[1], num_groups, group_size)
-        # Normalize Fisher weights independently for each (batch, token) across the
-        # group axis so the weighting reflects only relative saliency structure for
-        # that token, not the absolute Fisher magnitude of the current batch slice.
-        # fisher_l2 = torch.linalg.vector_norm(layer_output_fisher, ord=2, dim=-1, keepdim=True)
-        # fisher_norm = layer_output_fisher / (fisher_l2 + 1e-12) 删掉标准化更好
-        with profile_recorder.section("compute_refresh_loss.fisher_diag_mse.weighted_sq") if profile_recorder else _NULL_CONTEXT:
-            weighted_sq = layer_output_fisher.unsqueeze(-1) * delta_grouped.square()
-            fisher_loss = 0.5 * weighted_sq.sum(dim=(-1, -2)).mean()
+            if layer_output_fisher.shape[0] != hidden_size:
+                raise ValueError(
+                    f"Fisher matrix hidden dim ({layer_output_fisher.shape[0]}) does not match delta hidden dim ({hidden_size})."
+                )
+            fisher = layer_output_fisher.to(device=delta.device, dtype=torch.float32)
+            delta_flat = delta.float().reshape(-1, hidden_size)
+            fisher_loss = 0.5 * (delta_flat.matmul(fisher) * delta_flat).sum(dim=-1).mean()
 
         if refresh_loss_type != "refined_mse":
             return fisher_loss
@@ -3593,14 +3583,13 @@ def collect_layer_output_fisher_only(
     batch_position_ids,
     batch_position_embeddings,
     bsz,
-    fisher_num_groups,
     kl_topk,
     grad_hessian_topk,
     dev,
     layer_idx,
     layer_recorder=None,
 ):
-    layer_output_fisher_cache = []
+    fisher_sum = None
     with torch.enable_grad():
         for j in tqdm(
             range(0, inps.shape[0], bsz),
@@ -3652,18 +3641,14 @@ def collect_layer_output_fisher_only(
                     out_hidden.retain_grad()
 
                     def layer_output_grad_hook(grad):
-                        bsz_local, seq_len_local, hidden_dim = grad.shape
-                        if hidden_dim % fisher_num_groups != 0:
-                            raise ValueError(
-                                f"Output hidden dim ({hidden_dim}) must be divisible by fisher_num_groups ({fisher_num_groups})."
-                            )
-                        group_size = hidden_dim // fisher_num_groups
-                        token_count = bsz_local * seq_len_local
-                        grad_unmean = grad.float() * token_count
-                        grad_squared = grad_unmean.pow(2).view(
-                            bsz_local, seq_len_local, fisher_num_groups, group_size
-                        )
-                        layer_output_fisher_cache.append(grad_squared.mean(dim=-1).detach())
+                        nonlocal fisher_sum
+                        token_count = grad.shape[0] * grad.shape[1]
+                        grad_flat = (grad.detach().float() * token_count).reshape(-1, grad.shape[-1])
+                        fisher_block = grad_flat.t() @ grad_flat
+                        if fisher_sum is None:
+                            fisher_sum = fisher_block
+                        else:
+                            fisher_sum.add_(fisher_block)
 
                     out_hidden.register_hook(layer_output_grad_hook)
                     model.zero_grad()
@@ -3672,7 +3657,11 @@ def collect_layer_output_fisher_only(
                 # Per-batch cleanup_memory() was here. Removed for the same
                 # reason as above — autograd state is released automatically.
 
-    return torch.cat(layer_output_fisher_cache, dim=0) if layer_output_fisher_cache else None
+    if fisher_sum is None:
+        return None
+    dist_utils.allreduce_sum_(fisher_sum)
+    total_tokens = dist_utils.allreduce_sum_scalar(inps.shape[0] * inps.shape[1])
+    return (fisher_sum / float(total_tokens)).to(torch.bfloat16).cpu()
 
 
 def collect_true_weight_gradient(
@@ -3905,7 +3894,7 @@ def collect_true_weight_gradient(
                         with layer_recorder.section("layer.true_weight_grad.batch.fisher_slice") if layer_recorder else _NULL_CONTEXT:
                             fisher_batch = (
                                 None if layer_output_fisher is None
-                                else layer_output_fisher[batch_indices].to(dev).float()
+                                else layer_output_fisher.to(dev).float()
                             )
                             fp_final_batch = (
                                 None if fp_inps_final is None
@@ -4036,7 +4025,7 @@ def collect_true_weight_gradient(
                                 # residual_kl: doesn't — reuses fp_inps_final.
                                 fisher_batch_next = (
                                     None if next_layer_output_fisher is None
-                                    else next_layer_output_fisher[batch_indices].to(dev).float()
+                                    else next_layer_output_fisher.to(dev).float()
                                 )
                             with layer_recorder.section("layer.true_weight_grad.batch.refresh_loss_next") if layer_recorder else _NULL_CONTEXT:
                                 refresh_loss_next = compute_refresh_loss(
@@ -4112,7 +4101,6 @@ def collect_layer_grad_hessian_stats(
     position_embeddings,
     bsz,
     num_groups,
-    fisher_num_groups,
     kl_topk,
     grad_hessian_topk,
     dev,
@@ -4167,13 +4155,34 @@ def collect_layer_grad_hessian_stats(
                 precomputed_layer_output_fisher,
             )
 
+    if need_layer_output_fisher_collection:
+        precomputed_layer_output_fisher = collect_layer_output_fisher_only(
+            model=model,
+            layer=layer,
+            analyzer=analyzer,
+            inps=inps,
+            fp_inps=fp_inps,
+            batch_attention_mask=attention_mask.expand(bsz, -1, -1, -1),
+            batch_position_ids=position_ids.expand(bsz, -1),
+            batch_position_embeddings=(
+                position_embeddings[0].expand(bsz, -1, -1),
+                position_embeddings[1].expand(bsz, -1, -1),
+            ),
+            bsz=bsz,
+            kl_topk=kl_topk,
+            grad_hessian_topk=grad_hessian_topk,
+            dev=dev,
+            layer_idx=layer_idx,
+            layer_recorder=layer_recorder,
+        )
+        need_layer_output_fisher_collection = False
+
     need_output_head = (
         need_saliency_collection
         or (need_gradient_backward and (
             layer_refresh_loss_type == "kl"
             or gptq_reference_loss_type == "kl"
         ))
-        or need_layer_output_fisher_collection
     )
     with torch.enable_grad():
         saliency_cache = None
@@ -4182,7 +4191,6 @@ def collect_layer_grad_hessian_stats(
             saliency_cache.add_hook(full, enable=False)
         gradients_cache = GradientCache(names, num_groups)
         gradients_cache.add_hook(full, enable=False)
-        layer_output_fisher_cache = []
         reference_losses = []
 
         for j in tqdm(
@@ -4269,45 +4277,7 @@ def collect_layer_grad_hessian_stats(
                 batch_layer_output_fisher = None
                 if layer_refresh_loss_type in ("fisher_diag_mse", "refined_mse") and precomputed_layer_output_fisher is not None:
                     with layer_recorder.section("layer.grad_hessian.fisher_slice") if layer_recorder else _NULL_CONTEXT:
-                        batch_layer_output_fisher = precomputed_layer_output_fisher[j : j + bsz].to(dev).float()
-                elif need_layer_output_fisher_collection:
-                    with layer_recorder.section("layer.grad_hessian.fisher_collect") if layer_recorder else _NULL_CONTEXT:
-                        kl_logits = grad_hessian_logits if grad_hessian_topk > 0 else logits
-                        kl_logits_fp = grad_hessian_logits_fp if grad_hessian_topk > 0 else logits_fp
-                        if grad_hessian_topk <= 0 and kl_topk > 0:
-                            with layer_recorder.section("layer.grad_hessian.fisher_collect.topk") if layer_recorder else _NULL_CONTEXT:
-                                kl_logits_fp, indices = logits_fp.topk(kl_topk, dim=-1, sorted=False)
-                                kl_logits = logits.gather(-1, indices)
-                        with layer_recorder.section("layer.grad_hessian.fisher_collect.loss_build") if layer_recorder else _NULL_CONTEXT:
-                            fisher_kl_loss = F.kl_div(
-                                F.log_softmax(kl_logits, dim=-1),
-                                F.softmax(kl_logits_fp, dim=-1),
-                                reduction="none",
-                            )
-                            fisher_kl_loss = fisher_kl_loss.sum(dim=-1).mean()
-                        with layer_recorder.section("layer.grad_hessian.fisher_collect.hook_register") if layer_recorder else _NULL_CONTEXT:
-                            out_hidden.retain_grad()
-
-                            def layer_output_grad_hook(grad):
-                                bsz_local, seq_len_local, hidden_dim = grad.shape
-                                if hidden_dim % fisher_num_groups != 0:
-                                    raise ValueError(
-                                        f"Output hidden dim ({hidden_dim}) must be divisible by fisher_num_groups ({fisher_num_groups})."
-                                    )
-                                group_size = hidden_dim // fisher_num_groups
-                                token_count = bsz_local * seq_len_local
-                                grad_unmean = grad.float() * token_count
-                                grad_squared = grad_unmean.pow(2).view(
-                                    bsz_local, seq_len_local, fisher_num_groups, group_size
-                                )
-                                layer_output_fisher_cache.append(grad_squared.mean(dim=-1).detach())
-
-                            out_hidden.register_hook(layer_output_grad_hook)
-                        with layer_recorder.section("layer.grad_hessian.fisher_collect.backward") if layer_recorder else _NULL_CONTEXT:
-                            model.zero_grad()
-                            fisher_kl_loss.backward(retain_graph=True)
-                        batch_layer_output_fisher = layer_output_fisher_cache[-1]
-
+                        batch_layer_output_fisher = precomputed_layer_output_fisher.to(dev).float()
                 if need_gradient_backward:
                     with layer_recorder.section("layer.grad_hessian.gradient_loss_build") if layer_recorder else _NULL_CONTEXT:
                         if gptq_reference_loss_type == "kl":
@@ -4394,11 +4364,6 @@ def collect_layer_grad_hessian_stats(
                 module.weight.data, dtype=torch.float32
             )
     layer_output_fisher = precomputed_layer_output_fisher
-    if need_layer_output_fisher_collection:
-        # Keep the layer-output Fisher sharded across ranks — every consumer
-        # indexes it by rank-local sample ids (fp_inps local shard).
-        layer_output_fisher = torch.cat(layer_output_fisher_cache, dim=0)
-
     with layer_recorder.section("layer.cache_finalize") if layer_recorder else _NULL_CONTEXT:
         if saliency_cache is not None:
             for name in saliency_cache.names:
@@ -4714,7 +4679,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
         if global_loss_enabled:
             # Optional disk cache. The precompute result depends only on:
             #   model / dataset / nsamples / seq_len / rotate setting /
-            #   num_groups / fisher_num_groups / grad_hessian_topk /
+            #   num_groups / grad_hessian_topk /
             #   global_loss_bsz / seed.
             # Use `--static_cache_path DIR` to persist. Each rank writes/reads
             # its own shard file since saliency/fisher are rank-local.
@@ -4740,7 +4705,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                 static_cache_key = (
                     f"{args.model_name}_{dataset_id}_s{args.nsamples}_"
                     f"blk{args.seq_len}_rot{rotate_flag}_g{args.num_groups}_"
-                    f"fng{args.fisher_num_groups}_ghtk{args.grad_hessian_topk}_"
+                    f"fisherfull_ghtk{args.grad_hessian_topk}_"
                     f"glbsz{args.global_loss_bsz}_seed{args.seed}_"
                     f"salclip{sal_clip_tag}_rklNA{rkl_na}_fpfinal{fpfinal_tag}"
                     f"{mix_tag}"
@@ -4814,7 +4779,6 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             dataloader=dataloader,
                             dev=dev,
                             saliency_num_groups=args.num_groups,
-                            fisher_num_groups=args.fisher_num_groups,
                             grad_hessian_topk=args.grad_hessian_topk,
                             batch_size=args.global_loss_bsz,
                             use_fsdp=bool(getattr(args, "fsdp_precompute", False)),
@@ -5416,7 +5380,6 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             batch_position_ids=batch_position_ids,
                             batch_position_embeddings=batch_position_embeddings,
                             bsz=args.bsz,
-                            fisher_num_groups=args.fisher_num_groups,
                             kl_topk=args.kl_topk,
                             grad_hessian_topk=args.grad_hessian_topk,
                             dev=dev,
@@ -5535,7 +5498,6 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     position_embeddings=position_embeddings,
                     bsz=layer_stats_bsz,
                     num_groups=args.num_groups,
-                    fisher_num_groups=args.fisher_num_groups,
                     kl_topk=args.kl_topk,
                     grad_hessian_topk=args.grad_hessian_topk,
                     dev=dev,
