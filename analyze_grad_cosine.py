@@ -861,7 +861,6 @@ def quantize_and_measure(args, analyzer, trainloader, dev, target_layers, measur
             dataloader=trainloader,
             dev=dev,
             saliency_num_groups=args.num_groups,
-            fisher_num_groups=args.fisher_num_groups,
             grad_hessian_topk=args.grad_hessian_topk,
             batch_size=args.global_loss_bsz,
             collect_fisher=_want_fisher,
