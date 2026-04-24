@@ -30,9 +30,9 @@ DEVICE=${3}
 shift 3
 
 # Sweep configuration. Override from the shell when needed.
-GRAD_LRS_STR=${GRAD_LRS:-"0.00003"}
+GRAD_LRS_STR=${GRAD_LRS:-"0.00001"}
 DATASET=${DATASET:-wikitext2} # wikitext2 / neuralmagic / ultrachat_2k / numinamath
-N_SAMPLES=${N_SAMPLES:-512}
+N_SAMPLES=${N_SAMPLES:-2048}
 SEQ_LEN=${SEQ_LEN:-2048}
 BSZ=${BSZ:-128}
 FINAL_LAYER_STATS_BSZ=${FINAL_LAYER_STATS_BSZ:-8}
@@ -52,7 +52,7 @@ GRAD_CLIP=${GRAD_CLIP:-5e-5}
 # relative to earlier blocks. Empty / "none" → reuse GRAD_CLIP for every layer.
 FINAL_LAYER_GRAD_CLIP=${FINAL_LAYER_GRAD_CLIP:-5e-4}
 # --grad_refresh_loss {kl,hidden_mse,fisher_diag_mse,residual_kl,refined_residual_kl,refined_mse,refined_mix}
-GRAD_REFRESH_LOSS=${GRAD_REFRESH_LOSS:-refined_mse}
+GRAD_REFRESH_LOSS=${GRAD_REFRESH_LOSS:-fisher_diag_mse}
 # refined_residual_kl knobs (only used when GRAD_REFRESH_LOSS=refined_residual_kl)
 REFINED_RKL_NUM_A=${REFINED_RKL_NUM_A:-1}
 REFINED_RKL_DAMP=${REFINED_RKL_DAMP:-0.01}
@@ -61,11 +61,11 @@ REFINED_RKL_DAMP=${REFINED_RKL_DAMP:-0.01}
 # that layer's quant loop opens. Must divide GLOBAL_LOSS_BSZ / world.
 NUM_SAMPLES_FOR_REFINED_MSE=${NUM_SAMPLES_FOR_REFINED_MSE:-32}
 # refined_mix knobs (only used when GRAD_REFRESH_LOSS=refined_mix). Front
-# [0, SPLIT) layers use refined_mse, [SPLIT, N-1) use refined_residual_kl, and
-# the final layer stays on kl. RKL_LR_RATIO multiplies GRAD_LR / PRE_GRAD_LR on
-# the back half only (not swept). Empty SPLIT = default to N // 2 at runtime.
+# [0, SPLIT) layers use fisher_diag_mse, [SPLIT, N-1) use refined_residual_kl,
+# and the final layer stays on kl. RKL_LR_RATIO multiplies GRAD_LR / PRE_GRAD_LR
+# on the back half only (not swept). Empty SPLIT = default to N // 2 at runtime.
 REFINED_MIX_SPLIT_LAYER=${REFINED_MIX_SPLIT_LAYER:-}
-REFINED_MIX_RKL_LR_RATIO=${REFINED_MIX_RKL_LR_RATIO:-0.167}
+REFINED_MIX_RKL_LR_RATIO=${REFINED_MIX_RKL_LR_RATIO:-0.2}
 FINAL_LAYER_GRAD_LR=${FINAL_LAYER_GRAD_LR:-0.000001}
 PRE_GD_STEPS=${PRE_GD_STEPS:-10}
 PRE_GRAD_LR=${PRE_GRAD_LR:-0.00003}
@@ -73,7 +73,7 @@ PRE_FINAL_LAYER_GRAD_LR=${PRE_FINAL_LAYER_GRAD_LR:-0.3}
 PRE_GRAD_OPTIMIZER=${PRE_GRAD_OPTIMIZER:-adam}
 PRE_FINAL_LAYER_GRAD_OPTIMIZER=${PRE_FINAL_LAYER_GRAD_OPTIMIZER:-sgd}
 #--grad_reg_strategy {none,l2,hessian,quant_error_gate,quant_error_gate_optimized}
-GRAD_REG_STRATEGY=${GRAD_REG_STRATEGY:-l2}
+GRAD_REG_STRATEGY=${GRAD_REG_STRATEGY:-none}
 GRAD_REG_LAMBDA=${GRAD_REG_LAMBDA:-50.0}
 GRAD_GATE_FLOOR=${GRAD_GATE_FLOOR:-0.01}
 GRAD_GATE_SHARPNESS=${GRAD_GATE_SHARPNESS:-5.0}
@@ -83,7 +83,6 @@ SALIENCY_CLIP_PERCENTILE=${SALIENCY_CLIP_PERCENTILE:-1.0}
 PROJ_LR_SCALE=${PROJ_LR_SCALE:-1.0}
 DOWN_PROJ_LR_SCALE=${DOWN_PROJ_LR_SCALE:-1.0}
 SECOND_ORDER_SCALE=${SECOND_ORDER_SCALE:-1.0}
-FISHER_NUM_GROUPS=${FISHER_NUM_GROUPS:-512}
 PRE_CLIP=${PRE_CLIP:-0}
 GLOBAL_LOSS=${GLOBAL_LOSS:-1}
 GLOBAL_LOSS_BSZ=${GLOBAL_LOSS_BSZ:-8}
@@ -94,7 +93,7 @@ GRAD_LR_LAYER_SCHEDULE=${GRAD_LR_LAYER_SCHEDULE:-cosine}
 ALPHA=${ALPHA:-0.0}
 KL_TOPK=${KL_TOPK:-20}
 LM_EVAL_BATCH_SIZE=${LM_EVAL_BATCH_SIZE:-128}
-ENABLE_QA_EVAL=${ENABLE_QA_EVAL:-1}
+ENABLE_QA_EVAL=${ENABLE_QA_EVAL:-0}
 BASE_EXP=${BASE_EXP:-gptq_plus_lr_sweep}
 OUTPUT_ROOT=${OUTPUT_ROOT:-./outputs}
 # FSDP2 precompute: shard params + grads across ranks during
@@ -126,7 +125,7 @@ export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-0}
 # RDZV port decouples from DEVICE so the commas don't end up in the endpoint.
 IFS=',' read -r -a _DEVICE_LIST <<< "${DEVICE}"
 N_GPUS=${N_GPUS:-${#_DEVICE_LIST[@]}}
-RDZV_PORT=${RDZV_PORT:-29500}
+RDZV_PORT=${RDZV_PORT:-29400}
 
 sanitize_float() {
     local value="${1}"
@@ -256,7 +255,6 @@ if [[ "${FSDP_PRECOMPUTE}" == "1" && "${EXIT_AFTER_PRECOMPUTE}" != "1" ]]; then
     echo "[sweep] Stage 1/2: FSDP precompute → ${STATIC_CACHE_PATH}"
     echo "  Passes that affect the cache key must match Stage 2:"
     echo "    model, nsamples=${N_SAMPLES}, seq_len=${SEQ_LEN},"
-    echo "    num_groups=${NUM_GROUPS}, fisher_num_groups=${FISHER_NUM_GROUPS},"
     echo "    grad_hessian_topk=${GRAD_HESSIAN_TOPK}, global_loss_bsz=${GLOBAL_LOSS_BSZ},"
     echo "    world_size=${N_GPUS}, rotate=1"
     echo "============================================================"
@@ -265,7 +263,7 @@ if [[ "${FSDP_PRECOMPUTE}" == "1" && "${EXIT_AFTER_PRECOMPUTE}" != "1" ]]; then
         --model "${MODEL_PATH}" \
         --exp "precompute_fsdp" \
         --dataset "${DATASET}" --nsamples "${N_SAMPLES}" --seq_len "${SEQ_LEN}" \
-        --w_method gptq_plus --w_bits 4 --w_clip --num_groups "${NUM_GROUPS}" --fisher_num_groups "${FISHER_NUM_GROUPS}" --act_order \
+        --w_method gptq_plus --w_bits 4 --w_clip --num_groups "${NUM_GROUPS}"  --act_order \
         --kl_topk "${KL_TOPK}" --bsz "${BSZ}" --final_layer_stats_bsz "${FINAL_LAYER_STATS_BSZ}" --alpha "${ALPHA}" \
         --grad_hessian_topk "${GRAD_HESSIAN_TOPK}" \
         --saliency_clip_percentile "${SALIENCY_CLIP_PERCENTILE}" \
@@ -323,17 +321,10 @@ for grad_lr in "${GRAD_LRS[@]}"; do
         if [[ "${REFINED_MIX_RKL_LR_RATIO}" != "1.0" ]]; then
             refined_mix_suffix="${refined_mix_suffix}_rklr$(sanitize_float "${REFINED_MIX_RKL_LR_RATIO}")"
         fi
-        if [[ "${NUM_SAMPLES_FOR_REFINED_MSE}" != "32" ]]; then
-            refined_mix_suffix="${refined_mix_suffix}_nRM${NUM_SAMPLES_FOR_REFINED_MSE}"
-        fi
     fi
     grad_hessian_suffix=""
     if [[ "${GRAD_HESSIAN_TOPK}" != "-1" ]]; then
         grad_hessian_suffix="_ghtk${GRAD_HESSIAN_TOPK}"
-    fi
-    fisher_groups_suffix=""
-    if [[ "${FISHER_NUM_GROUPS}" != "${NUM_GROUPS}" ]]; then
-        fisher_groups_suffix="_fng${FISHER_NUM_GROUPS}"
     fi
     pre_gd_suffix=""
     if [[ "${PRE_GD_STEPS}" != "0" ]]; then
@@ -345,7 +336,7 @@ for grad_lr in "${GRAD_LRS[@]}"; do
             pre_gd_suffix="${pre_gd_suffix}_flopt${PRE_FINAL_LAYER_GRAD_OPTIMIZER}"
         fi
     fi
-    exp_name="${BASE_EXP}_block_gd_${GRAD_OPTIMIZER}${refresh_suffix}${refined_rkl_suffix}${refined_mse_suffix}${refined_mix_suffix}${reg_suffix}${grad_hessian_suffix}${fisher_groups_suffix}_lr${grad_lr_tag}_fllr${final_layer_grad_lr_tag}_s${second_order_tag}${pre_gd_suffix}${PRE_CLIP_TAG}${BLOCK_ATOMIC_TAG}${FINAL_LAYER_FULL_BACKWARD_TAG}${GLOBAL_LOSS_TAG}${LOSS_SLIDE_WINDOW_TAG}${DP_GLOBAL_SHUFFLE_TAG}${GRAD_LR_LAYER_SCHEDULE_TAG}"
+    exp_name="${BASE_EXP}_block_gd_${GRAD_OPTIMIZER}${refresh_suffix}${refined_rkl_suffix}${refined_mse_suffix}${refined_mix_suffix}${reg_suffix}${grad_hessian_suffix}_lr${grad_lr_tag}_fllr${final_layer_grad_lr_tag}_s${second_order_tag}${pre_gd_suffix}${PRE_CLIP_TAG}${BLOCK_ATOMIC_TAG}${FINAL_LAYER_FULL_BACKWARD_TAG}${GLOBAL_LOSS_TAG}${LOSS_SLIDE_WINDOW_TAG}${DP_GLOBAL_SHUFFLE_TAG}${GRAD_LR_LAYER_SCHEDULE_TAG}"
 
     echo "============================================================"
     echo "Running GPTQ+ LR sweep"
@@ -366,7 +357,6 @@ for grad_lr in "${GRAD_LRS[@]}"; do
     if [[ "${GRAD_REFRESH_LOSS}" == "refined_mix" ]]; then
         echo "  mix_sp : ${REFINED_MIX_SPLIT_LAYER:-<N//2>}"
         echo "  mix_rlr: ${REFINED_MIX_RKL_LR_RATIO}"
-        echo "  nRM    : ${NUM_SAMPLES_FOR_REFINED_MSE}"
     fi
     echo "  reg    : ${GRAD_REG_STRATEGY}"
     echo "  reg_l  : ${GRAD_REG_LAMBDA}"
@@ -374,7 +364,6 @@ for grad_lr in "${GRAD_LRS[@]}"; do
     echo "  gate_k : ${GRAD_GATE_SHARPNESS}"
     echo "  gate_a : ${GRAD_GATE_SINE_AMP}"
     echo "  gh_topk: ${GRAD_HESSIAN_TOPK}"
-    echo "  fng    : ${FISHER_NUM_GROUPS}"
     echo "  proj_s : ${PROJ_LR_SCALE}"
     echo "  down_s : ${DOWN_PROJ_LR_SCALE}"
     echo "  preclip: ${PRE_CLIP}"
@@ -408,7 +397,7 @@ for grad_lr in "${GRAD_LRS[@]}"; do
         --model "${MODEL_PATH}" \
         --exp "${exp_name}" \
         --dataset "${DATASET}" --nsamples "${N_SAMPLES}" --seq_len "${SEQ_LEN}" \
-        --w_method gptq_plus --w_bits 4 --w_clip --num_groups "${NUM_GROUPS}" --fisher_num_groups "${FISHER_NUM_GROUPS}" --act_order \
+        --w_method gptq_plus --w_bits 4 --w_clip --num_groups "${NUM_GROUPS}"  --act_order \
         --kl_topk "${KL_TOPK}" --bsz "${BSZ}" --final_layer_stats_bsz "${FINAL_LAYER_STATS_BSZ}" --alpha "${ALPHA}" --blocksize "${BLOCKSIZE}" \
         --enable_gptq_plus "${ENABLE_GPTQ_PLUS}" \
         ${HESSIAN_ACCUM_BSZ:+--hessian_accum_bsz "${HESSIAN_ACCUM_BSZ}"} \
