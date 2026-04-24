@@ -1,11 +1,11 @@
 # coding=utf-8
-"""Gradient cosine diagnostic for fisher_diag_mse / residual_kl surrogates.
+"""Gradient cosine diagnostic for Fisher-matrix / residual_kl surrogates.
 
 Runs a full GPTAQ quantization pass (rotate + w_clip + act_order, aligned with
 scripts/gptaq.sh) and, immediately BEFORE quantizing each transformer block in
 `--target_layers`, measures the cosine similarity between:
   * true KL gradient wrt this layer's linear weights (end-to-end backward)
-  * fisher_diag_mse surrogate gradient
+  * Fisher-matrix surrogate gradient
   * residual_kl  surrogate gradient
 
 Per target layer, batches of `--measure_batch_size` samples are averaged inside
@@ -373,7 +373,7 @@ def run_cosine_measurement(
     # Precompute per-module regularization gradient once (independent of batch).
     # reg_grad shape matches weight: (out_features, in_features), fp32 on dev.
     # l2:      reg_grad = λ · (W_q - W_fp)
-    # hessian: reg_grad = λ · (W_q - W_fp) · H, with H = inp.T @ inp (num_groups=1).
+    # hessian: reg_grad = λ · (W_q - W_fp) · H, with H the full Fisher/Hessian matrix.
     # We do NOT multiply by grad_lr — cosine is scale-invariant, and for the
     # combined `surrogate + reg` the raw-gradient sum is what measures how reg
     # reshapes the effective direction.
@@ -407,7 +407,11 @@ def run_cosine_measurement(
                         f"hessians missing entry for canonical name {canon!r}. "
                         f"Have: {sorted(hessians.keys())}."
                     )
-                H = hessians[canon].to(dev).float()  # (in, in)
+                H = hessians[canon].to(dev).float()
+                if H.dim() != 2 or H.shape[0] != H.shape[1] or H.shape[0] != diff.shape[1]:
+                    raise ValueError(
+                        f"hessian matrix for {canon!r} must be square and match in_features; got {tuple(H.shape)} vs diff {tuple(diff.shape)}"
+                    )
                 rg = reg_lambda * diff.matmul(H)
             reg_grads[canon] = rg
             reg_grad_norm[canon] = rg.flatten().norm(p=2).item()
@@ -469,10 +473,7 @@ def run_cosine_measurement(
             # Keep fp_final in model dtype (bf16) so hidden2logits can run through
             # the bf16 norm + lm_head without a dtype mismatch.
             fp_final_batch = fp_inps_final[start:end].to(dev)
-            fisher_batch = (
-                fisher_tensor[start:end].to(dev).float()
-                if need_fisher_slice and fisher_tensor is not None else None
-            )
+            fisher_batch = fisher_tensor.to(dev).float() if need_fisher_slice and fisher_tensor is not None else None
 
             # ---------- (1) true KL ----------
             _zero_grads(target_params)
@@ -965,9 +966,8 @@ def quantize_and_measure(args, analyzer, trainloader, dev, target_layers, measur
                     gptq[name].H = gptq[first_module_name].H
                     gptq[name].dXXT = gptq[first_module_name].dXXT
 
-            # Capture raw H = inp.T @ inp BEFORE fasterquant mutates it
-            # (Cholesky / damping overwrite in-place). Stored on CPU.
-            # num_groups=1 for the regularization is by design — see plan.
+            # Capture raw Fisher/Hessian matrix before fasterquant mutates it.
+            # Stored on CPU.
             if is_target:
                 for name in subset:
                     if name not in gptq:
