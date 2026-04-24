@@ -2364,6 +2364,9 @@ def collect_static_end_to_end_saliency_and_fisher(
     fp_final_store_dtype=torch.bfloat16,
     fisher_layer_ids=None,
     refined_rkl_layer_ids=None,
+    collect_dynsal=False,
+    dynsal_rank=16,
+    dynsal_evd_thresh=1e-6,
 ):
     logging.info(
         "Collecting static end-to-end saliency/fisher caches from a single pre-quantization full-model backward pass. "
@@ -2505,6 +2508,22 @@ def collect_static_end_to_end_saliency_and_fisher(
     # driver sets `a` before each backward call.
     refined_dy_buffer = {}
     refined_current_a_idx = {"a": 0}
+    # Dynamic saliency low-rank decomposition: accumulate per-(layer, module)
+    # G^T G on CPU fp32 across all rank-local backward batches. After the loop
+    # all-reduce across ranks and do EVD to get V, Σ². G^T G itself is freed
+    # right after EVD (can be ~500 MB per up/gate on Llama-7B). U is collected
+    # in a SECOND backward pass below, once V, Σ are known.
+    dynsal_gtg_data = (
+        [
+            {module_name: None for module_name in module_dict.keys()}
+            for module_dict in module_dicts
+        ]
+        if collect_dynsal else None
+    )
+    # Populated by the dynsal second-pass block inside `try:` below when
+    # `collect_dynsal=True`. Remains None otherwise so downstream unpacking
+    # (`..., static_dynsal = collect_static_...`) always has something to bind.
+    static_dynsal = None
     handles = []
 
     def make_module_hook(layer_idx, module_name):
@@ -2543,6 +2562,28 @@ def collect_static_end_to_end_saliency_and_fisher(
                 saliency_data[layer_idx][module_name].append(
                     sal_per_group.detach().cpu()
                 )
+
+            out_tensor.register_hook(grad_hook)
+
+        return forward_hook
+
+    def make_dynsal_module_hook(layer_idx, module_name):
+        """Capture per-module end-to-end gradient G (shape N_local×T × H_out, stacked
+        across batches) as a streaming CPU fp32 accumulator of G^T G. Post-loop
+        all-reduce + EVD gives V, Σ² for the low-rank decomposition used by the
+        dynamic saliency update."""
+        def forward_hook(module, inp, out):
+            out_tensor = out[0] if isinstance(out, (tuple, list)) else out
+            out_tensor.retain_grad()
+
+            def grad_hook(grad):
+                grad_flat = grad.detach().float().reshape(-1, grad.shape[-1])
+                gtg_block = (grad_flat.t() @ grad_flat).cpu()
+                slot = dynsal_gtg_data[layer_idx][module_name]
+                if slot is None:
+                    dynsal_gtg_data[layer_idx][module_name] = gtg_block
+                else:
+                    slot.add_(gtg_block)
 
             out_tensor.register_hook(grad_hook)
 
@@ -2666,6 +2707,8 @@ def collect_static_end_to_end_saliency_and_fisher(
             handles.append(layer.register_forward_hook(make_layer_hook(layer_idx)))
         for module_name, module in module_dict.items():
             handles.append(module.register_forward_hook(make_module_hook(layer_idx, module_name)))
+            if collect_dynsal:
+                handles.append(module.register_forward_hook(make_dynsal_module_hook(layer_idx, module_name)))
     if _collect_any_refined:
         # Register the last-layer "dy capture" hook FIRST in the hook list so
         # it runs first in the forward pass; that way `register_hook` attaches
@@ -2924,6 +2967,186 @@ def collect_static_end_to_end_saliency_and_fisher(
             if _collect_any_refined and refined_prev_a is not None:
                 with profile_recorder.section("pipeline.static_fisher.final_flush") if profile_recorder else _NULL_CONTEXT:
                     _flush_refined_rkl_sub_a(refined_prev_a)
+
+            # === Dynamic saliency: 1st-pass EVD + 2nd-pass backward for U ===
+            # Must happen BEFORE the outer finally because:
+            #   (a) the finally pushes the model back to CPU (non-FSDP path),
+            #       which would break any second forward/backward;
+            #   (b) we need to re-register hooks and re-enter `torch.enable_grad()`
+            #       while the _kick_off pre-hook is still attached.
+            if collect_dynsal:
+                with profile_recorder.section("pipeline.static_fisher.dynsal_aggregate") if profile_recorder else _NULL_CONTEXT:
+                    # EVD per (layer, module) — V, Σ² on GPU first then cached on CPU
+                    # bf16/fp32 for persistence, and also kept on GPU for the 2nd pass.
+                    first_layer_module = next(iter(module_dicts[0].keys()))
+                    local_tokens_N = sum(
+                        int(chunk.shape[0] * chunk.shape[1])
+                        for chunk in saliency_data[0][first_layer_module]
+                    )
+                    N_global = int(dist_utils.allreduce_sum_scalar(local_tokens_N))
+                    static_dynsal_by_layer = []
+                    dynsal_V_dev = [{} for _ in module_dicts]
+                    for layer_idx, module_dict in enumerate(module_dicts):
+                        layer_dynsal = {}
+                        for module_name in module_dict.keys():
+                            gtg_sum_cpu = dynsal_gtg_data[layer_idx][module_name]
+                            if gtg_sum_cpu is None:
+                                raise ValueError(
+                                    f"Failed to collect per-module G^T G for dynamic saliency: "
+                                    f"layer={layer_idx} module={module_name}."
+                                )
+                            gtg_gpu = gtg_sum_cpu.to(dev, dtype=torch.float32)
+                            dist_utils.allreduce_sum_(gtg_gpu)
+                            gtg_gpu = 0.5 * (gtg_gpu + gtg_gpu.t())
+                            eigvals, eigvecs = torch.linalg.eigh(gtg_gpu)
+                            H_out = gtg_gpu.shape[0]
+                            R_req = min(dynsal_rank, H_out)
+                            top_eigvals = eigvals[-R_req:].flip(0).clamp_min(0.0)
+                            top_eigvecs = eigvecs[:, -R_req:].flip(1)
+                            max_eig = top_eigvals[0].clamp_min(1e-30)
+                            keep_mask = top_eigvals >= max_eig * dynsal_evd_thresh
+                            R_eff = int(keep_mask.sum().item())
+                            if R_eff < 1:
+                                R_eff = 1
+                            Sigma_sq = top_eigvals[:R_eff].contiguous()
+                            V = top_eigvecs[:, :R_eff].contiguous()
+                            layer_dynsal[module_name] = {
+                                "V": V.to(torch.bfloat16).cpu(),
+                                "Sigma_sq": Sigma_sq.cpu(),  # fp32
+                                "H_out": int(H_out),
+                                "R_eff": int(R_eff),
+                            }
+                            # Keep the GPU copy of V around for the 2nd pass.
+                            dynsal_V_dev[layer_idx][module_name] = V.detach().clone()
+                            del gtg_gpu, eigvals, eigvecs, top_eigvals, top_eigvecs
+                            dynsal_gtg_data[layer_idx][module_name] = None
+                    dynsal_gtg_data = None
+                    memory_utils.cleanup_memory()
+                    static_dynsal = {
+                        "by_layer": static_dynsal_by_layer,
+                        "N_global": N_global,
+                        "dynsal_rank": int(dynsal_rank),
+                        "dynsal_evd_thresh": float(dynsal_evd_thresh),
+                    }
+                    logging.info(
+                        "dynsal: EVD done for %d layers × %d modules; R (requested)=%d, "
+                        "EVD threshold=%.0e, mean R_eff=%.1f, N_global=%d",
+                        len(layers), len(module_dicts[0]), dynsal_rank, dynsal_evd_thresh,
+                        float(sum(
+                            m["R_eff"] for layer_d in static_dynsal_by_layer for m in layer_d.values()
+                        )) / (len(layers) * len(module_dicts[0])),
+                        N_global,
+                    )
+
+                with profile_recorder.section("pipeline.static_fisher.dynsal_second_pass") if profile_recorder else _NULL_CONTEXT:
+                    # Switch hooks: remove first-pass hooks (saliency / fisher /
+                    # refined_rkl / dynsal_gtg / fp_final), keep only the new
+                    # U-collection hooks. Same driver loop, same batches, same
+                    # labels → the G rows seen by grad_hook are numerically
+                    # identical to the first pass.
+                    for h in handles:
+                        h.remove()
+                    handles.clear()
+                    dynsal_u_sigma_data = [
+                        {name: [] for name in md.keys()}
+                        for md in module_dicts
+                    ]
+
+                    def make_u_hook(layer_idx, module_name):
+                        """Capture per-batch (G_batch @ V) = U·Σ rows; thin SVD gives
+                        G V = U Σ V^T V = U Σ exactly, so no Σ⁻¹ is needed here."""
+                        def forward_hook(module, inp, out):
+                            out_tensor = out[0] if isinstance(out, (tuple, list)) else out
+                            out_tensor.retain_grad()
+
+                            def grad_hook(grad):
+                                grad_flat = grad.detach().float().reshape(-1, grad.shape[-1])
+                                V_m = dynsal_V_dev[layer_idx][module_name]  # (H_out, R) fp32 dev
+                                u_sigma_batch = grad_flat @ V_m  # (bsz*seq, R) fp32 dev
+                                dynsal_u_sigma_data[layer_idx][module_name].append(
+                                    u_sigma_batch.to(torch.bfloat16).cpu()
+                                )
+                            out_tensor.register_hook(grad_hook)
+                        return forward_hook
+
+                    for layer_idx, (layer, module_dict) in enumerate(zip(layers, module_dicts)):
+                        for module_name, module in module_dict.items():
+                            handles.append(module.register_forward_hook(make_u_hook(layer_idx, module_name)))
+
+                    with torch.enable_grad():
+                        for local_start in tqdm(
+                            range(0, len(local_batches), local_batch_size),
+                            ncols=120,
+                            desc="Dynsal 2nd pass (U)",
+                            position=1,
+                            leave=False,
+                        ):
+                            with profile_recorder.section("pipeline.static_fisher.dynsal_batch") if profile_recorder else _NULL_CONTEXT:
+                                global_start = shard.start + local_start
+                                input_ids = torch.cat(local_batches[local_start:local_start + local_batch_size], dim=0).to(dev)
+                                outputs = model(input_ids=input_ids)
+                                logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
+                                teacher_logits = logits.detach()
+                                student_logits = logits
+                                if grad_hessian_topk > 0:
+                                    teacher_logits, indices = teacher_logits.topk(
+                                        grad_hessian_topk, dim=-1, sorted=False,
+                                    )
+                                    student_logits = student_logits.gather(-1, indices)
+                                _batch_bsz = teacher_logits.shape[0]
+                                _global_indices = [global_start + _i for _i in range(_batch_bsz)]
+                                labels = _deterministic_categorical_labels(
+                                    teacher_logits, _global_indices, base_seed=0,
+                                )
+                                loss = F.cross_entropy(
+                                    student_logits.view(-1, student_logits.size(-1)),
+                                    labels.view(-1), reduction="sum",
+                                )
+                                loss.backward()
+                                del outputs, logits, teacher_logits, student_logits, labels, loss, input_ids
+
+                    # Concat U_Sigma chunks per module (CPU bf16).
+                    for l_idx, layer_d in enumerate(static_dynsal_by_layer):
+                        for name, entry in layer_d.items():
+                            chunks = dynsal_u_sigma_data[l_idx][name]
+                            if not chunks:
+                                raise RuntimeError(
+                                    f"dynsal 2nd pass collected no U for layer={l_idx} module={name}."
+                                )
+                            entry["U_Sigma"] = torch.cat(chunks, dim=0)
+                    dynsal_u_sigma_data = None
+                    dynsal_V_dev = None
+                    memory_utils.cleanup_memory()
+
+                with profile_recorder.section("pipeline.static_fisher.dynsal_pack_weights") if profile_recorder else _NULL_CONTEXT:
+                    # Pack C_k, W_cross, W_quad once up-front (fp32 on CPU). Each
+                    # module's packs are G × R × R; for Llama-7B with G=4, R=16
+                    # that's 4 KB per module — trivial.
+                    G_groups = int(saliency_num_groups)
+                    for layer_d in static_dynsal_by_layer:
+                        for entry in layer_d.values():
+                            V_dev = entry["V"].to(dev, dtype=torch.float32)   # (H_out, R_eff)
+                            Sigma_sq_dev = entry["Sigma_sq"].to(dev)          # (R_eff,) fp32
+                            H_out = entry["H_out"]
+                            R_eff = entry["R_eff"]
+                            if H_out % G_groups != 0:
+                                raise ValueError(
+                                    f"dynsal pack: H_out ({H_out}) must be divisible by num_groups ({G_groups})."
+                                )
+                            group_size = H_out // G_groups
+                            # C_k = V[J_k].T @ V[J_k] / |J_k|
+                            C_packed = torch.empty(G_groups, R_eff, R_eff, dtype=torch.float32, device=dev)
+                            for k in range(G_groups):
+                                Vk = V_dev[k * group_size:(k + 1) * group_size]  # (group_size, R_eff)
+                                C_packed[k] = (Vk.t() @ Vk) / float(group_size)
+                            D = torch.diag(Sigma_sq_dev)                       # (R_eff, R_eff)
+                            W_cross_packed = torch.matmul(C_packed, D)         # (G, R_eff, R_eff)
+                            W_quad_packed = torch.matmul(torch.matmul(D, C_packed), D)
+                            entry["C_packed"] = C_packed.cpu()
+                            entry["W_cross_packed"] = W_cross_packed.cpu()
+                            entry["W_quad_packed"] = W_quad_packed.cpu()
+                            del V_dev, Sigma_sq_dev, C_packed, D, W_cross_packed, W_quad_packed
+                    memory_utils.cleanup_memory()
     finally:
         with profile_recorder.section("pipeline.static_fisher.teardown") if profile_recorder else _NULL_CONTEXT:
             for handle in handles:
@@ -3027,7 +3250,7 @@ def collect_static_end_to_end_saliency_and_fisher(
         fp_inps_final = torch.cat(fp_final_cache, dim=0)
         fp_final_cache.clear()
 
-    return static_saliency, static_fisher, static_refined_A, static_refined_diag_A, fp_inps_final
+    return static_saliency, static_fisher, static_refined_A, static_refined_diag_A, fp_inps_final, static_dynsal
 
 
 def _pick_refined_A_for_batch(
@@ -3075,6 +3298,213 @@ def _pick_refined_A_for_batch(
         ],
         dim=0,
     )
+
+
+@torch.no_grad()
+def refresh_dynamic_saliency(
+    *,
+    dyn_entry,
+    static_saliency,
+    N_global,
+    current_Y,
+    fp_Y,
+    num_groups,
+    dev,
+):
+    """Compute S_new at a module-group boundary.
+
+    Formulas from saliency_dynamic_update_design.md §4:
+        Δs_cross[t, k] = (2/N_global)  · sum( U_Sigma ⊙ (P @ W_cross[k].T), dim=-1)
+        Δs_quad[t, k]  = (1/N_global²)· sum( P       ⊙ (P @ W_quad[k].T),  dim=-1)
+        S_new          = clamp_min(S_old_exact + Δs_cross + Δs_quad, 0)
+
+    where P = ΔY · V, ΔY = current_Y − fp_Y (cumulative output drift).
+
+    Args:
+      dyn_entry:       per-module dict with keys V / Sigma_sq / U_Sigma /
+                       C_packed / W_cross_packed / W_quad_packed / H_out / R_eff.
+                       Fields are CPU tensors (bf16 for V/U_Sigma, fp32 rest).
+      static_saliency: (N_local, T, G) tensor of S_old_exact (fp32/bf16 on CPU).
+      N_global:        global token count (int, used in 2/N and 1/N² factors).
+      current_Y:       (N_local, T, H_out) module output under current quant state (CPU bf16).
+      fp_Y:            (N_local, T, H_out) module output under all-FP weights   (CPU bf16).
+      num_groups:      G (saliency output-channel group count, usually 4).
+      dev:             target device for the matmuls.
+
+    Returns:
+      S_new: (N_local, T, G) fp32 CPU tensor, non-negative.
+    """
+    V_bf16 = dyn_entry["V"]                  # (H_out, R) bf16 CPU
+    U_Sigma_bf16 = dyn_entry["U_Sigma"]      # (N_local*T, R) bf16 CPU
+    W_cross_cpu = dyn_entry["W_cross_packed"]  # (G, R, R) fp32 CPU
+    W_quad_cpu = dyn_entry["W_quad_packed"]    # (G, R, R) fp32 CPU
+    H_out = int(dyn_entry["H_out"])
+    R_eff = int(dyn_entry["R_eff"])
+
+    N_local, T, H_out_check = current_Y.shape
+    if H_out_check != H_out:
+        raise ValueError(
+            f"refresh_dynamic_saliency: current_Y H_out mismatch: got {H_out_check}, expected {H_out}."
+        )
+    if fp_Y.shape != current_Y.shape:
+        raise ValueError(
+            f"refresh_dynamic_saliency: fp_Y shape {tuple(fp_Y.shape)} does not match "
+            f"current_Y shape {tuple(current_Y.shape)}."
+        )
+
+    G = int(num_groups)
+    total_tokens = N_local * T
+    if U_Sigma_bf16.shape[0] != total_tokens:
+        raise ValueError(
+            f"refresh_dynamic_saliency: U_Sigma rows ({U_Sigma_bf16.shape[0]}) != N_local*T ({total_tokens})."
+        )
+
+    # Move everything we need to the device in fp32.
+    V_dev = V_bf16.to(dev, dtype=torch.float32)                  # (H_out, R)
+    U_Sigma_dev = U_Sigma_bf16.to(dev, dtype=torch.float32).reshape(N_local, T, R_eff)  # (N_local, T, R)
+    W_cross_dev = W_cross_cpu.to(dev, dtype=torch.float32)        # (G, R, R)
+    W_quad_dev = W_quad_cpu.to(dev, dtype=torch.float32)          # (G, R, R)
+
+    # P = ΔY · V. Do the subtract + matmul per sample to bound peak memory:
+    # (T, H_out) · (H_out, R) → (T, R). Total across samples: (N_local, T, R) on dev.
+    # For Llama-7B up/gate: N_local·T·R = 262144·16·4B = 16.8 MB — fine to keep on dev.
+    P_dev = torch.empty(N_local, T, R_eff, dtype=torch.float32, device=dev)
+    for s in range(N_local):
+        cur_s = current_Y[s].to(dev, dtype=torch.float32)
+        fp_s = fp_Y[s].to(dev, dtype=torch.float32)
+        P_dev[s] = (cur_s - fp_s) @ V_dev
+        del cur_s, fp_s
+
+    # Batched across groups: tmp_c[k] shape (N_local, T, R), same for quad.
+    # P_dev @ W_cross_dev[k].T → (N_local, T, R). einsum keeps it explicit.
+    #   P_dev (N, T, R), W_cross_dev (G, R, R): 'ntr, gsr -> g n t s' is cross-type;
+    # simpler: loop over G (G is usually 4).
+    delta_s_cross = torch.empty(N_local, T, G, dtype=torch.float32, device=dev)
+    delta_s_quad = torch.empty(N_local, T, G, dtype=torch.float32, device=dev)
+    for k in range(G):
+        tmp_c = P_dev @ W_cross_dev[k].t()                       # (N_local, T, R)
+        delta_s_cross[..., k] = (U_Sigma_dev * tmp_c).sum(dim=-1)
+        tmp_q = P_dev @ W_quad_dev[k].t()                        # (N_local, T, R)
+        delta_s_quad[..., k] = (P_dev * tmp_q).sum(dim=-1)
+        del tmp_c, tmp_q
+
+    delta_s_cross.mul_(2.0 / float(N_global))
+    delta_s_quad.mul_(1.0 / (float(N_global) * float(N_global)))
+
+    S_old = static_saliency.to(dev, dtype=torch.float32)         # (N_local, T, G)
+    S_new = (S_old + delta_s_cross + delta_s_quad).clamp_min_(0.0)
+    return S_new.cpu()
+
+
+@torch.no_grad()
+def _collect_fp_module_outputs_for_dynsal(
+    *,
+    layer,
+    fp_inps,
+    module_dict,
+    dev,
+    bsz,
+    attention_mask,
+    position_ids,
+    position_embeddings,
+):
+    """Run ONE FP forward through `layer` (with its still-FP weights) using
+    `fp_inps` as input; capture every module's output into a CPU bf16 tensor.
+
+    Returns: dict {module_name -> Tensor (N_local, T, H_out) bf16 on CPU}.
+
+    Called exactly once per layer at the start of quantization, before any of
+    the 4 module-group boundaries. Each boundary later looks up + `pop()`s its
+    own modules from the returned dict, releasing memory as it consumes.
+    """
+    N_local = fp_inps.shape[0]
+    # Per-module running list of per-batch outputs — concatenated at end.
+    per_module_chunks = {name: [] for name in module_dict.keys()}
+    handles = []
+
+    def make_fp_hook(name):
+        def hook(module, inp, out):
+            out_tensor = out[0] if isinstance(out, (tuple, list)) else out
+            per_module_chunks[name].append(out_tensor.detach().to(torch.bfloat16).cpu())
+        return hook
+
+    try:
+        for name, module in module_dict.items():
+            handles.append(module.register_forward_hook(make_fp_hook(name)))
+
+        for j in range(0, N_local, bsz):
+            batch_bsz = min(bsz, N_local - j)
+            _ = layer(
+                fp_inps[j : j + batch_bsz].to(dev),
+                attention_mask=attention_mask.expand(batch_bsz, -1, -1, -1),
+                position_ids=position_ids.expand(batch_bsz, -1),
+                position_embeddings=(
+                    position_embeddings[0].expand(batch_bsz, -1, -1),
+                    position_embeddings[1].expand(batch_bsz, -1, -1),
+                ),
+            )
+    finally:
+        for h in handles:
+            h.remove()
+
+    out_dict = {}
+    for name, chunks in per_module_chunks.items():
+        if not chunks:
+            raise RuntimeError(
+                f"_collect_fp_module_outputs_for_dynsal: no FP output captured for module `{name}`."
+            )
+        out_dict[name] = torch.cat(chunks, dim=0)
+    return out_dict
+
+
+@torch.no_grad()
+def _collect_current_module_outputs_for_dynsal(
+    *,
+    layer,
+    inps,
+    module_dict,
+    dev,
+    bsz,
+    attention_mask,
+    position_ids,
+    position_embeddings,
+):
+    """Mirror of `_collect_fp_module_outputs_for_dynsal` but for the CURRENT
+    quantization state — run one forward through `layer` using the current
+    (possibly partially-quantized) weights and the current-state `inps`, hook
+    only the modules listed in `module_dict` (typically the modules in the
+    boundary's group to save work), and return a dict {name -> (N_local, T, H_out) bf16 CPU}.
+    """
+    N_local = inps.shape[0]
+    per_module_chunks = {name: [] for name in module_dict.keys()}
+    handles = []
+
+    def make_cur_hook(name):
+        def hook(module, inp, out):
+            out_tensor = out[0] if isinstance(out, (tuple, list)) else out
+            per_module_chunks[name].append(out_tensor.detach().to(torch.bfloat16).cpu())
+        return hook
+
+    try:
+        for name, module in module_dict.items():
+            handles.append(module.register_forward_hook(make_cur_hook(name)))
+
+        for j in range(0, N_local, bsz):
+            batch_bsz = min(bsz, N_local - j)
+            _ = layer(
+                inps[j : j + batch_bsz].to(dev),
+                attention_mask=attention_mask.expand(batch_bsz, -1, -1, -1),
+                position_ids=position_ids.expand(batch_bsz, -1),
+                position_embeddings=(
+                    position_embeddings[0].expand(batch_bsz, -1, -1),
+                    position_embeddings[1].expand(batch_bsz, -1, -1),
+                ),
+            )
+    finally:
+        for h in handles:
+            h.remove()
+
+    return {name: torch.cat(chunks, dim=0) for name, chunks in per_module_chunks.items()}
 
 
 def compute_refresh_loss(
@@ -4702,13 +5132,24 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                 # layer to keep them segregated. Non-mix runs keep the key
                 # byte-identical to previous versions (empty tag).
                 mix_tag = f"_mixsplit{refined_mix_split_layer}" if mix_mode else ""
+                # dynsal tag: when --enable_dynamic_saliency=1, key the cache by
+                # R and EVD threshold so sweeps over R don't collide. Disabled
+                # (=0, default) path emits an empty tag and stays byte-identical
+                # to pre-dynsal caches.
+                dynsal_enabled = bool(int(getattr(args, "enable_dynamic_saliency", 0)))
+                if dynsal_enabled:
+                    dynsal_R = int(getattr(args, "dyn_sal_rank", 16))
+                    dynsal_evd_tag = f"{float(getattr(args, 'dyn_sal_evd_thresh', 1e-6)):.0e}"
+                    dynsal_tag = f"_dynsalR{dynsal_R}_evd{dynsal_evd_tag}"
+                else:
+                    dynsal_tag = ""
                 static_cache_key = (
                     f"{args.model_name}_{dataset_id}_s{args.nsamples}_"
                     f"blk{args.seq_len}_rot{rotate_flag}_g{args.num_groups}_"
                     f"fisherfull_ghtk{args.grad_hessian_topk}_"
                     f"glbsz{args.global_loss_bsz}_seed{args.seed}_"
                     f"salclip{sal_clip_tag}_rklNA{rkl_na}_fpfinal{fpfinal_tag}"
-                    f"{mix_tag}"
+                    f"{mix_tag}{dynsal_tag}"
                 )
                 static_cache_key += f"_world{dist_utils.get_world_size()}_rank{dist_utils.get_rank()}"
                 os.makedirs(static_cache_dir, exist_ok=True)
@@ -4738,6 +5179,18 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     # fpfinal tag in the cache key guarantees we only load
                     # caches that match the current need_fp_inps_final flag.
                     fp_inps_final_cpu = _loaded.get("fp_inps_final", None)
+                    # Dynamic saliency low-rank cache. Present only when the run
+                    # that wrote the cache had --enable_dynamic_saliency=1. Cache
+                    # key carries `_dynsalR{R}` so a loaded cache here is already
+                    # guaranteed to match the current R, but we still assert the
+                    # presence of the dynsal payload when the current run wants it.
+                    static_dynsal = _loaded.get("dynsal", None)
+                    if dynsal_enabled and static_dynsal is None:
+                        raise RuntimeError(
+                            f"Cached static saliency/fisher at {static_cache_file} was built "
+                            f"without --enable_dynamic_saliency. Delete the cache (or use a "
+                            f"different --static_cache_path) and rerun precompute."
+                        )
             else:
                 want_refined = args.grad_refresh_loss in (
                     "refined_residual_kl", "refined_mix",
@@ -4772,7 +5225,11 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     # 5th return is the rank-local fp_inps_final on CPU in bf16
                     # (None unless `capture_fp_final=True`); we skip the
                     # separate Stage 2 bs=1 precompute when this is populated.
-                    static_saliency_by_layer, static_fisher_by_layer, static_refined_A_by_layer, _, fp_inps_final_cpu = \
+                    # 6th return is the dynamic-saliency low-rank decomposition
+                    # wrapper {"by_layer": [...], "N_global": int}, None when
+                    # `--enable_dynamic_saliency=0` (default).
+                    want_dynsal = bool(int(getattr(args, "enable_dynamic_saliency", 0)))
+                    static_saliency_by_layer, static_fisher_by_layer, static_refined_A_by_layer, _, fp_inps_final_cpu, static_dynsal = \
                         collect_static_end_to_end_saliency_and_fisher(
                             model=model,
                             analyzer=analyzer,
@@ -4792,6 +5249,9 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             capture_fp_final=need_fp_inps_final,
                             fisher_layer_ids=fisher_layer_ids,
                             refined_rkl_layer_ids=refined_rkl_layer_ids,
+                            collect_dynsal=want_dynsal,
+                            dynsal_rank=int(getattr(args, "dyn_sal_rank", 16)),
+                            dynsal_evd_thresh=float(getattr(args, "dyn_sal_evd_thresh", 1e-6)),
                         )
                 if static_cache_file is not None:
                     with pipeline_recorder.section("pipeline.static_cache.save") if pipeline_recorder else _NULL_CONTEXT:
@@ -4803,6 +5263,8 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         }
                         if fp_inps_final_cpu is not None:
                             _to_save["fp_inps_final"] = fp_inps_final_cpu
+                        if static_dynsal is not None:
+                            _to_save["dynsal"] = static_dynsal
                         torch.save(_to_save, static_cache_file)
             logging.info(
                 "Collected frozen end-to-end saliency/Fisher caches before quantization with global_loss_bsz=%d. "
@@ -4825,6 +5287,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
         else:
             static_saliency_by_layer = [None] * len(layers)
             static_fisher_by_layer = [None] * len(layers)
+            static_dynsal = None
             logging.info(
                 "Global loss mode is disabled. Saliency/Fisher caches will be collected layerwise with the output head, "
                 "and GPTQ+ second-order terms will use layerwise KL."
@@ -5479,11 +5942,109 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
             saliency_dict = None
             gradients_dict = None
 
+            # === Dynamic saliency: one FP forward per layer for fp_y_dict ===
+            # At this point layer i has not yet been touched by any quant step
+            # (all 7 linear modules still hold FP weights). One forward through
+            # the layer with `fp_inps[i]` captures every module's FP output; the
+            # dict drains as the 4 module-group boundaries consume their entries.
+            dynsal_enabled = (
+                bool(int(getattr(args, "enable_dynamic_saliency", 0)))
+                and static_dynsal is not None
+            )
+            fp_y_dict = None
+            if dynsal_enabled:
+                with layer_recorder.section("layer.dynsal.fp_forward") if layer_recorder else _NULL_CONTEXT:
+                    _fp_fwd_bsz = args.hessian_accum_bsz if args.hessian_accum_bsz is not None else args.bsz
+                    _fp_fwd_bsz = max(1, min(_fp_fwd_bsz, fp_inps.shape[0]))
+                    fp_y_dict = _collect_fp_module_outputs_for_dynsal(
+                        layer=layer,
+                        fp_inps=fp_inps,
+                        module_dict=full,
+                        dev=dev,
+                        bsz=_fp_fwd_bsz,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        position_embeddings=position_embeddings,
+                    )
+
             for group_names in sequential:
                 subset = {n: full.get(n, full.get(n + ".module", None)) for n in group_names}
                 subset = {n: m for n, m in subset.items() if m is not None}
                 if not subset:
                     continue
+
+                # === Dynamic saliency boundary refresh ===
+                # Run ONE lightweight current-state forward that only hooks the
+                # modules in this group, then compute S_new = S_old + Δs_cross +
+                # Δs_quad (clamped ≥ 0) per module, merge into the saliency dict
+                # handed to collect_layer_grad_hessian_stats. This runs BEFORE
+                # the GPTQPlus objects for this group are created, so add_batch
+                # inside the H-accum forward will see the refreshed saliency.
+                dynsal_refresh_overrides = None
+                if dynsal_enabled:
+                    with layer_recorder.section("layer.dynsal.boundary_refresh") if layer_recorder else _NULL_CONTEXT:
+                        _cur_fwd_bsz = args.hessian_accum_bsz if args.hessian_accum_bsz is not None else args.bsz
+                        _cur_fwd_bsz = max(1, min(_cur_fwd_bsz, inps.shape[0]))
+                        current_y_dict = _collect_current_module_outputs_for_dynsal(
+                            layer=layer,
+                            inps=inps,
+                            module_dict=subset,
+                            dev=dev,
+                            bsz=_cur_fwd_bsz,
+                            attention_mask=attention_mask,
+                            position_ids=position_ids,
+                            position_embeddings=position_embeddings,
+                        )
+                        dynsal_by_layer = static_dynsal["by_layer"]
+                        N_global = int(static_dynsal["N_global"])
+                        dynsal_refresh_overrides = {}
+                        for _name in subset.keys():
+                            dyn_entry = dynsal_by_layer[i].get(
+                                _name, dynsal_by_layer[i].get(_name + ".module", None)
+                            )
+                            if dyn_entry is None:
+                                raise KeyError(
+                                    f"Missing dynsal cache for layer={i} module={_name}. "
+                                    f"Available keys: {sorted(dynsal_by_layer[i].keys())}"
+                                )
+                            static_sal = static_saliency_by_layer[i].get(
+                                _name, static_saliency_by_layer[i].get(_name + ".module", None)
+                            )
+                            if static_sal is None:
+                                raise KeyError(
+                                    f"Missing static saliency for layer={i} module={_name}."
+                                )
+                            if _name not in fp_y_dict:
+                                raise KeyError(
+                                    f"fp_y_dict entry for layer={i} module={_name} was already "
+                                    f"popped — boundary refresh ordering is broken."
+                                )
+                            S_new = refresh_dynamic_saliency(
+                                dyn_entry=dyn_entry,
+                                static_saliency=static_sal,
+                                N_global=N_global,
+                                current_Y=current_y_dict[_name],
+                                fp_Y=fp_y_dict[_name],
+                                num_groups=args.num_groups,
+                                dev=dev,
+                            )
+                            dynsal_refresh_overrides[_name] = S_new
+                            # Release fp_y_dict entry for this module immediately
+                            # so peak CPU memory drops as boundaries progress.
+                            del fp_y_dict[_name]
+                        del current_y_dict
+                        memory_utils.cleanup_memory()
+
+                # Merge any dynsal-refreshed saliency with the static shards. The
+                # downstream `collect_layer_grad_hessian_stats` only uses the dict
+                # to bypass its own saliency-collection pass; replacing specific
+                # module entries with S_new is sufficient.
+                precomputed_saliency_for_group = static_saliency_by_layer[i]
+                if dynsal_refresh_overrides:
+                    precomputed_saliency_for_group = {
+                        **static_saliency_by_layer[i],
+                        **dynsal_refresh_overrides,
+                    }
 
                 saliency_dict, gradients_dict, mean_reference_loss, layer_output_fisher = collect_layer_grad_hessian_stats(
                     model=model,
@@ -5504,7 +6065,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     layer_idx=i,
                     layer_refresh_loss_type=layer_refresh_loss_type,
                     gptq_reference_loss_type=gptq_reference_loss_type,
-                    precomputed_saliency_dict=static_saliency_by_layer[i],
+                    precomputed_saliency_dict=precomputed_saliency_for_group,
                     precomputed_layer_output_fisher=(
                         static_fisher_by_layer[i]
                         if layer_refresh_loss_type in ("fisher_diag_mse", "refined_mse")
@@ -5911,6 +6472,12 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     del layer_refined_mse_grad_pool_next
                 if layer_refined_mse_mean_grad_next is not None:
                     del layer_refined_mse_mean_grad_next
+                if fp_y_dict is not None:
+                    # fp_y_dict should already be drained by the 4 boundaries
+                    # popping their entries, but explicitly `del` to make the
+                    # lifetime boundary obvious and release any leftover on layer
+                    # error / early exit.
+                    del fp_y_dict
                 memory_utils.cleanup_memory()
 
             if quant_stop_layer is not None and i >= quant_stop_layer:

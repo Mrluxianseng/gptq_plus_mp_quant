@@ -30,7 +30,7 @@ DEVICE=${3}
 shift 3
 
 # Sweep configuration. Override from the shell when needed.
-GRAD_LRS_STR=${GRAD_LRS:-"0.00001"}
+GRAD_LRS_STR=${GRAD_LRS:-"0.000006 0.000008 0.00001 0.00002 0.00003"}
 DATASET=${DATASET:-wikitext2} # wikitext2 / neuralmagic / ultrachat_2k / numinamath
 N_SAMPLES=${N_SAMPLES:-2048}
 SEQ_LEN=${SEQ_LEN:-2048}
@@ -66,6 +66,14 @@ NUM_SAMPLES_FOR_REFINED_MSE=${NUM_SAMPLES_FOR_REFINED_MSE:-32}
 # on the back half only (not swept). Empty SPLIT = default to N // 2 at runtime.
 REFINED_MIX_SPLIT_LAYER=${REFINED_MIX_SPLIT_LAYER:-}
 REFINED_MIX_RKL_LR_RATIO=${REFINED_MIX_RKL_LR_RATIO:-0.2}
+# Dynamic saliency update knobs. When ENABLE_DYN_SAL=1, saliency is refreshed at
+# each of the 4 module-group boundaries per layer using a rank-R low-rank
+# decomposition of per-module end-to-end gradient matrices G = U·Σ·V^T captured
+# in precompute. DYN_SAL_RANK is the low-rank dimension. See
+# saliency_dynamic_update_design.md.
+ENABLE_DYN_SAL=${ENABLE_DYN_SAL:-1}
+DYN_SAL_RANK=${DYN_SAL_RANK:-16}
+DYN_SAL_EVD_THRESH=${DYN_SAL_EVD_THRESH:-1e-6}
 FINAL_LAYER_GRAD_LR=${FINAL_LAYER_GRAD_LR:-0.000001}
 PRE_GD_STEPS=${PRE_GD_STEPS:-10}
 PRE_GRAD_LR=${PRE_GRAD_LR:-0.00003}
@@ -267,6 +275,9 @@ if [[ "${FSDP_PRECOMPUTE}" == "1" && "${EXIT_AFTER_PRECOMPUTE}" != "1" ]]; then
         --kl_topk "${KL_TOPK}" --bsz "${BSZ}" --final_layer_stats_bsz "${FINAL_LAYER_STATS_BSZ}" --alpha "${ALPHA}" \
         --grad_hessian_topk "${GRAD_HESSIAN_TOPK}" \
         --saliency_clip_percentile "${SALIENCY_CLIP_PERCENTILE}" \
+        --enable_dynamic_saliency "${ENABLE_DYN_SAL}" \
+        --dyn_sal_rank "${DYN_SAL_RANK}" \
+        --dyn_sal_evd_thresh "${DYN_SAL_EVD_THRESH}" \
         "${GLOBAL_LOSS_ARGS[@]}" \
         "${DP_GLOBAL_SHUFFLE_ARGS[@]}" \
         --rotate \
@@ -326,6 +337,13 @@ for grad_lr in "${GRAD_LRS[@]}"; do
     if [[ "${GRAD_HESSIAN_TOPK}" != "-1" ]]; then
         grad_hessian_suffix="_ghtk${GRAD_HESSIAN_TOPK}"
     fi
+    dyn_sal_suffix=""
+    if [[ "${ENABLE_DYN_SAL}" == "1" ]]; then
+        dyn_sal_suffix="_dynsalR${DYN_SAL_RANK}"
+        if [[ "${DYN_SAL_EVD_THRESH}" != "1e-6" ]]; then
+            dyn_sal_suffix="${dyn_sal_suffix}_evd$(sanitize_float "${DYN_SAL_EVD_THRESH}")"
+        fi
+    fi
     pre_gd_suffix=""
     if [[ "${PRE_GD_STEPS}" != "0" ]]; then
         pre_gd_suffix="_pregd${PRE_GD_STEPS}_lr$(sanitize_float "${PRE_GRAD_LR}")_opt${PRE_GRAD_OPTIMIZER}"
@@ -336,7 +354,7 @@ for grad_lr in "${GRAD_LRS[@]}"; do
             pre_gd_suffix="${pre_gd_suffix}_flopt${PRE_FINAL_LAYER_GRAD_OPTIMIZER}"
         fi
     fi
-    exp_name="${BASE_EXP}_block_gd_${GRAD_OPTIMIZER}${refresh_suffix}${refined_rkl_suffix}${refined_mse_suffix}${refined_mix_suffix}${reg_suffix}${grad_hessian_suffix}_lr${grad_lr_tag}_fllr${final_layer_grad_lr_tag}_s${second_order_tag}${pre_gd_suffix}${PRE_CLIP_TAG}${BLOCK_ATOMIC_TAG}${FINAL_LAYER_FULL_BACKWARD_TAG}${GLOBAL_LOSS_TAG}${LOSS_SLIDE_WINDOW_TAG}${DP_GLOBAL_SHUFFLE_TAG}${GRAD_LR_LAYER_SCHEDULE_TAG}"
+    exp_name="${BASE_EXP}_block_gd_${GRAD_OPTIMIZER}${refresh_suffix}${refined_rkl_suffix}${refined_mse_suffix}${refined_mix_suffix}${reg_suffix}${grad_hessian_suffix}${dyn_sal_suffix}_lr${grad_lr_tag}_fllr${final_layer_grad_lr_tag}_s${second_order_tag}${pre_gd_suffix}${PRE_CLIP_TAG}${BLOCK_ATOMIC_TAG}${FINAL_LAYER_FULL_BACKWARD_TAG}${GLOBAL_LOSS_TAG}${LOSS_SLIDE_WINDOW_TAG}${DP_GLOBAL_SHUFFLE_TAG}${GRAD_LR_LAYER_SCHEDULE_TAG}"
 
     echo "============================================================"
     echo "Running GPTQ+ LR sweep"
@@ -405,6 +423,9 @@ for grad_lr in "${GRAD_LRS[@]}"; do
         --g_update_mode block_gd --grad_lr "${grad_lr}" --grad_optimizer "${GRAD_OPTIMIZER}" --grad_refresh_loss "${GRAD_REFRESH_LOSS}" \
         --refined_rkl_num_A "${REFINED_RKL_NUM_A}" --refined_rkl_damp "${REFINED_RKL_DAMP}" \
         --num_samples_for_refined_mse "${NUM_SAMPLES_FOR_REFINED_MSE}" \
+        --enable_dynamic_saliency "${ENABLE_DYN_SAL}" \
+        --dyn_sal_rank "${DYN_SAL_RANK}" \
+        --dyn_sal_evd_thresh "${DYN_SAL_EVD_THRESH}" \
         "${MIX_ARGS[@]}" \
         --rotate \
         "${GLOBAL_LOSS_ARGS[@]}" \

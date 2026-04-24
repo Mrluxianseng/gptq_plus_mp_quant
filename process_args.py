@@ -564,6 +564,42 @@ def parse_gen():
             "H×H A fit)."
         ),
     )
+    parser.add_argument(
+        "--enable_dynamic_saliency",
+        type=int,
+        default=0,
+        choices=[0, 1],
+        help=(
+            "Dynamic saliency update. When 1, refresh per-module saliency at each of the "
+            "4 module-group boundaries (qkv / o_proj / up+gate / down) using a low-rank "
+            "decomposition of the per-module end-to-end gradient matrix G = U·Σ·V^T "
+            "(captured once per module in precompute). At each boundary, ΔY = current_Y − "
+            "FP_Y drives the Fisher-linearized gradient perturbation Δg ≈ (1/N)·G^T G·ΔY, "
+            "which in turn updates the per-group saliency S = E[g²]. Requires --global_loss. "
+            "Adds ~1 extra end-to-end backward in precompute (for U) plus 1 FP forward + "
+            "1 current-state forward per layer-group boundary. See saliency_dynamic_update_design.md."
+        ),
+    )
+    parser.add_argument(
+        "--dyn_sal_rank",
+        type=int,
+        default=16,
+        help=(
+            "--enable_dynamic_saliency only: low-rank dimension R kept after EVD of per-module "
+            "G^T G. Higher R = finer Δg approximation but larger per-module U_Sigma cache "
+            "(N_local · T · R) on CPU and more matmul per boundary. Default 16. Typical sweep: "
+            "8 / 16 / 32 / 64."
+        ),
+    )
+    parser.add_argument(
+        "--dyn_sal_evd_thresh",
+        type=float,
+        default=1e-6,
+        help=(
+            "--enable_dynamic_saliency only: after EVD of G^T G, drop eigenvalues below "
+            "max(Σ²) · thresh to avoid Σ⁻¹ blowup on near-zero singular values. Default 1e-6."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -749,6 +785,21 @@ def parse_gen():
             raise ValueError(
                 f"--refined_mix_rkl_lr_ratio must be positive. "
                 f"Got {args.refined_mix_rkl_lr_ratio}."
+            )
+    if int(getattr(args, "enable_dynamic_saliency", 0)) == 1:
+        if not args.global_loss:
+            raise ValueError(
+                "--enable_dynamic_saliency=1 requires --global_loss (per-module G^T G is "
+                "collected during the same end-to-end backward as saliency/fisher)."
+            )
+        if args.dyn_sal_rank <= 0:
+            raise ValueError(
+                f"--dyn_sal_rank must be positive when --enable_dynamic_saliency=1. "
+                f"Got {args.dyn_sal_rank}."
+            )
+        if not (0.0 < args.dyn_sal_evd_thresh < 1.0):
+            raise ValueError(
+                f"--dyn_sal_evd_thresh must be in (0, 1). Got {args.dyn_sal_evd_thresh}."
             )
     if args.nsamples % args.backward_samples != 0:
         raise ValueError(

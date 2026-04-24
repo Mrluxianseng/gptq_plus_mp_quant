@@ -855,7 +855,7 @@ def quantize_and_measure(args, analyzer, trainloader, dev, target_layers, measur
         getattr(args, "grad_clip", None),
         getattr(args, "final_layer_grad_clip", None),
     )
-    static_saliency, static_fisher_by_layer, static_refined_A_by_layer, static_refined_diag_A_by_layer, _fp_inps_final = \
+    static_saliency, static_fisher_by_layer, static_refined_A_by_layer, static_refined_diag_A_by_layer, _fp_inps_final, _dynsal = \
         collect_static_end_to_end_saliency_and_fisher(
             model=model,
             analyzer=analyzer,
