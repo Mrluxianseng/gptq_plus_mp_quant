@@ -2569,21 +2569,32 @@ def collect_static_end_to_end_saliency_and_fisher(
 
     def make_dynsal_module_hook(layer_idx, module_name):
         """Capture per-module end-to-end gradient G (shape N_local×T × H_out, stacked
-        across batches) as a streaming CPU fp32 accumulator of G^T G. Post-loop
+        across batches) as an IN-PLACE GPU fp32 accumulator of G^T G. Post-loop
         all-reduce + EVD gives V, Σ² for the low-rank decomposition used by the
-        dynamic saliency update."""
+        dynamic saliency update.
+
+        Note: we intentionally keep the running sum on the GPU to avoid a
+        per-batch synchronous `.cpu()` transfer — doing the transfer inside every
+        backward hook drains the backward pipeline (GPU idle while waiting on
+        PCIe), costing orders of magnitude more than the actual matmul. Peak GPU
+        memory is `Σ_m H_out_m² * 4B` across ALL (layer, module) pairs. For
+        Llama-7B that's ~42 GB, for Qwen3-0.6B ~650 MB. Larger models should
+        use `--fsdp_precompute` which shards params + grads across ranks; the
+        accumulator itself stays replicated per-rank."""
         def forward_hook(module, inp, out):
             out_tensor = out[0] if isinstance(out, (tuple, list)) else out
             out_tensor.retain_grad()
 
             def grad_hook(grad):
                 grad_flat = grad.detach().float().reshape(-1, grad.shape[-1])
-                gtg_block = (grad_flat.t() @ grad_flat).cpu()
+                gtg_block = grad_flat.t() @ grad_flat  # stays on GPU fp32
                 slot = dynsal_gtg_data[layer_idx][module_name]
                 if slot is None:
+                    # First batch — this tensor IS the running sum from now on.
                     dynsal_gtg_data[layer_idx][module_name] = gtg_block
                 else:
                     slot.add_(gtg_block)
+                    del gtg_block  # release the per-batch intermediate promptly
 
             out_tensor.register_hook(grad_hook)
 
@@ -2989,13 +3000,14 @@ def collect_static_end_to_end_saliency_and_fisher(
                     for layer_idx, module_dict in enumerate(module_dicts):
                         layer_dynsal = {}
                         for module_name in module_dict.keys():
-                            gtg_sum_cpu = dynsal_gtg_data[layer_idx][module_name]
-                            if gtg_sum_cpu is None:
+                            gtg_gpu = dynsal_gtg_data[layer_idx][module_name]
+                            if gtg_gpu is None:
                                 raise ValueError(
                                     f"Failed to collect per-module G^T G for dynamic saliency: "
                                     f"layer={layer_idx} module={module_name}."
                                 )
-                            gtg_gpu = gtg_sum_cpu.to(dev, dtype=torch.float32)
+                            # Accumulator already on `dev` in fp32 (see
+                            # make_dynsal_module_hook). Just all-reduce in place.
                             dist_utils.allreduce_sum_(gtg_gpu)
                             gtg_gpu = 0.5 * (gtg_gpu + gtg_gpu.t())
                             eigvals, eigvecs = torch.linalg.eigh(gtg_gpu)
@@ -3018,6 +3030,10 @@ def collect_static_end_to_end_saliency_and_fisher(
                             }
                             # Keep the GPU copy of V around for the 2nd pass.
                             dynsal_V_dev[layer_idx][module_name] = V.detach().clone()
+                            # Release the GPU `G^T G` now — holding 32 layer × 7
+                            # module accumulators (≈42 GB fp32 at 7B) simultaneously
+                            # is what limits this to ≤13B without FSDP. Freeing per
+                            # (layer, module) as we EVD them drops peak promptly.
                             del gtg_gpu, eigvals, eigvecs, top_eigvals, top_eigvecs
                             dynsal_gtg_data[layer_idx][module_name] = None
                     dynsal_gtg_data = None
