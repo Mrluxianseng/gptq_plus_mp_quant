@@ -5499,415 +5499,422 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             layer_recorder=layer_recorder,
                         )
 
-            saliency_dict, gradients_dict, mean_reference_loss, layer_output_fisher = collect_layer_grad_hessian_stats(
-                model=model,
-                layer=layer,
-                analyzer=analyzer,
-                full=full,
-                names=names,
-                inps=inps,
-                fp_inps=fp_inps,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                position_embeddings=position_embeddings,
-                bsz=layer_stats_bsz,
-                num_groups=args.num_groups,
-                fisher_num_groups=args.fisher_num_groups,
-                kl_topk=args.kl_topk,
-                grad_hessian_topk=args.grad_hessian_topk,
-                dev=dev,
-                layer_idx=i,
-                layer_refresh_loss_type=layer_refresh_loss_type,
-                gptq_reference_loss_type=gptq_reference_loss_type,
-                precomputed_saliency_dict=static_saliency_by_layer[i],
-                precomputed_layer_output_fisher=(
-                    static_fisher_by_layer[i]
-                    if layer_refresh_loss_type in ("fisher_diag_mse", "refined_mse")
-                    else None
-                ),
-                fp_inps_final=fp_inps_final,
-                refined_A_list=layer_refined_A_list,
-                samples_per_A=refined_rkl_samples_per_A,
-                dp_rank=dp_rank,
-                dp_shard_size=n_local,
-                layer_recorder=layer_recorder,
-                skip_gradient_backward=skip_ref_backward,
-            )
-
+            # Compute slide-window refresh span over the whole transformer block,
+            # then quantize modules group-by-group so later groups collect Hessian
+            # inputs after earlier groups have already been quantized.
+            slide_refreshes_per_module = {}
+            for _name, _module in subset.items():
+                if _module is None:
+                    slide_refreshes_per_module[_name] = 0
+                    continue
+                _cols = _module.weight.shape[1]
+                _n_blocks = (_cols + args.blocksize - 1) // args.blocksize
+                slide_refreshes_per_module[_name] = max(_n_blocks - 1, 0)
+            slide_refresh_block_total = sum(slide_refreshes_per_module.values())
+            slide_refresh_cursor = 0
             gptq = {}
-            with layer_recorder.section("layer.gptq_setup") if layer_recorder else _NULL_CONTEXT:
-                for name in subset:
-                    layer_weight_bits = args.w_bits
-                    layer_weight_sym = not args.w_asym
-                    if "lm_head" in name:
-                        continue
-                    saliency = saliency_dict.get(name, saliency_dict.get(name + ".module", None))
-                    if saliency is None:
-                        raise KeyError(
-                            f"Missing saliency cache for layer={i} module={name}. "
-                            f"Available keys: {sorted(saliency_dict.keys())}"
+            saliency_dict = None
+            gradients_dict = None
+
+            for group_names in sequential:
+                subset = {n: full.get(n, full.get(n + ".module", None)) for n in group_names}
+                subset = {n: m for n, m in subset.items() if m is not None}
+                if not subset:
+                    continue
+
+                saliency_dict, gradients_dict, mean_reference_loss, layer_output_fisher = collect_layer_grad_hessian_stats(
+                    model=model,
+                    layer=layer,
+                    analyzer=analyzer,
+                    full=full,
+                    names=group_names,
+                    inps=inps,
+                    fp_inps=fp_inps,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    position_embeddings=position_embeddings,
+                    bsz=layer_stats_bsz,
+                    num_groups=args.num_groups,
+                    fisher_num_groups=args.fisher_num_groups,
+                    kl_topk=args.kl_topk,
+                    grad_hessian_topk=args.grad_hessian_topk,
+                    dev=dev,
+                    layer_idx=i,
+                    layer_refresh_loss_type=layer_refresh_loss_type,
+                    gptq_reference_loss_type=gptq_reference_loss_type,
+                    precomputed_saliency_dict=static_saliency_by_layer[i],
+                    precomputed_layer_output_fisher=(
+                        static_fisher_by_layer[i]
+                        if layer_refresh_loss_type in ("fisher_diag_mse", "refined_mse")
+                        else None
+                    ),
+                    fp_inps_final=fp_inps_final,
+                    refined_A_list=layer_refined_A_list,
+                    samples_per_A=refined_rkl_samples_per_A,
+                    dp_rank=dp_rank,
+                    dp_shard_size=n_local,
+                    layer_recorder=layer_recorder,
+                    skip_gradient_backward=skip_ref_backward,
+                )
+
+                gptq = {}
+                with layer_recorder.section("layer.gptq_setup") if layer_recorder else _NULL_CONTEXT:
+                    for name in subset:
+                        layer_weight_bits = args.w_bits
+                        layer_weight_sym = not args.w_asym
+                        if "lm_head" in name:
+                            continue
+                        saliency = saliency_dict.get(name, saliency_dict.get(name + ".module", None))
+                        if saliency is None:
+                            raise KeyError(
+                                f"Missing saliency cache for layer={i} module={name}. "
+                                f"Available keys: {sorted(saliency_dict.keys())}"
+                            )
+
+                        gptq[name] = GPTQPlus(
+                            subset[name],
+                            saliency=saliency,
+                            gradient=gradients_dict[name],
+                            num_groups=args.num_groups,
+                            alpha=args.alpha,
+                            reference_loss=mean_reference_loss,
+                        )
+                        gptq[name].quantizer = quant_utils.WeightQuantizer()
+                        gptq[name].quantizer.configure(
+                            layer_weight_bits,
+                            perchannel=True,
+                            sym=layer_weight_sym,
+                            mse=args.w_clip,
                         )
 
-                    gptq[name] = GPTQPlus(
-                        subset[name],
-                        saliency=saliency,
-                        gradient=gradients_dict[name],
-                        num_groups=args.num_groups,
-                        alpha=args.alpha,
-                        reference_loss=mean_reference_loss,
-                    )
-                    gptq[name].quantizer = quant_utils.WeightQuantizer()
-                    gptq[name].quantizer.configure(
-                        layer_weight_bits,
-                        perchannel=True,
-                        sym=layer_weight_sym,
-                        mse=args.w_clip,
-                    )
+                def add_batch(name):
+                    def tmp(_, inp, out):
+                        gptq[name].add_batch(inp[0].data, out.data)
 
-            def add_batch(name):
-                def tmp(_, inp, out):
-                    gptq[name].add_batch(inp[0].data, out.data)
+                    return tmp
 
-                return tmp
-
-            handles = []
-            add_batch_recorders = {}
-            for name in gptq:
-                if should_profile_module(i, name):
-                    add_batch_recorders[name] = QuantProfileRecorder(dev, prefix=f"layers.{i}.{name}")
-                    gptq[name].profile_recorder = add_batch_recorders[name]
-                handles.append(subset[name].register_forward_hook(add_batch(name)))
-            with layer_recorder.section("layer.hessian_accumulation_forward") if layer_recorder else _NULL_CONTEXT:
-                # Batch the accumulation forward so we don't pay a per-sample
-                # kernel-launch tax. `add_batch` already handles arbitrary
-                # batch sizes (it reshapes to [bsz*seq, dim] internally), so
-                # the math is bit-exact regardless of bsz.
-                hessian_accum_bsz = args.hessian_accum_bsz if args.hessian_accum_bsz is not None else args.bsz
-                hessian_accum_bsz = max(1, min(hessian_accum_bsz, inps.shape[0]))
-                for j in tqdm(
-                    range(0, inps.shape[0], hessian_accum_bsz),
-                    ncols=120,
-                    desc=f"Layer {i} Hessian accumulation",
-                    position=1,
-                    leave=False,
-                ):
-                    batch_bsz = min(hessian_accum_bsz, inps.shape[0] - j)
-                    _ = layer(
-                        inps[j : j + batch_bsz].to(dev),
-                        attention_mask=attention_mask.expand(batch_bsz, -1, -1, -1),
-                        position_ids=position_ids.expand(batch_bsz, -1),
-                        position_embeddings=(
-                            position_embeddings[0].expand(batch_bsz, -1, -1),
-                            position_embeddings[1].expand(batch_bsz, -1, -1),
-                        ),
-                    )[0]
-            for h in handles:
-                h.remove()
-            for name in add_batch_recorders:
-                gptq[name].profile_recorder = None
-
-            # Close out the Hessian accumulation: all-reduce the per-rank sums
-            # and apply the global normalisation exactly once. After this call
-            # fasterquant sees a globally-averaged H that is bit-identical on
-            # every rank (NCCL all_reduce is deterministic for a given op+shape).
-            with layer_recorder.section("layer.hessian_finalize") if layer_recorder else _NULL_CONTEXT:
+                handles = []
+                add_batch_recorders = {}
                 for name in gptq:
-                    gptq[name].finalize_hessian()
-
-            def make_gradient_refresh_fn(
-                module_name,
-                slide_next_layer=None,
-                slide_fp_inps_next=None,
-                slide_next_layer_output_fisher=None,
-                slide_next_refined_A_list=None,
-                slide_next_refined_mse_grad_pool=None,
-                slide_next_refined_mse_mean_grad=None,
-            ):
-                def refresh_fn(weight_snapshot, slide_alpha=1.0):
-                    if args.final_layer_full_backward and i == final_layer_idx:
-                        sample_indices = full_refresh_sample_indices
-                    else:
-                        sample_indices = gradient_refresh_scheduler.next_indices()
-                    partial_grad_sum, partial_count, loss_sum, grad_extras = (
-                        collect_true_weight_gradient(
-                            layer=layer,
-                            analyzer=analyzer,
-                            module_name=module_name,
-                            full=full,
-                            inps=inps,
-                            fp_inps=fp_inps,
-                            attention_mask=attention_mask,
-                            position_ids=position_ids,
-                            position_embeddings=position_embeddings,
-                            bsz=layer_backward_bsz,
-                            kl_topk=args.kl_topk,
-                            dev=dev,
-                            weight_override=weight_snapshot,
-                            sample_indices=sample_indices,
-                            refresh_loss_type=layer_refresh_loss_type,
-                            layer_output_fisher=layer_output_fisher,
-                            slide_alpha=slide_alpha,
-                            next_layer=slide_next_layer,
-                            fp_inps_next=slide_fp_inps_next,
-                            next_layer_output_fisher=slide_next_layer_output_fisher,
-                            fp_inps_final=fp_inps_final,
-                            refined_A_list=layer_refined_A_list,
-                            next_refined_A_list=slide_next_refined_A_list,
-                            samples_per_A=refined_rkl_samples_per_A,
-                            global_shuffle=dp_global_shuffle,
-                            dp_rank=dp_rank,
-                            shard_size=n_local,
-                            refresh_mb=getattr(args, "refresh_mb", None),
-                            refined_mse_pool_ids=layer_refined_mse_pool_ids,
-                            refined_mse_grad_pool=layer_refined_mse_grad_pool,
-                            refined_mse_mean_grad=layer_refined_mse_mean_grad,
-                            next_refined_mse_grad_pool=slide_next_refined_mse_grad_pool,
-                            next_refined_mse_mean_grad=slide_next_refined_mse_mean_grad,
-                            layer_recorder=layer_recorder,
-                        )
-                    )
-                    # DP aggregation. When world_size > 1 we pack the grad sum
-                    # and all scalar aggregates into a single contiguous tensor
-                    # and do one all_reduce instead of 3-5 back-to-back NCCL
-                    # collectives. Each collective costs one cudaStreamSynchronize
-                    # on every rank; packing cuts 20-40% off true_gradient_refresh
-                    # wall time in multi-rank runs.
-                    if dp_world > 1:
-                        extra_scalar_keys = [
-                            k for k in ("loss_sum_current", "loss_sum_next")
-                            if k in grad_extras
-                        ]
-                        # Layout: [grad_flat | count | loss_sum | extra_scalar_keys...]
-                        # fp32 is enough: partial_count fits exactly (< 2^24), and
-                        # a single-collective sum matches the precision of the
-                        # original per-tensor allreduces (NCCL uses fp32 paths too).
-                        grad_flat = partial_grad_sum.reshape(-1)
-                        scalar_vec = torch.tensor(
-                            [float(partial_count), float(loss_sum)]
-                            + [float(grad_extras[k]) for k in extra_scalar_keys],
-                            dtype=grad_flat.dtype, device=grad_flat.device,
-                        )
-                        packed = torch.cat([grad_flat, scalar_vec])
-                        dist_utils.allreduce_sum_(packed)
-                        partial_grad_sum.copy_(packed[:grad_flat.numel()].view_as(partial_grad_sum))
-                        scalar_out = packed[grad_flat.numel():]
-                        global_count = int(scalar_out[0].item())
-                        global_loss_sum = scalar_out[1].item()
-                        for idx, k in enumerate(extra_scalar_keys, start=2):
-                            grad_extras[k] = scalar_out[idx].item()
-                    else:
-                        global_count = partial_count
-                        global_loss_sum = loss_sum
-                    if global_count <= 0:
-                        raise RuntimeError(
-                            f"refresh produced zero samples across all ranks; "
-                            f"sample_indices={sample_indices[:8]}..."
-                        )
-                    grad = partial_grad_sum / float(global_count)
-                    mean_refresh_loss = global_loss_sum / float(global_count)
-                    meta = {
-                        "mean_refresh_loss": mean_refresh_loss,
-                        "sample_indices": sample_indices,
-                    }
-                    if "slide_alpha" in grad_extras:
-                        meta["slide_alpha"] = grad_extras["slide_alpha"]
-                    if "loss_sum_current" in grad_extras:
-                        meta["mean_refresh_loss_current"] = (
-                            grad_extras["loss_sum_current"] / float(global_count)
-                        )
-                    if "loss_sum_next" in grad_extras:
-                        meta["mean_refresh_loss_next"] = (
-                            grad_extras["loss_sum_next"] / float(global_count)
-                        )
-                    return grad, meta
-
-                return refresh_fn
-
-            def make_block_observer(module_name, effective_grad_optimizer):
-                def observer(payload):
-                    logging.info(
-                        "block-metrics layer=%d module=%s mode=%s grad_opt=%s block=%d cols=[%d,%d) remain=%d grad_abs_mean=%s grad_clipped_abs_mean=%s grad_row_l2=%s loss=%s refresh_loss=%s train_loss=%s val_loss=%s second_abs=%s second_abs_max=%s second_abs_q99=%s first_raw_abs=%s first_abs=%s first_abs_max=%s first_abs_q99=%s reg_abs=%s sine_abs=%s slide_alpha=%s loss_cur=%s loss_next=%s",
-                        i,
-                        module_name,
-                        args.g_update_mode,
-                        effective_grad_optimizer,
-                        payload["block_idx"],
-                        payload["col_start"],
-                        payload["col_end"],
-                        payload["remaining_columns"],
-                        format_log_value(payload["remaining_grad_abs_mean"], digits=4),
-                        format_log_value(payload.get("remaining_grad_clipped_abs_mean"), digits=4),
-                        format_log_value(payload["remaining_grad_mean_row_l2"], digits=4),
-                        format_log_value(payload["mean_refresh_loss"], digits=6),
-                        format_log_value(payload["refresh_subset_mean_refresh_loss"], digits=6),
-                        format_log_value(payload["train_mean_refresh_loss"], digits=6),
-                        format_log_value(payload["val_mean_refresh_loss"], digits=6),
-                        format_log_value(payload["second_order_update_abs_mean"], digits=4),
-                        format_log_value(payload.get("second_order_update_abs_max"), digits=4),
-                        format_log_value(payload.get("second_order_update_abs_q99"), digits=4),
-                        format_log_value(payload["first_order_raw_abs_mean"], digits=4),
-                        format_log_value(payload["first_order_update_abs_mean"], digits=4),
-                        format_log_value(payload.get("first_order_update_abs_max"), digits=4),
-                        format_log_value(payload.get("first_order_update_abs_q99"), digits=4),
-                        format_log_value(payload["regularizer_update_abs_mean"], digits=4),
-                        format_log_value(payload["sine_regularizer_update_abs_mean"], digits=4),
-                        format_log_value(payload.get("slide_alpha"), digits=3),
-                        format_log_value(payload.get("mean_refresh_loss_current"), digits=6),
-                        format_log_value(payload.get("mean_refresh_loss_next"), digits=6),
-                    )
-
-                return observer
-
-            with layer_recorder.section("layer.module_quantization") if layer_recorder else _NULL_CONTEXT:
-                # Pre-compute block-level slide-window refresh counters. The
-                # α=1→0 schedule should span the whole transformer block
-                # (because next-layer loss is defined against the NEXT block),
-                # not a single linear layer. Each module's refresh count is
-                # ceil(cols/blocksize) - 1 since the last block doesn't fire
-                # a refresh.
-                slide_refreshes_per_module = {}
-                for _name in subset:
-                    if _name not in gptq:
-                        slide_refreshes_per_module[_name] = 0
-                        continue
-                    _cols = subset[_name].weight.shape[1]
-                    _n_blocks = (_cols + args.blocksize - 1) // args.blocksize
-                    slide_refreshes_per_module[_name] = max(_n_blocks - 1, 0)
-                slide_refresh_block_total = sum(slide_refreshes_per_module.values())
-                slide_refresh_cursor = 0
-                for name in subset:
-                    if name not in gptq:
-                        continue
-                    pbar.set_postfix(module=f"layers.{i}." + name, loss=f"{mean_reference_loss:.2e}")
-                    layer_w_groupsize = args.w_groupsize
-                    effective_grad_optimizer = (
-                        args.final_layer_grad_optimizer
-                        if i == final_layer_idx and args.final_layer_grad_optimizer is not None
-                        else args.grad_optimizer
-                    )
-                    base_grad_lr = (
-                        args.final_layer_grad_lr
-                        if i == final_layer_idx and args.final_layer_grad_lr is not None
-                        else args.grad_lr * grad_lr_layer_scale
-                    )
-                    # refined_mix: back-half layers (refined_residual_kl) use
-                    # `grad_lr * refined_mix_rkl_lr_ratio`. Final-layer override
-                    # wins (final layer is forced to kl and typically has its
-                    # own tuned lr), so the ratio only applies when we're NOT
-                    # on the final layer and the effective loss is refined_rkl.
-                    if (
-                        mix_mode
-                        and i != final_layer_idx
-                        and layer_refresh_loss_type == "refined_residual_kl"
+                    if should_profile_module(i, name):
+                        add_batch_recorders[name] = QuantProfileRecorder(dev, prefix=f"layers.{i}.{name}")
+                        gptq[name].profile_recorder = add_batch_recorders[name]
+                    handles.append(subset[name].register_forward_hook(add_batch(name)))
+                with layer_recorder.section("layer.hessian_accumulation_forward") if layer_recorder else _NULL_CONTEXT:
+                    # Batch the accumulation forward so we don't pay a per-sample
+                    # kernel-launch tax. `add_batch` already handles arbitrary
+                    # batch sizes (it reshapes to [bsz*seq, dim] internally), so
+                    # the math is bit-exact regardless of bsz.
+                    hessian_accum_bsz = args.hessian_accum_bsz if args.hessian_accum_bsz is not None else args.bsz
+                    hessian_accum_bsz = max(1, min(hessian_accum_bsz, inps.shape[0]))
+                    for j in tqdm(
+                        range(0, inps.shape[0], hessian_accum_bsz),
+                        ncols=120,
+                        desc=f"Layer {i} Hessian accumulation",
+                        position=1,
+                        leave=False,
                     ):
-                        base_grad_lr *= float(getattr(args, "refined_mix_rkl_lr_ratio", 1.0))
-                    effective_grad_reg_strategy = "none" if i == final_layer_idx else args.grad_reg_strategy
-                    # Final-layer gradients come through lm_head + final norm and
-                    # are often orders of magnitude larger; allow an independent
-                    # clip. Falls back to `--grad_clip` for non-final layers or
-                    # when the override is not set.
-                    effective_main_grad_clip = (
-                        args.final_layer_grad_clip
-                        if i == final_layer_idx and args.final_layer_grad_clip is not None
-                        else args.grad_clip
-                    )
-                    effective_grad_lr = get_module_grad_lr(
-                        name,
-                        base_grad_lr,
-                        proj_lr_scale=args.proj_lr_scale,
-                        down_proj_lr_scale=args.down_proj_lr_scale,
-                    )
-                    if (
-                        effective_grad_lr != base_grad_lr
-                        or base_grad_lr != args.grad_lr
-                        or effective_grad_optimizer != args.grad_optimizer
-                    ):
+                        batch_bsz = min(hessian_accum_bsz, inps.shape[0] - j)
+                        _ = layer(
+                            inps[j : j + batch_bsz].to(dev),
+                            attention_mask=attention_mask.expand(batch_bsz, -1, -1, -1),
+                            position_ids=position_ids.expand(batch_bsz, -1),
+                            position_embeddings=(
+                                position_embeddings[0].expand(batch_bsz, -1, -1),
+                                position_embeddings[1].expand(batch_bsz, -1, -1),
+                            ),
+                        )[0]
+                for h in handles:
+                    h.remove()
+                for name in add_batch_recorders:
+                    gptq[name].profile_recorder = None
+
+                # Close out the Hessian accumulation: all-reduce the per-rank sums
+                # and apply the global normalisation exactly once. After this call
+                # fasterquant sees a globally-averaged H that is bit-identical on
+                # every rank (NCCL all_reduce is deterministic for a given op+shape).
+                with layer_recorder.section("layer.hessian_finalize") if layer_recorder else _NULL_CONTEXT:
+                    for name in gptq:
+                        gptq[name].finalize_hessian()
+
+                def make_gradient_refresh_fn(
+                    module_name,
+                    slide_next_layer=None,
+                    slide_fp_inps_next=None,
+                    slide_next_layer_output_fisher=None,
+                    slide_next_refined_A_list=None,
+                    slide_next_refined_mse_grad_pool=None,
+                    slide_next_refined_mse_mean_grad=None,
+                ):
+                    def refresh_fn(weight_snapshot, slide_alpha=1.0):
+                        if args.final_layer_full_backward and i == final_layer_idx:
+                            sample_indices = full_refresh_sample_indices
+                        else:
+                            sample_indices = gradient_refresh_scheduler.next_indices()
+                        partial_grad_sum, partial_count, loss_sum, grad_extras = (
+                            collect_true_weight_gradient(
+                                layer=layer,
+                                analyzer=analyzer,
+                                module_name=module_name,
+                                full=full,
+                                inps=inps,
+                                fp_inps=fp_inps,
+                                attention_mask=attention_mask,
+                                position_ids=position_ids,
+                                position_embeddings=position_embeddings,
+                                bsz=layer_backward_bsz,
+                                kl_topk=args.kl_topk,
+                                dev=dev,
+                                weight_override=weight_snapshot,
+                                sample_indices=sample_indices,
+                                refresh_loss_type=layer_refresh_loss_type,
+                                layer_output_fisher=layer_output_fisher,
+                                slide_alpha=slide_alpha,
+                                next_layer=slide_next_layer,
+                                fp_inps_next=slide_fp_inps_next,
+                                next_layer_output_fisher=slide_next_layer_output_fisher,
+                                fp_inps_final=fp_inps_final,
+                                refined_A_list=layer_refined_A_list,
+                                next_refined_A_list=slide_next_refined_A_list,
+                                samples_per_A=refined_rkl_samples_per_A,
+                                global_shuffle=dp_global_shuffle,
+                                dp_rank=dp_rank,
+                                shard_size=n_local,
+                                refresh_mb=getattr(args, "refresh_mb", None),
+                                refined_mse_pool_ids=layer_refined_mse_pool_ids,
+                                refined_mse_grad_pool=layer_refined_mse_grad_pool,
+                                refined_mse_mean_grad=layer_refined_mse_mean_grad,
+                                next_refined_mse_grad_pool=slide_next_refined_mse_grad_pool,
+                                next_refined_mse_mean_grad=slide_next_refined_mse_mean_grad,
+                                layer_recorder=layer_recorder,
+                            )
+                        )
+                        # DP aggregation. When world_size > 1 we pack the grad sum
+                        # and all scalar aggregates into a single contiguous tensor
+                        # and do one all_reduce instead of 3-5 back-to-back NCCL
+                        # collectives. Each collective costs one cudaStreamSynchronize
+                        # on every rank; packing cuts 20-40% off true_gradient_refresh
+                        # wall time in multi-rank runs.
+                        if dp_world > 1:
+                            extra_scalar_keys = [
+                                k for k in ("loss_sum_current", "loss_sum_next")
+                                if k in grad_extras
+                            ]
+                            # Layout: [grad_flat | count | loss_sum | extra_scalar_keys...]
+                            # fp32 is enough: partial_count fits exactly (< 2^24), and
+                            # a single-collective sum matches the precision of the
+                            # original per-tensor allreduces (NCCL uses fp32 paths too).
+                            grad_flat = partial_grad_sum.reshape(-1)
+                            scalar_vec = torch.tensor(
+                                [float(partial_count), float(loss_sum)]
+                                + [float(grad_extras[k]) for k in extra_scalar_keys],
+                                dtype=grad_flat.dtype, device=grad_flat.device,
+                            )
+                            packed = torch.cat([grad_flat, scalar_vec])
+                            dist_utils.allreduce_sum_(packed)
+                            partial_grad_sum.copy_(packed[:grad_flat.numel()].view_as(partial_grad_sum))
+                            scalar_out = packed[grad_flat.numel():]
+                            global_count = int(scalar_out[0].item())
+                            global_loss_sum = scalar_out[1].item()
+                            for idx, k in enumerate(extra_scalar_keys, start=2):
+                                grad_extras[k] = scalar_out[idx].item()
+                        else:
+                            global_count = partial_count
+                            global_loss_sum = loss_sum
+                        if global_count <= 0:
+                            raise RuntimeError(
+                                f"refresh produced zero samples across all ranks; "
+                                f"sample_indices={sample_indices[:8]}..."
+                            )
+                        grad = partial_grad_sum / float(global_count)
+                        mean_refresh_loss = global_loss_sum / float(global_count)
+                        meta = {
+                            "mean_refresh_loss": mean_refresh_loss,
+                            "sample_indices": sample_indices,
+                        }
+                        if "slide_alpha" in grad_extras:
+                            meta["slide_alpha"] = grad_extras["slide_alpha"]
+                        if "loss_sum_current" in grad_extras:
+                            meta["mean_refresh_loss_current"] = (
+                                grad_extras["loss_sum_current"] / float(global_count)
+                            )
+                        if "loss_sum_next" in grad_extras:
+                            meta["mean_refresh_loss_next"] = (
+                                grad_extras["loss_sum_next"] / float(global_count)
+                            )
+                        return grad, meta
+
+                    return refresh_fn
+
+                def make_block_observer(module_name, effective_grad_optimizer):
+                    def observer(payload):
                         logging.info(
-                            "Applying block_gd config for layer=%d module=%s: global_base_lr=%.4e layer_base_lr=%.4e effective_lr=%.4e global_opt=%s effective_opt=%s refresh_loss=%s",
+                            "block-metrics layer=%d module=%s mode=%s grad_opt=%s block=%d cols=[%d,%d) remain=%d grad_abs_mean=%s grad_clipped_abs_mean=%s grad_row_l2=%s loss=%s refresh_loss=%s train_loss=%s val_loss=%s second_abs=%s second_abs_max=%s second_abs_q99=%s first_raw_abs=%s first_abs=%s first_abs_max=%s first_abs_q99=%s reg_abs=%s sine_abs=%s slide_alpha=%s loss_cur=%s loss_next=%s",
                             i,
-                            name,
-                            args.grad_lr,
-                            base_grad_lr,
-                            effective_grad_lr,
-                            args.grad_optimizer,
+                            module_name,
+                            args.g_update_mode,
                             effective_grad_optimizer,
-                            layer_refresh_loss_type,
+                            payload["block_idx"],
+                            payload["col_start"],
+                            payload["col_end"],
+                            payload["remaining_columns"],
+                            format_log_value(payload["remaining_grad_abs_mean"], digits=4),
+                            format_log_value(payload.get("remaining_grad_clipped_abs_mean"), digits=4),
+                            format_log_value(payload["remaining_grad_mean_row_l2"], digits=4),
+                            format_log_value(payload["mean_refresh_loss"], digits=6),
+                            format_log_value(payload["refresh_subset_mean_refresh_loss"], digits=6),
+                            format_log_value(payload["train_mean_refresh_loss"], digits=6),
+                            format_log_value(payload["val_mean_refresh_loss"], digits=6),
+                            format_log_value(payload["second_order_update_abs_mean"], digits=4),
+                            format_log_value(payload.get("second_order_update_abs_max"), digits=4),
+                            format_log_value(payload.get("second_order_update_abs_q99"), digits=4),
+                            format_log_value(payload["first_order_raw_abs_mean"], digits=4),
+                            format_log_value(payload["first_order_update_abs_mean"], digits=4),
+                            format_log_value(payload.get("first_order_update_abs_max"), digits=4),
+                            format_log_value(payload.get("first_order_update_abs_q99"), digits=4),
+                            format_log_value(payload["regularizer_update_abs_mean"], digits=4),
+                            format_log_value(payload["sine_regularizer_update_abs_mean"], digits=4),
+                            format_log_value(payload.get("slide_alpha"), digits=3),
+                            format_log_value(payload.get("mean_refresh_loss_current"), digits=6),
+                            format_log_value(payload.get("mean_refresh_loss_next"), digits=6),
                         )
-                    if i == final_layer_idx and args.grad_reg_strategy != "none":
-                        logging.info(
-                            "Disabling first-order regularization for final layer=%d module=%s: %s -> none",
-                            i,
+
+                    return observer
+
+                with layer_recorder.section("layer.module_quantization") if layer_recorder else _NULL_CONTEXT:
+                    for name in subset:
+                        if name not in gptq:
+                            continue
+                        pbar.set_postfix(module=f"layers.{i}." + name, loss=f"{mean_reference_loss:.2e}")
+                        layer_w_groupsize = args.w_groupsize
+                        effective_grad_optimizer = (
+                            args.final_layer_grad_optimizer
+                            if i == final_layer_idx and args.final_layer_grad_optimizer is not None
+                            else args.grad_optimizer
+                        )
+                        base_grad_lr = (
+                            args.final_layer_grad_lr
+                            if i == final_layer_idx and args.final_layer_grad_lr is not None
+                            else args.grad_lr * grad_lr_layer_scale
+                        )
+                        # refined_mix: back-half layers (refined_residual_kl) use
+                        # `grad_lr * refined_mix_rkl_lr_ratio`. Final-layer override
+                        # wins (final layer is forced to kl and typically has its
+                        # own tuned lr), so the ratio only applies when we're NOT
+                        # on the final layer and the effective loss is refined_rkl.
+                        if (
+                            mix_mode
+                            and i != final_layer_idx
+                            and layer_refresh_loss_type == "refined_residual_kl"
+                        ):
+                            base_grad_lr *= float(getattr(args, "refined_mix_rkl_lr_ratio", 1.0))
+                        effective_grad_reg_strategy = "none" if i == final_layer_idx else args.grad_reg_strategy
+                        # Final-layer gradients come through lm_head + final norm and
+                        # are often orders of magnitude larger; allow an independent
+                        # clip. Falls back to `--grad_clip` for non-final layers or
+                        # when the override is not set.
+                        effective_main_grad_clip = (
+                            args.final_layer_grad_clip
+                            if i == final_layer_idx and args.final_layer_grad_clip is not None
+                            else args.grad_clip
+                        )
+                        effective_grad_lr = get_module_grad_lr(
                             name,
-                            args.grad_reg_strategy,
+                            base_grad_lr,
+                            proj_lr_scale=args.proj_lr_scale,
+                            down_proj_lr_scale=args.down_proj_lr_scale,
                         )
-                    module_recorder = (
-                        QuantProfileRecorder(dev, prefix=f"layers.{i}.{name}")
-                        if should_profile_module(i, name) else None
-                    )
-                    if dist_utils.is_main() and getattr(args, "enable_debug", False):
-                        _H = gptq[name].H
-                        _grad = gptq[name].gradients
-                        _sal = gptq[name].saliencies
-                        _act = gptq[name].act_square
-                        logging.info(
-                            "dp-probe layer=%d module=%s H_mean=%.6e H_absmax=%.6e grad_mean=%.6e grad_absmax=%.6e "
-                            "act_mean=%.6e sal_mean=%.6e sal_shape=%s refloss=%.6e tokens=%d idx=%d",
-                            i, name,
-                            _H.float().mean().item(), _H.float().abs().max().item(),
-                            _grad.float().mean().item(), _grad.float().abs().max().item(),
-                            _act.float().mean().item(),
-                            _sal.float().mean().item(), tuple(_sal.shape),
-                            gptq[name].reference_loss,
-                            gptq[name].token_count, gptq[name].index,
+                        if (
+                            effective_grad_lr != base_grad_lr
+                            or base_grad_lr != args.grad_lr
+                            or effective_grad_optimizer != args.grad_optimizer
+                        ):
+                            logging.info(
+                                "Applying block_gd config for layer=%d module=%s: global_base_lr=%.4e layer_base_lr=%.4e effective_lr=%.4e global_opt=%s effective_opt=%s refresh_loss=%s",
+                                i,
+                                name,
+                                args.grad_lr,
+                                base_grad_lr,
+                                effective_grad_lr,
+                                args.grad_optimizer,
+                                effective_grad_optimizer,
+                                layer_refresh_loss_type,
+                            )
+                        if i == final_layer_idx and args.grad_reg_strategy != "none":
+                            logging.info(
+                                "Disabling first-order regularization for final layer=%d module=%s: %s -> none",
+                                i,
+                                name,
+                                args.grad_reg_strategy,
+                            )
+                        module_recorder = (
+                            QuantProfileRecorder(dev, prefix=f"layers.{i}.{name}")
+                            if should_profile_module(i, name) else None
                         )
-                    gptq[name].fasterquant(
-                        blocksize=args.blocksize,
-                        percdamp=args.percdamp,
-                        groupsize=layer_w_groupsize,
-                        actorder=args.act_order,
-                        static_groups=args.act_order,
-                        enable_gradient_update=True,
-                        g_update_mode=args.g_update_mode,
-                        export_to_et=args.export_to_et,
-                        profile_recorder=module_recorder,
-                        gradient_refresh_fn=make_gradient_refresh_fn(
-                            name,
-                            slide_next_layer=slide_next_layer,
-                            slide_fp_inps_next=slide_fp_inps_next,
-                            slide_next_layer_output_fisher=slide_next_layer_output_fisher,
-                            slide_next_refined_A_list=slide_next_refined_A_list,
-                            slide_next_refined_mse_grad_pool=layer_refined_mse_grad_pool_next,
-                            slide_next_refined_mse_mean_grad=layer_refined_mse_mean_grad_next,
-                        ) if args.g_update_mode in {"block_backward", "block_gd"} else None,
-                        grad_lr=effective_grad_lr,
-                        grad_optimizer=effective_grad_optimizer,
-                        grad_reg_strategy=effective_grad_reg_strategy,
-                        grad_reg_lambda=args.grad_reg_lambda,
-                        grad_gate_floor=args.grad_gate_floor,
-                        grad_gate_sharpness=args.grad_gate_sharpness,
-                        grad_gate_sine_amp=args.grad_gate_sine_amp,
-                        second_order_scale=args.second_order_scale,
-                        block_atomic_quant=args.block_atomic_quant,
-                        block_observer=make_block_observer(name, effective_grad_optimizer) if args.g_update_mode in {"block_backward", "block_gd"} else None,
-                        grad_clip=effective_main_grad_clip,
-                        diagnostic_recorder=diagnostic_registry.get_or_create(i, name),
-                        slide_refresh_start=slide_refresh_cursor,
-                        slide_refresh_block_total=slide_refresh_block_total,
-                        refresh_full_metrics=bool(getattr(args, "refresh_full_metrics", False)),
-                    )
-                    slide_refresh_cursor += slide_refreshes_per_module[name]
-                    # DP correctness check (debug only): fasterquant is meant
-                    # to be deterministic given identical inputs, and since H /
-                    # gradients / act_square are bit-identical across ranks after
-                    # all-reduce, the output weight must be bit-identical too.
-                    # Any drift here compounds across layers, so we fail fast.
-                    if getattr(args, "enable_debug", False):
-                        dist_utils.assert_bit_exact(
-                            subset[name].weight.data,
-                            tag=f"layer{i}.{name}.weight_after_fasterquant",
+                        if dist_utils.is_main() and getattr(args, "enable_debug", False):
+                            _H = gptq[name].H
+                            _grad = gptq[name].gradients
+                            _sal = gptq[name].saliencies
+                            _act = gptq[name].act_square
+                            logging.info(
+                                "dp-probe layer=%d module=%s H_mean=%.6e H_absmax=%.6e grad_mean=%.6e grad_absmax=%.6e "
+                                "act_mean=%.6e sal_mean=%.6e sal_shape=%s refloss=%.6e tokens=%d idx=%d",
+                                i, name,
+                                _H.float().mean().item(), _H.float().abs().max().item(),
+                                _grad.float().mean().item(), _grad.float().abs().max().item(),
+                                _act.float().mean().item(),
+                                _sal.float().mean().item(), tuple(_sal.shape),
+                                gptq[name].reference_loss,
+                                gptq[name].token_count, gptq[name].index,
+                            )
+                        gptq[name].fasterquant(
+                            blocksize=args.blocksize,
+                            percdamp=args.percdamp,
+                            groupsize=layer_w_groupsize,
+                            actorder=args.act_order,
+                            static_groups=args.act_order,
+                            enable_gradient_update=True,
+                            g_update_mode=args.g_update_mode,
+                            export_to_et=args.export_to_et,
+                            profile_recorder=module_recorder,
+                            gradient_refresh_fn=make_gradient_refresh_fn(
+                                name,
+                                slide_next_layer=slide_next_layer,
+                                slide_fp_inps_next=slide_fp_inps_next,
+                                slide_next_layer_output_fisher=slide_next_layer_output_fisher,
+                                slide_next_refined_A_list=slide_next_refined_A_list,
+                                slide_next_refined_mse_grad_pool=layer_refined_mse_grad_pool_next,
+                                slide_next_refined_mse_mean_grad=layer_refined_mse_mean_grad_next,
+                            ) if args.g_update_mode in {"block_backward", "block_gd"} else None,
+                            grad_lr=effective_grad_lr,
+                            grad_optimizer=effective_grad_optimizer,
+                            grad_reg_strategy=effective_grad_reg_strategy,
+                            grad_reg_lambda=args.grad_reg_lambda,
+                            grad_gate_floor=args.grad_gate_floor,
+                            grad_gate_sharpness=args.grad_gate_sharpness,
+                            grad_gate_sine_amp=args.grad_gate_sine_amp,
+                            second_order_scale=args.second_order_scale,
+                            block_atomic_quant=args.block_atomic_quant,
+                            block_observer=make_block_observer(name, effective_grad_optimizer) if args.g_update_mode in {"block_backward", "block_gd"} else None,
+                            grad_clip=effective_main_grad_clip,
+                            diagnostic_recorder=diagnostic_registry.get_or_create(i, name),
+                            slide_refresh_start=slide_refresh_cursor,
+                            slide_refresh_block_total=slide_refresh_block_total,
+                            refresh_full_metrics=bool(getattr(args, "refresh_full_metrics", False)),
                         )
-                    quantizers["model.layers.%d.%s" % (i, name)] = gptq[name].quantizer
-                    gptq[name].free()
+                        slide_refresh_cursor += slide_refreshes_per_module[name]
+                        # DP correctness check (debug only): fasterquant is meant
+                        # to be deterministic given identical inputs, and since H /
+                        # gradients / act_square are bit-identical across ranks after
+                        # all-reduce, the output weight must be bit-identical too.
+                        # Any drift here compounds across layers, so we fail fast.
+                        if getattr(args, "enable_debug", False):
+                            dist_utils.assert_bit_exact(
+                                subset[name].weight.data,
+                                tag=f"layer{i}.{name}.weight_after_fasterquant",
+                            )
+                        quantizers["model.layers.%d.%s" % (i, name)] = gptq[name].quantizer
+                        gptq[name].free()
 
             with layer_recorder.section("layer.quantized_replay_forward") if layer_recorder else _NULL_CONTEXT:
                 for j in range(inps.shape[0]):
