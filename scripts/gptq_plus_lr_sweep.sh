@@ -30,16 +30,16 @@ DEVICE=${3}
 shift 3
 
 # Sweep configuration. Override from the shell when needed.
-GRAD_LRS_STR=${GRAD_LRS:-"0.000003"}
+GRAD_LRS_STR=${GRAD_LRS:-"0.00001"}
 DATASET=${DATASET:-wikitext2} # wikitext2 / neuralmagic / ultrachat_2k / numinamath
 N_SAMPLES=${N_SAMPLES:-256}
 SEQ_LEN=${SEQ_LEN:-2048}
-BSZ=${BSZ:-256}
+BSZ=${BSZ:-128}
 FINAL_LAYER_STATS_BSZ=${FINAL_LAYER_STATS_BSZ:-8}
 HESSIAN_ACCUM_BSZ=${HESSIAN_ACCUM_BSZ:-64}
 ENABLE_GPTQ_PLUS=${ENABLE_GPTQ_PLUS:-0}
-BACKWARD_SAMPLES=${BACKWARD_SAMPLES:-8}
-BACKWARD_BSZ=${BACKWARD_BSZ:-8}
+BACKWARD_SAMPLES=${BACKWARD_SAMPLES:-4}
+BACKWARD_BSZ=${BACKWARD_BSZ:-4}
 FINAL_LAYER_BACKWARD_BSZ=${FINAL_LAYER_BACKWARD_BSZ:-8}
 FINAL_LAYER_FULL_BACKWARD=${FINAL_LAYER_FULL_BACKWARD:-0}
 BLOCKSIZE=${BLOCKSIZE:-256}
@@ -99,7 +99,7 @@ SECOND_ORDER_SCALE=${SECOND_ORDER_SCALE:-1.0}
 PRE_CLIP=${PRE_CLIP:-0}
 GLOBAL_LOSS=${GLOBAL_LOSS:-1}
 GLOBAL_LOSS_BSZ=${GLOBAL_LOSS_BSZ:-8}
-LOSS_SLIDE_WINDOW=${LOSS_SLIDE_WINDOW:-0}
+LOSS_SLIDE_WINDOW=${LOSS_SLIDE_WINDOW:-1}
 DP_GLOBAL_SHUFFLE=${DP_GLOBAL_SHUFFLE:-1}
 # Drop first ATTENTION_SINK_SIZE tokens from every loss (NLL/KL/MSE) when
 # IGNORE_ATTENTION_SINK=1. Sink tokens still flow through forward / KV; only
@@ -292,19 +292,26 @@ if [[ "${FSDP_PRECOMPUTE}" == "1" && "${EXIT_AFTER_PRECOMPUTE}" != "1" ]]; then
         --dataset "${DATASET}" --nsamples "${N_SAMPLES}" --seq_len "${SEQ_LEN}" \
         --w_method gptq_plus --w_bits 4 --w_clip --num_groups "${NUM_GROUPS}"  --act_order \
         --kl_topk "${KL_TOPK}" --bsz "${BSZ}" --final_layer_stats_bsz "${FINAL_LAYER_STATS_BSZ}" --alpha "${ALPHA}" \
+        --enable_gptq_plus "${ENABLE_GPTQ_PLUS}" \
+        --g_update_mode block_gd --grad_refresh_loss "${GRAD_REFRESH_LOSS}" \
+        --refined_rkl_num_A "${REFINED_RKL_NUM_A}" --refined_rkl_damp "${REFINED_RKL_DAMP}" \
+        --num_samples_for_refined_mse "${NUM_SAMPLES_FOR_REFINED_MSE}" \
         --grad_hessian_topk "${GRAD_HESSIAN_TOPK}" \
         --saliency_clip_percentile "${SALIENCY_CLIP_PERCENTILE}" \
         --enable_dynamic_saliency "${ENABLE_DYN_SAL}" \
         --dyn_sal_rank "${DYN_SAL_RANK}" \
         --dyn_sal_evd_thresh "${DYN_SAL_EVD_THRESH}" \
         --dyn_sal_refresh_mode "${DYN_SAL_REFRESH_MODE}" \
+        "${MIX_ARGS[@]}" \
         "${GLOBAL_LOSS_ARGS[@]}" \
+        "${LOSS_SLIDE_WINDOW_ARGS[@]}" \
         "${DP_GLOBAL_SHUFFLE_ARGS[@]}" \
         "${ATTENTION_SINK_ARGS[@]}" \
         --rotate \
         --skip_eval \
         --fsdp_precompute --exit_after_precompute --static_cache_path "${STATIC_CACHE_PATH}" \
-        "${PRECOMPUTE_CPU_OFFLOAD_ARG[@]}"
+        "${PRECOMPUTE_CPU_OFFLOAD_ARG[@]}" \
+        "$@"
 
     # For the sweep loop below, drop FSDP flags (model is fresh each run) and
     # just point at the cache so each quantisation pass reads precomputed
