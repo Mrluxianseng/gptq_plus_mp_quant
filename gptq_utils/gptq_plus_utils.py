@@ -3656,12 +3656,14 @@ def _collect_module_output_projections(
     attention_mask,
     position_ids,
     position_embeddings,
+    sink_size=0,
 ):
     """Run ONE forward through `layer` with `inputs`, hook each module's output,
     and project it to the low-rank space on the fly: P_batch = out_batch @ V.
-    Writes per-batch (bsz, T, R_eff) bf16 slices into a preallocated CPU buffer
-    `(N_local, T, R_eff)` per module; NEVER materialises the full (N_local, T,
-    H_out) tensor on CPU — which for Llama-3-8B up/gate is ~120 GB per module.
+    Writes per-batch (bsz, T_eff, R_eff) bf16 slices into a preallocated CPU
+    buffer `(N_local, T_eff, R_eff)` per module; NEVER materialises the full
+    (N_local, T, H_out) tensor on CPU — which for Llama-3-8B up/gate is ~120 GB
+    per module.
 
     `V_by_name` tensors MUST be bf16 on `dev`. The hook does a bf16 @ bf16
     matmul directly against the forward activation (also bf16), avoiding an
@@ -3674,18 +3676,25 @@ def _collect_module_output_projections(
       module_dict: {module_name -> nn.Linear}; only these get hooks.
       V_by_name: {module_name -> (H_out, R_eff) **bf16** tensor on `dev`}.
       bsz:       forward micro-batch size.
+      sink_size: when >0, drop leading sink token positions from the captured
+                 module output before projection, while still running the layer
+                 forward on the full sequence.
 
     Returns:
-      {module_name -> (N_local, T, R_eff) bf16 CPU} — the P projections.
+      {module_name -> (N_local, T_eff, R_eff) bf16 CPU} — the P projections,
+      where T_eff = T - sink_size if T > sink_size else T.
     """
     N_local = inputs.shape[0]
     T = inputs.shape[1]
+    sink_size = max(0, int(sink_size))
+    drop_sink = sink_size > 0 and T > sink_size
+    T_eff = T - sink_size if drop_sink else T
     per_module_P = {}
     per_module_cursor = {}
 
     for name, V in V_by_name.items():
         R_eff = V.shape[1]
-        per_module_P[name] = torch.empty(N_local, T, R_eff, dtype=torch.bfloat16, device="cpu")
+        per_module_P[name] = torch.empty(N_local, T_eff, R_eff, dtype=torch.bfloat16, device="cpu")
         per_module_cursor[name] = 0
 
     handles = []
@@ -3696,11 +3705,19 @@ def _collect_module_output_projections(
         def hook(module, inp, out):
             out_tensor = out[0] if isinstance(out, (tuple, list)) else out
             bsz_local = out_tensor.shape[0]
-            # Reshape is a view on contiguous bf16 output — no allocation, no
-            # fp32 cast. Matmul in bf16 via tensor cores; result bf16.
-            out_flat = out_tensor.detach().reshape(bsz_local * T, -1)
-            P_flat = out_flat @ V_m  # (bsz_local*T, R_eff) bf16 dev
-            P_batch = P_flat.reshape(bsz_local, T, R_eff_local)
+            if drop_sink:
+                out_tensor = out_tensor[:, sink_size:]
+            if out_tensor.shape[1] != T_eff:
+                raise RuntimeError(
+                    f"_collect_module_output_projections: expected token dim {T_eff} "
+                    f"after sink slicing, got {out_tensor.shape[1]} for module {name}."
+                )
+            # Full-sequence output reshapes as a view; sink slicing may
+            # materialise only the non-sink bf16 view. In both cases we avoid an
+            # fp32 cast of the full activation. Matmul result is bf16.
+            out_flat = out_tensor.detach().reshape(bsz_local * T_eff, -1)
+            P_flat = out_flat @ V_m  # (bsz_local*T_eff, R_eff) bf16 dev
+            P_batch = P_flat.reshape(bsz_local, T_eff, R_eff_local)
             cursor = per_module_cursor[name]
             per_module_P[name][cursor:cursor + bsz_local].copy_(
                 P_batch.cpu(), non_blocking=True
@@ -6335,6 +6352,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         attention_mask=attention_mask,
                         position_ids=position_ids,
                         position_embeddings=position_embeddings,
+                        sink_size=sink_size,
                     )
 
                 # per_layer mode: compute S_new for every module once at layer
@@ -6354,6 +6372,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             attention_mask=attention_mask,
                             position_ids=position_ids,
                             position_embeddings=position_embeddings,
+                            sink_size=sink_size,
                         )
                         N_global = int(static_dynsal["N_global"])
                         precomputed_S_new_by_canonical = {}
@@ -6556,6 +6575,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             attention_mask=attention_mask,
                             position_ids=position_ids,
                             position_embeddings=position_embeddings,
+                            sink_size=sink_size,
                         )
                         dynsal_by_layer = static_dynsal["by_layer"]
                         N_global = int(static_dynsal["N_global"])
