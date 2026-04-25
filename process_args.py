@@ -613,9 +613,9 @@ def parse_gen():
             "    upstream drift AND the accumulated effect of already-quantized modules "
             "    in this layer.\n"
             "  per_layer: refresh ONCE per layer, at layer entry with all weights still "
-            "    FP. Captures upstream drift only. Halves the number of current-state "
-            "    forwards per layer (4 → 1), good for large-model sweeps where the per-"
-            "    boundary forward cost dominates."
+            "    FP, and accumulate Hessian ONCE for the whole layer before the four "
+            "    module-group quantization boundaries. Captures upstream drift only, "
+            "    then reuses the per-module H through qkv / o / up+gate / down."
         ),
     )
 
