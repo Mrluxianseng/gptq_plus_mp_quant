@@ -172,6 +172,29 @@ def parse_gen():
         ),
     )
     parser.add_argument(
+        "--ignore_attention_sink",
+        action="store_true",
+        help=(
+            "Skip the first --attention_sink_size tokens of every calibration sequence when "
+            "computing any loss (NLL / KL / hidden_mse / fisher_diag_mse / refined_mse / "
+            "residual_kl / refined_residual_kl / refined_diag_residual_kl). Sink tokens still "
+            "participate in forward/KV (so downstream tokens see them as context), but their "
+            "loss contribution and the gradients flowing back through them are zero. "
+            "Affects static saliency/Fisher precompute and per-layer stats; the on-disk static "
+            "cache key is augmented with `_sink{N}` so caches don't cross-contaminate. "
+            "Default off (no slicing)."
+        ),
+    )
+    parser.add_argument(
+        "--attention_sink_size",
+        type=int,
+        default=256,
+        help=(
+            "Number of leading tokens to drop from every loss calculation when "
+            "--ignore_attention_sink is set. Must be < --seq_len. Default 256."
+        ),
+    )
+    parser.add_argument(
         "--dp_global_shuffle",
         action="store_true",
         help=(
@@ -825,6 +848,17 @@ def parse_gen():
         )
     if args.grad_reg_lambda < 0:
         raise ValueError(f"`grad_reg_lambda` must be non-negative. Got {args.grad_reg_lambda}.")
+    if getattr(args, "ignore_attention_sink", False):
+        if args.attention_sink_size <= 0:
+            raise ValueError(
+                f"`--attention_sink_size` must be > 0 when `--ignore_attention_sink` is set. "
+                f"Got {args.attention_sink_size}."
+            )
+        if args.attention_sink_size >= args.seq_len:
+            raise ValueError(
+                f"`--attention_sink_size` ({args.attention_sink_size}) must be strictly less than "
+                f"`--seq_len` ({args.seq_len}); otherwise every loss has 0 valid tokens."
+            )
     if args.grad_clip == 0:
         raise ValueError("`grad_clip` must be non-zero. Use a negative value to disable clipping.")
     if args.final_layer_grad_clip is not None and args.final_layer_grad_clip == 0:

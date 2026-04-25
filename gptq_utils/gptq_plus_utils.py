@@ -643,6 +643,17 @@ class GPTQPlus:
                 sal_batch = self.saliencies[self.index: self.index + bsz].to(self.dev)
                 self.index += bsz
 
+            # When --ignore_attention_sink is on, the per-token saliency stored
+            # on this GPTQPlus instance has its sink positions stripped (T_eff =
+            # T - sink). The activation `inp` still carries the full T from the
+            # forward (KV is computed normally over the sink). Drop the leading
+            # `sink` rows from `inp` so the weighted-input mul below stays shape
+            # aligned. This makes the hessian accumulation see only non-sink
+            # tokens, which is the consistent companion to slicing the loss.
+            if sal_batch.dim() == 3 and inp.shape[1] > sal_batch.shape[1]:
+                _sink = inp.shape[1] - sal_batch.shape[1]
+                inp = inp[:, _sink:]
+
             with profile_recorder.section("add_batch.prepare_inputs") if profile_recorder else _NULL_CONTEXT:
                 if inp.dim() == 3:
                     inp = inp.reshape(-1, inp.shape[-1])
@@ -2160,7 +2171,7 @@ class SaliencyCache:
     """
     class for saving the output activation gradients in each layer.
     """
-    def __init__(self, names, num_groups):
+    def __init__(self, names, num_groups, sink_size=0):
         self.num_groups = num_groups
         self.saliency_cache = {}
         self.names = names
@@ -2168,6 +2179,13 @@ class SaliencyCache:
             self.saliency_cache[name] = []
         self.handles = []
         self.hooks_enabled = False
+        # Drop the first `sink_size` token positions from saliency. The sink
+        # tokens still flow through forward (KV) and the loss-driven backward
+        # populates non-zero gradients at sink positions via attention; this
+        # field tells the hook to slice them off before squaring/grouping so
+        # the per-token saliency tensor matches the "ignore_attention_sink"
+        # interpretation in compute_refresh_loss.
+        self.sink_size = max(0, int(sink_size))
 
     def cache_saliency(self, module, inp, out, name):
         # We'll store gradient on 'out', so we must retain it
@@ -2180,10 +2198,13 @@ class SaliencyCache:
             """
             if not self.hooks_enabled:
                 return
-            bsz, seq_len, hidden_dim = grad.shape
+            g = grad
+            if self.sink_size > 0 and g.dim() >= 2 and g.shape[1] > self.sink_size:
+                g = g[:, self.sink_size:]
+            bsz, seq_len, hidden_dim = g.shape
             group_size = hidden_dim // self.num_groups
 
-            grad_squared = grad.float().pow(2).view(bsz, seq_len, self.num_groups, group_size)
+            grad_squared = g.float().pow(2).view(bsz, seq_len, self.num_groups, group_size)
             mean_squared_grad = grad_squared.mean(dim=-1)  # -> [bsz, seq_len, num_groups]
 
             self.saliency_cache[name].append(mean_squared_grad)
@@ -2380,6 +2401,7 @@ def collect_static_end_to_end_saliency_and_fisher(
     collect_dynsal=False,
     dynsal_rank=16,
     dynsal_evd_thresh=1e-6,
+    sink_size=0,
 ):
     logging.info(
         "Collecting static end-to-end saliency/fisher caches from a single pre-quantization full-model backward pass. "
@@ -2579,6 +2601,13 @@ def collect_static_end_to_end_saliency_and_fisher(
             out_tensor.retain_grad()
 
             def grad_hook(grad):
+                # When --ignore_attention_sink is on, the loss above already
+                # excluded sink positions, but autograd still populates non-zero
+                # gradient at sink positions via attention back-flow. Drop the
+                # sink slice here so saliency / dynsal sketches consistently
+                # ignore the sink (matches compute_refresh_loss's slicing).
+                if sink_size > 0 and grad.dim() >= 2 and grad.shape[1] > sink_size:
+                    grad = grad[:, sink_size:]
                 bsz_local, seq_len_local, hidden_dim = grad.shape
                 if hidden_dim % saliency_num_groups != 0:
                     raise ValueError(
@@ -2681,6 +2710,8 @@ def collect_static_end_to_end_saliency_and_fisher(
             out_tensor.retain_grad()
 
             def grad_hook(grad):
+                if sink_size > 0 and grad.dim() >= 2 and grad.shape[1] > sink_size:
+                    grad = grad[:, sink_size:]
                 grad_flat = grad.detach().float().reshape(-1, grad.shape[-1])
                 # `grad` comes from an output-token SUM loss. Accumulate the
                 # unnormalised sum over middle-layer tokens here; aggregation
@@ -2710,6 +2741,11 @@ def collect_static_end_to_end_saliency_and_fisher(
                 # Keep 3D fp32 on dev. The full-RKL flat view is produced on the
                 # fly by the per-layer hook (reshape is a view — no copy). Diag
                 # mode also needs the 3D structure so we cache once here.
+                # When ignore_attention_sink is on, drop sink rows here so the
+                # downstream LS fit (refined_C / refined_diag_C) only sees
+                # non-sink token positions.
+                if sink_size > 0 and grad.dim() >= 2 and grad.shape[1] > sink_size:
+                    grad = grad[:, sink_size:]
                 refined_dy_buffer["dy_3d"] = grad.detach().float()
 
             out_tensor.register_hook(grad_hook)
@@ -2738,8 +2774,14 @@ def collect_static_end_to_end_saliency_and_fisher(
                         f"refined_rkl layer {layer_idx}: dy not captured before "
                         "this hook. Check hook registration order."
                     )
-                dy_3d = refined_dy_buffer["dy_3d"]  # (B, seq, H) fp32 on dev
-                dx_3d = grad.detach().float()
+                dy_3d = refined_dy_buffer["dy_3d"]  # (B, seq[-sink], H) fp32 on dev
+                # `dy_3d` is already sliced if sink_size>0 (see last-hook above);
+                # match `dx_3d` to the same length so the LS fit accumulators
+                # stay shape-aligned.
+                if sink_size > 0 and grad.dim() >= 2 and grad.shape[1] > sink_size:
+                    dx_3d = grad[:, sink_size:].detach().float()
+                else:
+                    dx_3d = grad.detach().float()
                 a = refined_current_a_idx["a"]
 
                 if collect_refined_rkl:
@@ -3046,9 +3088,14 @@ def collect_static_end_to_end_saliency_and_fisher(
                             base_seed=0,  # global static saliency uses its own namespace
                         )
                     with profile_recorder.section("pipeline.static_fisher.batch.nll_build") if profile_recorder else _NULL_CONTEXT:
+                        sl_for_nll = student_logits
+                        labels_for_nll = labels
+                        if sink_size > 0 and sl_for_nll.shape[1] > sink_size:
+                            sl_for_nll = sl_for_nll[:, sink_size:]
+                            labels_for_nll = labels_for_nll[:, sink_size:]
                         loss = F.cross_entropy(
-                            student_logits.view(-1, student_logits.size(-1)),
-                            labels.view(-1),
+                            sl_for_nll.reshape(-1, sl_for_nll.size(-1)),
+                            labels_for_nll.reshape(-1),
                             reduction="sum",
                         )
                         loss_for_backward = loss * _E2E_PRECOMPUTE_LOSS_GRAD_SCALE
@@ -3177,9 +3224,17 @@ def collect_static_end_to_end_saliency_and_fisher(
                             out_tensor.retain_grad()
 
                             def grad_hook(grad):
+                                # Pass-1 saliency hook already drops the sink
+                                # slice when sink_size>0, so saliency_data /
+                                # local_tokens_N / the (N_local·T_eff, K) buffer
+                                # are sized to T_eff = T - sink. Mirror the slice
+                                # here so rows in B_local match the buffer.
+                                g = grad
+                                if sink_size > 0 and g.dim() >= 2 and g.shape[1] > sink_size:
+                                    g = g[:, sink_size:]
                                 grad_flat = (
-                                    (grad.detach().float() / _E2E_PRECOMPUTE_LOSS_GRAD_SCALE)
-                                    .reshape(-1, grad.shape[-1])
+                                    (g.detach().float() / _E2E_PRECOMPUTE_LOSS_GRAD_SCALE)
+                                    .reshape(-1, g.shape[-1])
                                 )
                                 Q_m = dynsal_Q_dev[layer_idx][module_name]  # (d_out, K) fp32
                                 B_local = grad_flat @ Q_m  # (B·T, K) fp32
@@ -3228,9 +3283,14 @@ def collect_static_end_to_end_saliency_and_fisher(
                                 labels = _deterministic_categorical_labels(
                                     teacher_logits, _global_indices, base_seed=0,
                                 )
+                                sl_for_nll = student_logits
+                                labels_for_nll = labels
+                                if sink_size > 0 and sl_for_nll.shape[1] > sink_size:
+                                    sl_for_nll = sl_for_nll[:, sink_size:]
+                                    labels_for_nll = labels_for_nll[:, sink_size:]
                                 loss = F.cross_entropy(
-                                    student_logits.view(-1, student_logits.size(-1)),
-                                    labels.view(-1), reduction="sum",
+                                    sl_for_nll.reshape(-1, sl_for_nll.size(-1)),
+                                    labels_for_nll.reshape(-1), reduction="sum",
                                 )
                                 loss_for_backward = loss * _E2E_PRECOMPUTE_LOSS_GRAD_SCALE
                                 loss_for_backward.backward()
@@ -3702,13 +3762,26 @@ def compute_refresh_loss(
     layer_output_grad_mean=None,
     pool_positions=None,
     profile_recorder=None,
+    sink_size=0,
 ):
+    # `sink_size > 0` (driven by --ignore_attention_sink) drops the first
+    # `sink_size` seq positions from every loss tensor before reduction. The
+    # underlying activations still flow through forward / KV unchanged; only
+    # the loss values (and gradients flowing back through them) skip the sink.
+    # We slice every per-token tensor on dim=1; for refined_mse we additionally
+    # slice the grad pool / mean grad along the same axis so the first-order
+    # term's `.mean(dim=-1)` denominator is the post-sink token count too.
+    def _drop_sink(x):
+        if sink_size <= 0 or x is None or x.dim() < 2 or x.shape[1] <= sink_size:
+            return x
+        return x[:, sink_size:]
+
     if refresh_loss_type == "kl":
         with profile_recorder.section("compute_refresh_loss.kl.total") if profile_recorder else _NULL_CONTEXT:
             with profile_recorder.section("compute_refresh_loss.kl.logits_quant") if profile_recorder else _NULL_CONTEXT:
-                logits = hidden2logits(out_hidden, analyzer)
+                logits = hidden2logits(_drop_sink(out_hidden), analyzer)
             with profile_recorder.section("compute_refresh_loss.kl.logits_fp") if profile_recorder else _NULL_CONTEXT:
-                logits_fp = hidden2logits(fp_hidden, analyzer)
+                logits_fp = hidden2logits(_drop_sink(fp_hidden), analyzer)
             if kl_topk > 0:
                 with profile_recorder.section("compute_refresh_loss.kl.topk_slice") if profile_recorder else _NULL_CONTEXT:
                     logits_fp, indices = logits_fp.topk(kl_topk, dim=-1, sorted=False)
@@ -3721,7 +3794,7 @@ def compute_refresh_loss(
                 )
                 return kl_loss.sum(dim=-1).mean()
 
-    delta = out_hidden - fp_hidden
+    delta = _drop_sink(out_hidden - fp_hidden)
     if refresh_loss_type == "hidden_mse":
         with profile_recorder.section("compute_refresh_loss.hidden_mse") if profile_recorder else _NULL_CONTEXT:
             return 0.5 * delta.square().sum(dim=-1).mean()
@@ -3740,12 +3813,13 @@ def compute_refresh_loss(
             raise ValueError(
                 "`fp_final_hidden` must be provided for refresh_loss_type='residual_kl'."
             )
+        fp_final_sliced = _drop_sink(fp_final_hidden)
         with profile_recorder.section("compute_refresh_loss.residual_kl.total") if profile_recorder else _NULL_CONTEXT:
-            final_with_delta = fp_final_hidden + delta
+            final_with_delta = fp_final_sliced + delta
             with profile_recorder.section("compute_refresh_loss.residual_kl.logits_perturbed") if profile_recorder else _NULL_CONTEXT:
                 logits_perturbed = hidden2logits(final_with_delta, analyzer)
             with profile_recorder.section("compute_refresh_loss.residual_kl.logits_fp") if profile_recorder else _NULL_CONTEXT:
-                logits_fp = hidden2logits(fp_final_hidden, analyzer)
+                logits_fp = hidden2logits(fp_final_sliced, analyzer)
             if kl_topk > 0:
                 with profile_recorder.section("compute_refresh_loss.residual_kl.topk_slice") if profile_recorder else _NULL_CONTEXT:
                     logits_fp, indices = logits_fp.topk(kl_topk, dim=-1, sorted=False)
@@ -3777,6 +3851,7 @@ def compute_refresh_loss(
             raise ValueError(
                 "`refined_A` must be provided for refresh_loss_type='refined_residual_kl'."
             )
+        fp_final_sliced = _drop_sink(fp_final_hidden)
         with profile_recorder.section("compute_refresh_loss.refined_residual_kl.total") if profile_recorder else _NULL_CONTEXT:
             with profile_recorder.section("compute_refresh_loss.refined_residual_kl.A_cast_apply") if profile_recorder else _NULL_CONTEXT:
                 _A_cast = refined_A.to(delta.dtype)
@@ -3785,11 +3860,11 @@ def compute_refresh_loss(
                     refined_delta = torch.bmm(delta, _A_cast.transpose(-1, -2))
                 else:
                     refined_delta = torch.matmul(delta, _A_cast.t())
-            final_with_refined = fp_final_hidden + delta + refined_delta
+            final_with_refined = fp_final_sliced + delta + refined_delta
             with profile_recorder.section("compute_refresh_loss.refined_residual_kl.logits_perturbed") if profile_recorder else _NULL_CONTEXT:
                 logits_perturbed = hidden2logits(final_with_refined, analyzer)
             with profile_recorder.section("compute_refresh_loss.refined_residual_kl.logits_fp") if profile_recorder else _NULL_CONTEXT:
-                logits_fp = hidden2logits(fp_final_hidden, analyzer)
+                logits_fp = hidden2logits(fp_final_sliced, analyzer)
             if kl_topk > 0:
                 with profile_recorder.section("compute_refresh_loss.refined_residual_kl.topk_slice") if profile_recorder else _NULL_CONTEXT:
                     logits_fp, indices = logits_fp.topk(kl_topk, dim=-1, sorted=False)
@@ -3816,16 +3891,20 @@ def compute_refresh_loss(
             raise ValueError(
                 "`refined_A` must be provided for refresh_loss_type='refined_diag_residual_kl'."
             )
+        fp_final_sliced = _drop_sink(fp_final_hidden)
+        # `refined_A` was fit only on non-sink positions in the precompute
+        # hooks (or full-T positions when sink_size=0), so its token axis
+        # already matches `delta`'s sliced seq dim — no extra slice here.
         with profile_recorder.section("compute_refresh_loss.refined_diag_residual_kl.total") if profile_recorder else _NULL_CONTEXT:
             with profile_recorder.section("compute_refresh_loss.refined_diag_residual_kl.A_apply") if profile_recorder else _NULL_CONTEXT:
                 _A_cast = refined_A.to(delta.dtype)
                 # Broadcasts: (seq, H) → (1, seq, H) vs (B, seq, H). Both element-wise.
                 refined_delta = delta * _A_cast
-            final_with_refined = fp_final_hidden + delta + refined_delta
+            final_with_refined = fp_final_sliced + delta + refined_delta
             with profile_recorder.section("compute_refresh_loss.refined_diag_residual_kl.logits_perturbed") if profile_recorder else _NULL_CONTEXT:
                 logits_perturbed = hidden2logits(final_with_refined, analyzer)
             with profile_recorder.section("compute_refresh_loss.refined_diag_residual_kl.logits_fp") if profile_recorder else _NULL_CONTEXT:
-                logits_fp = hidden2logits(fp_final_hidden, analyzer)
+                logits_fp = hidden2logits(fp_final_sliced, analyzer)
             if kl_topk > 0:
                 with profile_recorder.section("compute_refresh_loss.refined_diag_residual_kl.topk_slice") if profile_recorder else _NULL_CONTEXT:
                     logits_fp, indices = logits_fp.topk(kl_topk, dim=-1, sorted=False)
@@ -3886,7 +3965,7 @@ def compute_refresh_loss(
                         "refined_mse: `pool_positions` non-empty but `layer_output_grad_exact` is None."
                     )
                 with profile_recorder.section("compute_refresh_loss.refined_mse.pool_fo") if profile_recorder else _NULL_CONTEXT:
-                    grad_exact_cast = layer_output_grad_exact.to(delta.dtype)
+                    grad_exact_cast = _drop_sink(layer_output_grad_exact.to(delta.dtype))
                     delta_pool = delta.index_select(0, pool_positions.to(delta.device))
                     fo_pool_sum = (grad_exact_cast * delta_pool).sum(dim=-1).mean(dim=-1).sum()
                     # Build non-pool mask on the fly; fine because B is small (≤64 typical).
@@ -3923,6 +4002,7 @@ def collect_layer_output_grad_for_refined_mse(
     store_dtype=torch.bfloat16,
     layer_recorder=None,
     collect_next=False,
+    sink_size=0,
 ):
     """Capture g = ∂(top-k KL vs teacher) / ∂(out_of_layer_idx) for a per-layer
     random sample pool. Used only by refresh_loss_type='refined_mse' to supply
@@ -4056,10 +4136,14 @@ def collect_layer_output_grad_for_refined_mse(
                                 if collect_next and k == layer_idx + 1:
                                     out_next = h
                         with layer_recorder.section("layer.refined_mse_grad_pool.batch.logits_student") if layer_recorder else _NULL_CONTEXT:
-                            logits_student = hidden2logits(h, analyzer)
+                            h_for_logits = h if sink_size <= 0 else h[:, sink_size:]
+                            logits_student = hidden2logits(h_for_logits, analyzer)
                         with layer_recorder.section("layer.refined_mse_grad_pool.batch.logits_teacher") if layer_recorder else _NULL_CONTEXT:
+                            fp_final_batch = fp_inps_final[batch_ids].to(dev)
+                            if sink_size > 0:
+                                fp_final_batch = fp_final_batch[:, sink_size:]
                             logits_teacher = hidden2logits(
-                                fp_inps_final[batch_ids].to(dev), analyzer
+                                fp_final_batch, analyzer
                             ).detach()
                         if kl_topk > 0:
                             with layer_recorder.section("layer.refined_mse_grad_pool.batch.topk_slice") if layer_recorder else _NULL_CONTEXT:
@@ -4134,10 +4218,16 @@ def collect_layer_output_grad_for_refined_mse(
         # loss above. For non-pool refresh samples we still use a shared
         # coefficient over middle-layer tokens, so this remains an average over
         # the pool's middle-token axis only.
-        mean_grad = grad_pool.float().mean(dim=(0, 1)).to(dev)
+        # When sink_size > 0 the kl_loss above already excluded sink positions,
+        # so grad_pool[:, :sink_size] is exactly zero. We still need to slice
+        # them out of the divisor to avoid a (T-sink)/T bias on `mean_grad`
+        # (which the non-pool first-order term in compute_refresh_loss reads).
+        gp_for_mean = grad_pool if sink_size <= 0 else grad_pool[:, sink_size:]
+        mean_grad = gp_for_mean.float().mean(dim=(0, 1)).to(dev)
         mean_grad_next = None
         if grad_pool_next is not None:
-            mean_grad_next = grad_pool_next.float().mean(dim=(0, 1)).to(dev)
+            gpn_for_mean = grad_pool_next if sink_size <= 0 else grad_pool_next[:, sink_size:]
+            mean_grad_next = gpn_for_mean.float().mean(dim=(0, 1)).to(dev)
     return grad_pool, mean_grad, grad_pool_next, mean_grad_next
 
 
@@ -4204,6 +4294,7 @@ def collect_layer_output_fisher_only(
     dev,
     layer_idx,
     layer_recorder=None,
+    sink_size=0,
 ):
     fisher_sum = None
     with torch.enable_grad():
@@ -4246,6 +4337,13 @@ def collect_layer_output_fisher_only(
                     if grad_hessian_topk <= 0 and kl_topk > 0:
                         kl_logits_fp, indices = logits_fp.topk(kl_topk, dim=-1, sorted=False)
                         kl_logits = logits.gather(-1, indices)
+                    if sink_size > 0:
+                        # Drop sink positions from the loss; sink activations still
+                        # participated in the forward (KV) so the gradient at sink
+                        # positions reflects attention flow, but we exclude them
+                        # from the Fisher aggregation below to be consistent.
+                        kl_logits = kl_logits[:, sink_size:]
+                        kl_logits_fp = kl_logits_fp[:, sink_size:]
                     kl_loss = F.kl_div(
                         F.log_softmax(kl_logits, dim=-1),
                         F.softmax(kl_logits_fp, dim=-1),
@@ -4262,7 +4360,8 @@ def collect_layer_output_fisher_only(
 
                     def layer_output_grad_hook(grad):
                         nonlocal fisher_sum
-                        grad_flat = grad.detach().float().reshape(-1, grad.shape[-1])
+                        g = grad if sink_size <= 0 else grad[:, sink_size:]
+                        grad_flat = g.detach().float().reshape(-1, g.shape[-1])
                         fisher_block = grad_flat.t() @ grad_flat
                         if fisher_sum is None:
                             fisher_sum = fisher_block
@@ -4279,7 +4378,8 @@ def collect_layer_output_fisher_only(
     if fisher_sum is None:
         return None
     dist_utils.allreduce_sum_(fisher_sum)
-    total_tokens = dist_utils.allreduce_sum_scalar(inps.shape[0] * inps.shape[1])
+    eff_seq = max(1, inps.shape[1] - max(0, sink_size))
+    total_tokens = dist_utils.allreduce_sum_scalar(inps.shape[0] * eff_seq)
     return (fisher_sum / float(total_tokens)).to(torch.bfloat16).cpu()
 
 
@@ -4318,6 +4418,7 @@ def collect_true_weight_gradient(
     next_refined_mse_grad_pool=None,
     next_refined_mse_mean_grad=None,
     layer_recorder=None,
+    sink_size=0,
 ):
     """Compute the refresh gradient as a per-rank partial sum + count.
 
@@ -4628,6 +4729,7 @@ def collect_true_weight_gradient(
                                 ),
                                 pool_positions=refined_mse_pool_positions,
                                 profile_recorder=layer_recorder,
+                                sink_size=sink_size,
                             )
                         if slide_active:
                             with layer_recorder.section("layer.true_weight_grad.batch.slide_next_forward") if layer_recorder else _NULL_CONTEXT:
@@ -4669,6 +4771,7 @@ def collect_true_weight_gradient(
                                         if refresh_loss_type == "refined_mse" else None
                                     ),
                                     profile_recorder=layer_recorder,
+                                    sink_size=sink_size,
                                 )
                             with layer_recorder.section("layer.true_weight_grad.batch.blend") if layer_recorder else _NULL_CONTEXT:
                                 refresh_loss = (
@@ -4735,6 +4838,7 @@ def collect_layer_grad_hessian_stats(
     dp_shard_size=None,
     layer_recorder=None,
     skip_gradient_backward=False,
+    sink_size=0,
 ):
     need_saliency_collection = precomputed_saliency_dict is None
     # When the caller sets skip_gradient_backward, we're running pure GPTQ with
@@ -4793,6 +4897,7 @@ def collect_layer_grad_hessian_stats(
             dev=dev,
             layer_idx=layer_idx,
             layer_recorder=layer_recorder,
+            sink_size=sink_size,
         )
         need_layer_output_fisher_collection = False
 
@@ -4806,7 +4911,7 @@ def collect_layer_grad_hessian_stats(
     with torch.enable_grad():
         saliency_cache = None
         if need_saliency_collection:
-            saliency_cache = SaliencyCache(names, num_groups)
+            saliency_cache = SaliencyCache(names, num_groups, sink_size=sink_size)
             saliency_cache.add_hook(full, enable=False)
         gradients_cache = GradientCache(names, num_groups)
         gradients_cache.add_hook(full, enable=False)
@@ -4878,9 +4983,14 @@ def collect_layer_grad_hessian_stats(
                                 base_seed=layer_idx * 131 + 7,
                             )
                         with layer_recorder.section("layer.grad_hessian.forward.nll_build") if layer_recorder else _NULL_CONTEXT:
+                            ghl_for_nll = grad_hessian_logits
+                            labels_for_nll = labels
+                            if sink_size > 0 and ghl_for_nll.shape[1] > sink_size:
+                                ghl_for_nll = ghl_for_nll[:, sink_size:]
+                                labels_for_nll = labels_for_nll[:, sink_size:]
                             nll_loss = F.cross_entropy(
-                                grad_hessian_logits.view(-1, grad_hessian_logits.size(-1)),
-                                labels.view(-1),
+                                ghl_for_nll.reshape(-1, ghl_for_nll.size(-1)),
+                                labels_for_nll.reshape(-1),
                                 reduction="sum",
                             )
 
@@ -4906,6 +5016,9 @@ def collect_layer_grad_hessian_stats(
                                 with layer_recorder.section("layer.grad_hessian.gradient_loss_build.topk") if layer_recorder else _NULL_CONTEXT:
                                     kl_logits_fp, indices = logits_fp.topk(kl_topk, dim=-1, sorted=False)
                                     kl_logits = logits.gather(-1, indices)
+                            if sink_size > 0 and kl_logits.shape[1] > sink_size:
+                                kl_logits = kl_logits[:, sink_size:]
+                                kl_logits_fp = kl_logits_fp[:, sink_size:]
                             gradient_loss = F.kl_div(
                                 F.log_softmax(kl_logits, dim=-1),
                                 F.softmax(kl_logits_fp, dim=-1),
@@ -4940,6 +5053,7 @@ def collect_layer_grad_hessian_stats(
                                 fp_final_hidden=fp_final_batch,
                                 refined_A=refined_A_batch,
                                 profile_recorder=layer_recorder,
+                                sink_size=sink_size,
                             )
 
                     with layer_recorder.section("layer.grad_hessian.gradient_backward.total") if layer_recorder else _NULL_CONTEXT:
@@ -5029,6 +5143,7 @@ def run_pre_quant_gd(
     refined_mse_grad_pool=None,
     refined_mse_mean_grad=None,
     layer_recorder=None,
+    sink_size=0,
 ):
     if num_steps <= 0 or not module_names:
         return
@@ -5090,6 +5205,7 @@ def run_pre_quant_gd(
                                 refined_mse_grad_pool=refined_mse_grad_pool,
                                 refined_mse_mean_grad=refined_mse_mean_grad,
                                 layer_recorder=layer_recorder,
+                                sink_size=sink_size,
                             )
                         )
                     # DP aggregation — packed into one allreduce (grad tensor +
@@ -5193,6 +5309,20 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
         logging.info("Quantization will stop after transformer layer %d.", quant_stop_layer)
     preclip_enabled = bool(args.w_clip and getattr(args, "pre_clip", True))
     enable_gptq_plus = bool(getattr(args, "enable_gptq_plus", 1))
+    # Resolve once and thread through every loss/grad-collecting call site.
+    # When --ignore_attention_sink is off this is 0 and every site short-
+    # circuits the slicing branches (no numeric change vs the legacy code).
+    sink_size = (
+        int(getattr(args, "attention_sink_size", 256))
+        if bool(getattr(args, "ignore_attention_sink", False))
+        else 0
+    )
+    if sink_size > 0:
+        logging.info(
+            "ignore_attention_sink: dropping the first %d tokens of every loss "
+            "(NLL/KL/MSE) at static-precompute and per-layer stats; sink tokens "
+            "still flow through forward/KV.", sink_size,
+        )
     if not enable_gptq_plus:
         # Semantic of enable_gptq_plus=0: fully equivalent to setting alpha=0.
         # Only the GPTQ+ first-order term (GHinv / Z / beta inside fasterquant's
@@ -5340,6 +5470,10 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     f"salclip{sal_clip_tag}_rklNA{rkl_na}_fpfinal{fpfinal_tag}"
                     f"_e2els{int(_E2E_PRECOMPUTE_LOSS_GRAD_SCALE)}{mix_tag}{dynsal_tag}"
                 )
+                # Bind `_sink{N}` to the cache key only when the option is on,
+                # so legacy caches keep their byte-identical key (no migration).
+                if sink_size > 0:
+                    static_cache_key += f"_sink{sink_size}"
                 static_cache_key += f"_world{dist_utils.get_world_size()}_rank{dist_utils.get_rank()}"
                 os.makedirs(static_cache_dir, exist_ok=True)
             static_cache_file = (
@@ -5441,6 +5575,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             collect_dynsal=want_dynsal,
                             dynsal_rank=int(getattr(args, "dyn_sal_rank", 16)),
                             dynsal_evd_thresh=float(getattr(args, "dyn_sal_evd_thresh", 1e-6)),
+                            sink_size=sink_size,
                         )
                 if static_cache_file is not None:
                     with pipeline_recorder.section("pipeline.static_cache.save") if pipeline_recorder else _NULL_CONTEXT:
@@ -5851,6 +5986,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                                     dev=dev,
                                     collect_next=collect_next_refined_mse,
                                     layer_recorder=layer_recorder,
+                                    sink_size=sink_size,
                                 )
                         finally:
                             # Launch the downstream D2H on a side stream and
@@ -6037,6 +6173,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             dev=dev,
                             layer_idx=i,
                             layer_recorder=layer_recorder,
+                            sink_size=sink_size,
                         )
                 for name in subset:
                     if subset[name] is not None:
@@ -6112,6 +6249,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             refined_mse_grad_pool=layer_refined_mse_grad_pool,
                             refined_mse_mean_grad=layer_refined_mse_mean_grad,
                             layer_recorder=layer_recorder,
+                            sink_size=sink_size,
                         )
 
             # Compute slide-window refresh span over the whole transformer block,
@@ -6375,6 +6513,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         dp_shard_size=n_local,
                         layer_recorder=layer_recorder,
                         skip_gradient_backward=skip_ref_backward,
+                        sink_size=sink_size,
                     )
                     gptq = build_gptq_for_subset(
                         layerwide_subset,
@@ -6507,6 +6646,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         dp_shard_size=n_local,
                         layer_recorder=layer_recorder,
                         skip_gradient_backward=skip_ref_backward,
+                        sink_size=sink_size,
                     )
                     gptq = build_gptq_for_subset(
                         subset,
@@ -6566,6 +6706,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                                 next_refined_mse_grad_pool=slide_next_refined_mse_grad_pool,
                                 next_refined_mse_mean_grad=slide_next_refined_mse_mean_grad,
                                 layer_recorder=layer_recorder,
+                                sink_size=sink_size,
                             )
                         )
                         # DP aggregation. When world_size > 1 we pack the grad sum

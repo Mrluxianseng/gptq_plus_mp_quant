@@ -30,16 +30,16 @@ DEVICE=${3}
 shift 3
 
 # Sweep configuration. Override from the shell when needed.
-GRAD_LRS_STR=${GRAD_LRS:-"0.00001"}
+GRAD_LRS_STR=${GRAD_LRS:-"0.000003"}
 DATASET=${DATASET:-wikitext2} # wikitext2 / neuralmagic / ultrachat_2k / numinamath
-N_SAMPLES=${N_SAMPLES:-2048}
+N_SAMPLES=${N_SAMPLES:-256}
 SEQ_LEN=${SEQ_LEN:-2048}
-BSZ=${BSZ:-128}
+BSZ=${BSZ:-256}
 FINAL_LAYER_STATS_BSZ=${FINAL_LAYER_STATS_BSZ:-8}
 HESSIAN_ACCUM_BSZ=${HESSIAN_ACCUM_BSZ:-64}
 ENABLE_GPTQ_PLUS=${ENABLE_GPTQ_PLUS:-0}
-BACKWARD_SAMPLES=${BACKWARD_SAMPLES:-32}
-BACKWARD_BSZ=${BACKWARD_BSZ:-32}
+BACKWARD_SAMPLES=${BACKWARD_SAMPLES:-8}
+BACKWARD_BSZ=${BACKWARD_BSZ:-8}
 FINAL_LAYER_BACKWARD_BSZ=${FINAL_LAYER_BACKWARD_BSZ:-8}
 FINAL_LAYER_FULL_BACKWARD=${FINAL_LAYER_FULL_BACKWARD:-0}
 BLOCKSIZE=${BLOCKSIZE:-256}
@@ -71,14 +71,14 @@ REFINED_MIX_RKL_LR_RATIO=${REFINED_MIX_RKL_LR_RATIO:-0.2}
 # decomposition of per-module end-to-end gradient matrices G = U·Σ·V^T captured
 # in precompute. DYN_SAL_RANK is the low-rank dimension. See
 # saliency_dynamic_update_design.md.
-ENABLE_DYN_SAL=${ENABLE_DYN_SAL:-1}
+ENABLE_DYN_SAL=${ENABLE_DYN_SAL:-0}
 DYN_SAL_RANK=${DYN_SAL_RANK:-16}
 DYN_SAL_EVD_THRESH=${DYN_SAL_EVD_THRESH:-1e-6}
 # Refresh cadence. `per_boundary` (default) = 4 refreshes per layer (qkv / o /
 # up+gate / down entry). `per_layer` = 1 refresh per layer (at layer entry,
 # weights still FP; captures only upstream drift, halves the current-state
 # forwards per layer).
-DYN_SAL_REFRESH_MODE=${DYN_SAL_REFRESH_MODE:-per_boundary} # per_layer or per_boundary
+DYN_SAL_REFRESH_MODE=${DYN_SAL_REFRESH_MODE:-per_layer} # per_layer or per_boundary
 FINAL_LAYER_GRAD_LR=${FINAL_LAYER_GRAD_LR:-0.000001}
 PRE_GD_STEPS=${PRE_GD_STEPS:-10}
 PRE_GRAD_LR=${PRE_GRAD_LR:-0.00003}
@@ -101,6 +101,13 @@ GLOBAL_LOSS=${GLOBAL_LOSS:-1}
 GLOBAL_LOSS_BSZ=${GLOBAL_LOSS_BSZ:-8}
 LOSS_SLIDE_WINDOW=${LOSS_SLIDE_WINDOW:-0}
 DP_GLOBAL_SHUFFLE=${DP_GLOBAL_SHUFFLE:-1}
+# Drop first ATTENTION_SINK_SIZE tokens from every loss (NLL/KL/MSE) when
+# IGNORE_ATTENTION_SINK=1. Sink tokens still flow through forward / KV; only
+# the loss values and the gradients flowing back through them are zeroed.
+# Affects static saliency/Fisher precompute (cache key gets `_sink{N}` so it
+# doesn't collide with non-sink runs).
+IGNORE_ATTENTION_SINK=${IGNORE_ATTENTION_SINK:-1}
+ATTENTION_SINK_SIZE=${ATTENTION_SINK_SIZE:-256}
 # --grad_lr_layer_schedule {none, cosine, linear, sqrt}
 GRAD_LR_LAYER_SCHEDULE=${GRAD_LR_LAYER_SCHEDULE:-cosine}
 ALPHA=${ALPHA:-0.0}
@@ -138,7 +145,7 @@ export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-0}
 # RDZV port decouples from DEVICE so the commas don't end up in the endpoint.
 IFS=',' read -r -a _DEVICE_LIST <<< "${DEVICE}"
 N_GPUS=${N_GPUS:-${#_DEVICE_LIST[@]}}
-RDZV_PORT=${RDZV_PORT:-29400}
+RDZV_PORT=${RDZV_PORT:-29500}
 
 sanitize_float() {
     local value="${1}"
@@ -205,6 +212,13 @@ LOSS_SLIDE_WINDOW_TAG=""
 if [[ "${LOSS_SLIDE_WINDOW}" == "1" ]]; then
     LOSS_SLIDE_WINDOW_ARGS=(--loss_slide_window)
     LOSS_SLIDE_WINDOW_TAG="_slidewin"
+fi
+
+ATTENTION_SINK_ARGS=()
+ATTENTION_SINK_TAG=""
+if [[ "${IGNORE_ATTENTION_SINK}" == "1" ]]; then
+    ATTENTION_SINK_ARGS=(--ignore_attention_sink --attention_sink_size "${ATTENTION_SINK_SIZE}")
+    ATTENTION_SINK_TAG="_sink${ATTENTION_SINK_SIZE}"
 fi
 
 DP_GLOBAL_SHUFFLE_ARGS=()
@@ -286,6 +300,7 @@ if [[ "${FSDP_PRECOMPUTE}" == "1" && "${EXIT_AFTER_PRECOMPUTE}" != "1" ]]; then
         --dyn_sal_refresh_mode "${DYN_SAL_REFRESH_MODE}" \
         "${GLOBAL_LOSS_ARGS[@]}" \
         "${DP_GLOBAL_SHUFFLE_ARGS[@]}" \
+        "${ATTENTION_SINK_ARGS[@]}" \
         --rotate \
         --skip_eval \
         --fsdp_precompute --exit_after_precompute --static_cache_path "${STATIC_CACHE_PATH}" \
@@ -363,7 +378,7 @@ for grad_lr in "${GRAD_LRS[@]}"; do
             pre_gd_suffix="${pre_gd_suffix}_flopt${PRE_FINAL_LAYER_GRAD_OPTIMIZER}"
         fi
     fi
-    exp_name="${BASE_EXP}_block_gd_${GRAD_OPTIMIZER}${refresh_suffix}${refined_rkl_suffix}${refined_mse_suffix}${refined_mix_suffix}${reg_suffix}${grad_hessian_suffix}${dyn_sal_suffix}_lr${grad_lr_tag}_fllr${final_layer_grad_lr_tag}_s${second_order_tag}${pre_gd_suffix}${PRE_CLIP_TAG}${BLOCK_ATOMIC_TAG}${FINAL_LAYER_FULL_BACKWARD_TAG}${GLOBAL_LOSS_TAG}${LOSS_SLIDE_WINDOW_TAG}${DP_GLOBAL_SHUFFLE_TAG}${GRAD_LR_LAYER_SCHEDULE_TAG}"
+    exp_name="${BASE_EXP}_block_gd_${GRAD_OPTIMIZER}${refresh_suffix}${refined_rkl_suffix}${refined_mse_suffix}${refined_mix_suffix}${reg_suffix}${grad_hessian_suffix}${dyn_sal_suffix}_lr${grad_lr_tag}_fllr${final_layer_grad_lr_tag}_s${second_order_tag}${pre_gd_suffix}${PRE_CLIP_TAG}${BLOCK_ATOMIC_TAG}${FINAL_LAYER_FULL_BACKWARD_TAG}${GLOBAL_LOSS_TAG}${LOSS_SLIDE_WINDOW_TAG}${ATTENTION_SINK_TAG}${DP_GLOBAL_SHUFFLE_TAG}${GRAD_LR_LAYER_SCHEDULE_TAG}"
 
     echo "============================================================"
     echo "Running GPTQ+ LR sweep"
@@ -440,6 +455,7 @@ for grad_lr in "${GRAD_LRS[@]}"; do
         --rotate \
         "${GLOBAL_LOSS_ARGS[@]}" \
         "${LOSS_SLIDE_WINDOW_ARGS[@]}" \
+        "${ATTENTION_SINK_ARGS[@]}" \
         "${DP_GLOBAL_SHUFFLE_ARGS[@]}" \
         "${GRAD_LR_LAYER_SCHEDULE_ARGS[@]}" \
         "${FSDP_ARGS[@]}" \
