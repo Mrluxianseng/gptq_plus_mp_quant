@@ -6108,13 +6108,14 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
             # ~450× smaller than caching FP_Y directly.
             #
             # `dyn_sal_refresh_mode`:
-            #   per_boundary (default): 4 S_new refreshes per layer, one before
+            #   per_boundary (default): refresh S and accumulate Hessian before
             #     each of the qkv / o / up+gate / down boundaries. Captures both
             #     upstream drift AND the drift from already-quantized modules in
             #     this layer.
-            #   per_layer: 1 S_new refresh per layer, at layer entry with all
-            #     weights still FP. Captures only upstream drift. Cuts the
-            #     current-state forwards per layer 4 → 1.
+            #   per_layer: refresh S and accumulate Hessian ONCE per layer, at
+            #     layer entry with all weights still FP. Captures upstream drift
+            #     only, then reuses the resulting per-module H through the four
+            #     module-group quantization boundaries.
             dynsal_enabled = (
                 bool(int(getattr(args, "enable_dynamic_saliency", 0)))
                 and static_dynsal is not None
@@ -6207,6 +6208,144 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         P_fp_by_canonical = None
                         memory_utils.cleanup_memory()
 
+            layer_hessian_once = dynsal_refresh_mode == "per_layer"
+
+            def build_gptq_for_subset(subset_for_setup, saliency_for_setup, gradients_for_setup, reference_loss_for_setup):
+                gptq_local = {}
+                with layer_recorder.section("layer.gptq_setup") if layer_recorder else _NULL_CONTEXT:
+                    for module_name, module in subset_for_setup.items():
+                        layer_weight_bits = args.w_bits
+                        layer_weight_sym = not args.w_asym
+                        if module is None or "lm_head" in module_name:
+                            continue
+                        saliency = saliency_for_setup.get(module_name, saliency_for_setup.get(module_name + ".module", None))
+                        if saliency is None:
+                            raise KeyError(
+                                f"Missing saliency cache for layer={i} module={module_name}. "
+                                f"Available keys: {sorted(saliency_for_setup.keys())}"
+                            )
+
+                        gptq_local[module_name] = GPTQPlus(
+                            module,
+                            saliency=saliency,
+                            gradient=gradients_for_setup[module_name],
+                            num_groups=args.num_groups,
+                            alpha=args.alpha,
+                            reference_loss=reference_loss_for_setup,
+                        )
+                        gptq_local[module_name].quantizer = quant_utils.WeightQuantizer()
+                        gptq_local[module_name].quantizer.configure(
+                            layer_weight_bits,
+                            perchannel=True,
+                            sym=layer_weight_sym,
+                            mse=args.w_clip,
+                        )
+                return gptq_local
+
+            def accumulate_hessian_for_gptq(gptq_for_accum, subset_for_accum):
+                def add_batch(name):
+                    def tmp(_, inp, out):
+                        gptq_for_accum[name].add_batch(inp[0].data, out.data)
+
+                    return tmp
+
+                handles = []
+                add_batch_recorders = {}
+                for module_name in gptq_for_accum:
+                    if should_profile_module(i, module_name):
+                        add_batch_recorders[module_name] = QuantProfileRecorder(dev, prefix=f"layers.{i}.{module_name}")
+                        gptq_for_accum[module_name].profile_recorder = add_batch_recorders[module_name]
+                    handles.append(subset_for_accum[module_name].register_forward_hook(add_batch(module_name)))
+                with layer_recorder.section("layer.hessian_accumulation_forward") if layer_recorder else _NULL_CONTEXT:
+                    # Batch the accumulation forward so we don't pay a per-sample
+                    # kernel-launch tax. `add_batch` already handles arbitrary
+                    # batch sizes (it reshapes to [bsz*seq, dim] internally), so
+                    # the math is bit-exact regardless of bsz.
+                    hessian_accum_bsz = args.hessian_accum_bsz if args.hessian_accum_bsz is not None else args.bsz
+                    hessian_accum_bsz = max(1, min(hessian_accum_bsz, inps.shape[0]))
+                    for j in tqdm(
+                        range(0, inps.shape[0], hessian_accum_bsz),
+                        ncols=120,
+                        desc=f"Layer {i} Hessian accumulation",
+                        position=1,
+                        leave=False,
+                    ):
+                        batch_bsz = min(hessian_accum_bsz, inps.shape[0] - j)
+                        _ = layer(
+                            inps[j : j + batch_bsz].to(dev),
+                            attention_mask=attention_mask.expand(batch_bsz, -1, -1, -1),
+                            position_ids=position_ids.expand(batch_bsz, -1),
+                            position_embeddings=(
+                                position_embeddings[0].expand(batch_bsz, -1, -1),
+                                position_embeddings[1].expand(batch_bsz, -1, -1),
+                            ),
+                        )[0]
+                for h in handles:
+                    h.remove()
+                for module_name in add_batch_recorders:
+                    gptq_for_accum[module_name].profile_recorder = None
+
+                # Close out the Hessian accumulation: all-reduce the per-rank sums
+                # and apply the global normalisation exactly once. After this call
+                # fasterquant sees a globally-averaged H that is bit-identical on
+                # every rank (NCCL all_reduce is deterministic for a given op+shape).
+                with layer_recorder.section("layer.hessian_finalize") if layer_recorder else _NULL_CONTEXT:
+                    for module_name in gptq_for_accum:
+                        gptq_for_accum[module_name].finalize_hessian()
+
+            if layer_hessian_once:
+                with layer_recorder.section("layer.per_layer_stats_and_hessian") if layer_recorder else _NULL_CONTEXT:
+                    layerwide_subset = {
+                        n: full.get(n, full.get(n + ".module", None)) for n in names
+                    }
+                    layerwide_subset = {n: m for n, m in layerwide_subset.items() if m is not None}
+                    precomputed_saliency_for_layer = static_saliency_by_layer[i]
+                    if dynsal_enabled:
+                        precomputed_saliency_for_layer = {
+                            **static_saliency_by_layer[i],
+                            **precomputed_S_new_by_canonical,
+                        }
+                    saliency_dict, gradients_dict, mean_reference_loss, layer_output_fisher = collect_layer_grad_hessian_stats(
+                        model=model,
+                        layer=layer,
+                        analyzer=analyzer,
+                        full=full,
+                        names=list(layerwide_subset.keys()),
+                        inps=inps,
+                        fp_inps=fp_inps,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        position_embeddings=position_embeddings,
+                        bsz=layer_stats_bsz,
+                        num_groups=args.num_groups,
+                        kl_topk=args.kl_topk,
+                        grad_hessian_topk=args.grad_hessian_topk,
+                        dev=dev,
+                        layer_idx=i,
+                        layer_refresh_loss_type=layer_refresh_loss_type,
+                        gptq_reference_loss_type=gptq_reference_loss_type,
+                        precomputed_saliency_dict=precomputed_saliency_for_layer,
+                        precomputed_layer_output_fisher=(
+                            static_fisher_by_layer[i]
+                            if layer_refresh_loss_type in ("fisher_diag_mse", "refined_mse")
+                            else None
+                        ),
+                        fp_inps_final=fp_inps_final,
+                        refined_A_list=layer_refined_A_list,
+                        samples_per_A=refined_rkl_samples_per_A,
+                        dp_rank=dp_rank,
+                        dp_shard_size=n_local,
+                        layer_recorder=layer_recorder,
+                        skip_gradient_backward=skip_ref_backward,
+                    )
+                    gptq = build_gptq_for_subset(
+                        layerwide_subset,
+                        saliency_dict,
+                        gradients_dict,
+                        mean_reference_loss,
+                    )
+                    accumulate_hessian_for_gptq(gptq, layerwide_subset)
+
             for group_names in sequential:
                 subset = {n: full.get(n, full.get(n + ".module", None)) for n in group_names}
                 subset = {n: m for n, m in subset.items() if m is not None}
@@ -6296,119 +6435,47 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         **dynsal_refresh_overrides,
                     }
 
-                saliency_dict, gradients_dict, mean_reference_loss, layer_output_fisher = collect_layer_grad_hessian_stats(
-                    model=model,
-                    layer=layer,
-                    analyzer=analyzer,
-                    full=full,
-                    names=group_names,
-                    inps=inps,
-                    fp_inps=fp_inps,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    position_embeddings=position_embeddings,
-                    bsz=layer_stats_bsz,
-                    num_groups=args.num_groups,
-                    kl_topk=args.kl_topk,
-                    grad_hessian_topk=args.grad_hessian_topk,
-                    dev=dev,
-                    layer_idx=i,
-                    layer_refresh_loss_type=layer_refresh_loss_type,
-                    gptq_reference_loss_type=gptq_reference_loss_type,
-                    precomputed_saliency_dict=precomputed_saliency_for_group,
-                    precomputed_layer_output_fisher=(
-                        static_fisher_by_layer[i]
-                        if layer_refresh_loss_type in ("fisher_diag_mse", "refined_mse")
-                        else None
-                    ),
-                    fp_inps_final=fp_inps_final,
-                    refined_A_list=layer_refined_A_list,
-                    samples_per_A=refined_rkl_samples_per_A,
-                    dp_rank=dp_rank,
-                    dp_shard_size=n_local,
-                    layer_recorder=layer_recorder,
-                    skip_gradient_backward=skip_ref_backward,
-                )
-
-                gptq = {}
-                with layer_recorder.section("layer.gptq_setup") if layer_recorder else _NULL_CONTEXT:
-                    for name in subset:
-                        layer_weight_bits = args.w_bits
-                        layer_weight_sym = not args.w_asym
-                        if "lm_head" in name:
-                            continue
-                        saliency = saliency_dict.get(name, saliency_dict.get(name + ".module", None))
-                        if saliency is None:
-                            raise KeyError(
-                                f"Missing saliency cache for layer={i} module={name}. "
-                                f"Available keys: {sorted(saliency_dict.keys())}"
-                            )
-
-                        gptq[name] = GPTQPlus(
-                            subset[name],
-                            saliency=saliency,
-                            gradient=gradients_dict[name],
-                            num_groups=args.num_groups,
-                            alpha=args.alpha,
-                            reference_loss=mean_reference_loss,
-                        )
-                        gptq[name].quantizer = quant_utils.WeightQuantizer()
-                        gptq[name].quantizer.configure(
-                            layer_weight_bits,
-                            perchannel=True,
-                            sym=layer_weight_sym,
-                            mse=args.w_clip,
-                        )
-
-                def add_batch(name):
-                    def tmp(_, inp, out):
-                        gptq[name].add_batch(inp[0].data, out.data)
-
-                    return tmp
-
-                handles = []
-                add_batch_recorders = {}
-                for name in gptq:
-                    if should_profile_module(i, name):
-                        add_batch_recorders[name] = QuantProfileRecorder(dev, prefix=f"layers.{i}.{name}")
-                        gptq[name].profile_recorder = add_batch_recorders[name]
-                    handles.append(subset[name].register_forward_hook(add_batch(name)))
-                with layer_recorder.section("layer.hessian_accumulation_forward") if layer_recorder else _NULL_CONTEXT:
-                    # Batch the accumulation forward so we don't pay a per-sample
-                    # kernel-launch tax. `add_batch` already handles arbitrary
-                    # batch sizes (it reshapes to [bsz*seq, dim] internally), so
-                    # the math is bit-exact regardless of bsz.
-                    hessian_accum_bsz = args.hessian_accum_bsz if args.hessian_accum_bsz is not None else args.bsz
-                    hessian_accum_bsz = max(1, min(hessian_accum_bsz, inps.shape[0]))
-                    for j in tqdm(
-                        range(0, inps.shape[0], hessian_accum_bsz),
-                        ncols=120,
-                        desc=f"Layer {i} Hessian accumulation",
-                        position=1,
-                        leave=False,
-                    ):
-                        batch_bsz = min(hessian_accum_bsz, inps.shape[0] - j)
-                        _ = layer(
-                            inps[j : j + batch_bsz].to(dev),
-                            attention_mask=attention_mask.expand(batch_bsz, -1, -1, -1),
-                            position_ids=position_ids.expand(batch_bsz, -1),
-                            position_embeddings=(
-                                position_embeddings[0].expand(batch_bsz, -1, -1),
-                                position_embeddings[1].expand(batch_bsz, -1, -1),
-                            ),
-                        )[0]
-                for h in handles:
-                    h.remove()
-                for name in add_batch_recorders:
-                    gptq[name].profile_recorder = None
-
-                # Close out the Hessian accumulation: all-reduce the per-rank sums
-                # and apply the global normalisation exactly once. After this call
-                # fasterquant sees a globally-averaged H that is bit-identical on
-                # every rank (NCCL all_reduce is deterministic for a given op+shape).
-                with layer_recorder.section("layer.hessian_finalize") if layer_recorder else _NULL_CONTEXT:
-                    for name in gptq:
-                        gptq[name].finalize_hessian()
+                if not layer_hessian_once:
+                    saliency_dict, gradients_dict, mean_reference_loss, layer_output_fisher = collect_layer_grad_hessian_stats(
+                        model=model,
+                        layer=layer,
+                        analyzer=analyzer,
+                        full=full,
+                        names=group_names,
+                        inps=inps,
+                        fp_inps=fp_inps,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        position_embeddings=position_embeddings,
+                        bsz=layer_stats_bsz,
+                        num_groups=args.num_groups,
+                        kl_topk=args.kl_topk,
+                        grad_hessian_topk=args.grad_hessian_topk,
+                        dev=dev,
+                        layer_idx=i,
+                        layer_refresh_loss_type=layer_refresh_loss_type,
+                        gptq_reference_loss_type=gptq_reference_loss_type,
+                        precomputed_saliency_dict=precomputed_saliency_for_group,
+                        precomputed_layer_output_fisher=(
+                            static_fisher_by_layer[i]
+                            if layer_refresh_loss_type in ("fisher_diag_mse", "refined_mse")
+                            else None
+                        ),
+                        fp_inps_final=fp_inps_final,
+                        refined_A_list=layer_refined_A_list,
+                        samples_per_A=refined_rkl_samples_per_A,
+                        dp_rank=dp_rank,
+                        dp_shard_size=n_local,
+                        layer_recorder=layer_recorder,
+                        skip_gradient_backward=skip_ref_backward,
+                    )
+                    gptq = build_gptq_for_subset(
+                        subset,
+                        saliency_dict,
+                        gradients_dict,
+                        mean_reference_loss,
+                    )
+                    accumulate_hessian_for_gptq(gptq, subset)
 
                 def make_gradient_refresh_fn(
                     module_name,
