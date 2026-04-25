@@ -600,6 +600,24 @@ def parse_gen():
             "max(Σ²) · thresh to avoid Σ⁻¹ blowup on near-zero singular values. Default 1e-6."
         ),
     )
+    parser.add_argument(
+        "--dyn_sal_refresh_mode",
+        type=str,
+        default="per_boundary",
+        choices=["per_boundary", "per_layer"],
+        help=(
+            "--enable_dynamic_saliency only: when to refresh saliency inside each "
+            "transformer layer's quant loop.\n"
+            "  per_boundary (default): refresh 4× per layer, once BEFORE each of the "
+            "    four module-group boundaries (qkv / o / up+gate / down). Captures both "
+            "    upstream drift AND the accumulated effect of already-quantized modules "
+            "    in this layer.\n"
+            "  per_layer: refresh ONCE per layer, at layer entry with all weights still "
+            "    FP. Captures upstream drift only. Halves the number of current-state "
+            "    forwards per layer (4 → 1), good for large-model sweeps where the per-"
+            "    boundary forward cost dominates."
+        ),
+    )
 
     args = parser.parse_args()
 

@@ -6093,7 +6093,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
             saliency_dict = None
             gradients_dict = None
 
-            # === Dynamic saliency: one FP forward per layer, but stream P = Y · V ===
+            # === Dynamic saliency: one FP forward per layer, stream P = Y · V ===
             # Instead of caching all 7 modules' (N_local, T, H_out) outputs to
             # CPU (which is ~400 GB for Llama-3-8B — up/gate alone is 2 × 112 GB
             # and OOM-kills the host), compute P_fp = FP_Y · V in the forward
@@ -6101,42 +6101,53 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
             # preallocated per-module (N_local, T, R_eff) CPU buffer. For R=16
             # that's 128 MB per module × 7 = ~900 MB for the whole layer —
             # ~450× smaller than caching FP_Y directly.
+            #
+            # `dyn_sal_refresh_mode`:
+            #   per_boundary (default): 4 S_new refreshes per layer, one before
+            #     each of the qkv / o / up+gate / down boundaries. Captures both
+            #     upstream drift AND the drift from already-quantized modules in
+            #     this layer.
+            #   per_layer: 1 S_new refresh per layer, at layer entry with all
+            #     weights still FP. Captures only upstream drift. Cuts the
+            #     current-state forwards per layer 4 → 1.
             dynsal_enabled = (
                 bool(int(getattr(args, "enable_dynamic_saliency", 0)))
                 and static_dynsal is not None
             )
-            P_fp_by_module = None
+            dynsal_refresh_mode = str(getattr(args, "dyn_sal_refresh_mode", "per_boundary"))
+            P_fp_by_canonical = None
             dynsal_V_dev_for_layer = None
+            full_canonical = None
+            precomputed_S_new_by_canonical = None
             if dynsal_enabled:
                 with layer_recorder.section("layer.dynsal.fp_forward") if layer_recorder else _NULL_CONTEXT:
                     _fp_fwd_bsz = args.hessian_accum_bsz if args.hessian_accum_bsz is not None else args.bsz
                     _fp_fwd_bsz = max(1, min(_fp_fwd_bsz, fp_inps.shape[0]))
-                    # Load V for every module of this layer onto `dev` once,
-                    # reused across the FP forward and all 4 boundary forwards.
-                    # Keep V in bf16 to avoid fp32-casting the full (bsz·T, H_out)
-                    # forward activation inside the hook (that cast is ~7 GB GPU
-                    # transient per up/gate batch on 8B — more than the output
-                    # tensor itself).
-                    # `full.keys()` can carry the `.module` suffix for QuantWrapped
-                    # layers, while `static_dynsal["by_layer"][i]` was built from
-                    # `module_dicts` whose keys are canonical (suffix stripped by
-                    # `normalize_quant_module_name`). Normalise here to match.
+                    # Key everything by CANONICAL module name (the
+                    # `.module`-stripped form that `module_dicts` used during
+                    # precompute and that `group_names` / `subset` use later).
+                    # `full.keys()` may carry the `.module` suffix on
+                    # QuantWrapped layers; we normalise once and pass the
+                    # canonical-keyed dict through the rest of the dynsal code.
                     layer_dyn = static_dynsal["by_layer"][i]
+                    full_canonical = {
+                        normalize_quant_module_name(n): m for n, m in full.items()
+                    }
                     dynsal_V_dev_for_layer = {}
-                    for _name in full.keys():
-                        _canonical = normalize_quant_module_name(_name)
+                    for _canonical, _module in full_canonical.items():
                         _entry = layer_dyn.get(_canonical)
                         if _entry is None:
                             raise KeyError(
-                                f"Missing dynsal V for layer={i} module={_name} "
-                                f"(canonical={_canonical}). Available keys: "
-                                f"{sorted(layer_dyn.keys())}"
+                                f"Missing dynsal V for layer={i} module (canonical)={_canonical}. "
+                                f"Available keys: {sorted(layer_dyn.keys())}"
                             )
-                        dynsal_V_dev_for_layer[_name] = _entry["V"].to(dev, dtype=torch.bfloat16)
-                    P_fp_by_module = _collect_module_output_projections(
+                        # bf16 V: avoids fp32-casting the full (bsz·T, H_out)
+                        # forward activation inside the projection hook.
+                        dynsal_V_dev_for_layer[_canonical] = _entry["V"].to(dev, dtype=torch.bfloat16)
+                    P_fp_by_canonical = _collect_module_output_projections(
                         layer=layer,
                         inputs=fp_inps,
-                        module_dict=full,
+                        module_dict=full_canonical,
                         V_by_name=dynsal_V_dev_for_layer,
                         dev=dev,
                         bsz=_fp_fwd_bsz,
@@ -6145,6 +6156,52 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         position_embeddings=position_embeddings,
                     )
 
+                # per_layer mode: compute S_new for every module once at layer
+                # entry using `layer(inps)` with all weights still FP. Cache the
+                # per-module S_new and let each boundary just pull from it.
+                if dynsal_refresh_mode == "per_layer":
+                    with layer_recorder.section("layer.dynsal.per_layer_refresh") if layer_recorder else _NULL_CONTEXT:
+                        _cur_fwd_bsz = args.hessian_accum_bsz if args.hessian_accum_bsz is not None else args.bsz
+                        _cur_fwd_bsz = max(1, min(_cur_fwd_bsz, inps.shape[0]))
+                        P_cur_by_canonical = _collect_module_output_projections(
+                            layer=layer,
+                            inputs=inps,
+                            module_dict=full_canonical,
+                            V_by_name=dynsal_V_dev_for_layer,
+                            dev=dev,
+                            bsz=_cur_fwd_bsz,
+                            attention_mask=attention_mask,
+                            position_ids=position_ids,
+                            position_embeddings=position_embeddings,
+                        )
+                        N_global = int(static_dynsal["N_global"])
+                        precomputed_S_new_by_canonical = {}
+                        for _canonical in full_canonical.keys():
+                            dyn_entry = layer_dyn[_canonical]  # already verified above
+                            static_sal = static_saliency_by_layer[i].get(_canonical)
+                            if static_sal is None:
+                                raise KeyError(
+                                    f"Missing static saliency for layer={i} module (canonical)={_canonical}."
+                                )
+                            P_delta = (
+                                P_cur_by_canonical[_canonical].float()
+                                - P_fp_by_canonical[_canonical].float()
+                            ).to(torch.bfloat16)
+                            precomputed_S_new_by_canonical[_canonical] = refresh_dynamic_saliency(
+                                dyn_entry=dyn_entry,
+                                static_saliency=static_sal,
+                                N_global=N_global,
+                                P_delta=P_delta,
+                                num_groups=args.num_groups,
+                                dev=dev,
+                            )
+                            del P_delta
+                        # P_fp / P_cur no longer needed — per-layer S_new is
+                        # cached. Drop them to bound CPU peak.
+                        del P_cur_by_canonical
+                        P_fp_by_canonical = None
+                        memory_utils.cleanup_memory()
+
             for group_names in sequential:
                 subset = {n: full.get(n, full.get(n + ".module", None)) for n in group_names}
                 subset = {n: m for n, m in subset.items() if m is not None}
@@ -6152,13 +6209,12 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     continue
 
                 # === Dynamic saliency boundary refresh ===
-                # Run ONE lightweight current-state forward that only hooks the
-                # modules in this group, stream P_cur = current_Y · V into a
-                # per-module (N_local, T, R) CPU buffer; subtract P_fp to get
-                # P_delta, feed into refresh_dynamic_saliency for S_new. No
-                # (N_local, T, H_out) tensor is ever materialised.
+                # per_boundary: run a lightweight current-state forward covering
+                #   this group only, compute S_new per module on the fly.
+                # per_layer: S_new was already computed at layer entry; just
+                #   look up the cached value by canonical name.
                 dynsal_refresh_overrides = None
-                if dynsal_enabled:
+                if dynsal_enabled and dynsal_refresh_mode == "per_boundary":
                     with layer_recorder.section("layer.dynsal.boundary_refresh") if layer_recorder else _NULL_CONTEXT:
                         _cur_fwd_bsz = args.hessian_accum_bsz if args.hessian_accum_bsz is not None else args.bsz
                         _cur_fwd_bsz = max(1, min(_cur_fwd_bsz, inps.shape[0]))
@@ -6179,32 +6235,26 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         dynsal_by_layer = static_dynsal["by_layer"]
                         N_global = int(static_dynsal["N_global"])
                         dynsal_refresh_overrides = {}
-                        for _name in subset.keys():
-                            _canonical = normalize_quant_module_name(_name)
+                        for _canonical in subset.keys():
                             dyn_entry = dynsal_by_layer[i].get(_canonical)
                             if dyn_entry is None:
                                 raise KeyError(
-                                    f"Missing dynsal cache for layer={i} module={_name} "
-                                    f"(canonical={_canonical}). Available keys: "
-                                    f"{sorted(dynsal_by_layer[i].keys())}"
+                                    f"Missing dynsal cache for layer={i} module (canonical)={_canonical}. "
+                                    f"Available keys: {sorted(dynsal_by_layer[i].keys())}"
                                 )
                             static_sal = static_saliency_by_layer[i].get(_canonical)
                             if static_sal is None:
                                 raise KeyError(
-                                    f"Missing static saliency for layer={i} module={_name} "
-                                    f"(canonical={_canonical})."
+                                    f"Missing static saliency for layer={i} module (canonical)={_canonical}."
                                 )
-                            if _name not in P_fp_by_module:
+                            if _canonical not in P_fp_by_canonical:
                                 raise KeyError(
-                                    f"P_fp entry for layer={i} module={_name} was already "
-                                    f"popped — boundary refresh ordering is broken."
+                                    f"P_fp entry for layer={i} module (canonical)={_canonical} was "
+                                    f"already popped — boundary refresh ordering is broken."
                                 )
-                            # ΔY · V  =  (current_Y − fp_Y) · V  =  P_cur − P_fp.
-                            # Do the subtraction in fp32 on CPU — (N_local, T, R)
-                            # bf16 cast to fp32 is ~512 MB at R=16, trivial.
                             P_delta = (
-                                P_cur_for_group[_name].float()
-                                - P_fp_by_module[_name].float()
+                                P_cur_for_group[_canonical].float()
+                                - P_fp_by_canonical[_canonical].float()
                             ).to(torch.bfloat16)
                             S_new = refresh_dynamic_saliency(
                                 dyn_entry=dyn_entry,
@@ -6214,14 +6264,21 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                                 num_groups=args.num_groups,
                                 dev=dev,
                             )
-                            dynsal_refresh_overrides[_name] = S_new
+                            dynsal_refresh_overrides[_canonical] = S_new
                             # Release this module's P_fp / P_delta now — they
                             # won't be read again for this boundary or any future
                             # boundary in the same layer.
-                            del P_fp_by_module[_name]
+                            del P_fp_by_canonical[_canonical]
                             del P_delta
                         del P_cur_for_group
                         memory_utils.cleanup_memory()
+                elif dynsal_enabled and dynsal_refresh_mode == "per_layer":
+                    # Layer-level refresh: look up pre-computed S_new for each
+                    # module in this group (canonical key).
+                    dynsal_refresh_overrides = {
+                        _canonical: precomputed_S_new_by_canonical[_canonical]
+                        for _canonical in subset.keys()
+                    }
 
                 # Merge any dynsal-refreshed saliency with the static shards. The
                 # downstream `collect_layer_grad_hessian_stats` only uses the dict
@@ -6660,13 +6717,19 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     del layer_refined_mse_grad_pool_next
                 if layer_refined_mse_mean_grad_next is not None:
                     del layer_refined_mse_mean_grad_next
-                if P_fp_by_module is not None:
+                if P_fp_by_canonical is not None:
                     # By this point the 4 boundaries should have popped every
-                    # module from P_fp_by_module; explicit del bounds the
-                    # lifetime for good measure and releases V_dev too.
-                    del P_fp_by_module
+                    # module from P_fp_by_canonical (per_boundary mode) or we
+                    # explicitly set it to None (per_layer mode). Explicit del
+                    # bounds the lifetime for good measure and releases V_dev
+                    # too.
+                    del P_fp_by_canonical
                 if dynsal_V_dev_for_layer is not None:
                     del dynsal_V_dev_for_layer
+                if full_canonical is not None:
+                    del full_canonical
+                if precomputed_S_new_by_canonical is not None:
+                    del precomputed_S_new_by_canonical
                 memory_utils.cleanup_memory()
 
             if quant_stop_layer is not None and i >= quant_stop_layer:

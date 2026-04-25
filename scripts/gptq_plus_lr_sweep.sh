@@ -30,7 +30,7 @@ DEVICE=${3}
 shift 3
 
 # Sweep configuration. Override from the shell when needed.
-GRAD_LRS_STR=${GRAD_LRS:-"0.000006 0.000008 0.00001 0.00002 0.00003"}
+GRAD_LRS_STR=${GRAD_LRS:-"0.00001"}
 DATASET=${DATASET:-wikitext2} # wikitext2 / neuralmagic / ultrachat_2k / numinamath
 N_SAMPLES=${N_SAMPLES:-2048}
 SEQ_LEN=${SEQ_LEN:-2048}
@@ -74,6 +74,11 @@ REFINED_MIX_RKL_LR_RATIO=${REFINED_MIX_RKL_LR_RATIO:-0.2}
 ENABLE_DYN_SAL=${ENABLE_DYN_SAL:-1}
 DYN_SAL_RANK=${DYN_SAL_RANK:-16}
 DYN_SAL_EVD_THRESH=${DYN_SAL_EVD_THRESH:-1e-6}
+# Refresh cadence. `per_boundary` (default) = 4 refreshes per layer (qkv / o /
+# up+gate / down entry). `per_layer` = 1 refresh per layer (at layer entry,
+# weights still FP; captures only upstream drift, halves the current-state
+# forwards per layer).
+DYN_SAL_REFRESH_MODE=${DYN_SAL_REFRESH_MODE:-per_boundary} # per_layer or per_boundary
 FINAL_LAYER_GRAD_LR=${FINAL_LAYER_GRAD_LR:-0.000001}
 PRE_GD_STEPS=${PRE_GD_STEPS:-10}
 PRE_GRAD_LR=${PRE_GRAD_LR:-0.00003}
@@ -278,6 +283,7 @@ if [[ "${FSDP_PRECOMPUTE}" == "1" && "${EXIT_AFTER_PRECOMPUTE}" != "1" ]]; then
         --enable_dynamic_saliency "${ENABLE_DYN_SAL}" \
         --dyn_sal_rank "${DYN_SAL_RANK}" \
         --dyn_sal_evd_thresh "${DYN_SAL_EVD_THRESH}" \
+        --dyn_sal_refresh_mode "${DYN_SAL_REFRESH_MODE}" \
         "${GLOBAL_LOSS_ARGS[@]}" \
         "${DP_GLOBAL_SHUFFLE_ARGS[@]}" \
         --rotate \
@@ -342,6 +348,9 @@ for grad_lr in "${GRAD_LRS[@]}"; do
         dyn_sal_suffix="_dynsalR${DYN_SAL_RANK}"
         if [[ "${DYN_SAL_EVD_THRESH}" != "1e-6" ]]; then
             dyn_sal_suffix="${dyn_sal_suffix}_evd$(sanitize_float "${DYN_SAL_EVD_THRESH}")"
+        fi
+        if [[ "${DYN_SAL_REFRESH_MODE}" == "per_layer" ]]; then
+            dyn_sal_suffix="${dyn_sal_suffix}_reflayer"
         fi
     fi
     pre_gd_suffix=""
@@ -426,6 +435,7 @@ for grad_lr in "${GRAD_LRS[@]}"; do
         --enable_dynamic_saliency "${ENABLE_DYN_SAL}" \
         --dyn_sal_rank "${DYN_SAL_RANK}" \
         --dyn_sal_evd_thresh "${DYN_SAL_EVD_THRESH}" \
+        --dyn_sal_refresh_mode "${DYN_SAL_REFRESH_MODE}" \
         "${MIX_ARGS[@]}" \
         --rotate \
         "${GLOBAL_LOSS_ARGS[@]}" \
