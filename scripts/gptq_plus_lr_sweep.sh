@@ -72,7 +72,7 @@ REFINED_MIX_RKL_LR_RATIO=${REFINED_MIX_RKL_LR_RATIO:-0.2}
 # in precompute. DYN_SAL_RANK is the low-rank dimension. See
 # saliency_dynamic_update_design.md.
 ENABLE_DYN_SAL=${ENABLE_DYN_SAL:-1}
-DYN_SAL_RANK=${DYN_SAL_RANK:-32}
+DYN_SAL_RANK=${DYN_SAL_RANK:-16}
 DYN_SAL_EVD_THRESH=${DYN_SAL_EVD_THRESH:-1e-6}
 # Refresh cadence. `per_boundary` (default) = 4 refreshes per layer (qkv / o /
 # up+gate / down entry). `per_layer` = 1 refresh per layer (at layer entry,
@@ -98,7 +98,7 @@ DOWN_PROJ_LR_SCALE=${DOWN_PROJ_LR_SCALE:-1.0}
 SECOND_ORDER_SCALE=${SECOND_ORDER_SCALE:-1.0}
 PRE_CLIP=${PRE_CLIP:-0}
 GLOBAL_LOSS=${GLOBAL_LOSS:-1}
-GLOBAL_LOSS_BSZ=${GLOBAL_LOSS_BSZ:-4}
+GLOBAL_LOSS_BSZ=${GLOBAL_LOSS_BSZ:-8}
 LOSS_SLIDE_WINDOW=${LOSS_SLIDE_WINDOW:-0}
 DP_GLOBAL_SHUFFLE=${DP_GLOBAL_SHUFFLE:-1}
 # --grad_lr_layer_schedule {none, cosine, linear, sqrt}

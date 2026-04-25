@@ -3282,7 +3282,7 @@ def collect_static_end_to_end_saliency_and_fisher(
                     )
 
                 with profile_recorder.section("pipeline.static_fisher.dynsal_pack_weights") if profile_recorder else _NULL_CONTEXT:
-                    # Pack C_k, W_cross, W_quad once up-front (fp32 on CPU). Each
+                    # Pack C_k and W_cross once up-front (fp32 on CPU). Each
                     # module's packs are G × R × R; trivial in size.
                     G_groups = int(saliency_num_groups)
                     for layer_d in static_dynsal_by_layer:
@@ -3300,13 +3300,10 @@ def collect_static_end_to_end_saliency_and_fisher(
                             for k in range(G_groups):
                                 Vk = V_dev[k * group_size:(k + 1) * group_size]
                                 C_packed[k] = (Vk.t() @ Vk) / float(group_size)
-                            D = torch.diag(Sigma_sq_dev)
-                            W_cross_packed = torch.matmul(C_packed, D)
-                            W_quad_packed = torch.matmul(torch.matmul(D, C_packed), D)
+                            W_cross_packed = C_packed * Sigma_sq_dev.view(1, 1, R_eff)
                             entry["C_packed"] = C_packed.cpu()
                             entry["W_cross_packed"] = W_cross_packed.cpu()
-                            entry["W_quad_packed"] = W_quad_packed.cpu()
-                            del V_dev, Sigma_sq_dev, C_packed, D, W_cross_packed, W_quad_packed
+                            del V_dev, Sigma_sq_dev, C_packed, W_cross_packed
                     memory_utils.cleanup_memory()
     finally:
         with profile_recorder.section("pipeline.static_fisher.teardown") if profile_recorder else _NULL_CONTEXT:
@@ -3496,8 +3493,7 @@ def refresh_dynamic_saliency(
 
     Formulas from saliency_dynamic_update_design.md §4:
         Δs_cross[t, k] = (2/N_global)  · sum( U_Sigma ⊙ (P @ W_cross[k].T), dim=-1)
-        Δs_quad[t, k]  = (1/N_global²)· sum( P       ⊙ (P @ W_quad[k].T),  dim=-1)
-        S_new          = clamp_min(S_old_exact + Δs_cross + Δs_quad, 0)
+        S_new          = clamp_min(S_old_exact + Δs_cross, 0)
 
     where P = ΔY · V, ΔY = current_Y − fp_Y (cumulative output drift). P is
     precomputed by `_collect_module_output_projections` in STREAMING fashion
@@ -3506,7 +3502,7 @@ def refresh_dynamic_saliency(
 
     Args:
       dyn_entry:       per-module dict with keys V / Sigma_sq / U_Sigma /
-                       C_packed / W_cross_packed / W_quad_packed / H_out / R_eff.
+                       C_packed / W_cross_packed / H_out / R_eff.
       static_saliency: (N_local, T, G) tensor of S_old_exact on CPU.
       N_global:        global token count (int, used in 2/N and 1/N² factors).
       P_delta:         (N_local, T, R_eff) bf16 CPU — precomputed ΔY @ V.
@@ -3518,7 +3514,6 @@ def refresh_dynamic_saliency(
     """
     U_Sigma_bf16 = dyn_entry["U_Sigma"]      # (N_local*T, R) bf16 CPU
     W_cross_cpu = dyn_entry["W_cross_packed"]  # (G, R, R) fp32 CPU
-    W_quad_cpu = dyn_entry["W_quad_packed"]    # (G, R, R) fp32 CPU
     R_eff = int(dyn_entry["R_eff"])
 
     N_local, T, R_in_P = P_delta.shape
@@ -3537,23 +3532,18 @@ def refresh_dynamic_saliency(
     # Move to dev in fp32 for the matmuls.
     U_Sigma_dev = U_Sigma_bf16.to(dev, dtype=torch.float32).reshape(N_local, T, R_eff)
     W_cross_dev = W_cross_cpu.to(dev, dtype=torch.float32)
-    W_quad_dev = W_quad_cpu.to(dev, dtype=torch.float32)
     P_dev = P_delta.to(dev, dtype=torch.float32)           # (N_local, T, R_eff)
 
     delta_s_cross = torch.empty(N_local, T, G, dtype=torch.float32, device=dev)
-    delta_s_quad = torch.empty(N_local, T, G, dtype=torch.float32, device=dev)
     for k in range(G):
         tmp_c = P_dev @ W_cross_dev[k].t()
         delta_s_cross[..., k] = (U_Sigma_dev * tmp_c).sum(dim=-1)
-        tmp_q = P_dev @ W_quad_dev[k].t()
-        delta_s_quad[..., k] = (P_dev * tmp_q).sum(dim=-1)
-        del tmp_c, tmp_q
+        del tmp_c
 
     delta_s_cross.mul_(2.0 / float(N_global))
-    delta_s_quad.mul_(1.0 / (float(N_global) * float(N_global)))
 
     S_old = static_saliency.to(dev, dtype=torch.float32)
-    S_new = (S_old + delta_s_cross + delta_s_quad).clamp_min_(0.0)
+    S_new = (S_old + delta_s_cross).clamp_min_(0.0)
     return S_new.cpu()
 
 
