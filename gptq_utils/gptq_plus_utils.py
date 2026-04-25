@@ -27,6 +27,15 @@ from gptq_utils.diagnostics import DiagnosticRegistry, parse_diagnose_targets
 # nullcontext():` site inside the fasterquant/add_batch hot loops.
 _NULL_CONTEXT = nullcontext()
 
+# Static end-to-end saliency/Fisher precompute can produce very small
+# activation gradients in bf16-heavy graphs. We scale the scalar loss up during
+# backward, keep the saliency cache in the resulting grad^2 scale, and undo that
+# scale exactly at the consumers that need the original numerical convention.
+_E2E_PRECOMPUTE_LOSS_GRAD_SCALE = 1000.0
+_E2E_PRECOMPUTE_QUADRATIC_SCALE = (
+    _E2E_PRECOMPUTE_LOSS_GRAD_SCALE * _E2E_PRECOMPUTE_LOSS_GRAD_SCALE
+)
+
 
 def format_log_value(value, digits=6):
     if value is None:
@@ -337,6 +346,7 @@ class GPTQPlus:
         num_groups: int,
         alpha: float,
         reference_loss: float,
+        hessian_saliency_scale: float = 1.0,
     ):
         self.layer = layer
         self.dev = self.layer.weight.device
@@ -350,6 +360,7 @@ class GPTQPlus:
         assert self.num_groups == saliency.shape[2], "Number of groups for GuidedQuant must match saliency shape!"
         self.alpha = alpha
         self.reference_loss = max(reference_loss, 0)
+        self.hessian_saliency_scale = float(hessian_saliency_scale)
 
         self.saliencies = saliency.float()
         self.gradients = gradient.float()
@@ -678,6 +689,8 @@ class GPTQPlus:
             raise RuntimeError("finalize_hessian called before any add_batch ran.")
         seq_len = total_tokens / total_samples
         self.H.div_(total_samples * seq_len)
+        if self.hessian_saliency_scale != 1.0:
+            self.H.div_(self.hessian_saliency_scale)
         self.act_square.div_(seq_len)
         # Symmetrise H to wipe out residual asymmetry from tensor-core bmm
         # round-off (tf32 / bf16 outputs can lose exact H[i,j] == H[j,i]).
@@ -2637,7 +2650,10 @@ def collect_static_end_to_end_saliency_and_fisher(
                         dynsal_sketch_data[layer_idx][module_name] = sketch
                     # Y += G^T (G Ω). Use (B·T, K) intermediate (small).
                     g_omega = grad_flat @ Omega  # (B·T, K) fp32
-                    sketch.addmm_(grad_flat.t(), g_omega)  # in-place
+                    sketch.addmm_(
+                        grad_flat.t(), g_omega,
+                        alpha=1.0 / _E2E_PRECOMPUTE_QUADRATIC_SCALE,
+                    )
                     del grad_flat, g_omega
 
             out_tensor.register_hook(grad_hook)
@@ -2671,6 +2687,7 @@ def collect_static_end_to_end_saliency_and_fisher(
                 # below divides once by the global middle-token count to store
                 # the shared E_middle[g g^T] Fisher coefficient.
                 fisher_block = grad_flat.t() @ grad_flat  # stays on GPU fp32
+                fisher_block.div_(_E2E_PRECOMPUTE_QUADRATIC_SCALE)
                 if fisher_data[layer_idx] is None:
                     fisher_data[layer_idx] = fisher_block
                 else:
@@ -2732,8 +2749,8 @@ def collect_static_end_to_end_saliency_and_fisher(
                     # dy.t() @ delta → (H, H); dy.t() @ dy → (H, H). Compute on dev
                     # then transfer to CPU fp32 for accumulation (avoid bf16
                     # cancellation in the sum even when A itself is stored bf16).
-                    inc_C = (dy.t() @ delta).cpu()
-                    inc_H = (dy.t() @ dy).cpu()
+                    inc_C = (dy.t() @ delta).div_(_E2E_PRECOMPUTE_QUADRATIC_SCALE).cpu()
+                    inc_H = (dy.t() @ dy).div_(_E2E_PRECOMPUTE_QUADRATIC_SCALE).cpu()
                     if refined_C[layer_idx][a] is None:
                         refined_C[layer_idx][a] = inc_C
                         refined_H[layer_idx][a] = inc_H
@@ -2747,8 +2764,8 @@ def collect_static_end_to_end_saliency_and_fisher(
                     # Aggregation across batches within a sub-A happens via the
                     # running sum below; solve happens at sub-A flush.
                     delta_3d = dx_3d - dy_3d
-                    inc_Cd = (dy_3d * delta_3d).sum(dim=0).cpu()
-                    inc_Hd = dy_3d.pow(2).sum(dim=0).cpu()
+                    inc_Cd = (dy_3d * delta_3d).sum(dim=0).div_(_E2E_PRECOMPUTE_QUADRATIC_SCALE).cpu()
+                    inc_Hd = dy_3d.pow(2).sum(dim=0).div_(_E2E_PRECOMPUTE_QUADRATIC_SCALE).cpu()
                     if refined_diag_C[layer_idx][a] is None:
                         refined_diag_C[layer_idx][a] = inc_Cd
                         refined_diag_H[layer_idx][a] = inc_Hd
@@ -3034,9 +3051,10 @@ def collect_static_end_to_end_saliency_and_fisher(
                             labels.view(-1),
                             reduction="sum",
                         )
+                        loss_for_backward = loss * _E2E_PRECOMPUTE_LOSS_GRAD_SCALE
                     with profile_recorder.section("pipeline.static_fisher.batch.backward") if profile_recorder else _NULL_CONTEXT:
-                        loss.backward()
-                    del outputs, logits, teacher_logits, student_logits, labels, loss, input_ids
+                        loss_for_backward.backward()
+                    del outputs, logits, teacher_logits, student_logits, labels, loss, loss_for_backward, input_ids
             # Flush the last sub-A's accumulators. The streaming flush inside
             # the loop only fires on transitions, so the final one needs to be
             # drained explicitly.
@@ -3159,7 +3177,10 @@ def collect_static_end_to_end_saliency_and_fisher(
                             out_tensor.retain_grad()
 
                             def grad_hook(grad):
-                                grad_flat = grad.detach().float().reshape(-1, grad.shape[-1])
+                                grad_flat = (
+                                    (grad.detach().float() / _E2E_PRECOMPUTE_LOSS_GRAD_SCALE)
+                                    .reshape(-1, grad.shape[-1])
+                                )
                                 Q_m = dynsal_Q_dev[layer_idx][module_name]  # (d_out, K) fp32
                                 B_local = grad_flat @ Q_m  # (B·T, K) fp32
                                 # In-place accumulate B_cov += B^T B (small KxK).
@@ -3211,8 +3232,9 @@ def collect_static_end_to_end_saliency_and_fisher(
                                     student_logits.view(-1, student_logits.size(-1)),
                                     labels.view(-1), reduction="sum",
                                 )
-                                loss.backward()
-                                del outputs, logits, teacher_logits, student_logits, labels, loss, input_ids
+                                loss_for_backward = loss * _E2E_PRECOMPUTE_LOSS_GRAD_SCALE
+                                loss_for_backward.backward()
+                                del outputs, logits, teacher_logits, student_logits, labels, loss, loss_for_backward, input_ids
 
                     # Pass-2 finalisation: per (layer, module) all-reduce B_cov,
                     # eigh, top-R truncation, build V = Q @ V_hat, U_Sigma =
@@ -3488,6 +3510,7 @@ def refresh_dynamic_saliency(
     P_delta,
     num_groups,
     dev,
+    static_saliency_scale=1.0,
 ):
     """Compute S_new at a module-group boundary.
 
@@ -3508,6 +3531,11 @@ def refresh_dynamic_saliency(
       P_delta:         (N_local, T, R_eff) bf16 CPU — precomputed ΔY @ V.
       num_groups:      G (saliency output-channel group count, usually 4).
       dev:             target device for the matmuls.
+      static_saliency_scale:
+                       Positive scalar applied to the dynamic correction before
+                       adding it to static_saliency. Used when static saliency is
+                       intentionally kept in a loss-scale^2 domain until Hessian
+                       finalization.
 
     Returns:
       S_new: (N_local, T, G) fp32 CPU tensor, non-negative.
@@ -3541,6 +3569,11 @@ def refresh_dynamic_saliency(
         del tmp_c
 
     delta_s_cross.mul_(2.0 / float(N_global))
+    if static_saliency_scale != 1.0:
+        # Static saliency is intentionally kept in the loss-scale^2 domain
+        # until GPTQPlus.finalize_hessian() restores the Hessian scale.
+        # Keep the dynamic correction in that same domain before adding.
+        delta_s_cross.mul_(float(static_saliency_scale))
 
     S_old = static_saliency.to(dev, dtype=torch.float32)
     S_new = (S_old + delta_s_cross).clamp_min_(0.0)
@@ -5305,7 +5338,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     f"fisherfull_ghtk{args.grad_hessian_topk}_"
                     f"glbsz{args.global_loss_bsz}_seed{args.seed}_"
                     f"salclip{sal_clip_tag}_rklNA{rkl_na}_fpfinal{fpfinal_tag}"
-                    f"{mix_tag}{dynsal_tag}"
+                    f"_e2els{int(_E2E_PRECOMPUTE_LOSS_GRAD_SCALE)}{mix_tag}{dynsal_tag}"
                 )
                 static_cache_key += f"_world{dist_utils.get_world_size()}_rank{dist_utils.get_rank()}"
                 os.makedirs(static_cache_dir, exist_ok=True)
@@ -6200,6 +6233,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                                 P_delta=P_delta,
                                 num_groups=args.num_groups,
                                 dev=dev,
+                                static_saliency_scale=_E2E_PRECOMPUTE_QUADRATIC_SCALE,
                             )
                             del P_delta
                         # P_fp / P_cur no longer needed — per-layer S_new is
@@ -6232,6 +6266,10 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             num_groups=args.num_groups,
                             alpha=args.alpha,
                             reference_loss=reference_loss_for_setup,
+                            hessian_saliency_scale=(
+                                _E2E_PRECOMPUTE_QUADRATIC_SCALE
+                                if global_loss_enabled else 1.0
+                            ),
                         )
                         gptq_local[module_name].quantizer = quant_utils.WeightQuantizer()
                         gptq_local[module_name].quantizer.configure(
@@ -6407,6 +6445,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                                 P_delta=P_delta,
                                 num_groups=args.num_groups,
                                 dev=dev,
+                                static_saliency_scale=_E2E_PRECOMPUTE_QUADRATIC_SCALE,
                             )
                             dynsal_refresh_overrides[_canonical] = S_new
                             # Release this module's P_fp / P_delta now — they
