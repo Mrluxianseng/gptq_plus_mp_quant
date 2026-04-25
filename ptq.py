@@ -18,7 +18,7 @@ from gptq_utils.main import quantize_weights
 from utils import data_utils, dist_utils, eval_utils, model_utils, rotation_utils, \
                   memory_utils, quant_utils, hadamard_utils
 
-torch.backends.cuda.matmul.allow_tf32 = False
+torch.backends.cuda.matmul.allow_tf32 = True
 
 
 def main(args):

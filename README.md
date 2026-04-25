@@ -48,7 +48,7 @@
 - GRAD_GATE_SHARPNESS：quant_error_gate和quant_error_gate_optimized用的系数
 - GRAD_GATE_SINE_AMP：quant_error_gate_optimized用的系数
 - GRAD_HESSIAN_TOPK：计算saliency和fisher用的logits topk（如果用的不是端到端的kl(global_loss=0)，一定要设成-1，因为逐层的输出头的topk不一定是一样的）
-- SALIENCY_CLIP_PERCENTILE：在precompute阶段把每个token的saliency（`grad²(NLL_loss, module_output).mean(group)`）裁到这个分位数，默认0.99。用来压掉深层（layer 24+）NLL backward产生的极端gradient outlier（有几个token的saliency可以比中位数大10-12个数量级）。不裁的话这些outlier会让后续的`inp.T @ diag(s) @ inp`变成近rank-1的病态矩阵，Cholesky即使damp涨到0.5+还是失败。设成1.0可以关掉裁剪。改了这个值会让static_cache_path的cache key变（key里带`salclip{value}`），重新预计算。
+- SALIENCY_CLIP_PERCENTILE：在precompute阶段把每个中间层token的saliency（`grad²(NLL_total, module_output).mean(group)`）裁到这个分位数，默认0.99。这里 `NLL_total` 是对输出sample×输出token求和的 sampled NLL；`mean(group)` 只是在模块输出通道group内平均，不是在中间层token维平均。用来压掉深层（layer 24+）NLL backward产生的极端gradient outlier（有几个token的saliency可以比中位数大10-12个数量级）。不裁的话这些outlier会让后续的`inp.T @ diag(s) @ inp`变成近rank-1的病态矩阵，Cholesky即使damp涨到0.5+还是失败。设成1.0可以关掉裁剪。改了这个值会让static_cache_path的cache key变（key里带`salclip{value}`），重新预计算。
 - PROJ_LR_SCALE：调整o_proj层用的学习率
 - DOWN_PROJ_LR_SCALE：调整down_proj层用的学习率（这个层一般比较爆炸）
 - SECOND_ORDER_SCALE：调整gptq式二阶更新的scale，固定为1就行
@@ -155,13 +155,19 @@ $$
 L(y_i^{\text{fp}}+\Delta y_i) \;\approx\; L(y_i^{\text{fp}}) \;+\; g_i^{T}\Delta y_i \;+\; \tfrac{1}{2}\,\Delta y_i^{T} H_i\, \Delta y_i
 $$
 
-其中 $g_i = \left.\partial L/\partial y_i\right|_{y_i=y_i^{\text{fp}}}$ ，$H_i$ 是 $L$ 在 $y_i^{\text{fp}}$ 处的 Hessian。 $L(y_i^{\text{fp}})$ 对当前层权重不依赖、求梯度为 0，舍去。 $H_i$ 用预计算的 **empirical Fisher 矩阵** `E[g g^T]`（不再按 token 保存，也不再按 `fisher_num_groups` 分组）。忽略一阶项就是 Fisher 矩阵二次型；refined_mse 把一阶项加回来。
+其中 $g_i = \left.\partial L/\partial y_i\right|_{y_i=y_i^{\text{fp}}}$ ，$H_i$ 是 $L$ 在 $y_i^{\text{fp}}$ 处的 Hessian。 $L(y_i^{\text{fp}})$ 对当前层权重不依赖、求梯度为 0，舍去。 $H_i$ 用预计算的 **empirical Fisher 矩阵** `E[g g^T]`（不再按 token 保存，也不再按 `fisher_num_groups` 分组）。这里的 `g` 来自输出sample×输出token求和的 sampled NLL total loss；`E[...]` 是在中间层token维上的共享系数平均。忽略一阶项就是 Fisher 矩阵二次型；refined_mse 把一阶项加回来。
 
 一阶项 $g_i$ 取决于"从当前 layer $i$ 输出到端到端 KL 的反传"。在 fp 模型上 $g_i\equiv 0$（student 完全等于 teacher，KL=0，梯度处处为 0）——所以**必须在量化进行到 layer $i$ 的那一刻、上游 $0..i-1$ 已经量化的状态下**去采 $g_i$ ，才能拿到非零值。这一点是 refined_res_kl 在预处理一次就把 A 矩阵全收完的做法做不到的。
 
 ### 实现细节（代码怎么做）
 
 整个流程完全嵌进主量化循环（[gptq_fwrd](gptq_utils/gptq_plus_utils.py)），每一层独立算一次 grad pool 然后用于该层的 refresh：
+
+### Loss 尺度约定
+
+- **输出token维**：静态 saliency / Fisher / dynsal SVD 用 sampled NLL，loss 一律对输出sample×输出token求和后 backward，不做 batch/token mean。这样 activation grad 对应的是总 NLL loss 的梯度。
+- **中间层token维**：hook 拿到的是每个中间层token的 activation grad。Saliency 保留 per-token 值，只在输出通道 group 内平均；layer-output Fisher 存的是 `sum_middle g^T g / N_middle` 这个共享系数；dynsal SVD 累积未归一化的中间token和，动态更新公式里再显式用 `N_global`。
+- **refresh loss**：`compute_refresh_loss` 仍按当前 refresh mini-batch 返回平均 loss，外层再按样本数聚合梯度；这是优化步长的尺度约定，不改变静态 NLL/Fisher/SVD 的采集定义。
 
 **Step 1 — 采样（[gptq_plus_utils.py:4738-4808](gptq_utils/gptq_plus_utils.py#L4738-L4808)）**。开始量化 layer $i$ 之前：
 - 用 `random.Random(args.seed + i)` 建独立 RNG，从 `[0, n_local)` 无放回抽 `num_samples_for_refined_mse` 个 rank-local sample id（sorted）。
@@ -178,7 +184,7 @@ $$
   - `logits_student = hidden2logits(h, analyzer)`
   - `logits_teacher = hidden2logits(fp_inps_final[batch_ids], analyzer).detach()`
   - `kl_topk > 0` 时 gather 成 top-k
-  - `kl = F.kl_div(log_softmax(...), softmax(...), reduction='none').sum(-1).mean()`
+  - `kl = F.kl_div(log_softmax(...), softmax(...), reduction='none').sum(-1).sum()`，即对输出sample×输出token求总loss
   - `grad = torch.autograd.grad(kl, out_i, retain_graph=False)[0]`（**只反传到 `out_i`，不再往前**）
 - 所有 batch 的 grad 拼成 `grad_pool` shape `(N_pool, seq, H)`，bf16 存 CPU；顺便算 `mean_grad = grad_pool.float().mean(dim=(0,1))` shape `(H,)` fp32 on dev。
 - finally 把下游 layer 搬回 CPU、把 act-quant wrapper 恢复。

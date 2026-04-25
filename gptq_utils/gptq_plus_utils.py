@@ -2602,6 +2602,10 @@ def collect_static_end_to_end_saliency_and_fisher(
                     sal_per_group.detach().cpu()
                 )
                 # --- dynsal branch: streaming randomized SVD sketch ---
+                # `grad` is produced by a scalar loss that is summed over output
+                # samples/tokens. Rows below are middle-layer tokens; the sketch is
+                # an unnormalised middle-token sum. The 1/N middle-token factors
+                # are applied later in `refresh_dynamic_saliency`, not here.
                 # Replace the (d_out, d_out) G^T G accumulator (which alone
                 # costs ~50 GB GPU on Llama-3-8B and OOMs at ≥13B) with a
                 # rank-K Y_sketch = G^T (G Ω) accumulator of shape (d_out, K).
@@ -2662,6 +2666,10 @@ def collect_static_end_to_end_saliency_and_fisher(
 
             def grad_hook(grad):
                 grad_flat = grad.detach().float().reshape(-1, grad.shape[-1])
+                # `grad` comes from an output-token SUM loss. Accumulate the
+                # unnormalised sum over middle-layer tokens here; aggregation
+                # below divides once by the global middle-token count to store
+                # the shared E_middle[g g^T] Fisher coefficient.
                 fisher_block = grad_flat.t() @ grad_flat  # stays on GPU fp32
                 if fisher_data[layer_idx] is None:
                     fisher_data[layer_idx] = fisher_block
@@ -4041,7 +4049,7 @@ def collect_layer_output_grad_for_refined_mse(
                                 F.log_softmax(logits_student, dim=-1),
                                 F.softmax(logits_teacher, dim=-1),
                                 reduction="none",
-                            ).sum(dim=-1).mean()
+                            ).sum(dim=-1).sum()
                         with layer_recorder.section("layer.refined_mse_grad_pool.batch.backward") if layer_recorder else _NULL_CONTEXT:
                             if collect_next:
                                 # One backward pass, two gradient outputs — cheaper
@@ -4099,6 +4107,10 @@ def collect_layer_output_grad_for_refined_mse(
         # `.float()` / `.mean()` below are plain CPU ops that bypass any CUDA
         # stream ordering, so we need an explicit sync here.
         d2h_stream.synchronize()
+        # Per-token gradients in the pool come from the output-token SUM KL
+        # loss above. For non-pool refresh samples we still use a shared
+        # coefficient over middle-layer tokens, so this remains an average over
+        # the pool's middle-token axis only.
         mean_grad = grad_pool.float().mean(dim=(0, 1)).to(dev)
         mean_grad_next = None
         if grad_pool_next is not None:
@@ -4216,15 +4228,18 @@ def collect_layer_output_fisher_only(
                         F.softmax(kl_logits_fp, dim=-1),
                         reduction="none",
                     )
-                    kl_loss = kl_loss.sum(dim=-1).mean()
+                    # Sum over output samples/tokens to match the NLL-based
+                    # saliency/Fisher convention. The Fisher accumulator below
+                    # then averages only over middle-layer tokens when storing
+                    # the shared E_middle[g g^T] coefficient.
+                    kl_loss = kl_loss.sum(dim=-1).sum()
 
                 with layer_recorder.section("layer.pre_quant_fisher.backward") if layer_recorder else _NULL_CONTEXT:
                     out_hidden.retain_grad()
 
                     def layer_output_grad_hook(grad):
                         nonlocal fisher_sum
-                        token_count = grad.shape[0] * grad.shape[1]
-                        grad_flat = (grad.detach().float() * token_count).reshape(-1, grad.shape[-1])
+                        grad_flat = grad.detach().float().reshape(-1, grad.shape[-1])
                         fisher_block = grad_flat.t() @ grad_flat
                         if fisher_sum is None:
                             fisher_sum = fisher_block
