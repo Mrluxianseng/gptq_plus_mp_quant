@@ -2513,17 +2513,51 @@ def collect_static_end_to_end_saliency_and_fisher(
     # all-reduce across ranks and do EVD to get V, Σ². G^T G itself is freed
     # right after EVD (can be ~500 MB per up/gate on Llama-7B). U is collected
     # in a SECOND backward pass below, once V, Σ are known.
-    dynsal_gtg_data = (
+    # Dynamic saliency randomized SVD: per-(layer, module) sketch state for
+    # Pass 1, all kept on GPU at trivial cost compared to the previous
+    # full-G^T G accumulator (~50 GB GPU for Llama-3-8B, ≥150 GB for 13B+).
+    #
+    # The sketch sizes are O(d_out × K) with K = 2 × dynsal_rank: roughly
+    # 1-3 MB per module on Llama-3-8B (vs ~822 MB for up/gate's full G^T G).
+    #
+    # Layout per (layer, module):
+    #   omega:       Ω ∈ ℝ^(d_out × K), Gaussian, deterministically seeded so
+    #                every DP rank generates the SAME Ω (otherwise the sketch
+    #                across ranks would be incoherent and all-reduce would mix
+    #                projections from different sketches).
+    #   sketch:      Y_sketch ∈ ℝ^(d_out × K), accumulator for G^T (G Ω). After
+    #                Pass 1 we all-reduce + QR to get an orthonormal basis Q
+    #                of the same shape (d_out × K). Storage gets reused: the
+    #                same tensor's contents are overwritten with Q.
+    # Both lazily-allocated on the first hook call to size them by the actual
+    # output dim.
+    dynsal_omega_data = (
         [
             {module_name: None for module_name in module_dict.keys()}
             for module_dict in module_dicts
         ]
         if collect_dynsal else None
     )
+    dynsal_sketch_data = (
+        [
+            {module_name: None for module_name in module_dict.keys()}
+            for module_dict in module_dicts
+        ]
+        if collect_dynsal else None
+    )
+    dynsal_K = (2 * int(dynsal_rank)) if collect_dynsal else 0
     # Populated by the dynsal second-pass block inside `try:` below when
     # `collect_dynsal=True`. Remains None otherwise so downstream unpacking
     # (`..., static_dynsal = collect_static_...`) always has something to bind.
     static_dynsal = None
+    # Stable per-(layer, module) seed for Ω. We need every DP rank to draw the
+    # SAME Gaussian Ω, so we derive a deterministic 31-bit integer from the
+    # global args seed plus the canonical (layer_idx, module_name) — this stays
+    # stable regardless of rank or batching.
+    import zlib as _zlib
+    def _omega_seed(_layer_idx, _module_name):
+        h = _zlib.crc32(_module_name.encode()) ^ (_layer_idx * 0x9E3779B1)
+        return ((int(getattr(profile_recorder, "_dynsal_seed_base", 0xC0FFEE)) + h) & 0x7FFFFFFF)
     handles = []
 
     def make_module_hook(layer_idx, module_name):
@@ -2567,44 +2601,53 @@ def collect_static_end_to_end_saliency_and_fisher(
                 saliency_data[layer_idx][module_name].append(
                     sal_per_group.detach().cpu()
                 )
-                # --- dynsal branch (in-place GPU accumulator, see
-                # make_dynsal_module_hook docstring for why) ---
+                # --- dynsal branch: streaming randomized SVD sketch ---
+                # Replace the (d_out, d_out) G^T G accumulator (which alone
+                # costs ~50 GB GPU on Llama-3-8B and OOMs at ≥13B) with a
+                # rank-K Y_sketch = G^T (G Ω) accumulator of shape (d_out, K).
+                # K = 2 × dynsal_rank covers the standard 2× oversampling.
+                # Total per-module GPU is O(d_out × K × 4B) ≈ 1-3 MB at K=32.
                 if collect_dynsal:
-                    grad_flat = grad_fp32.reshape(-1, hidden_dim)
-                    gtg_block = grad_flat.t() @ grad_flat
-                    slot = dynsal_gtg_data[layer_idx][module_name]
-                    if slot is None:
-                        dynsal_gtg_data[layer_idx][module_name] = gtg_block
-                    else:
-                        slot.add_(gtg_block)
-                        del gtg_block
+                    grad_flat = grad_fp32.reshape(-1, hidden_dim)  # (B·T, d_out)
+                    Omega = dynsal_omega_data[layer_idx][module_name]
+                    sketch = dynsal_sketch_data[layer_idx][module_name]
+                    if Omega is None:
+                        # Lazy-init Ω with a deterministic per-(layer, module)
+                        # seed so every DP rank generates the same Gaussian.
+                        omega_seed = _omega_seed(layer_idx, module_name)
+                        omega_gen = torch.Generator(device=grad_flat.device)
+                        omega_gen.manual_seed(omega_seed)
+                        K_eff = min(dynsal_K, hidden_dim)
+                        Omega = torch.randn(
+                            hidden_dim, K_eff,
+                            generator=omega_gen,
+                            dtype=torch.float32,
+                            device=grad_flat.device,
+                        )
+                        dynsal_omega_data[layer_idx][module_name] = Omega
+                        sketch = torch.zeros(
+                            hidden_dim, K_eff,
+                            dtype=torch.float32,
+                            device=grad_flat.device,
+                        )
+                        dynsal_sketch_data[layer_idx][module_name] = sketch
+                    # Y += G^T (G Ω). Use (B·T, K) intermediate (small).
+                    g_omega = grad_flat @ Omega  # (B·T, K) fp32
+                    sketch.addmm_(grad_flat.t(), g_omega)  # in-place
+                    del grad_flat, g_omega
 
             out_tensor.register_hook(grad_hook)
 
         return forward_hook
 
-    def make_dynsal_module_hook(layer_idx, module_name):
-        """(Kept for binary-compat — no longer used when collect_dynsal=True;
-        the logic is merged into make_module_hook above to share the fp32 cast
-        and halve the grad-hook count. Leaving the factory in place so nothing
-        else breaks in case an out-of-tree caller references it.)"""
-        def forward_hook(module, inp, out):
-            out_tensor = out[0] if isinstance(out, (tuple, list)) else out
-            out_tensor.retain_grad()
-
-            def grad_hook(grad):
-                grad_flat = grad.detach().float().reshape(-1, grad.shape[-1])
-                gtg_block = grad_flat.t() @ grad_flat  # stays on GPU fp32
-                slot = dynsal_gtg_data[layer_idx][module_name]
-                if slot is None:
-                    dynsal_gtg_data[layer_idx][module_name] = gtg_block
-                else:
-                    slot.add_(gtg_block)
-                    del gtg_block
-
-            out_tensor.register_hook(grad_hook)
-
-        return forward_hook
+    def make_dynsal_module_hook(*args, **kwargs):
+        """Removed. Dynsal G^T G is now computed inside `make_module_hook` as a
+        randomized SVD sketch; calling this directly is a hard error to catch
+        any out-of-tree caller that hasn't migrated."""
+        raise RuntimeError(
+            "make_dynsal_module_hook is obsolete; use make_module_hook (merged "
+            "saliency + dynsal sketch hook)."
+        )
 
     def make_layer_hook(layer_idx):
         """Per-layer end-to-end Fisher (H, H) at the transformer block output.
@@ -2993,16 +3036,32 @@ def collect_static_end_to_end_saliency_and_fisher(
                 with profile_recorder.section("pipeline.static_fisher.final_flush") if profile_recorder else _NULL_CONTEXT:
                     _flush_refined_rkl_sub_a(refined_prev_a)
 
-            # === Dynamic saliency: 1st-pass EVD + 2nd-pass backward for U ===
+            # === Dynamic saliency: randomized SVD (sketch + 2nd-pass) ===
+            # Replaces the explicit (d_out, d_out) G^T G EVD which OOMs at ≥13B.
+            # Pass 1 (already done above by the merged hook): accumulated
+            #   Y_sketch = G^T (G Ω) ∈ ℝ^(d_out × K) per (layer, module).
+            # Now:
+            #   1. all-reduce Y_sketch across DP ranks (Ω is identical across
+            #      ranks by deterministic seeding, so the per-rank Y's are
+            #      sketches of the same column space — sum is consistent).
+            #   2. QR(Y_sketch) → Q ∈ ℝ^(d_out × K); same span as the top-K
+            #      right singular subspace of G with high probability.
+            #   3. Pass 2 (new backward): for each batch, compute B_local =
+            #      G_batch @ Q ∈ ℝ^(B·T × K) and accumulate
+            #      B_cov += B_local^T B_local on GPU. Also stream B_local rows
+            #      into a preallocated GPU buffer for later assembly into
+            #      U_Sigma. K K matrices are tiny (≪1 MB), B_full buffers are
+            #      O(N_local·T·K) bf16 — same order as the previous U_Sigma
+            #      buffer, just with K = 2R columns.
+            #   4. eigh(B_cov) → V_hat (K-dim), truncate to top-R.
+            #      V = Q @ V_hat ∈ ℝ^(d_out × R), U_Sigma = B_full @ V_hat.
             # Must happen BEFORE the outer finally because:
-            #   (a) the finally pushes the model back to CPU (non-FSDP path),
-            #       which would break any second forward/backward;
-            #   (b) we need to re-register hooks and re-enter `torch.enable_grad()`
-            #       while the _kick_off pre-hook is still attached.
+            #   (a) the finally pushes the model back to CPU (non-FSDP path);
+            #   (b) we need to re-register hooks while _kick_off pre-hook is
+            #       still attached.
             if collect_dynsal:
-                with profile_recorder.section("pipeline.static_fisher.dynsal_aggregate") if profile_recorder else _NULL_CONTEXT:
-                    # EVD per (layer, module) — V, Σ² on GPU first then cached on CPU
-                    # bf16/fp32 for persistence, and also kept on GPU for the 2nd pass.
+                with profile_recorder.section("pipeline.static_fisher.dynsal_qr") if profile_recorder else _NULL_CONTEXT:
+                    # Pass-1 finalisation: all-reduce Y_sketch, QR → Q.
                     first_layer_module = next(iter(module_dicts[0].keys()))
                     local_tokens_N = sum(
                         int(chunk.shape[0] * chunk.shape[1])
@@ -3010,128 +3069,104 @@ def collect_static_end_to_end_saliency_and_fisher(
                     )
                     N_global = int(dist_utils.allreduce_sum_scalar(local_tokens_N))
                     static_dynsal_by_layer = []
-                    dynsal_V_dev = [{} for _ in module_dicts]
+                    dynsal_Q_dev = [{} for _ in module_dicts]
+                    dynsal_H_out = [{} for _ in module_dicts]
                     for layer_idx, module_dict in enumerate(module_dicts):
                         layer_dynsal = {}
                         for module_name in module_dict.keys():
-                            gtg_gpu = dynsal_gtg_data[layer_idx][module_name]
-                            if gtg_gpu is None:
+                            sketch = dynsal_sketch_data[layer_idx][module_name]
+                            if sketch is None:
                                 raise ValueError(
-                                    f"Failed to collect per-module G^T G for dynamic saliency: "
+                                    f"Failed to collect Y_sketch for dynsal: "
                                     f"layer={layer_idx} module={module_name}."
                                 )
-                            # Accumulator already on `dev` in fp32 (see
-                            # make_dynsal_module_hook). Just all-reduce in place.
-                            dist_utils.allreduce_sum_(gtg_gpu)
-                            gtg_gpu = 0.5 * (gtg_gpu + gtg_gpu.t())
-                            eigvals, eigvecs = torch.linalg.eigh(gtg_gpu)
-                            H_out = gtg_gpu.shape[0]
-                            R_req = min(dynsal_rank, H_out)
-                            top_eigvals = eigvals[-R_req:].flip(0).clamp_min(0.0)
-                            top_eigvecs = eigvecs[:, -R_req:].flip(1)
-                            max_eig = top_eigvals[0].clamp_min(1e-30)
-                            keep_mask = top_eigvals >= max_eig * dynsal_evd_thresh
-                            R_eff = int(keep_mask.sum().item())
-                            if R_eff < 1:
-                                R_eff = 1
-                            Sigma_sq = top_eigvals[:R_eff].contiguous()
-                            V = top_eigvecs[:, :R_eff].contiguous()
+                            dist_utils.allreduce_sum_(sketch)
+                            # QR — Q has same shape as sketch, orthonormal columns.
+                            # `mode='reduced'` is the default; sketch is (d_out, K)
+                            # with d_out >= K, so Q is (d_out, K).
+                            Q, _R_qr = torch.linalg.qr(sketch, mode="reduced")
+                            del _R_qr
+                            H_out = Q.shape[0]
+                            K_eff = Q.shape[1]
+                            # Stash entry shell — V / U_Sigma / Sigma_sq filled
+                            # in after Pass 2's eigh.
                             layer_dynsal[module_name] = {
-                                "V": V.to(torch.bfloat16).cpu(),
-                                "Sigma_sq": Sigma_sq.cpu(),  # fp32
                                 "H_out": int(H_out),
-                                "R_eff": int(R_eff),
+                                # R_eff finalised after eigh + threshold below.
                             }
-                            # Keep the GPU copy of V around for the 2nd pass.
-                            dynsal_V_dev[layer_idx][module_name] = V.detach().clone()
-                            # Release the GPU `G^T G` now — holding 32 layer × 7
-                            # module accumulators (≈42 GB fp32 at 7B) simultaneously
-                            # is what limits this to ≤13B without FSDP. Freeing per
-                            # (layer, module) as we EVD them drops peak promptly.
-                            del gtg_gpu, eigvals, eigvecs, top_eigvals, top_eigvecs
-                            dynsal_gtg_data[layer_idx][module_name] = None
-                        # End of per-module loop — record this layer's dict.
-                        # Without this append, `static_dynsal_by_layer` stays
-                        # empty and the 2nd-pass setup hits IndexError.
+                            dynsal_Q_dev[layer_idx][module_name] = Q.contiguous()
+                            dynsal_H_out[layer_idx][module_name] = int(H_out)
+                            # Drop Ω + the original sketch buffer; we no longer
+                            # need them once Q is in hand.
+                            dynsal_omega_data[layer_idx][module_name] = None
+                            dynsal_sketch_data[layer_idx][module_name] = None
+                            del sketch
                         static_dynsal_by_layer.append(layer_dynsal)
-                    dynsal_gtg_data = None
+                    dynsal_omega_data = None
+                    dynsal_sketch_data = None
                     memory_utils.cleanup_memory()
-                    static_dynsal = {
-                        "by_layer": static_dynsal_by_layer,
-                        "N_global": N_global,
-                        "dynsal_rank": int(dynsal_rank),
-                        "dynsal_evd_thresh": float(dynsal_evd_thresh),
-                    }
                     logging.info(
-                        "dynsal: EVD done for %d layers × %d modules; R (requested)=%d, "
-                        "EVD threshold=%.0e, mean R_eff=%.1f, N_global=%d",
-                        len(layers), len(module_dicts[0]), dynsal_rank, dynsal_evd_thresh,
-                        float(sum(
-                            m["R_eff"] for layer_d in static_dynsal_by_layer for m in layer_d.values()
-                        )) / (len(layers) * len(module_dicts[0])),
-                        N_global,
+                        "dynsal: QR done for %d layers × %d modules; K=%d, "
+                        "(R will be picked from eigh after Pass 2). N_global=%d",
+                        len(layers), len(module_dicts[0]), dynsal_K, N_global,
                     )
 
                 with profile_recorder.section("pipeline.static_fisher.dynsal_second_pass") if profile_recorder else _NULL_CONTEXT:
-                    # Switch hooks: remove first-pass hooks (saliency / fisher /
-                    # refined_rkl / dynsal_gtg / fp_final), keep only the new
-                    # U-collection hooks. Same driver loop, same batches, same
-                    # labels → the G rows seen by grad_hook are numerically
-                    # identical to the first pass.
+                    # Pass-2 backward: replace first-pass hooks with U-collection
+                    # hooks that accumulate B_cov AND stream B_local into a
+                    # preallocated GPU buffer.
                     for h in handles:
                         h.remove()
                     handles.clear()
 
-                    # Pre-allocate one GPU buffer per module sized (N_local_total, R)
-                    # bf16 and fill it in-place as batches arrive. Single `.cpu()`
-                    # transfer at the very end (vs per-batch in the old version)
-                    # keeps the backward stream from stalling on PCIe. For 7 modules
-                    # × 32 layer × (N_local ≈ 128·2048 tokens, R=16) bf16: ~1.8 GB
-                    # GPU total — trivial.
-                    dynsal_u_sigma_dev = {}
+                    dynsal_b_buf_dev = {}      # (N_local·T, K) bf16 per (l, m)
+                    dynsal_b_cov = {}           # (K, K) fp32 per (l, m)
                     dynsal_write_cursor = {}
-                    token_total_local = 0
-                    for md in module_dicts:
-                        for name in md.keys():
-                            break
-                        break
-                    # Infer total rank-local token count from the Step-A saliency
-                    # cache (same N_local applies to every module/layer).
                     token_total_local = sum(
                         int(chunk.shape[0] * chunk.shape[1])
                         for chunk in saliency_data[0][next(iter(module_dicts[0].keys()))]
                     )
                     for layer_idx, md in enumerate(module_dicts):
-                        dynsal_u_sigma_dev[layer_idx] = {}
+                        dynsal_b_buf_dev[layer_idx] = {}
+                        dynsal_b_cov[layer_idx] = {}
                         dynsal_write_cursor[layer_idx] = {name: 0 for name in md.keys()}
                         for name in md.keys():
-                            R_eff = static_dynsal_by_layer[layer_idx][name]["R_eff"]
-                            dynsal_u_sigma_dev[layer_idx][name] = torch.empty(
-                                token_total_local, R_eff,
+                            K_for_module = dynsal_Q_dev[layer_idx][name].shape[1]
+                            dynsal_b_buf_dev[layer_idx][name] = torch.empty(
+                                token_total_local, K_for_module,
                                 dtype=torch.bfloat16, device=dev,
+                            )
+                            dynsal_b_cov[layer_idx][name] = torch.zeros(
+                                K_for_module, K_for_module,
+                                dtype=torch.float32, device=dev,
                             )
 
                     def make_u_hook(layer_idx, module_name):
-                        """Capture per-batch (G_batch @ V) = U·Σ rows; thin SVD gives
-                        G V = U Σ V^T V = U Σ exactly, so no Σ⁻¹ is needed here.
-                        Writes directly into a preallocated GPU buffer slice to
-                        avoid any per-batch `.cpu()` sync."""
+                        """Pass-2 hook: B_local = G_batch @ Q, accumulate B_cov in
+                        place, and stream B_local rows into the preallocated
+                        (N_local·T, K) bf16 GPU buffer for later U_Sigma = B_full
+                        @ V_hat after eigh."""
                         def forward_hook(module, inp, out):
                             out_tensor = out[0] if isinstance(out, (tuple, list)) else out
                             out_tensor.retain_grad()
 
                             def grad_hook(grad):
                                 grad_flat = grad.detach().float().reshape(-1, grad.shape[-1])
-                                V_m = dynsal_V_dev[layer_idx][module_name]  # (H_out, R) fp32 dev
-                                u_sigma_batch = grad_flat @ V_m           # (N_tokens_batch, R) fp32 dev
-                                buf = dynsal_u_sigma_dev[layer_idx][module_name]
-                                n_tokens_batch = u_sigma_batch.shape[0]
+                                Q_m = dynsal_Q_dev[layer_idx][module_name]  # (d_out, K) fp32
+                                B_local = grad_flat @ Q_m  # (B·T, K) fp32
+                                # In-place accumulate B_cov += B^T B (small KxK).
+                                dynsal_b_cov[layer_idx][module_name].addmm_(
+                                    B_local.t(), B_local
+                                )
+                                # Stream rows to the preallocated bf16 buffer.
+                                buf = dynsal_b_buf_dev[layer_idx][module_name]
+                                n_tokens_batch = B_local.shape[0]
                                 cursor = dynsal_write_cursor[layer_idx][module_name]
                                 buf[cursor:cursor + n_tokens_batch].copy_(
-                                    u_sigma_batch.to(torch.bfloat16), non_blocking=True
+                                    B_local.to(torch.bfloat16), non_blocking=True
                                 )
                                 dynsal_write_cursor[layer_idx][module_name] = cursor + n_tokens_batch
-                                del u_sigma_batch, grad_flat
+                                del B_local, grad_flat
                             out_tensor.register_hook(grad_hook)
                         return forward_hook
 
@@ -3171,33 +3206,76 @@ def collect_static_end_to_end_saliency_and_fisher(
                                 loss.backward()
                                 del outputs, logits, teacher_logits, student_logits, labels, loss, input_ids
 
-                    # Verify every buffer is fully filled, then transfer to CPU
-                    # bf16 exactly once per module.
-                    for l_idx, layer_d in enumerate(static_dynsal_by_layer):
+                    # Pass-2 finalisation: per (layer, module) all-reduce B_cov,
+                    # eigh, top-R truncation, build V = Q @ V_hat, U_Sigma =
+                    # B_full @ V_hat. Free Q, B_full, B_cov immediately after.
+                    R_eff_total = 0
+                    for layer_idx, layer_d in enumerate(static_dynsal_by_layer):
                         for name, entry in layer_d.items():
-                            buf = dynsal_u_sigma_dev[l_idx][name]
-                            written = dynsal_write_cursor[l_idx][name]
-                            if written != buf.shape[0]:
+                            written = dynsal_write_cursor[layer_idx][name]
+                            B_full_dev = dynsal_b_buf_dev[layer_idx][name]
+                            if written != B_full_dev.shape[0]:
                                 raise RuntimeError(
-                                    f"dynsal 2nd pass: expected {buf.shape[0]} rows written for "
-                                    f"layer={l_idx} module={name}, got {written}."
+                                    f"dynsal 2nd pass: expected {B_full_dev.shape[0]} rows for "
+                                    f"layer={layer_idx} module={name}, got {written}."
                                 )
-                            entry["U_Sigma"] = buf.cpu()
-                            # Release the per-(layer, module) GPU buffer right
-                            # away so peak GPU drops as we transfer (was holding
-                            # all ~29 GB U_Sigma alive until the end of the
-                            # transfer loop before).
-                            dynsal_u_sigma_dev[l_idx][name] = None
-                            del buf
-                    dynsal_u_sigma_dev = None
+                            B_cov_m = dynsal_b_cov[layer_idx][name]
+                            dist_utils.allreduce_sum_(B_cov_m)
+                            B_cov_m = 0.5 * (B_cov_m + B_cov_m.t())  # symmetrise
+                            eigvals, eigvecs = torch.linalg.eigh(B_cov_m)
+                            K_for_module = B_cov_m.shape[0]
+                            R_req = min(int(dynsal_rank), K_for_module)
+                            top_eigvals = eigvals[-R_req:].flip(0).clamp_min(0.0)
+                            top_eigvecs = eigvecs[:, -R_req:].flip(1)  # (K, R_req)
+                            max_eig = top_eigvals[0].clamp_min(1e-30)
+                            keep_mask = top_eigvals >= max_eig * dynsal_evd_thresh
+                            R_eff = int(keep_mask.sum().item())
+                            if R_eff < 1:
+                                R_eff = 1
+                            Sigma_sq = top_eigvals[:R_eff].contiguous()
+                            V_hat = top_eigvecs[:, :R_eff].contiguous()  # (K, R_eff)
+                            # V = Q @ V_hat ∈ (d_out, R_eff) fp32 → bf16 CPU.
+                            Q_m = dynsal_Q_dev[layer_idx][name]
+                            V = Q_m @ V_hat  # (d_out, R_eff) fp32 dev
+                            # U_Sigma = B_full @ V_hat ∈ (N_local·T, R_eff).
+                            # bf16 matmul (B_full bf16, cast V_hat to bf16).
+                            V_hat_bf = V_hat.to(torch.bfloat16)
+                            U_Sigma_dev = B_full_dev @ V_hat_bf  # (N_local·T, R_eff) bf16
+                            entry["V"] = V.to(torch.bfloat16).cpu()
+                            entry["Sigma_sq"] = Sigma_sq.cpu()
+                            entry["R_eff"] = int(R_eff)
+                            entry["U_Sigma"] = U_Sigma_dev.cpu()
+                            R_eff_total += R_eff
+                            # Free per-module GPU footprint immediately.
+                            dynsal_b_buf_dev[layer_idx][name] = None
+                            dynsal_b_cov[layer_idx][name] = None
+                            dynsal_Q_dev[layer_idx][name] = None
+                            del B_full_dev, B_cov_m, eigvals, eigvecs, top_eigvals, top_eigvecs
+                            del Q_m, V, V_hat, V_hat_bf, U_Sigma_dev, Sigma_sq
+                    dynsal_b_buf_dev = None
+                    dynsal_b_cov = None
                     dynsal_write_cursor = None
-                    dynsal_V_dev = None
+                    dynsal_Q_dev = None
+                    dynsal_H_out = None
                     memory_utils.cleanup_memory()
+                    static_dynsal = {
+                        "by_layer": static_dynsal_by_layer,
+                        "N_global": N_global,
+                        "dynsal_rank": int(dynsal_rank),
+                        "dynsal_evd_thresh": float(dynsal_evd_thresh),
+                        "dynsal_K": int(dynsal_K),
+                    }
+                    logging.info(
+                        "dynsal: rsvd done for %d layers × %d modules; K=%d, "
+                        "EVD threshold=%.0e, mean R_eff=%.1f, N_global=%d",
+                        len(layers), len(module_dicts[0]), dynsal_K, dynsal_evd_thresh,
+                        float(R_eff_total) / (len(layers) * len(module_dicts[0])),
+                        N_global,
+                    )
 
                 with profile_recorder.section("pipeline.static_fisher.dynsal_pack_weights") if profile_recorder else _NULL_CONTEXT:
                     # Pack C_k, W_cross, W_quad once up-front (fp32 on CPU). Each
-                    # module's packs are G × R × R; for Llama-7B with G=4, R=16
-                    # that's 4 KB per module — trivial.
+                    # module's packs are G × R × R; trivial in size.
                     G_groups = int(saliency_num_groups)
                     for layer_d in static_dynsal_by_layer:
                         for entry in layer_d.values():
@@ -3210,13 +3288,12 @@ def collect_static_end_to_end_saliency_and_fisher(
                                     f"dynsal pack: H_out ({H_out}) must be divisible by num_groups ({G_groups})."
                                 )
                             group_size = H_out // G_groups
-                            # C_k = V[J_k].T @ V[J_k] / |J_k|
                             C_packed = torch.empty(G_groups, R_eff, R_eff, dtype=torch.float32, device=dev)
                             for k in range(G_groups):
-                                Vk = V_dev[k * group_size:(k + 1) * group_size]  # (group_size, R_eff)
+                                Vk = V_dev[k * group_size:(k + 1) * group_size]
                                 C_packed[k] = (Vk.t() @ Vk) / float(group_size)
-                            D = torch.diag(Sigma_sq_dev)                       # (R_eff, R_eff)
-                            W_cross_packed = torch.matmul(C_packed, D)         # (G, R_eff, R_eff)
+                            D = torch.diag(Sigma_sq_dev)
+                            W_cross_packed = torch.matmul(C_packed, D)
                             W_quad_packed = torch.matmul(torch.matmul(D, C_packed), D)
                             entry["C_packed"] = C_packed.cpu()
                             entry["W_cross_packed"] = W_cross_packed.cpu()
@@ -6040,13 +6117,20 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     # forward activation inside the hook (that cast is ~7 GB GPU
                     # transient per up/gate batch on 8B — more than the output
                     # tensor itself).
+                    # `full.keys()` can carry the `.module` suffix for QuantWrapped
+                    # layers, while `static_dynsal["by_layer"][i]` was built from
+                    # `module_dicts` whose keys are canonical (suffix stripped by
+                    # `normalize_quant_module_name`). Normalise here to match.
                     layer_dyn = static_dynsal["by_layer"][i]
                     dynsal_V_dev_for_layer = {}
                     for _name in full.keys():
-                        _entry = layer_dyn.get(_name, layer_dyn.get(_name + ".module", None))
+                        _canonical = normalize_quant_module_name(_name)
+                        _entry = layer_dyn.get(_canonical)
                         if _entry is None:
                             raise KeyError(
-                                f"Missing dynsal V for layer={i} module={_name}."
+                                f"Missing dynsal V for layer={i} module={_name} "
+                                f"(canonical={_canonical}). Available keys: "
+                                f"{sorted(layer_dyn.keys())}"
                             )
                         dynsal_V_dev_for_layer[_name] = _entry["V"].to(dev, dtype=torch.bfloat16)
                     P_fp_by_module = _collect_module_output_projections(
@@ -6096,20 +6180,19 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         N_global = int(static_dynsal["N_global"])
                         dynsal_refresh_overrides = {}
                         for _name in subset.keys():
-                            dyn_entry = dynsal_by_layer[i].get(
-                                _name, dynsal_by_layer[i].get(_name + ".module", None)
-                            )
+                            _canonical = normalize_quant_module_name(_name)
+                            dyn_entry = dynsal_by_layer[i].get(_canonical)
                             if dyn_entry is None:
                                 raise KeyError(
-                                    f"Missing dynsal cache for layer={i} module={_name}. "
-                                    f"Available keys: {sorted(dynsal_by_layer[i].keys())}"
+                                    f"Missing dynsal cache for layer={i} module={_name} "
+                                    f"(canonical={_canonical}). Available keys: "
+                                    f"{sorted(dynsal_by_layer[i].keys())}"
                                 )
-                            static_sal = static_saliency_by_layer[i].get(
-                                _name, static_saliency_by_layer[i].get(_name + ".module", None)
-                            )
+                            static_sal = static_saliency_by_layer[i].get(_canonical)
                             if static_sal is None:
                                 raise KeyError(
-                                    f"Missing static saliency for layer={i} module={_name}."
+                                    f"Missing static saliency for layer={i} module={_name} "
+                                    f"(canonical={_canonical})."
                                 )
                             if _name not in P_fp_by_module:
                                 raise KeyError(
