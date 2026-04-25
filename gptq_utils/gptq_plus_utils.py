@@ -2538,7 +2538,12 @@ def collect_static_end_to_end_saliency_and_fisher(
                         f"Module output dim ({hidden_dim}) must be divisible by saliency num_groups ({saliency_num_groups})."
                     )
                 group_size = hidden_dim // saliency_num_groups
-                grad_squared = grad.float().pow(2).view(
+                # Single fp32 cast shared between saliency (grad² group-mean) and
+                # dynsal (G^T G). Before merging these into one hook we cast
+                # grad → fp32 twice per module per backward; now once.
+                grad_fp32 = grad.detach().float()
+                # --- saliency branch ---
+                grad_squared = grad_fp32.pow(2).view(
                     bsz_local,
                     seq_len_local,
                     saliency_num_groups,
@@ -2562,25 +2567,27 @@ def collect_static_end_to_end_saliency_and_fisher(
                 saliency_data[layer_idx][module_name].append(
                     sal_per_group.detach().cpu()
                 )
+                # --- dynsal branch (in-place GPU accumulator, see
+                # make_dynsal_module_hook docstring for why) ---
+                if collect_dynsal:
+                    grad_flat = grad_fp32.reshape(-1, hidden_dim)
+                    gtg_block = grad_flat.t() @ grad_flat
+                    slot = dynsal_gtg_data[layer_idx][module_name]
+                    if slot is None:
+                        dynsal_gtg_data[layer_idx][module_name] = gtg_block
+                    else:
+                        slot.add_(gtg_block)
+                        del gtg_block
 
             out_tensor.register_hook(grad_hook)
 
         return forward_hook
 
     def make_dynsal_module_hook(layer_idx, module_name):
-        """Capture per-module end-to-end gradient G (shape N_local×T × H_out, stacked
-        across batches) as an IN-PLACE GPU fp32 accumulator of G^T G. Post-loop
-        all-reduce + EVD gives V, Σ² for the low-rank decomposition used by the
-        dynamic saliency update.
-
-        Note: we intentionally keep the running sum on the GPU to avoid a
-        per-batch synchronous `.cpu()` transfer — doing the transfer inside every
-        backward hook drains the backward pipeline (GPU idle while waiting on
-        PCIe), costing orders of magnitude more than the actual matmul. Peak GPU
-        memory is `Σ_m H_out_m² * 4B` across ALL (layer, module) pairs. For
-        Llama-7B that's ~42 GB, for Qwen3-0.6B ~650 MB. Larger models should
-        use `--fsdp_precompute` which shards params + grads across ranks; the
-        accumulator itself stays replicated per-rank."""
+        """(Kept for binary-compat — no longer used when collect_dynsal=True;
+        the logic is merged into make_module_hook above to share the fp32 cast
+        and halve the grad-hook count. Leaving the factory in place so nothing
+        else breaks in case an out-of-tree caller references it.)"""
         def forward_hook(module, inp, out):
             out_tensor = out[0] if isinstance(out, (tuple, list)) else out
             out_tensor.retain_grad()
@@ -2590,28 +2597,34 @@ def collect_static_end_to_end_saliency_and_fisher(
                 gtg_block = grad_flat.t() @ grad_flat  # stays on GPU fp32
                 slot = dynsal_gtg_data[layer_idx][module_name]
                 if slot is None:
-                    # First batch — this tensor IS the running sum from now on.
                     dynsal_gtg_data[layer_idx][module_name] = gtg_block
                 else:
                     slot.add_(gtg_block)
-                    del gtg_block  # release the per-batch intermediate promptly
+                    del gtg_block
 
             out_tensor.register_hook(grad_hook)
 
         return forward_hook
 
     def make_layer_hook(layer_idx):
+        """Per-layer end-to-end Fisher (H, H) at the transformer block output.
+        Same in-GPU-accumulator strategy as dynsal: keep the running sum on
+        the device, transfer to CPU exactly once during aggregation. Before
+        this change the hook did `(grad.t() @ grad).cpu()` + CPU fp32 add on
+        every batch — 32 sync points per batch that drained the backward
+        stream hard and left the GPU oscillating at low utilization."""
         def forward_hook(module, inp, out):
             out_tensor = out[0] if isinstance(out, (tuple, list)) else out
             out_tensor.retain_grad()
 
             def grad_hook(grad):
                 grad_flat = grad.detach().float().reshape(-1, grad.shape[-1])
-                fisher_block = (grad_flat.t() @ grad_flat).cpu()
+                fisher_block = grad_flat.t() @ grad_flat  # stays on GPU fp32
                 if fisher_data[layer_idx] is None:
                     fisher_data[layer_idx] = fisher_block
                 else:
                     fisher_data[layer_idx].add_(fisher_block)
+                    del fisher_block
 
             out_tensor.register_hook(grad_hook)
 
@@ -2717,9 +2730,10 @@ def collect_static_end_to_end_saliency_and_fisher(
         if collect_fisher and (fisher_layer_ids is None or layer_idx in fisher_layer_ids):
             handles.append(layer.register_forward_hook(make_layer_hook(layer_idx)))
         for module_name, module in module_dict.items():
+            # `make_module_hook` handles both saliency and (if collect_dynsal)
+            # dynsal G^T G accumulation in a single grad hook to share the fp32
+            # cast and halve the number of grad-hook invocations per backward.
             handles.append(module.register_forward_hook(make_module_hook(layer_idx, module_name)))
-            if collect_dynsal:
-                handles.append(module.register_forward_hook(make_dynsal_module_hook(layer_idx, module_name)))
     if _collect_any_refined:
         # Register the last-layer "dy capture" hook FIRST in the hook list so
         # it runs first in the forward pass; that way `register_hook` attaches
@@ -3036,6 +3050,10 @@ def collect_static_end_to_end_saliency_and_fisher(
                             # (layer, module) as we EVD them drops peak promptly.
                             del gtg_gpu, eigvals, eigvecs, top_eigvals, top_eigvecs
                             dynsal_gtg_data[layer_idx][module_name] = None
+                        # End of per-module loop — record this layer's dict.
+                        # Without this append, `static_dynsal_by_layer` stays
+                        # empty and the 2nd-pass setup hits IndexError.
+                        static_dynsal_by_layer.append(layer_dynsal)
                     dynsal_gtg_data = None
                     memory_utils.cleanup_memory()
                     static_dynsal = {
@@ -3063,14 +3081,41 @@ def collect_static_end_to_end_saliency_and_fisher(
                     for h in handles:
                         h.remove()
                     handles.clear()
-                    dynsal_u_sigma_data = [
-                        {name: [] for name in md.keys()}
-                        for md in module_dicts
-                    ]
+
+                    # Pre-allocate one GPU buffer per module sized (N_local_total, R)
+                    # bf16 and fill it in-place as batches arrive. Single `.cpu()`
+                    # transfer at the very end (vs per-batch in the old version)
+                    # keeps the backward stream from stalling on PCIe. For 7 modules
+                    # × 32 layer × (N_local ≈ 128·2048 tokens, R=16) bf16: ~1.8 GB
+                    # GPU total — trivial.
+                    dynsal_u_sigma_dev = {}
+                    dynsal_write_cursor = {}
+                    token_total_local = 0
+                    for md in module_dicts:
+                        for name in md.keys():
+                            break
+                        break
+                    # Infer total rank-local token count from the Step-A saliency
+                    # cache (same N_local applies to every module/layer).
+                    token_total_local = sum(
+                        int(chunk.shape[0] * chunk.shape[1])
+                        for chunk in saliency_data[0][next(iter(module_dicts[0].keys()))]
+                    )
+                    for layer_idx, md in enumerate(module_dicts):
+                        dynsal_u_sigma_dev[layer_idx] = {}
+                        dynsal_write_cursor[layer_idx] = {name: 0 for name in md.keys()}
+                        for name in md.keys():
+                            R_eff = static_dynsal_by_layer[layer_idx][name]["R_eff"]
+                            dynsal_u_sigma_dev[layer_idx][name] = torch.empty(
+                                token_total_local, R_eff,
+                                dtype=torch.bfloat16, device=dev,
+                            )
 
                     def make_u_hook(layer_idx, module_name):
                         """Capture per-batch (G_batch @ V) = U·Σ rows; thin SVD gives
-                        G V = U Σ V^T V = U Σ exactly, so no Σ⁻¹ is needed here."""
+                        G V = U Σ V^T V = U Σ exactly, so no Σ⁻¹ is needed here.
+                        Writes directly into a preallocated GPU buffer slice to
+                        avoid any per-batch `.cpu()` sync."""
                         def forward_hook(module, inp, out):
                             out_tensor = out[0] if isinstance(out, (tuple, list)) else out
                             out_tensor.retain_grad()
@@ -3078,10 +3123,15 @@ def collect_static_end_to_end_saliency_and_fisher(
                             def grad_hook(grad):
                                 grad_flat = grad.detach().float().reshape(-1, grad.shape[-1])
                                 V_m = dynsal_V_dev[layer_idx][module_name]  # (H_out, R) fp32 dev
-                                u_sigma_batch = grad_flat @ V_m  # (bsz*seq, R) fp32 dev
-                                dynsal_u_sigma_data[layer_idx][module_name].append(
-                                    u_sigma_batch.to(torch.bfloat16).cpu()
+                                u_sigma_batch = grad_flat @ V_m           # (N_tokens_batch, R) fp32 dev
+                                buf = dynsal_u_sigma_dev[layer_idx][module_name]
+                                n_tokens_batch = u_sigma_batch.shape[0]
+                                cursor = dynsal_write_cursor[layer_idx][module_name]
+                                buf[cursor:cursor + n_tokens_batch].copy_(
+                                    u_sigma_batch.to(torch.bfloat16), non_blocking=True
                                 )
+                                dynsal_write_cursor[layer_idx][module_name] = cursor + n_tokens_batch
+                                del u_sigma_batch, grad_flat
                             out_tensor.register_hook(grad_hook)
                         return forward_hook
 
@@ -3121,16 +3171,26 @@ def collect_static_end_to_end_saliency_and_fisher(
                                 loss.backward()
                                 del outputs, logits, teacher_logits, student_logits, labels, loss, input_ids
 
-                    # Concat U_Sigma chunks per module (CPU bf16).
+                    # Verify every buffer is fully filled, then transfer to CPU
+                    # bf16 exactly once per module.
                     for l_idx, layer_d in enumerate(static_dynsal_by_layer):
                         for name, entry in layer_d.items():
-                            chunks = dynsal_u_sigma_data[l_idx][name]
-                            if not chunks:
+                            buf = dynsal_u_sigma_dev[l_idx][name]
+                            written = dynsal_write_cursor[l_idx][name]
+                            if written != buf.shape[0]:
                                 raise RuntimeError(
-                                    f"dynsal 2nd pass collected no U for layer={l_idx} module={name}."
+                                    f"dynsal 2nd pass: expected {buf.shape[0]} rows written for "
+                                    f"layer={l_idx} module={name}, got {written}."
                                 )
-                            entry["U_Sigma"] = torch.cat(chunks, dim=0)
-                    dynsal_u_sigma_data = None
+                            entry["U_Sigma"] = buf.cpu()
+                            # Release the per-(layer, module) GPU buffer right
+                            # away so peak GPU drops as we transfer (was holding
+                            # all ~29 GB U_Sigma alive until the end of the
+                            # transfer loop before).
+                            dynsal_u_sigma_dev[l_idx][name] = None
+                            del buf
+                    dynsal_u_sigma_dev = None
+                    dynsal_write_cursor = None
                     dynsal_V_dev = None
                     memory_utils.cleanup_memory()
 
@@ -3201,6 +3261,12 @@ def collect_static_end_to_end_saliency_and_fisher(
                     )
                 # Rank-local shard of shape (n_local, T, G). Not gathered.
                 layer_saliency[module_name] = torch.cat(saliency_data[layer_idx][module_name], dim=0)
+                # Free the per-batch chunks right after concat. Otherwise both
+                # the list (~14 GB for 8B across all layers) AND the catted
+                # tensor (~14 GB) are alive simultaneously until function exit,
+                # which adds a transient 14 GB CPU peak right at the boundary
+                # where the quant phase also starts allocating inps/fp_inps.
+                saliency_data[layer_idx][module_name] = None
             static_saliency.append(layer_saliency)
             if collect_fisher:
                 want_fisher_this_layer = (
@@ -3209,11 +3275,26 @@ def collect_static_end_to_end_saliency_and_fisher(
                 if want_fisher_this_layer:
                     if fisher_data[layer_idx] is None:
                         raise ValueError(f"Failed to collect static end-to-end Fisher for layer={layer_idx}.")
-                    fisher_sum = fisher_data[layer_idx].to(dev)
+                    # fisher_data[layer_idx] is now accumulated in GPU fp32 (see
+                    # make_layer_hook). In-place all-reduce then ship to CPU bf16
+                    # exactly once per layer.
+                    fisher_sum = fisher_data[layer_idx]
+                    if fisher_sum.device.type != "cuda":
+                        # Fall back to the old CPU→GPU path if it ever holds CPU
+                        # (e.g. legacy caller or serialized dict).
+                        fisher_sum = fisher_sum.to(dev)
                     dist_utils.allreduce_sum_(fisher_sum)
-                    local_tokens = sum(int(chunk.shape[0] * chunk.shape[1]) for chunk in saliency_data[layer_idx][next(iter(module_dict.keys()))])
+                    # Token count: derive from the already-catted saliency tensor
+                    # rather than from the per-batch chunks (which we freed above
+                    # to cut a 14 GB transient CPU peak). Same value either way.
+                    _any_cat = next(iter(layer_saliency.values()))
+                    local_tokens = int(_any_cat.shape[0] * _any_cat.shape[1])
                     total_tokens = dist_utils.allreduce_sum_scalar(local_tokens)
                     static_fisher.append((fisher_sum / float(total_tokens)).to(torch.bfloat16).cpu())
+                    # Release the per-layer GPU fp32 Fisher immediately. For
+                    # Llama-7B: 32 × 64 MB = 2 GB ~ freed as we go.
+                    fisher_data[layer_idx] = None
+                    del fisher_sum
                 else:
                     # Caller opted out of fisher for this layer (e.g. refined_mix
                     # back half uses refined_residual_kl, which doesn't need fisher).
@@ -3322,8 +3403,7 @@ def refresh_dynamic_saliency(
     dyn_entry,
     static_saliency,
     N_global,
-    current_Y,
-    fp_Y,
+    P_delta,
     num_groups,
     dev,
 ):
@@ -3334,38 +3414,32 @@ def refresh_dynamic_saliency(
         Δs_quad[t, k]  = (1/N_global²)· sum( P       ⊙ (P @ W_quad[k].T),  dim=-1)
         S_new          = clamp_min(S_old_exact + Δs_cross + Δs_quad, 0)
 
-    where P = ΔY · V, ΔY = current_Y − fp_Y (cumulative output drift).
+    where P = ΔY · V, ΔY = current_Y − fp_Y (cumulative output drift). P is
+    precomputed by `_collect_module_output_projections` in STREAMING fashion
+    to avoid ever materialising the full (N_local, T, H_out) ΔY tensor on CPU
+    — for Llama-3-8B up/gate that tensor alone is ~120 GB.
 
     Args:
       dyn_entry:       per-module dict with keys V / Sigma_sq / U_Sigma /
                        C_packed / W_cross_packed / W_quad_packed / H_out / R_eff.
-                       Fields are CPU tensors (bf16 for V/U_Sigma, fp32 rest).
-      static_saliency: (N_local, T, G) tensor of S_old_exact (fp32/bf16 on CPU).
+      static_saliency: (N_local, T, G) tensor of S_old_exact on CPU.
       N_global:        global token count (int, used in 2/N and 1/N² factors).
-      current_Y:       (N_local, T, H_out) module output under current quant state (CPU bf16).
-      fp_Y:            (N_local, T, H_out) module output under all-FP weights   (CPU bf16).
+      P_delta:         (N_local, T, R_eff) bf16 CPU — precomputed ΔY @ V.
       num_groups:      G (saliency output-channel group count, usually 4).
       dev:             target device for the matmuls.
 
     Returns:
       S_new: (N_local, T, G) fp32 CPU tensor, non-negative.
     """
-    V_bf16 = dyn_entry["V"]                  # (H_out, R) bf16 CPU
     U_Sigma_bf16 = dyn_entry["U_Sigma"]      # (N_local*T, R) bf16 CPU
     W_cross_cpu = dyn_entry["W_cross_packed"]  # (G, R, R) fp32 CPU
     W_quad_cpu = dyn_entry["W_quad_packed"]    # (G, R, R) fp32 CPU
-    H_out = int(dyn_entry["H_out"])
     R_eff = int(dyn_entry["R_eff"])
 
-    N_local, T, H_out_check = current_Y.shape
-    if H_out_check != H_out:
+    N_local, T, R_in_P = P_delta.shape
+    if R_in_P != R_eff:
         raise ValueError(
-            f"refresh_dynamic_saliency: current_Y H_out mismatch: got {H_out_check}, expected {H_out}."
-        )
-    if fp_Y.shape != current_Y.shape:
-        raise ValueError(
-            f"refresh_dynamic_saliency: fp_Y shape {tuple(fp_Y.shape)} does not match "
-            f"current_Y shape {tuple(current_Y.shape)}."
+            f"refresh_dynamic_saliency: P_delta R ({R_in_P}) != dyn_entry R_eff ({R_eff})."
         )
 
     G = int(num_groups)
@@ -3375,83 +3449,101 @@ def refresh_dynamic_saliency(
             f"refresh_dynamic_saliency: U_Sigma rows ({U_Sigma_bf16.shape[0]}) != N_local*T ({total_tokens})."
         )
 
-    # Move everything we need to the device in fp32.
-    V_dev = V_bf16.to(dev, dtype=torch.float32)                  # (H_out, R)
-    U_Sigma_dev = U_Sigma_bf16.to(dev, dtype=torch.float32).reshape(N_local, T, R_eff)  # (N_local, T, R)
-    W_cross_dev = W_cross_cpu.to(dev, dtype=torch.float32)        # (G, R, R)
-    W_quad_dev = W_quad_cpu.to(dev, dtype=torch.float32)          # (G, R, R)
+    # Move to dev in fp32 for the matmuls.
+    U_Sigma_dev = U_Sigma_bf16.to(dev, dtype=torch.float32).reshape(N_local, T, R_eff)
+    W_cross_dev = W_cross_cpu.to(dev, dtype=torch.float32)
+    W_quad_dev = W_quad_cpu.to(dev, dtype=torch.float32)
+    P_dev = P_delta.to(dev, dtype=torch.float32)           # (N_local, T, R_eff)
 
-    # P = ΔY · V. Do the subtract + matmul per sample to bound peak memory:
-    # (T, H_out) · (H_out, R) → (T, R). Total across samples: (N_local, T, R) on dev.
-    # For Llama-7B up/gate: N_local·T·R = 262144·16·4B = 16.8 MB — fine to keep on dev.
-    P_dev = torch.empty(N_local, T, R_eff, dtype=torch.float32, device=dev)
-    for s in range(N_local):
-        cur_s = current_Y[s].to(dev, dtype=torch.float32)
-        fp_s = fp_Y[s].to(dev, dtype=torch.float32)
-        P_dev[s] = (cur_s - fp_s) @ V_dev
-        del cur_s, fp_s
-
-    # Batched across groups: tmp_c[k] shape (N_local, T, R), same for quad.
-    # P_dev @ W_cross_dev[k].T → (N_local, T, R). einsum keeps it explicit.
-    #   P_dev (N, T, R), W_cross_dev (G, R, R): 'ntr, gsr -> g n t s' is cross-type;
-    # simpler: loop over G (G is usually 4).
     delta_s_cross = torch.empty(N_local, T, G, dtype=torch.float32, device=dev)
     delta_s_quad = torch.empty(N_local, T, G, dtype=torch.float32, device=dev)
     for k in range(G):
-        tmp_c = P_dev @ W_cross_dev[k].t()                       # (N_local, T, R)
+        tmp_c = P_dev @ W_cross_dev[k].t()
         delta_s_cross[..., k] = (U_Sigma_dev * tmp_c).sum(dim=-1)
-        tmp_q = P_dev @ W_quad_dev[k].t()                        # (N_local, T, R)
+        tmp_q = P_dev @ W_quad_dev[k].t()
         delta_s_quad[..., k] = (P_dev * tmp_q).sum(dim=-1)
         del tmp_c, tmp_q
 
     delta_s_cross.mul_(2.0 / float(N_global))
     delta_s_quad.mul_(1.0 / (float(N_global) * float(N_global)))
 
-    S_old = static_saliency.to(dev, dtype=torch.float32)         # (N_local, T, G)
+    S_old = static_saliency.to(dev, dtype=torch.float32)
     S_new = (S_old + delta_s_cross + delta_s_quad).clamp_min_(0.0)
     return S_new.cpu()
 
 
 @torch.no_grad()
-def _collect_fp_module_outputs_for_dynsal(
+def _collect_module_output_projections(
     *,
     layer,
-    fp_inps,
+    inputs,
     module_dict,
+    V_by_name,
     dev,
     bsz,
     attention_mask,
     position_ids,
     position_embeddings,
 ):
-    """Run ONE FP forward through `layer` (with its still-FP weights) using
-    `fp_inps` as input; capture every module's output into a CPU bf16 tensor.
+    """Run ONE forward through `layer` with `inputs`, hook each module's output,
+    and project it to the low-rank space on the fly: P_batch = out_batch @ V.
+    Writes per-batch (bsz, T, R_eff) bf16 slices into a preallocated CPU buffer
+    `(N_local, T, R_eff)` per module; NEVER materialises the full (N_local, T,
+    H_out) tensor on CPU — which for Llama-3-8B up/gate is ~120 GB per module.
 
-    Returns: dict {module_name -> Tensor (N_local, T, H_out) bf16 on CPU}.
+    `V_by_name` tensors MUST be bf16 on `dev`. The hook does a bf16 @ bf16
+    matmul directly against the forward activation (also bf16), avoiding an
+    expensive fp32 cast of the full (bsz·T, H_out) activation — for 8B up/gate
+    that cast alone is ~7 GB GPU transient PER BATCH PER MODULE.
 
-    Called exactly once per layer at the start of quantization, before any of
-    the 4 module-group boundaries. Each boundary later looks up + `pop()`s its
-    own modules from the returned dict, releasing memory as it consumes.
+    Args:
+      layer:     current transformer block (must be on `dev` already).
+      inputs:    (N_local, T, H_hidden) on CPU.
+      module_dict: {module_name -> nn.Linear}; only these get hooks.
+      V_by_name: {module_name -> (H_out, R_eff) **bf16** tensor on `dev`}.
+      bsz:       forward micro-batch size.
+
+    Returns:
+      {module_name -> (N_local, T, R_eff) bf16 CPU} — the P projections.
     """
-    N_local = fp_inps.shape[0]
-    # Per-module running list of per-batch outputs — concatenated at end.
-    per_module_chunks = {name: [] for name in module_dict.keys()}
+    N_local = inputs.shape[0]
+    T = inputs.shape[1]
+    per_module_P = {}
+    per_module_cursor = {}
+
+    for name, V in V_by_name.items():
+        R_eff = V.shape[1]
+        per_module_P[name] = torch.empty(N_local, T, R_eff, dtype=torch.bfloat16, device="cpu")
+        per_module_cursor[name] = 0
+
     handles = []
 
-    def make_fp_hook(name):
+    def make_hook(name):
+        V_m = V_by_name[name]  # (H_out, R_eff) bf16 dev
+        R_eff_local = V_m.shape[1]
         def hook(module, inp, out):
             out_tensor = out[0] if isinstance(out, (tuple, list)) else out
-            per_module_chunks[name].append(out_tensor.detach().to(torch.bfloat16).cpu())
+            bsz_local = out_tensor.shape[0]
+            # Reshape is a view on contiguous bf16 output — no allocation, no
+            # fp32 cast. Matmul in bf16 via tensor cores; result bf16.
+            out_flat = out_tensor.detach().reshape(bsz_local * T, -1)
+            P_flat = out_flat @ V_m  # (bsz_local*T, R_eff) bf16 dev
+            P_batch = P_flat.reshape(bsz_local, T, R_eff_local)
+            cursor = per_module_cursor[name]
+            per_module_P[name][cursor:cursor + bsz_local].copy_(
+                P_batch.cpu(), non_blocking=True
+            )
+            per_module_cursor[name] = cursor + bsz_local
+            del P_flat, P_batch
         return hook
 
     try:
         for name, module in module_dict.items():
-            handles.append(module.register_forward_hook(make_fp_hook(name)))
-
+            handles.append(module.register_forward_hook(make_hook(name)))
         for j in range(0, N_local, bsz):
             batch_bsz = min(bsz, N_local - j)
             _ = layer(
-                fp_inps[j : j + batch_bsz].to(dev),
+                inputs[j : j + batch_bsz].to(dev),
                 attention_mask=attention_mask.expand(batch_bsz, -1, -1, -1),
                 position_ids=position_ids.expand(batch_bsz, -1),
                 position_embeddings=(
@@ -3463,64 +3555,30 @@ def _collect_fp_module_outputs_for_dynsal(
         for h in handles:
             h.remove()
 
-    out_dict = {}
-    for name, chunks in per_module_chunks.items():
-        if not chunks:
+    for name in module_dict.keys():
+        if per_module_cursor[name] != N_local:
             raise RuntimeError(
-                f"_collect_fp_module_outputs_for_dynsal: no FP output captured for module `{name}`."
+                f"_collect_module_output_projections: module {name} wrote "
+                f"{per_module_cursor[name]} / {N_local} rows."
             )
-        out_dict[name] = torch.cat(chunks, dim=0)
-    return out_dict
+    return per_module_P
 
 
-@torch.no_grad()
-def _collect_current_module_outputs_for_dynsal(
-    *,
-    layer,
-    inps,
-    module_dict,
-    dev,
-    bsz,
-    attention_mask,
-    position_ids,
-    position_embeddings,
-):
-    """Mirror of `_collect_fp_module_outputs_for_dynsal` but for the CURRENT
-    quantization state — run one forward through `layer` using the current
-    (possibly partially-quantized) weights and the current-state `inps`, hook
-    only the modules listed in `module_dict` (typically the modules in the
-    boundary's group to save work), and return a dict {name -> (N_local, T, H_out) bf16 CPU}.
-    """
-    N_local = inps.shape[0]
-    per_module_chunks = {name: [] for name in module_dict.keys()}
-    handles = []
+# Legacy names kept for binary-compat. New code should use
+# `_collect_module_output_projections` which streams the projection and uses
+# O(N_local × T × R) CPU memory instead of O(N_local × T × H_out).
+def _collect_fp_module_outputs_for_dynsal(*args, **kwargs):
+    raise RuntimeError(
+        "_collect_fp_module_outputs_for_dynsal is removed — use "
+        "_collect_module_output_projections to stream P = Y · V directly."
+    )
 
-    def make_cur_hook(name):
-        def hook(module, inp, out):
-            out_tensor = out[0] if isinstance(out, (tuple, list)) else out
-            per_module_chunks[name].append(out_tensor.detach().to(torch.bfloat16).cpu())
-        return hook
 
-    try:
-        for name, module in module_dict.items():
-            handles.append(module.register_forward_hook(make_cur_hook(name)))
-
-        for j in range(0, N_local, bsz):
-            batch_bsz = min(bsz, N_local - j)
-            _ = layer(
-                inps[j : j + batch_bsz].to(dev),
-                attention_mask=attention_mask.expand(batch_bsz, -1, -1, -1),
-                position_ids=position_ids.expand(batch_bsz, -1),
-                position_embeddings=(
-                    position_embeddings[0].expand(batch_bsz, -1, -1),
-                    position_embeddings[1].expand(batch_bsz, -1, -1),
-                ),
-            )
-    finally:
-        for h in handles:
-            h.remove()
-
-    return {name: torch.cat(chunks, dim=0) for name, chunks in per_module_chunks.items()}
+def _collect_current_module_outputs_for_dynsal(*args, **kwargs):
+    raise RuntimeError(
+        "_collect_current_module_outputs_for_dynsal is removed — use "
+        "_collect_module_output_projections to stream P = Y · V directly."
+    )
 
 
 def compute_refresh_loss(
@@ -5958,24 +6016,44 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
             saliency_dict = None
             gradients_dict = None
 
-            # === Dynamic saliency: one FP forward per layer for fp_y_dict ===
-            # At this point layer i has not yet been touched by any quant step
-            # (all 7 linear modules still hold FP weights). One forward through
-            # the layer with `fp_inps[i]` captures every module's FP output; the
-            # dict drains as the 4 module-group boundaries consume their entries.
+            # === Dynamic saliency: one FP forward per layer, but stream P = Y · V ===
+            # Instead of caching all 7 modules' (N_local, T, H_out) outputs to
+            # CPU (which is ~400 GB for Llama-3-8B — up/gate alone is 2 × 112 GB
+            # and OOM-kills the host), compute P_fp = FP_Y · V in the forward
+            # hook on the fly, writing (bsz, T, R_eff) bf16 slices into a
+            # preallocated per-module (N_local, T, R_eff) CPU buffer. For R=16
+            # that's 128 MB per module × 7 = ~900 MB for the whole layer —
+            # ~450× smaller than caching FP_Y directly.
             dynsal_enabled = (
                 bool(int(getattr(args, "enable_dynamic_saliency", 0)))
                 and static_dynsal is not None
             )
-            fp_y_dict = None
+            P_fp_by_module = None
+            dynsal_V_dev_for_layer = None
             if dynsal_enabled:
                 with layer_recorder.section("layer.dynsal.fp_forward") if layer_recorder else _NULL_CONTEXT:
                     _fp_fwd_bsz = args.hessian_accum_bsz if args.hessian_accum_bsz is not None else args.bsz
                     _fp_fwd_bsz = max(1, min(_fp_fwd_bsz, fp_inps.shape[0]))
-                    fp_y_dict = _collect_fp_module_outputs_for_dynsal(
+                    # Load V for every module of this layer onto `dev` once,
+                    # reused across the FP forward and all 4 boundary forwards.
+                    # Keep V in bf16 to avoid fp32-casting the full (bsz·T, H_out)
+                    # forward activation inside the hook (that cast is ~7 GB GPU
+                    # transient per up/gate batch on 8B — more than the output
+                    # tensor itself).
+                    layer_dyn = static_dynsal["by_layer"][i]
+                    dynsal_V_dev_for_layer = {}
+                    for _name in full.keys():
+                        _entry = layer_dyn.get(_name, layer_dyn.get(_name + ".module", None))
+                        if _entry is None:
+                            raise KeyError(
+                                f"Missing dynsal V for layer={i} module={_name}."
+                            )
+                        dynsal_V_dev_for_layer[_name] = _entry["V"].to(dev, dtype=torch.bfloat16)
+                    P_fp_by_module = _collect_module_output_projections(
                         layer=layer,
-                        fp_inps=fp_inps,
+                        inputs=fp_inps,
                         module_dict=full,
+                        V_by_name=dynsal_V_dev_for_layer,
                         dev=dev,
                         bsz=_fp_fwd_bsz,
                         attention_mask=attention_mask,
@@ -5991,20 +6069,23 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
 
                 # === Dynamic saliency boundary refresh ===
                 # Run ONE lightweight current-state forward that only hooks the
-                # modules in this group, then compute S_new = S_old + Δs_cross +
-                # Δs_quad (clamped ≥ 0) per module, merge into the saliency dict
-                # handed to collect_layer_grad_hessian_stats. This runs BEFORE
-                # the GPTQPlus objects for this group are created, so add_batch
-                # inside the H-accum forward will see the refreshed saliency.
+                # modules in this group, stream P_cur = current_Y · V into a
+                # per-module (N_local, T, R) CPU buffer; subtract P_fp to get
+                # P_delta, feed into refresh_dynamic_saliency for S_new. No
+                # (N_local, T, H_out) tensor is ever materialised.
                 dynsal_refresh_overrides = None
                 if dynsal_enabled:
                     with layer_recorder.section("layer.dynsal.boundary_refresh") if layer_recorder else _NULL_CONTEXT:
                         _cur_fwd_bsz = args.hessian_accum_bsz if args.hessian_accum_bsz is not None else args.bsz
                         _cur_fwd_bsz = max(1, min(_cur_fwd_bsz, inps.shape[0]))
-                        current_y_dict = _collect_current_module_outputs_for_dynsal(
+                        V_for_group = {
+                            name: dynsal_V_dev_for_layer[name] for name in subset.keys()
+                        }
+                        P_cur_for_group = _collect_module_output_projections(
                             layer=layer,
-                            inps=inps,
+                            inputs=inps,
                             module_dict=subset,
+                            V_by_name=V_for_group,
                             dev=dev,
                             bsz=_cur_fwd_bsz,
                             attention_mask=attention_mask,
@@ -6030,25 +6111,33 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                                 raise KeyError(
                                     f"Missing static saliency for layer={i} module={_name}."
                                 )
-                            if _name not in fp_y_dict:
+                            if _name not in P_fp_by_module:
                                 raise KeyError(
-                                    f"fp_y_dict entry for layer={i} module={_name} was already "
+                                    f"P_fp entry for layer={i} module={_name} was already "
                                     f"popped — boundary refresh ordering is broken."
                                 )
+                            # ΔY · V  =  (current_Y − fp_Y) · V  =  P_cur − P_fp.
+                            # Do the subtraction in fp32 on CPU — (N_local, T, R)
+                            # bf16 cast to fp32 is ~512 MB at R=16, trivial.
+                            P_delta = (
+                                P_cur_for_group[_name].float()
+                                - P_fp_by_module[_name].float()
+                            ).to(torch.bfloat16)
                             S_new = refresh_dynamic_saliency(
                                 dyn_entry=dyn_entry,
                                 static_saliency=static_sal,
                                 N_global=N_global,
-                                current_Y=current_y_dict[_name],
-                                fp_Y=fp_y_dict[_name],
+                                P_delta=P_delta,
                                 num_groups=args.num_groups,
                                 dev=dev,
                             )
                             dynsal_refresh_overrides[_name] = S_new
-                            # Release fp_y_dict entry for this module immediately
-                            # so peak CPU memory drops as boundaries progress.
-                            del fp_y_dict[_name]
-                        del current_y_dict
+                            # Release this module's P_fp / P_delta now — they
+                            # won't be read again for this boundary or any future
+                            # boundary in the same layer.
+                            del P_fp_by_module[_name]
+                            del P_delta
+                        del P_cur_for_group
                         memory_utils.cleanup_memory()
 
                 # Merge any dynsal-refreshed saliency with the static shards. The
@@ -6488,12 +6577,13 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     del layer_refined_mse_grad_pool_next
                 if layer_refined_mse_mean_grad_next is not None:
                     del layer_refined_mse_mean_grad_next
-                if fp_y_dict is not None:
-                    # fp_y_dict should already be drained by the 4 boundaries
-                    # popping their entries, but explicitly `del` to make the
-                    # lifetime boundary obvious and release any leftover on layer
-                    # error / early exit.
-                    del fp_y_dict
+                if P_fp_by_module is not None:
+                    # By this point the 4 boundaries should have popped every
+                    # module from P_fp_by_module; explicit del bounds the
+                    # lifetime for good measure and releases V_dev too.
+                    del P_fp_by_module
+                if dynsal_V_dev_for_layer is not None:
+                    del dynsal_V_dev_for_layer
                 memory_utils.cleanup_memory()
 
             if quant_stop_layer is not None and i >= quant_stop_layer:
