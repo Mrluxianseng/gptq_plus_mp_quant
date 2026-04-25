@@ -30,19 +30,19 @@ DEVICE=${3}
 shift 3
 
 # Sweep configuration. Override from the shell when needed.
-GRAD_LRS_STR=${GRAD_LRS:-"0.00001"}
+GRAD_LRS_STR=${GRAD_LRS:-"0.000001"}
 DATASET=${DATASET:-wikitext2} # wikitext2 / neuralmagic / ultrachat_2k / numinamath
 N_SAMPLES=${N_SAMPLES:-256}
 SEQ_LEN=${SEQ_LEN:-2048}
-BSZ=${BSZ:-128}
+BSZ=${BSZ:-32}
 FINAL_LAYER_STATS_BSZ=${FINAL_LAYER_STATS_BSZ:-8}
-HESSIAN_ACCUM_BSZ=${HESSIAN_ACCUM_BSZ:-64}
+HESSIAN_ACCUM_BSZ=${HESSIAN_ACCUM_BSZ:-32}
 ENABLE_GPTQ_PLUS=${ENABLE_GPTQ_PLUS:-0}
-BACKWARD_SAMPLES=${BACKWARD_SAMPLES:-4}
-BACKWARD_BSZ=${BACKWARD_BSZ:-4}
+BACKWARD_SAMPLES=${BACKWARD_SAMPLES:-8}
+BACKWARD_BSZ=${BACKWARD_BSZ:-8}
 FINAL_LAYER_BACKWARD_BSZ=${FINAL_LAYER_BACKWARD_BSZ:-8}
 FINAL_LAYER_FULL_BACKWARD=${FINAL_LAYER_FULL_BACKWARD:-0}
-BLOCKSIZE=${BLOCKSIZE:-256}
+BLOCKSIZE=${BLOCKSIZE:-1024}
 BLOCK_ATOMIC_QUANT=${BLOCK_ATOMIC_QUANT:-0}
 GRAD_OPTIMIZER=${GRAD_OPTIMIZER:-adam}
 FINAL_LAYER_GRAD_OPTIMIZER=${FINAL_LAYER_GRAD_OPTIMIZER:-adam}
@@ -99,7 +99,7 @@ SECOND_ORDER_SCALE=${SECOND_ORDER_SCALE:-1.0}
 PRE_CLIP=${PRE_CLIP:-0}
 GLOBAL_LOSS=${GLOBAL_LOSS:-1}
 GLOBAL_LOSS_BSZ=${GLOBAL_LOSS_BSZ:-8}
-LOSS_SLIDE_WINDOW=${LOSS_SLIDE_WINDOW:-1}
+LOSS_SLIDE_WINDOW=${LOSS_SLIDE_WINDOW:-0}
 DP_GLOBAL_SHUFFLE=${DP_GLOBAL_SHUFFLE:-1}
 # Drop first ATTENTION_SINK_SIZE tokens from every loss (NLL/KL/MSE) when
 # IGNORE_ATTENTION_SINK=1. Sink tokens still flow through forward / KV; only
@@ -123,6 +123,7 @@ OUTPUT_ROOT=${OUTPUT_ROOT:-./outputs}
 #   Stage 2: STATIC_CACHE_PATH=<same>  (no FSDP, reads cache)
 FSDP_PRECOMPUTE=${FSDP_PRECOMPUTE:-0}
 FSDP_CPU_OFFLOAD=${FSDP_CPU_OFFLOAD:-0}
+FSDP_META_INIT=${FSDP_META_INIT:-${FSDP_PRECOMPUTE}}
 STATIC_CACHE_PATH=${STATIC_CACHE_PATH:-}
 EXIT_AFTER_PRECOMPUTE=${EXIT_AFTER_PRECOMPUTE:-0}
 
@@ -245,6 +246,9 @@ fi
 if [[ "${EXIT_AFTER_PRECOMPUTE}" == "1" ]]; then
     FSDP_ARGS+=(--exit_after_precompute)
 fi
+if [[ "${FSDP_META_INIT}" == "1" ]]; then
+    FSDP_ARGS+=(--fsdp_meta_init)
+fi
 if [[ -n "${STATIC_CACHE_PATH}" ]]; then
     FSDP_ARGS+=(--static_cache_path "${STATIC_CACHE_PATH}")
 fi
@@ -276,6 +280,10 @@ if [[ "${FSDP_PRECOMPUTE}" == "1" && "${EXIT_AFTER_PRECOMPUTE}" != "1" ]]; then
     PRECOMPUTE_CPU_OFFLOAD_ARG=()
     if [[ "${FSDP_CPU_OFFLOAD}" == "1" ]]; then
         PRECOMPUTE_CPU_OFFLOAD_ARG=(--fsdp_cpu_offload)
+    fi
+    PRECOMPUTE_META_INIT_ARG=()
+    if [[ "${FSDP_META_INIT}" == "1" ]]; then
+        PRECOMPUTE_META_INIT_ARG=(--fsdp_meta_init)
     fi
 
     echo "============================================================"
@@ -311,6 +319,7 @@ if [[ "${FSDP_PRECOMPUTE}" == "1" && "${EXIT_AFTER_PRECOMPUTE}" != "1" ]]; then
         --skip_eval \
         --fsdp_precompute --exit_after_precompute --static_cache_path "${STATIC_CACHE_PATH}" \
         "${PRECOMPUTE_CPU_OFFLOAD_ARG[@]}" \
+        "${PRECOMPUTE_META_INIT_ARG[@]}" \
         "$@"
 
     # For the sweep loop below, drop FSDP flags (model is fresh each run) and

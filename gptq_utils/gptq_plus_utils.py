@@ -2437,7 +2437,8 @@ def collect_static_end_to_end_saliency_and_fisher(
     # `--static_cache_path` so precompute exits immediately after saving to
     # disk; a subsequent run without `--fsdp_precompute` reads the cache and
     # performs quantisation. The sweep script wires this up automatically.
-    if use_fsdp:
+    fsdp_already_prepared = bool(getattr(model, "_gptqplus_fsdp_prepared", False))
+    if use_fsdp and not fsdp_already_prepared:
         with profile_recorder.section("pipeline.static_fisher.fsdp_wrap") if profile_recorder else _NULL_CONTEXT:
             from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy, CPUOffloadPolicy
             from torch.distributed.device_mesh import init_device_mesh
@@ -2463,7 +2464,10 @@ def collect_static_end_to_end_saliency_and_fisher(
             if offload_policy is not None:
                 kwargs["offload_policy"] = offload_policy
             fully_shard(model, **kwargs)
+            model._gptqplus_fsdp_prepared = True
             # FSDP-managed params live on-rank already; don't model.to(dev).
+    elif use_fsdp and fsdp_already_prepared:
+        logging.info("FSDP2 precompute: model was already sharded before checkpoint load; skipping FSDP wrap.")
     with profile_recorder.section("pipeline.static_fisher.build_module_dicts") if profile_recorder else _NULL_CONTEXT:
         module_dicts = []
         for layer in layers:

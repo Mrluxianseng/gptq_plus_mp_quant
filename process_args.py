@@ -230,6 +230,25 @@ def parse_gen():
         help="When --fsdp_precompute is set, offload param shards to CPU (pinned) between layer forwards.",
     )
     parser.add_argument(
+        "--fsdp_meta_init",
+        action="store_true",
+        help=(
+            "Precompute-only memory saver: initialize the model on meta, apply FSDP2 before "
+            "checkpoint load, then load directly into sharded FSDP params. This avoids each "
+            "torchrun rank materializing a full CPU copy before FSDP. Requires "
+            "--fsdp_precompute --exit_after_precompute."
+        ),
+    )
+    parser.add_argument(
+        "--fsdp_prepared_max_shard_size",
+        type=str,
+        default="5GB",
+        help=(
+            "Max shard size used when --fsdp_meta_init has to write a rank0-prepared "
+            "checkpoint (rotated or untied) before FSDP sharded loading."
+        ),
+    )
+    parser.add_argument(
         "--static_cache_path",
         type=str,
         default=None,
@@ -842,6 +861,27 @@ def parse_gen():
             raise ValueError(
                 f"--dyn_sal_evd_thresh must be in (0, 1). Got {args.dyn_sal_evd_thresh}."
             )
+    if getattr(args, "fsdp_meta_init", False):
+        if not args.fsdp_precompute:
+            raise ValueError("--fsdp_meta_init requires --fsdp_precompute.")
+        if not args.exit_after_precompute:
+            raise ValueError(
+                "--fsdp_meta_init requires --exit_after_precompute. The meta/FSDP-loaded "
+                "model remains DTensor-wrapped and is intended only for the Stage 1 "
+                "static precompute process."
+            )
+        if args.static_cache_path is None:
+            raise ValueError(
+                "--fsdp_meta_init requires --static_cache_path so the Stage 1 "
+                "precompute result can be saved and reused by Stage 2."
+            )
+    if args.fsdp_precompute and args.exit_after_precompute and not args.skip_eval:
+        logging.info(
+            "--fsdp_precompute --exit_after_precompute is a Stage 1 cache build; "
+            "forcing --skip_eval because reference-logit eval is unused and "
+            "incompatible with FSDP/DTensor-managed params."
+        )
+        args.skip_eval = True
     if args.nsamples % args.backward_samples != 0:
         raise ValueError(
             f"`nsamples` ({args.nsamples}) must be divisible by `backward_samples` ({args.backward_samples})."

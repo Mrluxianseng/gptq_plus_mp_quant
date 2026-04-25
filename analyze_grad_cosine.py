@@ -67,6 +67,14 @@ _VALID_MEASURE_LOSSES = {
     "refined_mse",
 }
 
+_LOSS_REPORT_ORDER = (
+    "fisher_diag_mse",
+    "residual_kl",
+    "refined_residual_kl",
+    "refined_diag_residual_kl",
+    "refined_mse",
+)
+
 
 def _parse_measure_losses(spec: str):
     """Parse --measure_losses into a set. Rejects unknown names explicitly so a
@@ -273,6 +281,45 @@ def _cosine_per_linear(grads_true, grads_surrogate):
     return out
 
 
+def _summarize_loss_series(per_loss_values):
+    summary = {}
+    for loss_name, values in per_loss_values.items():
+        if not values:
+            continue
+        t = torch.tensor(values, dtype=torch.float32)
+        summary[loss_name] = {
+            "mean": t.mean().item(),
+            "std": t.std(unbiased=False).item() if len(t) > 1 else 0.0,
+            "n_batches": int(t.numel()),
+            "per_batch": t.tolist(),
+        }
+    return summary
+
+
+def _format_layer_loss_summary(loss_summary):
+    bits = []
+    for loss_name in _LOSS_REPORT_ORDER:
+        stats = loss_summary.get(loss_name)
+        if stats is not None:
+            bits.append(f"{loss_name}={stats['mean']:.6g}")
+    return " ".join(bits) if bits else "<no selected loss evaluated>"
+
+
+def _select_refined_A_for_batch(refined_A_list, samples_per_A, start, loss_name):
+    a_idx = 0 if samples_per_A <= 0 else (start // samples_per_A)
+    if a_idx >= len(refined_A_list):
+        raise RuntimeError(
+            f"{loss_name}: batch start={start} resolves to a_idx={a_idx} "
+            f"which exceeds num_A={len(refined_A_list)}."
+        )
+    refined_A_slot = refined_A_list[a_idx]
+    if refined_A_slot is None:
+        raise RuntimeError(
+            f"{loss_name}: missing A for batch start={start}, a_idx={a_idx}."
+        )
+    return refined_A_slot
+
+
 def run_cosine_measurement(
     *,
     analyzer,
@@ -445,6 +492,14 @@ def run_cosine_measurement(
                      "refined_residual_kl", "refined_diag_residual_kl",
                      "refined_mse")
     }
+    # Per-batch loss VALUES (the scalar each loss reduces to in this batch).
+    # One series per loss type; only filled for losses we actually evaluated.
+    # Used to print "loss after each layer" alongside the cosine/grad-norm view.
+    per_batch_fisher_loss = []
+    per_batch_residual_loss = []
+    per_batch_refined_loss = []
+    per_batch_refined_diag_loss = []
+    per_batch_refined_mse_loss = []
 
     def _call_layer(h_in):
         return _layer_out(layer(
@@ -510,6 +565,7 @@ def run_cosine_measurement(
                     fp_final_hidden=None,
                 )
                 fisher_loss.backward()
+                per_batch_fisher_loss.append(fisher_loss.item())
                 grads_fisher = _capture_grads(name_to_weight, grad_clip=grad_clip)
                 del out_hidden, fisher_loss
 
@@ -528,6 +584,7 @@ def run_cosine_measurement(
                     fp_final_hidden=fp_final_batch,
                 )
                 residual_loss.backward()
+                per_batch_residual_loss.append(residual_loss.item())
                 grads_residual = _capture_grads(name_to_weight, grad_clip=grad_clip)
                 del out_hidden, residual_loss
 
@@ -563,6 +620,7 @@ def run_cosine_measurement(
                     refined_A=refined_A_dev,
                 )
                 refined_loss.backward()
+                per_batch_refined_loss.append(refined_loss.item())
                 grads_refined = _capture_grads(name_to_weight, grad_clip=grad_clip)
                 del out_hidden, refined_loss, refined_A_dev
 
@@ -596,6 +654,7 @@ def run_cosine_measurement(
                     refined_A=refined_diag_dev,
                 )
                 refined_diag_loss.backward()
+                per_batch_refined_diag_loss.append(refined_diag_loss.item())
                 grads_refined_diag = _capture_grads(name_to_weight, grad_clip=grad_clip)
                 del out_hidden, refined_diag_loss, refined_diag_dev
 
@@ -637,6 +696,7 @@ def run_cosine_measurement(
                     pool_positions=pool_positions,
                 )
                 refined_mse_loss.backward()
+                per_batch_refined_mse_loss.append(refined_mse_loss.item())
                 grads_refined_mse = _capture_grads(name_to_weight, grad_clip=grad_clip)
                 del out_hidden, refined_mse_loss
                 if layer_output_grad_exact is not None:
@@ -722,6 +782,14 @@ def run_cosine_measurement(
             torch.cuda.empty_cache()
 
         _zero_grads(target_params)
+
+    loss_summary = _summarize_loss_series({
+        "fisher_diag_mse": per_batch_fisher_loss,
+        "residual_kl": per_batch_residual_loss,
+        "refined_residual_kl": per_batch_refined_loss,
+        "refined_diag_residual_kl": per_batch_refined_diag_loss,
+        "refined_mse": per_batch_refined_mse_loss,
+    })
 
     results = {}
     for n in name_to_weight:
@@ -810,7 +878,268 @@ def run_cosine_measurement(
                 entry[f"{loss_name}_combined_grad_norm_mean"] = nn_.mean().item()
                 entry[f"per_batch_{loss_name}_combined_grad_norm"] = nn_.tolist()
         results[n] = entry
-    return results
+    return results, loss_summary
+
+
+def _collect_refined_mse_state_for_loss_report(
+    *,
+    args,
+    analyzer,
+    layer,
+    layer_idx,
+    layers,
+    inps,
+    fp_inps_final,
+    attention_mask,
+    position_ids,
+    position_embeddings,
+    dev,
+):
+    import random as _rng_mod
+
+    if layer_idx == 0:
+        return (
+            torch.tensor([], dtype=torch.long),
+            None,
+            torch.zeros(
+                analyzer.model.config.hidden_size,
+                dtype=torch.float32,
+                device=dev,
+            ),
+        )
+
+    n_pool = int(getattr(args, "num_samples_for_refined_mse", 32))
+    if n_pool <= 0:
+        raise ValueError(
+            f"num_samples_for_refined_mse must be > 0 when measuring refined_mse, got {n_pool}."
+        )
+    if n_pool > inps.shape[0]:
+        raise ValueError(
+            f"num_samples_for_refined_mse ({n_pool}) exceeds calibration pool ({inps.shape[0]})."
+        )
+    rm_bwd_bsz = args.global_loss_bsz
+    if n_pool % rm_bwd_bsz != 0:
+        raise ValueError(
+            f"num_samples_for_refined_mse ({n_pool}) must be divisible by "
+            f"global_loss_bsz ({rm_bwd_bsz})."
+        )
+
+    rng = _rng_mod.Random(args.seed + layer_idx)
+    sample_ids_local = sorted(rng.sample(range(inps.shape[0]), n_pool))
+    (
+        refined_mse_grad_pool,
+        refined_mse_mean_grad,
+        _unused_grad_pool_next,
+        _unused_mean_grad_next,
+    ) = collect_layer_output_grad_for_refined_mse(
+        analyzer=analyzer,
+        layer=layer,
+        layer_idx=layer_idx,
+        layers=layers,
+        inps=inps,
+        fp_inps_final=fp_inps_final,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        position_embeddings=position_embeddings,
+        sample_ids_local=sample_ids_local,
+        backward_bsz=rm_bwd_bsz,
+        kl_topk=args.kl_topk,
+        dev=dev,
+    )
+    return (
+        torch.tensor(sample_ids_local, dtype=torch.long),
+        refined_mse_grad_pool,
+        refined_mse_mean_grad,
+    )
+
+
+@torch.no_grad()
+def measure_layer_losses_after_quant(
+    *,
+    analyzer,
+    layer,
+    layer_idx,
+    inps,
+    fp_inps,
+    fp_inps_final,
+    fisher_tensor,
+    refined_A_list,
+    refined_diag_A_list,
+    samples_per_A,
+    attention_mask,
+    position_ids,
+    position_embeddings,
+    measure_samples,
+    measure_batch_size,
+    kl_topk,
+    dev,
+    measure_losses,
+    refined_mse_pool_ids=None,
+    refined_mse_grad_pool=None,
+    refined_mse_mean_grad=None,
+):
+    if measure_samples % measure_batch_size != 0:
+        raise ValueError(
+            f"measure_samples ({measure_samples}) must be divisible by "
+            f"measure_batch_size ({measure_batch_size})."
+        )
+    if measure_samples > inps.shape[0]:
+        raise ValueError(
+            f"measure_samples ({measure_samples}) > calibration pool ({inps.shape[0]})."
+        )
+
+    want_fisher = "fisher_diag_mse" in measure_losses
+    want_refined_mse = "refined_mse" in measure_losses
+    need_fisher = want_fisher or want_refined_mse
+    want_residual = "residual_kl" in measure_losses
+    has_refined = (
+        "refined_residual_kl" in measure_losses
+        and refined_A_list is not None
+        and len(refined_A_list) > 0
+        and any(a is not None for a in refined_A_list)
+    )
+    has_refined_diag = (
+        "refined_diag_residual_kl" in measure_losses
+        and refined_diag_A_list is not None
+        and len(refined_diag_A_list) > 0
+        and any(a is not None for a in refined_diag_A_list)
+    )
+    has_refined_mse = want_refined_mse and refined_mse_mean_grad is not None
+    refined_mse_pool_lookup = {}
+    if has_refined_mse and refined_mse_pool_ids is not None:
+        refined_mse_pool_lookup = {
+            int(li): int(pp) for pp, li in enumerate(refined_mse_pool_ids.tolist())
+        }
+    if need_fisher and fisher_tensor is None:
+        raise RuntimeError(
+            "measure_losses requested fisher_diag_mse or refined_mse but fisher was not collected "
+            "(check collect_fisher flag)."
+        )
+    if want_refined_mse and not has_refined_mse:
+        raise RuntimeError(
+            "measure_losses requested refined_mse but refined_mse grad state was not provided."
+        )
+    if (has_refined or has_refined_diag) and samples_per_A > 0 and samples_per_A % measure_batch_size != 0:
+        raise ValueError(
+            f"refined_rkl: samples_per_A ({samples_per_A}) must be divisible by "
+            f"measure_batch_size ({measure_batch_size}) so each measurement batch "
+            f"lands in one sub-A bucket."
+        )
+
+    per_loss_values = {loss_name: [] for loss_name in _LOSS_REPORT_ORDER}
+    b_attn, b_pos_ids, b_pos_emb = _expand_batch_kwargs(
+        attention_mask, position_ids, position_embeddings, measure_batch_size,
+    )
+    n_batches = measure_samples // measure_batch_size
+    fisher_batch = fisher_tensor.to(dev).float() if need_fisher else None
+
+    for b in tqdm(range(n_batches), ncols=100, desc=f"loss@layer{layer_idx}", leave=False):
+        start = b * measure_batch_size
+        end = start + measure_batch_size
+        inp_batch = inps[start:end].to(dev)
+        fp_hidden_cached = fp_inps[start:end].to(dev)
+        fp_final_batch = fp_inps_final[start:end].to(dev)
+
+        out_hidden = _layer_out(layer(
+            inp_batch,
+            attention_mask=b_attn,
+            position_ids=b_pos_ids,
+            position_embeddings=b_pos_emb,
+        ))
+
+        if want_fisher:
+            loss = compute_refresh_loss(
+                refresh_loss_type="fisher_diag_mse",
+                out_hidden=out_hidden,
+                fp_hidden=fp_hidden_cached,
+                analyzer=analyzer,
+                kl_topk=kl_topk,
+                layer_output_fisher=fisher_batch,
+                fp_final_hidden=None,
+            )
+            per_loss_values["fisher_diag_mse"].append(loss.item())
+        if want_residual:
+            loss = compute_refresh_loss(
+                refresh_loss_type="residual_kl",
+                out_hidden=out_hidden,
+                fp_hidden=fp_hidden_cached,
+                analyzer=analyzer,
+                kl_topk=kl_topk,
+                layer_output_fisher=None,
+                fp_final_hidden=fp_final_batch,
+            )
+            per_loss_values["residual_kl"].append(loss.item())
+        if has_refined:
+            refined_A = _select_refined_A_for_batch(
+                refined_A_list, samples_per_A, start, "refined_residual_kl",
+            ).to(dev)
+            loss = compute_refresh_loss(
+                refresh_loss_type="refined_residual_kl",
+                out_hidden=out_hidden,
+                fp_hidden=fp_hidden_cached,
+                analyzer=analyzer,
+                kl_topk=kl_topk,
+                layer_output_fisher=None,
+                fp_final_hidden=fp_final_batch,
+                refined_A=refined_A,
+            )
+            per_loss_values["refined_residual_kl"].append(loss.item())
+            del refined_A
+        if has_refined_diag:
+            refined_diag_A = _select_refined_A_for_batch(
+                refined_diag_A_list, samples_per_A, start,
+                "refined_diag_residual_kl",
+            ).to(dev)
+            loss = compute_refresh_loss(
+                refresh_loss_type="refined_diag_residual_kl",
+                out_hidden=out_hidden,
+                fp_hidden=fp_hidden_cached,
+                analyzer=analyzer,
+                kl_topk=kl_topk,
+                layer_output_fisher=None,
+                fp_final_hidden=fp_final_batch,
+                refined_A=refined_diag_A,
+            )
+            per_loss_values["refined_diag_residual_kl"].append(loss.item())
+            del refined_diag_A
+        if has_refined_mse:
+            pool_pos_list = []
+            batch_row_list = []
+            for p_in_batch in range(measure_batch_size):
+                li = start + p_in_batch
+                pp = refined_mse_pool_lookup.get(int(li))
+                if pp is not None:
+                    pool_pos_list.append(pp)
+                    batch_row_list.append(p_in_batch)
+            if batch_row_list:
+                layer_output_grad_exact = refined_mse_grad_pool[
+                    pool_pos_list
+                ].to(dev, dtype=torch.float32)
+                pool_positions = torch.tensor(
+                    batch_row_list, dtype=torch.long, device=dev
+                )
+            else:
+                layer_output_grad_exact = None
+                pool_positions = None
+            loss = compute_refresh_loss(
+                refresh_loss_type="refined_mse",
+                out_hidden=out_hidden,
+                fp_hidden=fp_hidden_cached,
+                analyzer=analyzer,
+                kl_topk=kl_topk,
+                layer_output_fisher=fisher_batch,
+                fp_final_hidden=None,
+                layer_output_grad_exact=layer_output_grad_exact,
+                layer_output_grad_mean=refined_mse_mean_grad,
+                pool_positions=pool_positions,
+            )
+            per_loss_values["refined_mse"].append(loss.item())
+            if layer_output_grad_exact is not None:
+                del layer_output_grad_exact
+
+        del inp_batch, fp_hidden_cached, fp_final_batch, out_hidden
+
+    return _summarize_loss_series(per_loss_values)
 
 
 # ---------------------------------------------------------------------------
@@ -893,6 +1222,7 @@ def quantize_and_measure(args, analyzer, trainloader, dev, target_layers, measur
     fp_inputs_cache = FPInputsCache(sequential)
     fp_inps = inps.clone()
     cosine_results = {}
+    layer_loss_results = {}
 
     pbar = tqdm(range(len(layers)), ncols=120, desc="Quantizing Layers")
     for i in pbar:
@@ -987,7 +1317,8 @@ def quantize_and_measure(args, analyzer, trainloader, dev, target_layers, measur
                 quantizers["model.layers.%d.%s" % (i, name)] = gptq[name].quantizer
                 gptq[name].free()
 
-        # ---------- (D) MEASUREMENT (after target layer is fully quantized) ----------
+        # ---------- (D) LOSS REPORT / MEASUREMENT (after target layer is fully quantized) ----------
+        layer_loss_summary = None
         if is_target:
             # Downstream layers to dev for tail forward.
             for k in range(i + 1, len(layers)):
@@ -1026,59 +1357,24 @@ def quantize_and_measure(args, analyzer, trainloader, dev, target_layers, measur
                     refined_mse_grad_pool_i = None
                     refined_mse_mean_grad_i = None
                     if "refined_mse" in measure_losses:
-                        if i == 0:
-                            refined_mse_pool_ids_i = torch.tensor([], dtype=torch.long)
-                            refined_mse_mean_grad_i = torch.zeros(
-                                analyzer.model.config.hidden_size,
-                                dtype=torch.float32, device=dev,
-                            )
-                        else:
-                            import random as _rng_mod
-                            n_pool = int(
-                                getattr(args, "num_samples_for_refined_mse", 32)
-                            )
-                            if n_pool > inps.shape[0]:
-                                raise ValueError(
-                                    f"num_samples_for_refined_mse ({n_pool}) "
-                                    f"exceeds calibration pool ({inps.shape[0]})."
-                                )
-                            # Match production: fresh rng per layer, seed =
-                            # args.seed + layer_idx, sample without replacement.
-                            rng = _rng_mod.Random(args.seed + i)
-                            sample_ids_local = sorted(
-                                rng.sample(range(inps.shape[0]), n_pool)
-                            )
-                            rm_bwd_bsz = args.global_loss_bsz
-                            if n_pool % rm_bwd_bsz != 0:
-                                raise ValueError(
-                                    f"num_samples_for_refined_mse ({n_pool}) "
-                                    f"must be divisible by global_loss_bsz "
-                                    f"({rm_bwd_bsz})."
-                                )
-                            (
-                                refined_mse_grad_pool_i,
-                                refined_mse_mean_grad_i,
-                                _unused_grad_pool_next,
-                                _unused_mean_grad_next,
-                            ) = collect_layer_output_grad_for_refined_mse(
-                                analyzer=analyzer,
-                                layer=layer,
-                                layer_idx=i,
-                                layers=layers,
-                                inps=inps,
-                                fp_inps_final=fp_inps_final,
-                                attention_mask=attention_mask,
-                                position_ids=position_ids,
-                                position_embeddings=position_embeddings,
-                                sample_ids_local=sample_ids_local,
-                                backward_bsz=rm_bwd_bsz,
-                                kl_topk=args.kl_topk,
-                                dev=dev,
-                            )
-                            refined_mse_pool_ids_i = torch.tensor(
-                                sample_ids_local, dtype=torch.long
-                            )
-                    cosine_results[i] = run_cosine_measurement(
+                        (
+                            refined_mse_pool_ids_i,
+                            refined_mse_grad_pool_i,
+                            refined_mse_mean_grad_i,
+                        ) = _collect_refined_mse_state_for_loss_report(
+                            args=args,
+                            analyzer=analyzer,
+                            layer=layer,
+                            layer_idx=i,
+                            layers=layers,
+                            inps=inps,
+                            fp_inps_final=fp_inps_final,
+                            attention_mask=attention_mask,
+                            position_ids=position_ids,
+                            position_embeddings=position_embeddings,
+                            dev=dev,
+                        )
+                    cosine_results[i], layer_loss_summary = run_cosine_measurement(
                         analyzer=analyzer,
                         layer=layer,
                         layer_idx=i,
@@ -1107,6 +1403,13 @@ def quantize_and_measure(args, analyzer, trainloader, dev, target_layers, measur
                         reg_strategy=args.grad_reg_strategy,
                         reg_lambda=args.grad_reg_lambda,
                     )
+                layer_loss_results[i] = layer_loss_summary
+                logging.info(
+                    "Layer %d loss after quantization (batch-avg over %d samples): %s",
+                    i,
+                    args.measure_samples,
+                    _format_layer_loss_summary(layer_loss_summary),
+                )
                 def _fmt_entry(name, r):
                     cos_bits = []
                     if "fisher_mean" in r:
@@ -1158,6 +1461,77 @@ def quantize_and_measure(args, analyzer, trainloader, dev, target_layers, measur
                 if hessians is not None:
                     del hessians
                 memory_utils.cleanup_memory()
+        else:
+            refined_A_list_i = (
+                static_refined_A_by_layer[i]
+                if static_refined_A_by_layer is not None
+                else None
+            )
+            refined_diag_A_list_i = (
+                static_refined_diag_A_by_layer[i]
+                if static_refined_diag_A_by_layer is not None
+                else None
+            )
+            refined_mse_pool_ids_i = None
+            refined_mse_grad_pool_i = None
+            refined_mse_mean_grad_i = None
+            if "refined_mse" in measure_losses:
+                # refined_mse's first-order term needs an exact output-gradient
+                # pool at this post-quantized layer state, same as target layers.
+                for k in range(i + 1, len(layers)):
+                    layers[k].to(dev)
+                try:
+                    (
+                        refined_mse_pool_ids_i,
+                        refined_mse_grad_pool_i,
+                        refined_mse_mean_grad_i,
+                    ) = _collect_refined_mse_state_for_loss_report(
+                        args=args,
+                        analyzer=analyzer,
+                        layer=layer,
+                        layer_idx=i,
+                        layers=layers,
+                        inps=inps,
+                        fp_inps_final=fp_inps_final,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        position_embeddings=position_embeddings,
+                        dev=dev,
+                    )
+                finally:
+                    for k in range(i + 1, len(layers)):
+                        layers[k] = layers[k].to(orig_device)
+            layer_loss_summary = measure_layer_losses_after_quant(
+                analyzer=analyzer,
+                layer=layer,
+                layer_idx=i,
+                inps=inps,
+                fp_inps=fp_inps,
+                fp_inps_final=fp_inps_final,
+                fisher_tensor=static_fisher_by_layer[i],
+                refined_A_list=refined_A_list_i,
+                refined_diag_A_list=refined_diag_A_list_i,
+                samples_per_A=samples_per_A,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                position_embeddings=position_embeddings,
+                measure_samples=args.measure_samples,
+                measure_batch_size=args.measure_batch_size,
+                kl_topk=args.kl_topk,
+                dev=dev,
+                measure_losses=measure_losses,
+                refined_mse_pool_ids=refined_mse_pool_ids_i,
+                refined_mse_grad_pool=refined_mse_grad_pool_i,
+                refined_mse_mean_grad=refined_mse_mean_grad_i,
+            )
+            layer_loss_results[i] = layer_loss_summary
+            logging.info(
+                "Layer %d loss after quantization (batch-avg over %d samples): %s",
+                i,
+                args.measure_samples,
+                _format_layer_loss_summary(layer_loss_summary),
+            )
+            memory_utils.cleanup_memory()
 
         # ---------- (E) Advance inps with the now-quantized layer ----------
         for j in range(args.nsamples):
@@ -1181,7 +1555,7 @@ def quantize_and_measure(args, analyzer, trainloader, dev, target_layers, measur
     model.config.use_cache = use_cache
     memory_utils.cleanup_memory(verbos=True)
     logging.info("----- GPTAQ + grad-cosine done -----")
-    return quantizers, cosine_results
+    return quantizers, cosine_results, layer_loss_results
 
 
 # ---------------------------------------------------------------------------
@@ -1280,7 +1654,7 @@ def main(args):
         if torch.cuda.is_available() else "cpu"
     )
 
-    _, cosine_results = quantize_and_measure(
+    _, cosine_results, layer_loss_results = quantize_and_measure(
         args, analyzer, trainloader, dp_dev, target_layers, measure_losses,
     )
 
@@ -1288,7 +1662,14 @@ def main(args):
         out_dir = args.output_dir
         os.makedirs(out_dir, exist_ok=True)
         out_pt = os.path.join(out_dir, "grad_cosine_results.pt")
-        torch.save({"results": cosine_results, "args": vars(args)}, out_pt)
+        torch.save(
+            {
+                "results": cosine_results,
+                "layer_losses": layer_loss_results,
+                "args": vars(args),
+            },
+            out_pt,
+        )
         logging.info("Saved cosine results to %s", out_pt)
 
         # ---------- TSV table (long format) ----------
@@ -1384,6 +1765,28 @@ def main(args):
             for row in rows:
                 f.write("\t".join(row) + "\n")
         logging.info("Wrote cosine table to %s (%d rows)", out_tsv, len(rows))
+
+        out_loss_tsv = os.path.join(out_dir, "layer_loss_table.txt")
+        loss_rows = []
+        for layer_idx in sorted(layer_loss_results.keys()):
+            for loss_name in ordered_losses:
+                stats = layer_loss_results[layer_idx].get(loss_name)
+                if stats is None:
+                    continue
+                loss_rows.append([
+                    str(layer_idx),
+                    loss_name,
+                    f"{stats['mean']:.8g}",
+                    f"{stats['std']:.8g}",
+                    str(stats["n_batches"]),
+                ])
+        with open(out_loss_tsv, "w") as f:
+            f.write("# analyze_grad_cosine per-layer post-quantization losses\n")
+            f.write(f"# measure_samples={args.measure_samples}  measure_batch_size={args.measure_batch_size}\n")
+            f.write("\t".join(["layer", "loss", "mean", "std", "n_batches"]) + "\n")
+            for row in loss_rows:
+                f.write("\t".join(row) + "\n")
+        logging.info("Wrote layer-loss table to %s (%d rows)", out_loss_tsv, len(loss_rows))
 
         logging.info("==== cosine summary (batch-avg) ====")
         def _summary_entry(r):

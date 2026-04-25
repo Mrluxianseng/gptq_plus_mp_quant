@@ -23,7 +23,8 @@ def quantize_weights(args, analyzer: model_utils.ModelAnalyzer):
     transformers.set_seed(args.seed)
 
     model = analyzer.model
-    model.cpu()
+    if not bool(getattr(model, "_gptqplus_fsdp_prepared", False)):
+        model.cpu()
     remove_hook_from_module(model, recurse=True)
 
     if args.w_bits < 16:

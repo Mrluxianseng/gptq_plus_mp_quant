@@ -18,7 +18,7 @@ from gptq_utils.main import quantize_weights
 from utils import data_utils, dist_utils, eval_utils, model_utils, rotation_utils, \
                   memory_utils, quant_utils, hadamard_utils
 
-torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cuda.matmul.allow_tf32 = False
 
 
 def main(args):
@@ -30,13 +30,24 @@ def main(args):
         torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     dist_utils.init_process_group()
 
-    analyzer = model_utils.ModelAnalyzer(args.model, args.seq_len)
+    if bool(getattr(args, "fsdp_meta_init", False)):
+        analyzer = model_utils.load_model_fsdp_meta_for_precompute(args)
+    else:
+        analyzer = model_utils.ModelAnalyzer(args.model, args.seq_len)
     model = analyzer.model
     tokenizer = analyzer.tokenizer
 
     # Generate reference logits for KL eval
     test_loader_dict, ref_logits_dict = {}, {}
     orig_lm_head = None
+    stage1_precompute_only = bool(getattr(args, "fsdp_precompute", False)) and bool(
+        getattr(args, "exit_after_precompute", False)
+    )
+    if stage1_precompute_only and not args.skip_eval:
+        logging.info(
+            "Skipping eval/reference-logit generation for FSDP Stage 1 precompute-only run."
+        )
+        args.skip_eval = True
     if not args.skip_eval:
         for eval_dataset in args.eval_datasets:
             test_loader = data_utils.get_loaders(eval_dataset, split="test", tokenizer=tokenizer,
@@ -45,8 +56,20 @@ def main(args):
             test_loader_dict[eval_dataset] = test_loader
             ref_logits_dict[eval_dataset] = ref_logits
 
+    def add_activation_quant_wrappers():
+        quant_utils.add_actquant(analyzer)  # Add Activation Wrapper to the model
+        qlayers = quant_utils.find_qlayers(model)
+        for name in qlayers:
+            if "down_proj" in name:
+                had_K, K = hadamard_utils.get_hadK(model.config.intermediate_size)
+                qlayers[name].online_full_had = True
+                qlayers[name].had_K = had_K
+                qlayers[name].K = K
+                qlayers[name].fp32_had = False
+
+    model_pre_rotated = bool(getattr(model, "_gptqplus_checkpoint_is_rotated", False))
     # Rotate the weights
-    if args.rotate:
+    if args.rotate and not model_pre_rotated:
         rotation_utils.fuse_layer_norms(analyzer)
         rotation_utils.rotate_model(args, analyzer)
         memory_utils.cleanup_memory()
@@ -77,15 +100,10 @@ def main(args):
                 if data.data_ptr() != p.data.data_ptr():
                     p.data = data
 
-        quant_utils.add_actquant(analyzer)  # Add Activation Wrapper to the model
-        qlayers = quant_utils.find_qlayers(model)
-        for name in qlayers:
-            if "down_proj" in name:
-                had_K, K = hadamard_utils.get_hadK(model.config.intermediate_size)
-                qlayers[name].online_full_had = True
-                qlayers[name].had_K = had_K
-                qlayers[name].K = K
-                qlayers[name].fp32_had = False
+        add_activation_quant_wrappers()
+    elif args.rotate and model_pre_rotated:
+        logging.info("Model was loaded from a pre-rotated checkpoint; skipping in-process rotation.")
+        add_activation_quant_wrappers()
     else:
         quant_utils.add_actquant(analyzer)
 

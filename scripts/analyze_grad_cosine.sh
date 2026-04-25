@@ -15,7 +15,7 @@ MEASURE_BSZ=4
 # Subset of surrogate losses to measure against the true end-to-end KL gradient.
 # Choices: fisher_diag_mse, residual_kl, refined_residual_kl, refined_diag_residual_kl.
 # Skipping refined_residual_kl avoids the H×H A fit (big CPU-RAM win on 70B).
-MEASURE_LOSSES=${MEASURE_LOSSES:-"refined_mse"}
+MEASURE_LOSSES=${MEASURE_LOSSES:-"fisher_diag_mse"}
 # Grad clip applied element-wise to every captured gradient before cosine /
 # L2-norm measurement. Mirrors the main pipeline so the diagnostic reflects
 # what block_gd actually sees. Negative → disable. FINAL_LAYER_GRAD_CLIP is
@@ -40,7 +40,7 @@ GRAD_REG_LAMBDA=${GRAD_REG_LAMBDA:-0.0}
 export CUDA_VISIBLE_DEVICES=${DEVICE}
 
 python -m torch.distributed.run \
-    --nnodes=1 --nproc_per_node=1 --rdzv_endpoint=localhost:2950${DEVICE} ./analyze_grad_cosine.py \
+    --nnodes=1 --nproc_per_node=1 --rdzv_endpoint=localhost:2960${DEVICE} ./analyze_grad_cosine.py \
     --model ${MODEL_PATH} \
     --exp grad_cosine \
     --dataset wikitext2 --nsamples ${N_SAMPLES} --seq_len ${SEQ_LEN} \

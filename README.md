@@ -68,8 +68,9 @@
 - BASE_EXP：实验名
 - OUTPUT_ROOT：实验日志输出
 - ENABLE_GPTQ_PLUS：GPTQ+一阶项开关，完全等价于把alpha调成0。设0时只关掉fasterquant内循环/外更新里的GHinv一阶项（GHinv/Z/beta全部变0），其他所有机制（block_gd梯度下降、loss_slide_window、pre_gd_steps、fisher预计算、residual_kl的fp_inps_final预计算）照常运行，与alpha的语义解耦。作为性能优化，stats阶段会跳过reference loss的backward（因为它算出来的权重梯度会被beta=0乘掉，无用）。做纯GPTQ一阶/二阶对照实验时设为0即可。
-- FSDP_PRECOMPUTE：在`collect_static_end_to_end_saliency_and_fisher`里用FSDP2把模型权重+梯度分片到各个rank上，给单卡放不下整模型backward的大模型用。权重dtype保持不变，grad dtype fp32；因为precompute里所有param都会被冻结（`requires_grad=False`），所以FSDP的reduce_scatter路径不触发，只走param的all_gather。**precompute结束后会自动unwrap FSDP**（用进FSDP前的CPU快照把DTensor param复原成普通Tensor，并摘掉forward/backward hooks），所以同一个run可以直接接着跑正常的per-layer量化，不需要分两阶段跑。但unwrap靠的是CPU snapshot，需要一份完整模型大小的额外CPU RAM：4B≈+8GB、7B≈+14GB、13B≈+26GB可以直接跑；**70B需要+140GB CPU RAM，大概率爆cgroup，这种情况必须走两阶段**（`EXIT_AFTER_PRECOMPUTE=1 STATIC_CACHE_PATH=...`先存盘退出，再换一次run读盘量化）。
+- FSDP_PRECOMPUTE：只用于Stage 1 static saliency/fisher precompute，在`collect_static_end_to_end_saliency_and_fisher`里用FSDP2把模型权重分片到各个rank上，给单卡放不下整模型backward的大模型用。当前支持的稳定工作流是两阶段：Stage 1必须配合`EXIT_AFTER_PRECOMPUTE=1 STATIC_CACHE_PATH=...`写cache后退出，Stage 2重新启动普通量化进程读cache。
 - FSDP_CPU_OFFLOAD：开了FSDP后，把param的shard放在pinned CPU内存里，每次forward前all_gather到GPU、forward后释放。进一步省GPU显存，代价是多一轮CPU↔GPU带宽。
+- FSDP_META_INIT：precompute阶段的CPU内存优化，默认跟随`FSDP_PRECOMPUTE`开启。它先在rank0准备一份可直接加载的checkpoint，然后所有rank用meta model初始化、先FSDP分片、再把checkpoint加载到本rank shard，避免torchrun每个rank各自持有一整份CPU权重。`rotate=1`时rank0会先单独加载一份完整模型并执行现有fuse/rotate，再把旋转后的checkpoint写到`STATIC_CACHE_PATH/_prepared_checkpoints/`；其他rank不加载完整CPU模型。非rotate且源模型缺少独立`lm_head.weight`时，也会rank0先写一份untied prepared checkpoint。
 - STATIC_CACHE_PATH：precompute结果的磁盘缓存目录。key绑定`model/dataset/nsamples/seq_len/rotate/num_groups/full_fisher/grad_hessian_topk/global_loss_bsz/seed/world_size/rank`，每rank存自己的分片（`_world{W}_rank{R}.pt`）。cache命中时跳过precompute直接读盘，在sweep不同lr之间复用同一份saliency/fisher、或者70B走两阶段工作流时用。要复用cache必须用相同的world_size和rank分配，否则cache miss重算。
 - EXIT_AFTER_PRECOMPUTE：precompute完成+结果存盘后直接退出（跳过量化和eval），专门给70B的两阶段流程用。默认0。
 - BASE_EXP：实验名
@@ -87,26 +88,17 @@ FSDP只在有帮助的时候开。它**只shard参数+梯度，不shard激活值
 | 30B左右 | 可开可不开。A100-80G够用时不开；更小卡用FSDP会有帮助 |
 | **≥70B** | **必须开FSDP**。单机单卡放不下140GB权重+280GB fp32梯度。**且必须走两阶段**，否则in-process unwrap的CPU快照会爆内存 |
 
-### 一阶段用法（4B / 7B / 13B，默认）
+### 两阶段用法（FSDP必用）
 
-直接开`FSDP_PRECOMPUTE=1`跑就行，precompute完会自动unwrap：
-```bash
-FSDP_PRECOMPUTE=1 bash scripts/gptq_plus_lr_sweep.sh <model_path> 4 0,1
-```
-
-不过这个规模**开FSDP通常不会让你更快或更省**，因为激活内存才是瓶颈。真想压显存优先考虑`GLOBAL_LOSS_BSZ=1`。
-
-### 两阶段用法（70B必用）
-
-70B整模型放GPU做backward需要超过400GB显存，单卡搞不定；而in-process unwrap又需要140GB CPU RAM做快照，也会爆。解决办法：**第一个run用FSDP跑precompute、存盘、退出；第二个run不用FSDP、读盘、跑量化**。
+70B整模型放GPU做backward需要超过400GB显存，单卡搞不定；普通torchrun启动还会让每个rank先在CPU各加载一整份权重。解决办法：**第一个run用FSDP + meta-init跑precompute、存盘、退出；第二个run不用FSDP、读盘、跑量化**。这样precompute阶段不会出现`world_size × full model`的CPU权重副本；`rotate=1`时仍会由rank0短暂持有一份完整CPU模型来生成已旋转checkpoint。
 
 **Stage 1：FSDP下precompute + 存盘 + 退出**
 ```bash
 # 8×80G跑precompute，按rank分片存到./cache/static_stats
-FSDP_PRECOMPUTE=1 FSDP_CPU_OFFLOAD=1 \
+FSDP_PRECOMPUTE=1 FSDP_META_INIT=1 FSDP_CPU_OFFLOAD=1 \
   EXIT_AFTER_PRECOMPUTE=1 \
   STATIC_CACHE_PATH=./cache/static_stats \
-  GLOBAL_LOSS_BSZ=1 \
+  GLOBAL_LOSS_BSZ=8 \
   bash scripts/gptq_plus_lr_sweep.sh /path/to/Llama-2-70b-hf 4 0,1,2,3,4,5,6,7
 ```
 
