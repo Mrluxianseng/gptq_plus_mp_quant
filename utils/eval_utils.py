@@ -1,6 +1,7 @@
 import logging
 import os
 import copy
+import hashlib
 from tqdm import tqdm
 from collections import OrderedDict
 
@@ -110,15 +111,21 @@ def _get_logits(args, analyzer: model_utils.ModelAnalyzer, testenc, dev):
 def get_ref_logits(args, analyzer, dataset, dataloader):
     cache_dir = os.path.join(args.cache_dir, "ref_logits")
     os.makedirs(cache_dir, exist_ok=True)
-    rotate_tag = "_rot1" if bool(getattr(analyzer.model, "_gptqplus_checkpoint_is_rotated", False)) else ""
-    ref_logits_path = f'{cache_dir}/{args.model_name}_{dataset}_test_{args.eval_seq_len}{rotate_tag}.cache'
+    ref_cache_tag = ""
+    prepared_checkpoint_path = getattr(analyzer.model, "_gptqplus_prepared_checkpoint_path", None)
+    if prepared_checkpoint_path:
+        digest = hashlib.sha1(os.path.abspath(prepared_checkpoint_path).encode()).hexdigest()[:10]
+        ref_cache_tag = f"_prepared_rot1_{digest}"
+    elif bool(getattr(analyzer.model, "_gptqplus_checkpoint_is_rotated", False)):
+        ref_cache_tag = "_rot1"
+    ref_logits_path = f'{cache_dir}/{args.model_name}_{dataset}_test_{args.eval_seq_len}{ref_cache_tag}.cache'
     if not os.path.exists(ref_logits_path):
-        logging.info(f"Generating reference logits for {dataset}...")
+        logging.info(f"Generating reference logits for {dataset} at {ref_logits_path}...")
         ref_logits, _ = _get_logits(args, analyzer, dataloader, torch.device("cuda"))
         if dist_utils.is_main():
             torch.save(ref_logits, ref_logits_path)
     else:
-        logging.info(f"Loading reference logits for {dataset}...")
+        logging.info(f"Loading reference logits for {dataset} from {ref_logits_path}...")
         ref_logits = torch.load(ref_logits_path).cpu()
     orig_lm_head = copy.deepcopy(analyzer.model.lm_head)
     # Align ref_logits dtype to the current lm_head dtype. Old fp16 caches

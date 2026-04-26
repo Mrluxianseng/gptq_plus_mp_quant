@@ -39,6 +39,18 @@ def main(args):
     model = analyzer.model
     tokenizer = analyzer.tokenizer
 
+    model_pre_rotated = bool(getattr(model, "_gptqplus_checkpoint_is_rotated", False))
+
+    def add_activation_quant_wrappers():
+        rotation_utils.add_activation_quant_wrappers_for_rotation(analyzer)
+
+    if args.rotate and model_pre_rotated:
+        logging.info(
+            "Model was loaded from a pre-rotated checkpoint; installing rotation wrappers "
+            "before reference-logit generation."
+        )
+        add_activation_quant_wrappers()
+
     # Generate reference logits for KL eval
     test_loader_dict, ref_logits_dict = {}, {}
     orig_lm_head = None
@@ -58,10 +70,6 @@ def main(args):
             test_loader_dict[eval_dataset] = test_loader
             ref_logits_dict[eval_dataset] = ref_logits
 
-    def add_activation_quant_wrappers():
-        rotation_utils.add_activation_quant_wrappers_for_rotation(analyzer)
-
-    model_pre_rotated = bool(getattr(model, "_gptqplus_checkpoint_is_rotated", False))
     # Rotate the weights
     if args.rotate and not model_pre_rotated:
         rotation_utils.fuse_layer_norms(analyzer)
@@ -97,7 +105,6 @@ def main(args):
         add_activation_quant_wrappers()
     elif args.rotate and model_pre_rotated:
         logging.info("Model was loaded from a pre-rotated checkpoint; skipping in-process rotation.")
-        add_activation_quant_wrappers()
     else:
         quant_utils.add_actquant(analyzer)
 

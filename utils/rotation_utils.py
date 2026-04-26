@@ -145,6 +145,8 @@ def rotate_model(args, analyzer: model_utils.ModelAnalyzer):
 
 def add_activation_quant_wrappers_for_rotation(analyzer: model_utils.ModelAnalyzer) -> None:
     model = analyzer.model
+    if bool(getattr(model, "_gptqplus_rotation_wrappers_installed", False)):
+        return
     quant_utils.add_actquant(analyzer)
     qlayers = quant_utils.find_qlayers(model)
     for name in qlayers:
@@ -154,6 +156,7 @@ def add_activation_quant_wrappers_for_rotation(analyzer: model_utils.ModelAnalyz
             qlayers[name].had_K = had_K
             qlayers[name].K = K
             qlayers[name].fp32_had = False
+    model._gptqplus_rotation_wrappers_installed = True
 
 
 def prepare_model_for_rotated_quantization(args, analyzer: model_utils.ModelAnalyzer) -> None:
