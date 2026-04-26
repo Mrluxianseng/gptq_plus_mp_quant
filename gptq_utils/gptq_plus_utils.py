@@ -2744,7 +2744,6 @@ def collect_static_end_to_end_saliency_and_fisher(
     def make_module_hook(layer_idx, module_name):
         def forward_hook(module, inp, out):
             out_tensor = out[0] if isinstance(out, (tuple, list)) else out
-            out_tensor.retain_grad()
 
             def grad_hook(grad):
                 # When --ignore_attention_sink is on, the loss above already
@@ -2853,7 +2852,6 @@ def collect_static_end_to_end_saliency_and_fisher(
         stream hard and left the GPU oscillating at low utilization."""
         def forward_hook(module, inp, out):
             out_tensor = out[0] if isinstance(out, (tuple, list)) else out
-            out_tensor.retain_grad()
 
             def grad_hook(grad):
                 if sink_size > 0 and grad.dim() >= 2 and grad.shape[1] > sink_size:
@@ -2881,7 +2879,6 @@ def collect_static_end_to_end_saliency_and_fisher(
         earlier-layer refined_rkl hooks read from this slot in the same backward."""
         def forward_hook(module, inp, out):
             out_tensor = out[0] if isinstance(out, (tuple, list)) else out
-            out_tensor.retain_grad()
 
             def grad_hook(grad):
                 # Keep 3D fp32 on dev. The full-RKL flat view is produced on the
@@ -2910,7 +2907,6 @@ def collect_static_end_to_end_saliency_and_fisher(
         Solve at sub-A flush time → A_diag_{l,a} shape (seq, H)."""
         def forward_hook(module, inp, out):
             out_tensor = out[0] if isinstance(out, (tuple, list)) else out
-            out_tensor.retain_grad()
 
             def grad_hook(grad):
                 if "dy_3d" not in refined_dy_buffer:
@@ -3367,7 +3363,6 @@ def collect_static_end_to_end_saliency_and_fisher(
                         @ V_hat after eigh."""
                         def forward_hook(module, inp, out):
                             out_tensor = out[0] if isinstance(out, (tuple, list)) else out
-                            out_tensor.retain_grad()
 
                             def grad_hook(grad):
                                 # Pass-1 saliency hook already drops the sink
