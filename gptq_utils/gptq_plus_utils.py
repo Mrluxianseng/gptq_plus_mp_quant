@@ -3926,6 +3926,7 @@ def compute_refresh_loss(
     pool_positions=None,
     profile_recorder=None,
     sink_size=0,
+    a_loss_ratio=1.0,
 ):
     # `sink_size > 0` (driven by --ignore_attention_sink) drops the first
     # `sink_size` seq positions from every loss tensor before reduction. The
@@ -4098,7 +4099,24 @@ def compute_refresh_loss(
                 )
             fisher = layer_output_fisher.to(device=delta.device, dtype=torch.float32)
             delta_flat = delta.float().reshape(-1, hidden_size)
-            fisher_loss = 0.5 * (delta_flat.matmul(fisher) * delta_flat).sum(dim=-1).mean()
+            fisher_loss_per_token = 0.5 * (delta_flat.matmul(fisher) * delta_flat).sum(dim=-1)
+            if a_loss_ratio < 1.0:
+                fp_hidden_sliced = _drop_sink(fp_hidden)
+                act_scale = fp_hidden_sliced.float().abs().amax(dim=-1).reshape(-1)
+                keep_count = max(1, int(math.ceil(float(a_loss_ratio) * act_scale.numel())))
+                if keep_count < act_scale.numel():
+                    with profile_recorder.section("compute_refresh_loss.fisher_diag_mse.a_loss_filter") if profile_recorder else _NULL_CONTEXT:
+                        keep_indices = torch.topk(
+                            act_scale,
+                            k=keep_count,
+                            largest=False,
+                            sorted=False,
+                        ).indices
+                        fisher_loss = fisher_loss_per_token.index_select(0, keep_indices).mean()
+                else:
+                    fisher_loss = fisher_loss_per_token.mean()
+            else:
+                fisher_loss = fisher_loss_per_token.mean()
 
         if refresh_loss_type != "refined_mse":
             return fisher_loss
@@ -4585,6 +4603,7 @@ def collect_true_weight_gradient(
     next_refined_mse_mean_grad=None,
     layer_recorder=None,
     sink_size=0,
+    a_loss_ratio=1.0,
 ):
     """Compute the refresh gradient as a per-rank partial sum + count.
 
@@ -4896,6 +4915,7 @@ def collect_true_weight_gradient(
                                 pool_positions=refined_mse_pool_positions,
                                 profile_recorder=layer_recorder,
                                 sink_size=sink_size,
+                                a_loss_ratio=a_loss_ratio,
                             )
                         if slide_active:
                             with layer_recorder.section("layer.true_weight_grad.batch.slide_next_forward") if layer_recorder else _NULL_CONTEXT:
@@ -4938,6 +4958,7 @@ def collect_true_weight_gradient(
                                     ),
                                     profile_recorder=layer_recorder,
                                     sink_size=sink_size,
+                                    a_loss_ratio=a_loss_ratio,
                                 )
                             with layer_recorder.section("layer.true_weight_grad.batch.blend") if layer_recorder else _NULL_CONTEXT:
                                 refresh_loss = (
@@ -5005,6 +5026,7 @@ def collect_layer_grad_hessian_stats(
     layer_recorder=None,
     skip_gradient_backward=False,
     sink_size=0,
+    a_loss_ratio=1.0,
 ):
     need_saliency_collection = precomputed_saliency_dict is None
     # When the caller sets skip_gradient_backward, we're running pure GPTQ with
@@ -5220,6 +5242,7 @@ def collect_layer_grad_hessian_stats(
                                 refined_A=refined_A_batch,
                                 profile_recorder=layer_recorder,
                                 sink_size=sink_size,
+                                a_loss_ratio=a_loss_ratio,
                             )
 
                     with layer_recorder.section("layer.grad_hessian.gradient_backward.total") if layer_recorder else _NULL_CONTEXT:
@@ -5310,6 +5333,7 @@ def run_pre_quant_gd(
     refined_mse_mean_grad=None,
     layer_recorder=None,
     sink_size=0,
+    a_loss_ratio=1.0,
 ):
     if num_steps <= 0 or not module_names:
         return
@@ -5372,6 +5396,7 @@ def run_pre_quant_gd(
                                 refined_mse_mean_grad=refined_mse_mean_grad,
                                 layer_recorder=layer_recorder,
                                 sink_size=sink_size,
+                                a_loss_ratio=a_loss_ratio,
                             )
                         )
                     # DP aggregation — packed into one allreduce (grad tensor +
@@ -6470,6 +6495,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             refined_mse_mean_grad=layer_refined_mse_mean_grad,
                             layer_recorder=layer_recorder,
                             sink_size=sink_size,
+                            a_loss_ratio=args.a_loss_ratio,
                         )
 
             # Compute slide-window refresh span over the whole transformer block,
@@ -6737,6 +6763,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         layer_recorder=layer_recorder,
                         skip_gradient_backward=skip_ref_backward,
                         sink_size=sink_size,
+                        a_loss_ratio=args.a_loss_ratio,
                     )
                     gptq = build_gptq_for_subset(
                         layerwide_subset,
@@ -6871,6 +6898,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         layer_recorder=layer_recorder,
                         skip_gradient_backward=skip_ref_backward,
                         sink_size=sink_size,
+                        a_loss_ratio=args.a_loss_ratio,
                     )
                     gptq = build_gptq_for_subset(
                         subset,
@@ -6931,6 +6959,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                                 next_refined_mse_mean_grad=slide_next_refined_mse_mean_grad,
                                 layer_recorder=layer_recorder,
                                 sink_size=sink_size,
+                                a_loss_ratio=args.a_loss_ratio,
                             )
                         )
                         # DP aggregation. When world_size > 1 we pack the grad sum

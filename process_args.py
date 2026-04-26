@@ -56,6 +56,16 @@ def parse_gen():
     )
     parser.set_defaults(pre_clip=True)
     parser.add_argument("--a_clip_ratio", type=float, default=1.0, help="Activation clipping ratio")
+    parser.add_argument(
+        "--a_loss_ratio",
+        type=float,
+        default=1.0,
+        help=(
+            "Fisher-MSE loss token ratio based on FP activation scale. "
+            "1.0 keeps all tokens; values <1 ignore the largest-activation tokens "
+            "when computing 1/2 * delta_y^T H delta_y. Independent of activation quantization."
+        ),
+    )
     parser.add_argument("--k_clip_ratio", type=float, default=1.0, help="K cache clipping ratio")
     parser.add_argument("--v_clip_ratio", type=float, default=1.0, help="V cache clipping ratio")
     parser.add_argument(
@@ -769,6 +779,8 @@ def parse_gen():
         args.backward_bsz = args.bsz
     if args.backward_bsz <= 0:
         raise ValueError(f"`backward_bsz` must be positive or -1. Got {args.backward_bsz}.")
+    if not (0.0 < args.a_loss_ratio <= 1.0):
+        raise ValueError(f"`a_loss_ratio` must be in (0, 1]. Got {args.a_loss_ratio}.")
     if getattr(args, "act_quant_aware_gptq", False):
         if args.w_method != "gptq_plus":
             raise ValueError("--act_quant_aware_gptq is currently implemented only for --w_method=gptq_plus.")

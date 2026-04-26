@@ -30,7 +30,7 @@ DEVICE=${3}
 shift 3
 
 # Sweep configuration. Override from the shell when needed.
-GRAD_LRS_STR=${GRAD_LRS:-"0.000001"}
+GRAD_LRS_STR=${GRAD_LRS:-"0.0000001 0.000001 0.000005"}
 DATASET=${DATASET:-wikitext2} # wikitext2 / neuralmagic / ultrachat_2k / numinamath
 N_SAMPLES=${N_SAMPLES:-256}
 SEQ_LEN=${SEQ_LEN:-2048}
@@ -53,6 +53,7 @@ A_BITS=${A_BITS:-16}
 A_GROUPSIZE=${A_GROUPSIZE:--1}
 A_ASYM=${A_ASYM:-0}
 A_CLIP_RATIO=${A_CLIP_RATIO:-1.0}
+A_LOSS_RATIO=${A_LOSS_RATIO:-1.0}
 K_BITS=${K_BITS:-16}
 K_GROUPSIZE=${K_GROUPSIZE:--1}
 K_ASYM=${K_ASYM:-0}
@@ -263,6 +264,7 @@ fi
 
 ACT_KV_QUANT_ARGS=(
     --a_bits "${A_BITS}" --a_groupsize "${A_GROUPSIZE}" --a_clip_ratio "${A_CLIP_RATIO}"
+    --a_loss_ratio "${A_LOSS_RATIO}"
     --k_bits "${K_BITS}" --k_groupsize "${K_GROUPSIZE}" --k_clip_ratio "${K_CLIP_RATIO}"
     --v_bits "${V_BITS}" --v_groupsize "${V_GROUPSIZE}" --v_clip_ratio "${V_CLIP_RATIO}"
 )
@@ -284,6 +286,9 @@ if [[ "${A_BITS}" != "16" ]]; then
     if [[ "${A_CLIP_RATIO}" != "1.0" && "${A_CLIP_RATIO}" != "1" ]]; then
         ACT_KV_QUANT_TAG="${ACT_KV_QUANT_TAG}clip$(sanitize_float "${A_CLIP_RATIO}")"
     fi
+fi
+if [[ "${A_LOSS_RATIO}" != "1.0" && "${A_LOSS_RATIO}" != "1" ]]; then
+    ACT_KV_QUANT_TAG="${ACT_KV_QUANT_TAG}_aloss$(sanitize_float "${A_LOSS_RATIO}")"
 fi
 if [[ "${K_BITS}" != "16" ]]; then
     ACT_KV_QUANT_TAG="${ACT_KV_QUANT_TAG}_k${K_BITS}g$(sanitize_float "${K_GROUPSIZE}")"
@@ -511,7 +516,7 @@ for grad_lr in "${GRAD_LRS[@]}"; do
     echo "  gate_a : ${GRAD_GATE_SINE_AMP}"
     echo "  gh_topk: ${GRAD_HESSIAN_TOPK}"
     echo "  w_quant: group=${W_GROUPSIZE} act_order=${ACT_ORDER}"
-    echo "  a_quant: bits=${A_BITS} g=${A_GROUPSIZE} asym=${A_ASYM} clip=${A_CLIP_RATIO} aware=${ACT_QUANT_AWARE_GPTQ}"
+    echo "  a_quant: bits=${A_BITS} g=${A_GROUPSIZE} asym=${A_ASYM} clip=${A_CLIP_RATIO} loss_ratio=${A_LOSS_RATIO} aware=${ACT_QUANT_AWARE_GPTQ}"
     echo "  k_quant: bits=${K_BITS} g=${K_GROUPSIZE} asym=${K_ASYM} clip=${K_CLIP_RATIO} aware=${K_CACHE_QUANT_AWARE_GPTQ}"
     echo "  v_quant: bits=${V_BITS} g=${V_GROUPSIZE} asym=${V_ASYM} clip=${V_CLIP_RATIO}"
     echo "  proj_s : ${PROJ_LR_SCALE}"
