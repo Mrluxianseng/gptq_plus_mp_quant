@@ -178,10 +178,28 @@ def _build_untied_checkpoint_on_rank0(args, untied_dir: str) -> None:
     memory_utils.cleanup_memory()
 
 
-def _get_fsdp_meta_checkpoint_path(args) -> Tuple[str, bool]:
+def _prepared_checkpoint_base_dir(args) -> str:
     base_dir = getattr(args, "static_cache_path", None)
     if base_dir is None:
         base_dir = os.path.join(getattr(args, "cache_dir", "./cache"), "fsdp_meta_prepared")
+    return base_dir
+
+
+def _prepared_rotated_checkpoint_dir(args) -> str:
+    if getattr(args, "optimized_rotation_path", None) is not None:
+        opt_tag = os.path.basename(str(args.optimized_rotation_path)).replace("/", "_")
+    else:
+        opt_tag = "hadamard"
+    seed_tag = f"seed{int(getattr(args, 'seed', 0))}"
+    return os.path.join(
+        _prepared_checkpoint_base_dir(args),
+        "_prepared_checkpoints",
+        f"{getattr(args, 'model_name', os.path.basename(args.model))}_rot_{opt_tag}_{seed_tag}",
+    )
+
+
+def _get_fsdp_meta_checkpoint_path(args) -> Tuple[str, bool]:
+    base_dir = _prepared_checkpoint_base_dir(args)
     if not getattr(args, "rotate", False):
         src_config = AutoConfig.from_pretrained(args.model, trust_remote_code=True)
         if not getattr(src_config, "tie_word_embeddings", False):
@@ -198,16 +216,7 @@ def _get_fsdp_meta_checkpoint_path(args) -> Tuple[str, bool]:
         if dist.is_available() and dist.is_initialized():
             dist.barrier()
         return untied_dir, False
-    if getattr(args, "optimized_rotation_path", None) is not None:
-        opt_tag = os.path.basename(str(args.optimized_rotation_path)).replace("/", "_")
-    else:
-        opt_tag = "hadamard"
-    seed_tag = f"seed{int(getattr(args, 'seed', 0))}"
-    rotated_dir = os.path.join(
-        base_dir,
-        "_prepared_checkpoints",
-        f"{getattr(args, 'model_name', os.path.basename(args.model))}_rot_{opt_tag}_{seed_tag}",
-    )
+    rotated_dir = _prepared_rotated_checkpoint_dir(args)
     if dist_utils.is_main() and not _prepared_checkpoint_ready(
         rotated_dir, args, kind="rotated", rotate=True,
     ):
@@ -215,6 +224,38 @@ def _get_fsdp_meta_checkpoint_path(args) -> Tuple[str, bool]:
     if dist.is_available() and dist.is_initialized():
         dist.barrier()
     return rotated_dir, True
+
+
+def get_existing_prepared_rotated_checkpoint_path(args) -> Optional[str]:
+    """Return an existing rank0-prepared rotated checkpoint for normal Stage 2 loading."""
+    if not getattr(args, "rotate", False):
+        return None
+    if getattr(args, "static_cache_path", None) is None:
+        return None
+    rotated_dir = _prepared_rotated_checkpoint_dir(args)
+    if not _prepared_checkpoint_ready(rotated_dir, args, kind="rotated", rotate=True):
+        return None
+    return rotated_dir
+
+
+def load_model_from_prepared_checkpoint_for_quantization(args):
+    """Load a full ordinary model from the prepared rotated checkpoint, if available."""
+    checkpoint_path = get_existing_prepared_rotated_checkpoint_path(args)
+    if checkpoint_path is None:
+        return None
+    logging.info(
+        "Loading pre-rotated prepared checkpoint for quantization from %s; "
+        "skipping in-process fuse/rotate.",
+        checkpoint_path,
+    )
+    analyzer = ModelAnalyzer(
+        checkpoint_path,
+        args.seq_len,
+        tokenizer_source=checkpoint_path,
+    )
+    analyzer.model._gptqplus_checkpoint_is_rotated = True
+    analyzer.model._gptqplus_prepared_checkpoint_path = checkpoint_path
+    return analyzer
 
 
 def load_model_fsdp_meta_for_precompute(args):

@@ -110,7 +110,8 @@ def _get_logits(args, analyzer: model_utils.ModelAnalyzer, testenc, dev):
 def get_ref_logits(args, analyzer, dataset, dataloader):
     cache_dir = os.path.join(args.cache_dir, "ref_logits")
     os.makedirs(cache_dir, exist_ok=True)
-    ref_logits_path = f'{cache_dir}/{args.model_name}_{dataset}_test_{args.eval_seq_len}.cache'
+    rotate_tag = "_rot1" if bool(getattr(analyzer.model, "_gptqplus_checkpoint_is_rotated", False)) else ""
+    ref_logits_path = f'{cache_dir}/{args.model_name}_{dataset}_test_{args.eval_seq_len}{rotate_tag}.cache'
     if not os.path.exists(ref_logits_path):
         logging.info(f"Generating reference logits for {dataset}...")
         ref_logits, _ = _get_logits(args, analyzer, dataloader, torch.device("cuda"))

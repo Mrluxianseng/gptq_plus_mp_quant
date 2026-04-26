@@ -58,6 +58,16 @@ def parse_gen():
     parser.add_argument("--a_clip_ratio", type=float, default=1.0, help="Activation clipping ratio")
     parser.add_argument("--k_clip_ratio", type=float, default=1.0, help="K cache clipping ratio")
     parser.add_argument("--v_clip_ratio", type=float, default=1.0, help="V cache clipping ratio")
+    parser.add_argument(
+        "--act_quant_aware_gptq",
+        action="store_true",
+        help=(
+            "GPTQ+ only: enable activation quantization during the GPTQ+ student "
+            "path so Hessian accumulation, refresh gradients, and layer replay see "
+            "the same A-quantized activations used at evaluation. FP teacher paths "
+            "still disable activation quantization."
+        ),
+    )
     parser.add_argument("--export_to_et", action="store_true", help="Export quantized model (TODO)")
     # Rotate
     parser.add_argument("--optimized_rotation_path", type=str, default=None, help="The path to rotation ckpt")
@@ -738,6 +748,14 @@ def parse_gen():
         args.backward_bsz = args.bsz
     if args.backward_bsz <= 0:
         raise ValueError(f"`backward_bsz` must be positive or -1. Got {args.backward_bsz}.")
+    if getattr(args, "act_quant_aware_gptq", False):
+        if args.w_method != "gptq_plus":
+            raise ValueError("--act_quant_aware_gptq is currently implemented only for --w_method=gptq_plus.")
+        if args.grad_refresh_loss == "refined_mse":
+            raise ValueError(
+                "--act_quant_aware_gptq does not support --grad_refresh_loss=refined_mse yet. "
+                "The refined_mse grad-pool path and layer-0 shortcut still assume an FP student path."
+            )
     if args.final_layer_backward_bsz is None:
         args.final_layer_backward_bsz = args.backward_bsz
     if args.final_layer_backward_bsz <= 0:

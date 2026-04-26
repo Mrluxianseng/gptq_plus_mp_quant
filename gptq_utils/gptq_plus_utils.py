@@ -88,6 +88,45 @@ def get_effective_gptq_reference_loss_type(global_loss_enabled: bool, layer_refr
     return layer_refresh_loss_type if global_loss_enabled else "kl"
 
 
+def configure_activation_quantizers_for_gptq(args, model):
+    """Enable ActQuantWrapper fake quant for GPTQ+ student paths.
+
+    This deliberately does not install/configure K-cache quantization. K-cache
+    quantization lives after RoPE and is not covered by disable_act_quant(), so
+    it needs separate teacher-path plumbing before it can participate here.
+    """
+    if args.a_bits >= 16 and args.v_bits >= 16:
+        return 0, 0
+
+    qlayers = quant_utils.find_qlayers(model, layers=[quant_utils.ActQuantWrapper])
+    input_count = 0
+    v_count = 0
+    for name, wrapper in qlayers.items():
+        layer_input_bits = args.a_bits
+        if "lm_head" in name:
+            layer_input_bits = 16
+
+        wrapper.quantizer.configure(
+            bits=layer_input_bits,
+            groupsize=args.a_groupsize,
+            sym=not args.a_asym,
+            clip_ratio=args.a_clip_ratio,
+        )
+        if layer_input_bits < 16:
+            input_count += 1
+
+        if "v_proj" in name and args.v_bits < 16:
+            wrapper.out_quantizer.configure(
+                bits=args.v_bits,
+                groupsize=args.v_groupsize,
+                sym=not args.v_asym,
+                clip_ratio=args.v_clip_ratio,
+            )
+            v_count += 1
+
+    return input_count, v_count
+
+
 def compute_safe_beta_from_reference_loss(
     gradients_sub: torch.Tensor,
     hinv_init: torch.Tensor,
@@ -5402,6 +5441,24 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
     skip_ref_backward = args.alpha == 0
     effective_pre_gd_steps = args.pre_gd_steps if preclip_enabled else 0
     global_loss_enabled = bool(getattr(args, "global_loss", False))
+    act_quant_aware_gptq = bool(getattr(args, "act_quant_aware_gptq", False))
+    if act_quant_aware_gptq and args.grad_refresh_loss == "refined_mse":
+        raise ValueError(
+            "--act_quant_aware_gptq does not support refined_mse yet; "
+            "refined_mse's grad-pool path still assumes an FP student path."
+        )
+    if act_quant_aware_gptq:
+        logging.info(
+            "act_quant_aware_gptq enabled: GPTQ+ student paths will use A/V fake "
+            "quantization after FP teacher caches are captured (a_bits=%d, v_bits=%d).",
+            args.a_bits,
+            args.v_bits,
+        )
+        if args.k_bits < 16:
+            logging.info(
+                "act_quant_aware_gptq does not include K-cache quantization in the "
+                "GPTQ+ loop yet; --k_bits will still be applied after weight quantization."
+            )
     # refined_mix mode: layers [0, split) use refined_mse, [split, N-1) use
     # refined_residual_kl, final layer always kl. `split` is resolved here
     # once so the per-layer helper calls and the precompute layer-id sets
@@ -5743,6 +5800,16 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
         sequential = analyzer.get_sequential_quantizable_module_names()
         names = [n for ns in sequential for n in ns]
         fp_inps = inps.clone()
+
+        if act_quant_aware_gptq:
+            with pipeline_recorder.section("pipeline.configure_act_quant_for_gptq") if pipeline_recorder else _NULL_CONTEXT:
+                input_q_count, v_q_count = configure_activation_quantizers_for_gptq(args, model)
+                logging.info(
+                    "Configured activation quantization for GPTQ+ student paths: "
+                    "input_wrappers=%d v_out_wrappers=%d.",
+                    input_q_count,
+                    v_q_count,
+                )
 
         if args.offload_inps:
             with pipeline_recorder.section("pipeline.offload_inputs") if pipeline_recorder else _NULL_CONTEXT:
@@ -6386,18 +6453,22 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         # bf16 V: avoids fp32-casting the full (bsz·T, H_out)
                         # forward activation inside the projection hook.
                         dynsal_V_dev_for_layer[_canonical] = _entry["V"].to(dev, dtype=torch.bfloat16)
-                    P_fp_by_canonical = _collect_module_output_projections(
-                        layer=layer,
-                        inputs=fp_inps,
-                        module_dict=full_canonical,
-                        V_by_name=dynsal_V_dev_for_layer,
-                        dev=dev,
-                        bsz=_fp_fwd_bsz,
-                        attention_mask=attention_mask,
-                        position_ids=position_ids,
-                        position_embeddings=position_embeddings,
-                        sink_size=sink_size,
-                    )
+                    dynsal_fp_bits_config = quant_utils.disable_act_quant(layer)
+                    try:
+                        P_fp_by_canonical = _collect_module_output_projections(
+                            layer=layer,
+                            inputs=fp_inps,
+                            module_dict=full_canonical,
+                            V_by_name=dynsal_V_dev_for_layer,
+                            dev=dev,
+                            bsz=_fp_fwd_bsz,
+                            attention_mask=attention_mask,
+                            position_ids=position_ids,
+                            position_embeddings=position_embeddings,
+                            sink_size=sink_size,
+                        )
+                    finally:
+                        quant_utils.enable_act_quant(layer, dynsal_fp_bits_config)
 
                 # per_layer mode: compute S_new for every module once at layer
                 # entry using `layer(inps)` with all weights still FP. Cache the

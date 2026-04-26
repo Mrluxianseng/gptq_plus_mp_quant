@@ -33,7 +33,9 @@ def main(args):
     if bool(getattr(args, "fsdp_meta_init", False)):
         analyzer = model_utils.load_model_fsdp_meta_for_precompute(args)
     else:
-        analyzer = model_utils.ModelAnalyzer(args.model, args.seq_len)
+        analyzer = model_utils.load_model_from_prepared_checkpoint_for_quantization(args)
+        if analyzer is None:
+            analyzer = model_utils.ModelAnalyzer(args.model, args.seq_len)
     model = analyzer.model
     tokenizer = analyzer.tokenizer
 
