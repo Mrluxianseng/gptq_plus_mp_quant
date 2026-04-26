@@ -5,6 +5,7 @@ from process_args import parse_gen
 from utils.model_utils import ModelAnalyzer
 from utils.data_utils import get_tokens
 from utils.gradients import get_gradients
+from utils import rotation_utils
 
 
 def save_gradients(
@@ -13,6 +14,8 @@ def save_gradients(
     dataset="wikitext2", seq_len=2048, nsamples=1024,
     seed=42,
     num_groups=4,
+    rotate=False,
+    optimized_rotation_path=None,
     **kwargs,
 ):
     if mode == 'tokens':
@@ -48,6 +51,25 @@ def save_gradients(
 
     if mode == 'tokens':
         return
+
+    if rotate:
+        logging.info(
+            "Applying rotation before gradient/saliency collection "
+            "(seed=%s, optimized_rotation_path=%s).",
+            seed,
+            optimized_rotation_path,
+        )
+    rotation_utils.prepare_model_for_rotated_quantization(args, analyzer)
+    if rotate:
+        down_wrappers = [
+            name for name, module in analyzer.model.named_modules()
+            if name.endswith("down_proj")
+            and getattr(module, "online_full_had", False)
+        ]
+        logging.info(
+            "Configured online Hadamard for %d down_proj wrappers before saliency collection.",
+            len(down_wrappers),
+        )
 
     # ------------------- Gradients -------------------
 

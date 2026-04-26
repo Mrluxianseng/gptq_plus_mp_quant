@@ -1,6 +1,7 @@
 import argparse
 import os
 import logging
+import hashlib
 
 import transformers
 
@@ -682,10 +683,16 @@ def parse_gen():
     args.tokens_cache_path = (f"{args.cache_dir}/tokens/"
                               f"{args.model_name}-{args.dataset}_s{args.nsamples}_blk{args.seq_len}.pt")
     if args.num_groups is not None:
+        rotation_cache_tag = f"rot{int(bool(args.rotate))}_seed{args.seed}"
+        if args.optimized_rotation_path is not None:
+            opt_hash = hashlib.sha1(str(args.optimized_rotation_path).encode()).hexdigest()[:8]
+            rotation_cache_tag += f"_opt{opt_hash}"
         args.saliency_cache_path = (f"{args.cache_dir}/saliency/"
-                                    f"{args.model_name}-{args.dataset}_s{args.nsamples}_blk{args.seq_len}_g{args.num_groups}")
+                                    f"{args.model_name}-{args.dataset}_s{args.nsamples}_blk{args.seq_len}_"
+                                    f"{rotation_cache_tag}_g{args.num_groups}")
         args.gradients_cache_path = (f"{args.cache_dir}/gradients/"
-                                    f"{args.model_name}-{args.dataset}_s{args.nsamples}_blk{args.seq_len}_g{args.num_groups}.pt")
+                                    f"{args.model_name}-{args.dataset}_s{args.nsamples}_blk{args.seq_len}_"
+                                    f"{rotation_cache_tag}_g{args.num_groups}.pt")
     else:
         args.saliency_cache_path = None
         args.gradients_cache_path = None

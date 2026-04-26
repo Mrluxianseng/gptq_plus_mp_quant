@@ -53,7 +53,7 @@ def get_hadK(n, transpose=False):
     raise ValueError(f"Can't find appropriate Hadamard for size {n}!")
 
 
-def random_orthogonal_matrix(size, device):
+def random_orthogonal_matrix(size, device, generator=None):
     """
     Generate a random orthogonal matrix of the specified size.
     First, we generate a random matrix with entries from a standard distribution.
@@ -67,14 +67,14 @@ def random_orthogonal_matrix(size, device):
     torch.Tensor: An orthogonal matrix of the specified size.
     """
     torch.cuda.empty_cache()
-    random_matrix = torch.randn(size, size, dtype=torch.float64).to(device)
+    random_matrix = torch.randn(size, size, dtype=torch.float64, generator=generator).to(device)
     q, r = torch.linalg.qr(random_matrix)
     q *= torch.sign(torch.diag(r)).unsqueeze(0)
     return q
 
 
-def random_hadamard_matrix(size, device):
-    Q = torch.randint(low=0, high=2, size=(size,)).to(torch.float64)
+def random_hadamard_matrix(size, device, generator=None):
+    Q = torch.randint(low=0, high=2, size=(size,), generator=generator).to(torch.float64)
     Q = Q * 2 - 1
     Q = torch.diag(Q)
     return matmul_hadU(Q).to(device)

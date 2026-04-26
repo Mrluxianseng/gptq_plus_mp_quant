@@ -40,11 +40,11 @@ def fuse_layer_norms(analyzer: model_utils.ModelAnalyzer) -> None:
     memory_utils.cleanup_memory()
 
 
-def get_orthogonal_matrix(size, mode, device="cuda"):
+def get_orthogonal_matrix(size, mode, device="cuda", generator=None):
     if mode == "random":
-        return hadamard_utils.random_orthogonal_matrix(size, device)
+        return hadamard_utils.random_orthogonal_matrix(size, device, generator=generator)
     elif mode == "hadamard":
-        return hadamard_utils.random_hadamard_matrix(size, device)
+        return hadamard_utils.random_hadamard_matrix(size, device, generator=generator)
     else:
         raise ValueError(f"Unknown mode {mode}")
 
@@ -110,10 +110,18 @@ def rotate_ov_proj(analyzer: model_utils.ModelAnalyzer, layer, R2=None):
 
 @torch.inference_mode()
 def rotate_model(args, analyzer: model_utils.ModelAnalyzer):
-    R1 = get_orthogonal_matrix(analyzer.hidden_size, "hadamard")
     if args.optimized_rotation_path is not None:
         R_cpk = args.optimized_rotation_path
         R1 = torch.load(R_cpk)["R1"].cuda().to(torch.float64)
+        rotation_gen = None
+    else:
+        seed = int(getattr(args, "seed", 0))
+        rotation_gen = torch.Generator(device="cpu").manual_seed(seed)
+        R1 = get_orthogonal_matrix(
+            analyzer.hidden_size,
+            "hadamard",
+            generator=rotation_gen,
+        )
 
     rotate_embeddings(analyzer, R1)
     rotate_head(analyzer, R1)
@@ -124,11 +132,42 @@ def rotate_model(args, analyzer: model_utils.ModelAnalyzer):
             key = f"model.layers.{idx}.self_attn.R2"
             R2 = torch.load(R_cpk)[key].cuda().to(torch.float64)
         else:
-            R2 = get_orthogonal_matrix(analyzer.head_dim, "hadamard")
+            R2 = get_orthogonal_matrix(
+                analyzer.head_dim,
+                "hadamard",
+                generator=rotation_gen,
+            )
         rotate_attention_mlp_inputs(analyzer, layer, R1)
         rotate_attention_mlp_output(analyzer, layer, R1)
         rotate_down_proj(analyzer, layer)
         rotate_ov_proj(analyzer, layer, R2=R2)
+
+
+def add_activation_quant_wrappers_for_rotation(analyzer: model_utils.ModelAnalyzer) -> None:
+    model = analyzer.model
+    quant_utils.add_actquant(analyzer)
+    qlayers = quant_utils.find_qlayers(model)
+    for name in qlayers:
+        if "down_proj" in name:
+            had_K, K = hadamard_utils.get_hadK(model.config.intermediate_size)
+            qlayers[name].online_full_had = True
+            qlayers[name].had_K = had_K
+            qlayers[name].K = K
+            qlayers[name].fp32_had = False
+
+
+def prepare_model_for_rotated_quantization(args, analyzer: model_utils.ModelAnalyzer) -> None:
+    model = analyzer.model
+    model_pre_rotated = bool(getattr(model, "_gptqplus_checkpoint_is_rotated", False))
+    if getattr(args, "rotate", False) and not model_pre_rotated:
+        fuse_layer_norms(analyzer)
+        rotate_model(args, analyzer)
+        memory_utils.cleanup_memory()
+        add_activation_quant_wrappers_for_rotation(analyzer)
+    elif getattr(args, "rotate", False) and model_pre_rotated:
+        add_activation_quant_wrappers_for_rotation(analyzer)
+    else:
+        quant_utils.add_actquant(analyzer)
 
 
 class QKRotationWrapper(torch.nn.Module):

@@ -16,7 +16,7 @@ import transformers
 from process_args import parse_gen
 from gptq_utils.main import quantize_weights
 from utils import data_utils, dist_utils, eval_utils, model_utils, rotation_utils, \
-                  memory_utils, quant_utils, hadamard_utils
+                  memory_utils, quant_utils
 
 torch.backends.cuda.matmul.allow_tf32 = False
 
@@ -57,15 +57,7 @@ def main(args):
             ref_logits_dict[eval_dataset] = ref_logits
 
     def add_activation_quant_wrappers():
-        quant_utils.add_actquant(analyzer)  # Add Activation Wrapper to the model
-        qlayers = quant_utils.find_qlayers(model)
-        for name in qlayers:
-            if "down_proj" in name:
-                had_K, K = hadamard_utils.get_hadK(model.config.intermediate_size)
-                qlayers[name].online_full_had = True
-                qlayers[name].had_K = had_K
-                qlayers[name].K = K
-                qlayers[name].fp32_had = False
+        rotation_utils.add_activation_quant_wrappers_for_rotation(analyzer)
 
     model_pre_rotated = bool(getattr(model, "_gptqplus_checkpoint_is_rotated", False))
     # Rotate the weights

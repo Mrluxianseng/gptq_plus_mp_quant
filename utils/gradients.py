@@ -9,6 +9,10 @@ from utils.dist_utils import distribute_model
 from utils import model_utils
 
 
+def _normalize_quant_module_name(name: str) -> str:
+    return name[:-7] if name.endswith(".module") else name
+
+
 def get_gradients(
     analyzer: model_utils.ModelAnalyzer,
     input_tokens,
@@ -61,7 +65,10 @@ def get_gradients(
     if saliency_path is not None:
         # We'll store chunk-lists for all layers
         saliency_data = [
-            {module_name: [] for module_name in analyzer.get_quantizable_modules(layer).keys()}
+            {
+                _normalize_quant_module_name(module_name): []
+                for module_name in analyzer.get_quantizable_modules(layer).keys()
+            }
             for layer in layers
         ]
 
@@ -97,7 +104,8 @@ def get_gradients(
 
             # Register forward hooks for each module
             for module_name, module in analyzer.get_quantizable_modules(layer).items():
-                h = module.register_forward_hook(make_forward_hook(layer_idx, module_name))
+                canonical_name = _normalize_quant_module_name(module_name)
+                h = module.register_forward_hook(make_forward_hook(layer_idx, canonical_name))
                 saliency_hooks.append(h)
 
     # ----------------------------------------------------------------
@@ -111,7 +119,13 @@ def get_gradients(
     #     for module in analyzer.get_quantizable_modules(layer_idx).values():
     #         weight_hooks.append(module.weight.register_hook(weight_grad_hook))
 
-    gradients = [{module_name: 0 for module_name in analyzer.get_quantizable_modules(layer)} for layer in layers]
+    gradients = [
+        {
+            _normalize_quant_module_name(module_name): 0
+            for module_name in analyzer.get_quantizable_modules(layer)
+        }
+        for layer in layers
+    ]
     # hessians = [{module_name: 0 for module_name in analyzer.get_quantizable_modules(layer)} for layer in layers]
 
     # ----------------------------------------------------------------
@@ -126,6 +140,7 @@ def get_gradients(
 
         for layer_idx, layer in enumerate(layers):
             for module_name, module in analyzer.get_quantizable_modules(layer).items():
+                canonical_name = _normalize_quant_module_name(module_name)
                 grad = module.weight.grad.data.float()
                 d_row, d_col = grad.shape
                 
@@ -133,7 +148,7 @@ def get_gradients(
                 grad_grouped = grad.view(num_groups, group_size, d_col)
                 grad_mean = grad_grouped.mean(dim=1)
                 
-                gradients[layer_idx][module_name] += grad_mean.cpu()
+                gradients[layer_idx][canonical_name] += grad_mean.cpu()
 
                 # fisher = torch.einsum('ngi,ngj->nij', grad_grouped, grad_grouped) / group_size
                 # hessians[layer_idx][module_name] += fisher.cpu()
@@ -157,7 +172,8 @@ def get_gradients(
     # ----------------------------------------------------------------
     for layer_idx, layer in enumerate(layers):
         for module_name in analyzer.get_quantizable_modules(layer).keys():
-            gradients[layer_idx][module_name] = gradients[layer_idx][module_name] / len(input_tokens)
+            canonical_name = _normalize_quant_module_name(module_name)
+            gradients[layer_idx][canonical_name] = gradients[layer_idx][canonical_name] / len(input_tokens)
             # hessians[layer_idx][module_name] = hessians[layer_idx][module_name] / len(input_tokens)
 
     # ----------------------------------------------------------------
