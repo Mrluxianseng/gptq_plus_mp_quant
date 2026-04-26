@@ -18,7 +18,7 @@ try:
 except ImportError:
     from torch.nn.utils.stateless import functional_call
 
-from utils import quant_utils, memory_utils, model_utils, dist_utils
+from utils import quant_utils, memory_utils, model_utils, dist_utils, rotation_utils
 from gptq_utils.diagnostics import DiagnosticRegistry, parse_diagnose_targets
 
 
@@ -91,9 +91,8 @@ def get_effective_gptq_reference_loss_type(global_loss_enabled: bool, layer_refr
 def configure_activation_quantizers_for_gptq(args, model):
     """Enable ActQuantWrapper fake quant for GPTQ+ student paths.
 
-    This deliberately does not install/configure K-cache quantization. K-cache
-    quantization lives after RoPE and is not covered by disable_act_quant(), so
-    it needs separate teacher-path plumbing before it can participate here.
+    K-cache quantization lives after RoPE and is configured separately by
+    configure_k_cache_quantizers_for_gptq().
     """
     if args.a_bits >= 16 and args.v_bits >= 16:
         return 0, 0
@@ -125,6 +124,38 @@ def configure_activation_quantizers_for_gptq(args, model):
             v_count += 1
 
     return input_count, v_count
+
+
+def configure_k_cache_quantizers_for_gptq(args, analyzer):
+    rope_function_name = "apply_rotary_pos_emb"
+    k_quant_config = {
+        "k_bits": args.k_bits,
+        "k_groupsize": args.k_groupsize,
+        "k_sym": not args.k_asym,
+        "k_clip_ratio": args.k_clip_ratio,
+        "k_quant_enabled": True,
+    }
+    count = 0
+    for layer in analyzer.get_layers():
+        rotation_utils.add_qk_rotation_wrapper_after_function_call_in_forward(
+            layer.self_attn,
+            rope_function_name,
+            head_dim=analyzer.head_dim,
+            **k_quant_config,
+        )
+        count += 1
+    return count
+
+
+@contextmanager
+def disable_fp_path_quant(module):
+    act_bits = quant_utils.disable_act_quant(module)
+    k_state = rotation_utils.disable_k_cache_quant(module)
+    try:
+        yield
+    finally:
+        rotation_utils.enable_k_cache_quant(module, k_state)
+        quant_utils.enable_act_quant(module, act_bits)
 
 
 def compute_safe_beta_from_reference_loss(
@@ -912,8 +943,20 @@ class GPTQPlus:
                 with profile_recorder.section("fasterquant.quantizer_find_params_initial") if profile_recorder else _NULL_CONTEXT:
                     self.quantizer.find_params(W)
 
+            dynamic_groups = groupsize != -1 and not static_groups
+            if dynamic_groups and groupsize != blocksize:
+                raise ValueError(
+                    "`groupsize` must equal `blocksize` when using dynamic groups in GPTQ+. "
+                    f"Got groupsize={groupsize}, blocksize={blocksize}."
+                )
+            if dynamic_groups and grad_reg_strategy in {"quant_error_gate", "quant_error_gate_optimized"}:
+                raise ValueError(
+                    "Dynamic weight groups are not supported with quant_error_gate regularization yet. "
+                    "Use static groups or disable the quantization-error gate."
+                )
+
             shared_groups = None
-            if groupsize != -1:
+            if groupsize != -1 and static_groups:
                 with profile_recorder.section("fasterquant.quantizer_build_groups") if profile_recorder else _NULL_CONTEXT:
                     shared_groups = []
                     for col_start in range(0, self.columns, groupsize):
@@ -1103,6 +1146,15 @@ class GPTQPlus:
                                 inner_update_mode,
                             )
                             fast_quant_scale = state["fast_quant_scale"] if fast_quant_enabled else None
+                            dynamic_quantizer = None
+                            if dynamic_groups:
+                                # Dynamic groups estimate the row-wise scale at the
+                                # last possible moment before this group/block is
+                                # quantized, using the current working weight after
+                                # all previous GPTQ/block-GD updates.
+                                with profile_recorder.section("fasterquant.block.dynamic_group_find_params") if profile_recorder else _NULL_CONTEXT:
+                                    dynamic_quantizer = copy.deepcopy(self.quantizer)
+                                    dynamic_quantizer.find_params(W_block_start)
                             # Diagnostic: snapshot state at the start of this block
                             # BEFORE any inner quant updates. Captures the input to
                             # the block loop: W1_start is what the inner loop will
@@ -1151,7 +1203,13 @@ class GPTQPlus:
                                         w = W_block_start[:, i]
 
                                         quantizer = self.quantizer
-                                        if groupsize != -1:
+                                        quant_st_idx = state["row_start"]
+                                        quant_end_idx = state["row_end"]
+                                        if dynamic_quantizer is not None:
+                                            quantizer = dynamic_quantizer
+                                            quant_st_idx = None
+                                            quant_end_idx = None
+                                        elif groupsize != -1:
                                             idx = i1 + i
                                             if actorder:
                                                 idx = state["perm"][idx]
@@ -1160,8 +1218,8 @@ class GPTQPlus:
                                         with profile_recorder.section("fasterquant.column.quantize") if profile_recorder else _NULL_CONTEXT:
                                             q, int_weight, scale = quantizer.fake_quantize(
                                                 w.unsqueeze(1),
-                                                st_idx=state["row_start"],
-                                                end_idx=state["row_end"],
+                                                st_idx=quant_st_idx,
+                                                end_idx=quant_end_idx,
                                             )
                                         Q1[:, i] = q.flatten()
                                         W_int1[:, i] = int_weight.flatten()
@@ -1202,15 +1260,21 @@ class GPTQPlus:
                                     scale = fast_quant_scale
                                 else:
                                     quantizer = self.quantizer
-                                    if groupsize != -1:
+                                    quant_st_idx = state["row_start"]
+                                    quant_end_idx = state["row_end"]
+                                    if dynamic_quantizer is not None:
+                                        quantizer = dynamic_quantizer
+                                        quant_st_idx = None
+                                        quant_end_idx = None
+                                    elif groupsize != -1:
                                         idx = i1 + i
                                         if actorder:
                                             idx = state["perm"][idx]
                                         quantizer = state["groups"][idx // groupsize]
                                     q_fake, int_weight, scale = quantizer.fake_quantize(
                                         w_col,
-                                        st_idx=state["row_start"],
-                                        end_idx=state["row_end"],
+                                        st_idx=quant_st_idx,
+                                        end_idx=quant_end_idx,
                                     )
                                 q_flat = q_fake.flatten()
                                 Q1[:, i] = q_flat
@@ -4178,15 +4242,17 @@ def collect_layer_output_grad_for_refined_mse(
     # one stream is fine.
     d2h_stream = torch.cuda.Stream(device=dev)
 
-    # Drop act-quant on the current + downstream layers so the forward used
+    # Drop act/K-cache quant on the current + downstream layers so the forward used
     # for the gradient measurement is pure FP. (Weights are still FP — this
     # layer hasn't been quantised yet, and downstream layers haven't either.)
     with layer_recorder.section("layer.refined_mse_grad_pool.disable_act_quant") if layer_recorder else _NULL_CONTEXT:
-        restore_bits = []
+        restore_states = []
         downstream_layers = layers[layer_idx + 1:]
         all_layers_for_grad = [layer, *downstream_layers]
         for lay in all_layers_for_grad:
-            restore_bits.append((lay, quant_utils.disable_act_quant(lay)))
+            act_bits = quant_utils.disable_act_quant(lay)
+            k_state = rotation_utils.disable_k_cache_quant(lay)
+            restore_states.append((lay, act_bits, k_state))
 
     grad_modules = all_layers_for_grad + [
         analyzer.get_layernorm_before_head(),
@@ -4305,8 +4371,9 @@ def collect_layer_output_grad_for_refined_mse(
                             del grad_out_next_bf16
     finally:
         with layer_recorder.section("layer.refined_mse_grad_pool.restore_act_quant") if layer_recorder else _NULL_CONTEXT:
-            for lay, bits_cfg in restore_bits:
-                quant_utils.enable_act_quant(lay, bits_cfg)
+            for lay, act_bits, k_state in restore_states:
+                rotation_utils.enable_k_cache_quant(lay, k_state)
+                quant_utils.enable_act_quant(lay, act_bits)
 
     with layer_recorder.section("layer.refined_mse_grad_pool.mean_reduce") if layer_recorder else _NULL_CONTEXT:
         # Drain any in-flight async D2Hs before we read grad_pool on the CPU.
@@ -5442,11 +5509,20 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
     effective_pre_gd_steps = args.pre_gd_steps if preclip_enabled else 0
     global_loss_enabled = bool(getattr(args, "global_loss", False))
     act_quant_aware_gptq = bool(getattr(args, "act_quant_aware_gptq", False))
+    k_cache_quant_aware_gptq = bool(getattr(args, "k_cache_quant_aware_gptq", False))
     if act_quant_aware_gptq and args.grad_refresh_loss == "refined_mse":
         raise ValueError(
             "--act_quant_aware_gptq does not support refined_mse yet; "
             "refined_mse's grad-pool path still assumes an FP student path."
         )
+    if k_cache_quant_aware_gptq:
+        if args.k_bits >= 16:
+            raise ValueError("--k_cache_quant_aware_gptq requires --k_bits < 16.")
+        if args.grad_refresh_loss == "refined_mse":
+            raise ValueError(
+                "--k_cache_quant_aware_gptq does not support refined_mse yet; "
+                "refined_mse's grad-pool path still assumes an FP student path."
+            )
     if act_quant_aware_gptq:
         logging.info(
             "act_quant_aware_gptq enabled: GPTQ+ student paths will use A/V fake "
@@ -5454,11 +5530,14 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
             args.a_bits,
             args.v_bits,
         )
-        if args.k_bits < 16:
-            logging.info(
-                "act_quant_aware_gptq does not include K-cache quantization in the "
-                "GPTQ+ loop yet; --k_bits will still be applied after weight quantization."
-            )
+    if k_cache_quant_aware_gptq:
+        logging.info(
+            "k_cache_quant_aware_gptq enabled: GPTQ+ student paths will use online "
+            "K fake quantization after RoPE/QK rotation (k_bits=%d, k_groupsize=%d). "
+            "FP teacher paths keep K quantization disabled.",
+            args.k_bits,
+            args.k_groupsize,
+        )
     # refined_mix mode: layers [0, split) use refined_mse, [split, N-1) use
     # refined_residual_kl, final layer always kl. `split` is resolved here
     # once so the per-layer helper calls and the precompute layer-id sets
@@ -5631,6 +5710,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             f"without --enable_dynamic_saliency. Delete the cache (or use a "
                             f"different --static_cache_path) and rerun precompute."
                         )
+                    del _loaded
             else:
                 want_refined = args.grad_refresh_loss in (
                     "refined_residual_kl", "refined_mix",
@@ -5707,6 +5787,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         if static_dynsal is not None:
                             _to_save["dynsal"] = static_dynsal
                         torch.save(_to_save, static_cache_file)
+                        del _to_save
             logging.info(
                 "Collected frozen end-to-end saliency/Fisher caches before quantization with global_loss_bsz=%d. "
                 "These cached coefficients will be reused for Hessian estimation and fisher_diag_mse throughout quantization.",
@@ -5728,6 +5809,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
         else:
             static_saliency_by_layer = [None] * len(layers)
             static_fisher_by_layer = [None] * len(layers)
+            static_refined_A_by_layer = None
             static_dynsal = None
             logging.info(
                 "Global loss mode is disabled. Saliency/Fisher caches will be collected layerwise with the output head, "
@@ -5811,6 +5893,15 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     v_q_count,
                 )
 
+        if k_cache_quant_aware_gptq:
+            with pipeline_recorder.section("pipeline.configure_k_cache_quant_for_gptq") if pipeline_recorder else _NULL_CONTEXT:
+                k_q_count = configure_k_cache_quantizers_for_gptq(args, analyzer)
+                logging.info(
+                    "Configured K-cache quantization for GPTQ+ student paths: "
+                    "qk_wrappers=%d.",
+                    k_q_count,
+                )
+
         if args.offload_inps:
             with pipeline_recorder.section("pipeline.offload_inputs") if pipeline_recorder else _NULL_CONTEXT:
                 inps = inps.cpu()
@@ -5882,18 +5973,17 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     scratch = inps.detach().clone().to(dev)
                     for idx in range(len(layers)):
                         lay = layers[idx].to(dev)
-                        bits_cfg = quant_utils.disable_act_quant(lay)
-                        # Per-sample forward matches the per-layer fp_reference_forward
-                        # pattern; batching here would change numerics (cuBLAS kernel
-                        # selection) and has been shown to cause drift.
-                        for j in range(scratch.shape[0]):
-                            scratch[j] = lay(
-                                scratch[j].unsqueeze(0),
-                                attention_mask=attention_mask,
-                                position_ids=position_ids,
-                                position_embeddings=position_embeddings,
-                            )[0].squeeze(0)
-                        quant_utils.enable_act_quant(lay, bits_cfg)
+                        with disable_fp_path_quant(lay):
+                            # Per-sample forward matches the per-layer fp_reference_forward
+                            # pattern; batching here would change numerics (cuBLAS kernel
+                            # selection) and has been shown to cause drift.
+                            for j in range(scratch.shape[0]):
+                                scratch[j] = lay(
+                                    scratch[j].unsqueeze(0),
+                                    attention_mask=attention_mask,
+                                    position_ids=position_ids,
+                                    position_embeddings=position_embeddings,
+                                )[0].squeeze(0)
                         # Return each layer to its original (CPU) residency so the
                         # main quant loop's `layers[i].to(dev)` starts from the same
                         # state as if this precompute never happened.
@@ -6159,16 +6249,15 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             )
 
             with layer_recorder.section("layer.fp_reference_forward") if layer_recorder else _NULL_CONTEXT:
-                bits_config = quant_utils.disable_act_quant(layer)
-                # inps/fp_inps are rank-local shards of length n_local.
-                for j in range(inps.shape[0]):
-                    fp_inps[j] = layer(
-                        fp_inps[j].unsqueeze(0).to(dev),
-                        attention_mask=attention_mask,
-                        position_ids=position_ids,
-                        position_embeddings=position_embeddings,
-                    )[0].to(fp_inps.device)
-                quant_utils.enable_act_quant(layer, bits_config)
+                with disable_fp_path_quant(layer):
+                    # inps/fp_inps are rank-local shards of length n_local.
+                    for j in range(inps.shape[0]):
+                        fp_inps[j] = layer(
+                            fp_inps[j].unsqueeze(0).to(dev),
+                            attention_mask=attention_mask,
+                            position_ids=position_ids,
+                            position_embeddings=position_embeddings,
+                        )[0].to(fp_inps.device)
 
             # --- Loss-slide-window setup: precompute reference output of the
             # next FP transformer block, so the per-block refresh can blend the
@@ -6224,11 +6313,9 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
             slide_fp_inps_next = None
             slide_next_layer_output_fisher = None
             slide_next_refined_A_list = None
-            slide_next_bits_config = None
             if slide_active_layer:
                 with layer_recorder.section("layer.slide_window.next_fp_reference") if layer_recorder else _NULL_CONTEXT:
                     slide_next_layer = layers[i + 1].to(dev)
-                    slide_next_bits_config = quant_utils.disable_act_quant(slide_next_layer)
                     # fisher_diag_mse and refined_mse both need the next-layer
                     # fisher (they share the fisher-diag second-order term);
                     # refined_residual_kl needs the next-layer A. residual_kl
@@ -6245,13 +6332,14 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                                 for s in _next_list
                             ]
                     slide_fp_inps_next = torch.empty_like(fp_inps)
-                    for j in range(fp_inps.shape[0]):
-                        slide_fp_inps_next[j] = slide_next_layer(
-                            fp_inps[j].unsqueeze(0).to(dev),
-                            attention_mask=attention_mask,
-                            position_ids=position_ids,
-                            position_embeddings=position_embeddings,
-                        )[0].to(slide_fp_inps_next.device)
+                    with disable_fp_path_quant(slide_next_layer):
+                        for j in range(fp_inps.shape[0]):
+                            slide_fp_inps_next[j] = slide_next_layer(
+                                fp_inps[j].unsqueeze(0).to(dev),
+                                attention_mask=attention_mask,
+                                position_ids=position_ids,
+                                position_embeddings=position_embeddings,
+                            )[0].to(slide_fp_inps_next.device)
                     logging.info(
                         "Loss-slide-window active for layer %d (next=%d, mode=%s).",
                         i,
@@ -6453,8 +6541,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         # bf16 V: avoids fp32-casting the full (bsz·T, H_out)
                         # forward activation inside the projection hook.
                         dynsal_V_dev_for_layer[_canonical] = _entry["V"].to(dev, dtype=torch.bfloat16)
-                    dynsal_fp_bits_config = quant_utils.disable_act_quant(layer)
-                    try:
+                    with disable_fp_path_quant(layer):
                         P_fp_by_canonical = _collect_module_output_projections(
                             layer=layer,
                             inputs=fp_inps,
@@ -6467,8 +6554,6 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             position_embeddings=position_embeddings,
                             sink_size=sink_size,
                         )
-                    finally:
-                        quant_utils.enable_act_quant(layer, dynsal_fp_bits_config)
 
                 # per_layer mode: compute S_new for every module once at layer
                 # entry using `layer(inps)` with all weights still FP. Cache the
@@ -7090,18 +7175,21 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
 
             with layer_recorder.section("layer.cleanup") if layer_recorder else _NULL_CONTEXT:
                 if slide_active_layer and slide_next_layer is not None:
-                    # Restore next-layer bit widths so iter i+1 sees a clean
-                    # act-quant state when it calls disable_act_quant again.
-                    quant_utils.enable_act_quant(slide_next_layer, slide_next_bits_config)
                     del slide_fp_inps_next
                     slide_next_layer = None
                     slide_fp_inps_next = None
                     slide_next_layer_output_fisher = None
-                    slide_next_bits_config = None
+                    slide_next_refined_A_list = None
                 layers[i] = layer.to(orig_device)
                 del layer
                 del gptq
                 del saliency_dict, gradients_dict
+                layer_output_fisher = None
+                layer_output_fisher_by_module = None
+                layer_refined_A_list = None
+                precomputed_saliency_for_layer = None
+                precomputed_saliency_for_group = None
+                dynsal_refresh_overrides = None
                 if layer_refined_mse_grad_pool is not None:
                     del layer_refined_mse_grad_pool
                 if layer_refined_mse_mean_grad is not None:
@@ -7125,7 +7213,17 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     del full_canonical
                 if precomputed_S_new_by_canonical is not None:
                     del precomputed_S_new_by_canonical
-                memory_utils.cleanup_memory()
+                if static_saliency_by_layer is not None and i < len(static_saliency_by_layer):
+                    static_saliency_by_layer[i] = None
+                if static_fisher_by_layer is not None and i < len(static_fisher_by_layer):
+                    static_fisher_by_layer[i] = None
+                if static_refined_A_by_layer is not None and i < len(static_refined_A_by_layer):
+                    static_refined_A_by_layer[i] = None
+                if static_dynsal is not None and isinstance(static_dynsal, dict):
+                    _dyn_layers = static_dynsal.get("by_layer")
+                    if _dyn_layers is not None and i < len(_dyn_layers):
+                        _dyn_layers[i] = None
+                memory_utils.cleanup_memory(trim_cpu=True)
 
             if quant_stop_layer is not None and i >= quant_stop_layer:
                 logging.info("Stopping quantization after transformer layer %d due to --quant_stop_layer.", i)

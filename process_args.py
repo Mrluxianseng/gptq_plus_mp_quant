@@ -68,6 +68,15 @@ def parse_gen():
             "still disable activation quantization."
         ),
     )
+    parser.add_argument(
+        "--k_cache_quant_aware_gptq",
+        action="store_true",
+        help=(
+            "GPTQ+ only: install K-cache quantization during the GPTQ+ student "
+            "path so Hessian accumulation, refresh gradients, and layer replay see "
+            "online K fake quantization. FP teacher paths keep K quantization disabled."
+        ),
+    )
     parser.add_argument("--export_to_et", action="store_true", help="Export quantized model (TODO)")
     # Rotate
     parser.add_argument("--optimized_rotation_path", type=str, default=None, help="The path to rotation ckpt")
@@ -711,6 +720,18 @@ def parse_gen():
 
     init_logging(args.log_dir)
 
+    if args.w_bits < 16:
+        if args.w_asym:
+            raise ValueError(
+                "--w_asym is temporarily unsupported for weight quantization. "
+                "The GPTQ/GPTQ+ fake-quant path currently does not preserve asymmetric zero-points."
+            )
+        if args.w_groupsize != -1 and args.w_groupsize != args.blocksize:
+            raise ValueError(
+                "--w_groupsize must be -1 or equal to --blocksize for now. "
+                f"Got w_groupsize={args.w_groupsize}, blocksize={args.blocksize}."
+            )
+
     if args.backward_samples == -1:
         args.backward_samples = args.nsamples
     if args.backward_samples <= 0:
@@ -755,6 +776,16 @@ def parse_gen():
             raise ValueError(
                 "--act_quant_aware_gptq does not support --grad_refresh_loss=refined_mse yet. "
                 "The refined_mse grad-pool path and layer-0 shortcut still assume an FP student path."
+            )
+    if getattr(args, "k_cache_quant_aware_gptq", False):
+        if args.w_method != "gptq_plus":
+            raise ValueError("--k_cache_quant_aware_gptq is currently implemented only for --w_method=gptq_plus.")
+        if args.k_bits >= 16:
+            raise ValueError("--k_cache_quant_aware_gptq requires --k_bits < 16.")
+        if args.grad_refresh_loss == "refined_mse":
+            raise ValueError(
+                "--k_cache_quant_aware_gptq does not support --grad_refresh_loss=refined_mse yet. "
+                "The refined_mse grad-pool path still assumes an FP student path."
             )
     if args.final_layer_backward_bsz is None:
         args.final_layer_backward_bsz = args.backward_bsz

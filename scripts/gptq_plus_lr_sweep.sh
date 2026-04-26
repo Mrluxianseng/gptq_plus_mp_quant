@@ -30,20 +30,39 @@ DEVICE=${3}
 shift 3
 
 # Sweep configuration. Override from the shell when needed.
-GRAD_LRS_STR=${GRAD_LRS:-"0.0005 0.0007 0.001 0.0015 0.002 0.003 0.005"}
+GRAD_LRS_STR=${GRAD_LRS:-"0.000001"}
 DATASET=${DATASET:-wikitext2} # wikitext2 / neuralmagic / ultrachat_2k / numinamath
-N_SAMPLES=${N_SAMPLES:-2048}
+N_SAMPLES=${N_SAMPLES:-256}
 SEQ_LEN=${SEQ_LEN:-2048}
-BSZ=${BSZ:-256}
+BSZ=${BSZ:-32}
 FINAL_LAYER_STATS_BSZ=${FINAL_LAYER_STATS_BSZ:-8}
-HESSIAN_ACCUM_BSZ=${HESSIAN_ACCUM_BSZ:-64}
+HESSIAN_ACCUM_BSZ=${HESSIAN_ACCUM_BSZ:-32}
 ENABLE_GPTQ_PLUS=${ENABLE_GPTQ_PLUS:-0}
-BACKWARD_SAMPLES=${BACKWARD_SAMPLES:-32}
-BACKWARD_BSZ=${BACKWARD_BSZ:-32}
+BACKWARD_SAMPLES=${BACKWARD_SAMPLES:-8}
+BACKWARD_BSZ=${BACKWARD_BSZ:-8}
 FINAL_LAYER_BACKWARD_BSZ=${FINAL_LAYER_BACKWARD_BSZ:-8}
 FINAL_LAYER_FULL_BACKWARD=${FINAL_LAYER_FULL_BACKWARD:-0}
-BLOCKSIZE=${BLOCKSIZE:-256}
+BLOCKSIZE=${BLOCKSIZE:-512}
+W_GROUPSIZE=${W_GROUPSIZE:--1}
+ACT_ORDER=${ACT_ORDER:-1}
 BLOCK_ATOMIC_QUANT=${BLOCK_ATOMIC_QUANT:-0}
+# Activation / KV quantization knobs. A/V/K quantization is applied to the
+# final quantized model when the bit-width is <16. The quant-aware flags also
+# enable the corresponding fake-quant paths inside GPTQ+ student forwards.
+A_BITS=${A_BITS:-16}
+A_GROUPSIZE=${A_GROUPSIZE:--1}
+A_ASYM=${A_ASYM:-0}
+A_CLIP_RATIO=${A_CLIP_RATIO:-1.0}
+K_BITS=${K_BITS:-16}
+K_GROUPSIZE=${K_GROUPSIZE:--1}
+K_ASYM=${K_ASYM:-0}
+K_CLIP_RATIO=${K_CLIP_RATIO:-1.0}
+V_BITS=${V_BITS:-16}
+V_GROUPSIZE=${V_GROUPSIZE:--1}
+V_ASYM=${V_ASYM:-0}
+V_CLIP_RATIO=${V_CLIP_RATIO:-1.0}
+ACT_QUANT_AWARE_GPTQ=${ACT_QUANT_AWARE_GPTQ:-0}
+K_CACHE_QUANT_AWARE_GPTQ=${K_CACHE_QUANT_AWARE_GPTQ:-0}
 GRAD_OPTIMIZER=${GRAD_OPTIMIZER:-adam}
 FINAL_LAYER_GRAD_OPTIMIZER=${FINAL_LAYER_GRAD_OPTIMIZER:-adam}
 GRAD_CLIP=${GRAD_CLIP:-5e-5}
@@ -98,7 +117,7 @@ DOWN_PROJ_LR_SCALE=${DOWN_PROJ_LR_SCALE:-1.0}
 SECOND_ORDER_SCALE=${SECOND_ORDER_SCALE:-1.0}
 PRE_CLIP=${PRE_CLIP:-0}
 GLOBAL_LOSS=${GLOBAL_LOSS:-1}
-GLOBAL_LOSS_BSZ=${GLOBAL_LOSS_BSZ:-16}
+GLOBAL_LOSS_BSZ=${GLOBAL_LOSS_BSZ:-8}
 LOSS_SLIDE_WINDOW=${LOSS_SLIDE_WINDOW:-0}
 DP_GLOBAL_SHUFFLE=${DP_GLOBAL_SHUFFLE:-1}
 # Drop first ATTENTION_SINK_SIZE tokens from every loss (NLL/KL/MSE) when
@@ -114,7 +133,7 @@ GRAD_LR_LAYER_SCHEDULE=${GRAD_LR_LAYER_SCHEDULE:-cosine}
 GRAD_LR_LAYER_BASE_RATIO=${GRAD_LR_LAYER_BASE_RATIO:-0.01}
 ALPHA=${ALPHA:-0.0}
 KL_TOPK=${KL_TOPK:-20}
-LM_EVAL_BATCH_SIZE=${LM_EVAL_BATCH_SIZE:-128}
+LM_EVAL_BATCH_SIZE=${LM_EVAL_BATCH_SIZE:-32}
 ENABLE_QA_EVAL=${ENABLE_QA_EVAL:-0}
 BASE_EXP=${BASE_EXP:-gptq_plus_lr_sweep}
 OUTPUT_ROOT=${OUTPUT_ROOT:-./outputs}
@@ -126,7 +145,7 @@ OUTPUT_ROOT=${OUTPUT_ROOT:-./outputs}
 FSDP_PRECOMPUTE=${FSDP_PRECOMPUTE:-0}
 FSDP_CPU_OFFLOAD=${FSDP_CPU_OFFLOAD:-0}
 FSDP_META_INIT=${FSDP_META_INIT:-${FSDP_PRECOMPUTE}}
-STATIC_CACHE_PATH=${STATIC_CACHE_PATH:-}
+STATIC_CACHE_PATH=${STATIC_CACHE_PATH:-cache/qwen32}
 EXIT_AFTER_PRECOMPUTE=${EXIT_AFTER_PRECOMPUTE:-0}
 
 IFS=' ' read -r -a GRAD_LRS <<< "${GRAD_LRS_STR}"
@@ -148,7 +167,7 @@ export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-0}
 # RDZV port decouples from DEVICE so the commas don't end up in the endpoint.
 IFS=',' read -r -a _DEVICE_LIST <<< "${DEVICE}"
 N_GPUS=${N_GPUS:-${#_DEVICE_LIST[@]}}
-RDZV_PORT=${RDZV_PORT:-29600}
+RDZV_PORT=${RDZV_PORT:-29500}
 
 sanitize_float() {
     local value="${1}"
@@ -231,6 +250,68 @@ if [[ "${DP_GLOBAL_SHUFFLE}" == "1" ]]; then
     DP_GLOBAL_SHUFFLE_TAG="_gshuf"
 fi
 
+W_QUANT_ARGS=(--w_groupsize "${W_GROUPSIZE}")
+W_QUANT_TAG=""
+if [[ "${ACT_ORDER}" == "1" ]]; then
+    W_QUANT_ARGS+=(--act_order)
+else
+    W_QUANT_TAG="${W_QUANT_TAG}_noactorder"
+fi
+if [[ "${W_GROUPSIZE}" != "-1" ]]; then
+    W_QUANT_TAG="${W_QUANT_TAG}_wg$(sanitize_float "${W_GROUPSIZE}")"
+fi
+
+ACT_KV_QUANT_ARGS=(
+    --a_bits "${A_BITS}" --a_groupsize "${A_GROUPSIZE}" --a_clip_ratio "${A_CLIP_RATIO}"
+    --k_bits "${K_BITS}" --k_groupsize "${K_GROUPSIZE}" --k_clip_ratio "${K_CLIP_RATIO}"
+    --v_bits "${V_BITS}" --v_groupsize "${V_GROUPSIZE}" --v_clip_ratio "${V_CLIP_RATIO}"
+)
+ACT_KV_QUANT_TAG=""
+if [[ "${A_ASYM}" == "1" ]]; then
+    ACT_KV_QUANT_ARGS+=(--a_asym)
+fi
+if [[ "${K_ASYM}" == "1" ]]; then
+    ACT_KV_QUANT_ARGS+=(--k_asym)
+fi
+if [[ "${V_ASYM}" == "1" ]]; then
+    ACT_KV_QUANT_ARGS+=(--v_asym)
+fi
+if [[ "${A_BITS}" != "16" ]]; then
+    ACT_KV_QUANT_TAG="${ACT_KV_QUANT_TAG}_a${A_BITS}g$(sanitize_float "${A_GROUPSIZE}")"
+    if [[ "${A_ASYM}" == "1" ]]; then
+        ACT_KV_QUANT_TAG="${ACT_KV_QUANT_TAG}asym"
+    fi
+    if [[ "${A_CLIP_RATIO}" != "1.0" && "${A_CLIP_RATIO}" != "1" ]]; then
+        ACT_KV_QUANT_TAG="${ACT_KV_QUANT_TAG}clip$(sanitize_float "${A_CLIP_RATIO}")"
+    fi
+fi
+if [[ "${K_BITS}" != "16" ]]; then
+    ACT_KV_QUANT_TAG="${ACT_KV_QUANT_TAG}_k${K_BITS}g$(sanitize_float "${K_GROUPSIZE}")"
+    if [[ "${K_ASYM}" == "1" ]]; then
+        ACT_KV_QUANT_TAG="${ACT_KV_QUANT_TAG}asym"
+    fi
+    if [[ "${K_CLIP_RATIO}" != "1.0" && "${K_CLIP_RATIO}" != "1" ]]; then
+        ACT_KV_QUANT_TAG="${ACT_KV_QUANT_TAG}clip$(sanitize_float "${K_CLIP_RATIO}")"
+    fi
+fi
+if [[ "${V_BITS}" != "16" ]]; then
+    ACT_KV_QUANT_TAG="${ACT_KV_QUANT_TAG}_v${V_BITS}g$(sanitize_float "${V_GROUPSIZE}")"
+    if [[ "${V_ASYM}" == "1" ]]; then
+        ACT_KV_QUANT_TAG="${ACT_KV_QUANT_TAG}asym"
+    fi
+    if [[ "${V_CLIP_RATIO}" != "1.0" && "${V_CLIP_RATIO}" != "1" ]]; then
+        ACT_KV_QUANT_TAG="${ACT_KV_QUANT_TAG}clip$(sanitize_float "${V_CLIP_RATIO}")"
+    fi
+fi
+if [[ "${ACT_QUANT_AWARE_GPTQ}" == "1" ]]; then
+    ACT_KV_QUANT_ARGS+=(--act_quant_aware_gptq)
+    ACT_KV_QUANT_TAG="${ACT_KV_QUANT_TAG}_aqaware"
+fi
+if [[ "${K_CACHE_QUANT_AWARE_GPTQ}" == "1" ]]; then
+    ACT_KV_QUANT_ARGS+=(--k_cache_quant_aware_gptq)
+    ACT_KV_QUANT_TAG="${ACT_KV_QUANT_TAG}_kqaware"
+fi
+
 GRAD_LR_LAYER_SCHEDULE_ARGS=()
 GRAD_LR_LAYER_SCHEDULE_TAG=""
 if [[ "${GRAD_LR_LAYER_SCHEDULE}" != "none" ]]; then
@@ -303,7 +384,9 @@ if [[ "${FSDP_PRECOMPUTE}" == "1" && "${EXIT_AFTER_PRECOMPUTE}" != "1" ]]; then
         --model "${MODEL_PATH}" \
         --exp "precompute_fsdp" \
         --dataset "${DATASET}" --nsamples "${N_SAMPLES}" --seq_len "${SEQ_LEN}" \
-        --w_method gptq_plus --w_bits 4 --w_clip --num_groups "${NUM_GROUPS}"  --act_order \
+        --w_method gptq_plus --w_bits 4 --w_clip --num_groups "${NUM_GROUPS}" --blocksize "${BLOCKSIZE}" \
+        "${W_QUANT_ARGS[@]}" \
+        "${ACT_KV_QUANT_ARGS[@]}" \
         --kl_topk "${KL_TOPK}" --bsz "${BSZ}" --final_layer_stats_bsz "${FINAL_LAYER_STATS_BSZ}" --alpha "${ALPHA}" \
         --enable_gptq_plus "${ENABLE_GPTQ_PLUS}" \
         --g_update_mode block_gd --grad_refresh_loss "${GRAD_REFRESH_LOSS}" \
@@ -399,7 +482,7 @@ for grad_lr in "${GRAD_LRS[@]}"; do
             pre_gd_suffix="${pre_gd_suffix}_flopt${PRE_FINAL_LAYER_GRAD_OPTIMIZER}"
         fi
     fi
-    exp_name="${BASE_EXP}_block_gd_${GRAD_OPTIMIZER}${refresh_suffix}${refined_rkl_suffix}${refined_mse_suffix}${refined_mix_suffix}${reg_suffix}${grad_hessian_suffix}${dyn_sal_suffix}_lr${grad_lr_tag}_fllr${final_layer_grad_lr_tag}_s${second_order_tag}${pre_gd_suffix}${PRE_CLIP_TAG}${BLOCK_ATOMIC_TAG}${FINAL_LAYER_FULL_BACKWARD_TAG}${GLOBAL_LOSS_TAG}${LOSS_SLIDE_WINDOW_TAG}${ATTENTION_SINK_TAG}${DP_GLOBAL_SHUFFLE_TAG}${GRAD_LR_LAYER_SCHEDULE_TAG}"
+    exp_name="${BASE_EXP}_block_gd_${GRAD_OPTIMIZER}${refresh_suffix}${refined_rkl_suffix}${refined_mse_suffix}${refined_mix_suffix}${reg_suffix}${grad_hessian_suffix}${dyn_sal_suffix}${W_QUANT_TAG}${ACT_KV_QUANT_TAG}_lr${grad_lr_tag}_fllr${final_layer_grad_lr_tag}_s${second_order_tag}${pre_gd_suffix}${PRE_CLIP_TAG}${BLOCK_ATOMIC_TAG}${FINAL_LAYER_FULL_BACKWARD_TAG}${GLOBAL_LOSS_TAG}${LOSS_SLIDE_WINDOW_TAG}${ATTENTION_SINK_TAG}${DP_GLOBAL_SHUFFLE_TAG}${GRAD_LR_LAYER_SCHEDULE_TAG}"
 
     echo "============================================================"
     echo "Running GPTQ+ LR sweep"
@@ -427,6 +510,10 @@ for grad_lr in "${GRAD_LRS[@]}"; do
     echo "  gate_k : ${GRAD_GATE_SHARPNESS}"
     echo "  gate_a : ${GRAD_GATE_SINE_AMP}"
     echo "  gh_topk: ${GRAD_HESSIAN_TOPK}"
+    echo "  w_quant: group=${W_GROUPSIZE} act_order=${ACT_ORDER}"
+    echo "  a_quant: bits=${A_BITS} g=${A_GROUPSIZE} asym=${A_ASYM} clip=${A_CLIP_RATIO} aware=${ACT_QUANT_AWARE_GPTQ}"
+    echo "  k_quant: bits=${K_BITS} g=${K_GROUPSIZE} asym=${K_ASYM} clip=${K_CLIP_RATIO} aware=${K_CACHE_QUANT_AWARE_GPTQ}"
+    echo "  v_quant: bits=${V_BITS} g=${V_GROUPSIZE} asym=${V_ASYM} clip=${V_CLIP_RATIO}"
     echo "  proj_s : ${PROJ_LR_SCALE}"
     echo "  down_s : ${DOWN_PROJ_LR_SCALE}"
     echo "  preclip: ${PRE_CLIP}"
@@ -461,7 +548,9 @@ for grad_lr in "${GRAD_LRS[@]}"; do
         --model "${MODEL_PATH}" \
         --exp "${exp_name}" \
         --dataset "${DATASET}" --nsamples "${N_SAMPLES}" --seq_len "${SEQ_LEN}" \
-        --w_method gptq_plus --w_bits 4 --w_clip --num_groups "${NUM_GROUPS}"  --act_order \
+        --w_method gptq_plus --w_bits 4 --w_clip --num_groups "${NUM_GROUPS}" \
+        "${W_QUANT_ARGS[@]}" \
+        "${ACT_KV_QUANT_ARGS[@]}" \
         --kl_topk "${KL_TOPK}" --bsz "${BSZ}" --final_layer_stats_bsz "${FINAL_LAYER_STATS_BSZ}" --alpha "${ALPHA}" --blocksize "${BLOCKSIZE}" \
         --enable_gptq_plus "${ENABLE_GPTQ_PLUS}" \
         ${HESSIAN_ACCUM_BSZ:+--hessian_accum_bsz "${HESSIAN_ACCUM_BSZ}"} \

@@ -177,29 +177,62 @@ class QKRotationWrapper(torch.nn.Module):
             head_dim
         ), f"Only power of 2 head_dim is supported for K-cache Quantization!"
         self.func = func
+        self.head_dim = head_dim
         self.k_quantizer = quant_utils.ActQuantizer()
+        # K-cache quant params are re-estimated online every forward; keeping
+        # them out of checkpoints avoids extra state_dict keys when GPTQ+ installs
+        # this wrapper during weight quantization.
+        self.k_quantizer._non_persistent_buffers_set.update({"maxq", "scale", "zero"})
         self.k_bits = 16
-        if kwargs is not None:
-            assert kwargs["k_groupsize"] in [
-                -1,
-                head_dim,
-            ], f"Only token-wise/{head_dim}g quantization is supported for K-cache"
-            self.k_bits = kwargs["k_bits"]
-            self.k_groupsize = kwargs["k_groupsize"]
-            self.k_sym = kwargs["k_sym"]
-            self.k_clip_ratio = kwargs["k_clip_ratio"]
-            self.k_quantizer.configure(
-                bits=self.k_bits,
-                groupsize=-1,  # we put -1 to be toke-wise quantization and handle head-wise quantization by ourself
-                sym=self.k_sym,
-                clip_ratio=self.k_clip_ratio,
+        self.k_groupsize = -1
+        self.k_sym = False
+        self.k_clip_ratio = 1.0
+        self.k_quant_enabled = False
+        if kwargs:
+            self.configure_k_quant(**kwargs)
+
+    def configure_k_quant(
+        self,
+        head_dim=None,
+        k_bits=None,
+        k_groupsize=None,
+        k_sym=None,
+        k_clip_ratio=None,
+        k_quant_enabled=True,
+    ):
+        if head_dim is not None and int(head_dim) != self.head_dim:
+            raise ValueError(
+                f"Existing QKRotationWrapper head_dim={self.head_dim} cannot be "
+                f"reconfigured with head_dim={head_dim}."
             )
+        if k_bits is not None:
+            self.k_bits = int(k_bits)
+        if k_groupsize is not None:
+            self.k_groupsize = int(k_groupsize)
+        if k_sym is not None:
+            self.k_sym = bool(k_sym)
+        if k_clip_ratio is not None:
+            self.k_clip_ratio = float(k_clip_ratio)
+        assert self.k_groupsize in [
+            -1,
+            self.head_dim,
+        ], f"Only token-wise/{self.head_dim}g quantization is supported for K-cache"
+        self.k_quantizer.configure(
+            bits=self.k_bits,
+            groupsize=-1,  # token-wise; head-wise is handled explicitly below.
+            sym=self.k_sym,
+            clip_ratio=self.k_clip_ratio,
+        )
+        self.k_quant_enabled = bool(k_quant_enabled)
 
     def forward(self, *args, **kwargs):
         q, k = self.func(*args, **kwargs)
         dtype = q.dtype
         q = (hadamard_utils.HadamardTransform.apply(q.float()) / math.sqrt(q.shape[-1])).to(dtype)
         k = (hadamard_utils.HadamardTransform.apply(k.float()) / math.sqrt(k.shape[-1])).to(dtype)
+        if not self.k_quant_enabled or self.k_bits >= 16:
+            return q, k
+
         (bsz, num_heads, seq_len, head_dim) = k.shape
 
         if self.k_groupsize == -1:  # token-wise quantization
@@ -237,11 +270,31 @@ def add_qk_rotation_wrapper_after_function_call_in_forward(
     """
 
     attr_name = f"{function_name}_qk_rotation_wrapper"
-    assert not hasattr(module, attr_name)
+    if hasattr(module, attr_name):
+        wrapper = getattr(module, attr_name)
+        if args or kwargs:
+            wrapper.configure_k_quant(*args, **kwargs)
+        return wrapper
+
     wrapper = monkeypatch.add_wrapper_after_function_call_in_method(
         module,
         "forward",
         function_name,
-        functools.partial(QKRotationWrapper, *args, **kwargs),
+        lambda original_func: QKRotationWrapper(original_func, *args, **kwargs),
     )
     setattr(module, attr_name, wrapper)
+    return wrapper
+
+
+def disable_k_cache_quant(module):
+    state = []
+    for _, m in module.named_modules():
+        if isinstance(m, QKRotationWrapper):
+            state.append((m, m.k_quant_enabled))
+            m.k_quant_enabled = False
+    return state
+
+
+def enable_k_cache_quant(module, state):
+    for wrapper, enabled in state:
+        wrapper.k_quant_enabled = enabled

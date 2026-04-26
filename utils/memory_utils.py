@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 
 
-def cleanup_memory(verbos=False) -> None:
+def cleanup_memory(verbos=False, trim_cpu=False) -> None:
     import gc
     import inspect
     caller_name = ''
@@ -24,6 +24,13 @@ def cleanup_memory(verbos=False) -> None:
     memory_before = total_reserved_mem()
 
     gc.collect()
+
+    if trim_cpu:
+        try:
+            import ctypes
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except Exception:
+            pass
 
     torch.cuda.synchronize()
     torch._C._cuda_clearCublasWorkspaces()
