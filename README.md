@@ -60,7 +60,8 @@
 - GLOBAL_LOSS_BSZ：预计算整个模型反传时的batchsize
 - LOSS_SLIDE_WINDOW：开启后会同时计算本层和下一层的loss并线性配比
 - DP_GLOBAL_SHUFFLE：开启dp后的数据shuffle模式，固定为1就行
-- GRAD_LR_LAYER_SCHEDULE：跨layer的学习率调度器
+- GRAD_LR_LAYER_SCHEDULE：跨layer的学习率调度器。`cosine` 时非 final layer 的有效学习率为 `base_lr + (lr - base_lr) * 0.5 * (1 - cos(pi * layer_idx / (num_layers - 1)))`
+- GRAD_LR_LAYER_BASE_RATIO：跨layer调度器的起始学习率比例，默认0.01，即 `base_lr = 0.01 * GRAD_LR` / `0.01 * PRE_GRAD_LR`。设成0可恢复旧的从0起步的cosine
 - ALPHA：中兴的算法用的，固定为0就行
 - KL_TOPK：计算kl和res kl用的topk
 - LM_EVAL_BATCH_SIZE：eval时batchsize
@@ -270,7 +271,7 @@ layer 0 上游还没量化，student == teacher，KL=0，$g_i\equiv 0$。代码�
 
 ### 学习率两段制
 
-`--refined_mix_rkl_lr_ratio r`（默认 1.0）：后半段 layer（refined_residual_kl）的 block_gd LR 和 pre_gd LR 都等于 `r × --grad_lr` / `r × --pre_grad_lr`。前半段用原始 `--grad_lr`。Final layer 仍独立使用 `--final_layer_grad_lr` / `--pre_final_layer_grad_lr`。Cosine / linear LR schedule (`--grad_lr_layer_schedule`) 在两段各自内部正常生效。
+`--refined_mix_rkl_lr_ratio r`（默认 1.0）：后半段 layer（refined_residual_kl）的 block_gd LR 和 pre_gd LR 都等于 `r × --grad_lr` / `r × --pre_grad_lr`。前半段用原始 `--grad_lr`。Final layer 仍独立使用 `--final_layer_grad_lr` / `--pre_final_layer_grad_lr`。Cosine / linear LR schedule (`--grad_lr_layer_schedule`) 在两段各自内部正常生效；调度后的 LR 先按 `--grad_lr_layer_base_ratio` 从 base lr 插值，再乘 refined_mix 的后半段 ratio。
 
 ### 约束
 

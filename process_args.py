@@ -329,6 +329,18 @@ def parse_gen():
         ),
     )
     parser.add_argument(
+        "--grad_lr_layer_base_ratio",
+        type=float,
+        default=0.01,
+        help=(
+            "Base LR as a fraction of --grad_lr / --pre_grad_lr for per-layer "
+            "schedules. Scheduled non-final layers use "
+            "base_lr + (target_lr - base_lr) * schedule_scale, where "
+            "base_lr = target_lr * ratio. Default 0.01 makes layer 0 start at "
+            "1% of the target LR. Set 0 to recover the old zero-base ramp."
+        ),
+    )
+    parser.add_argument(
         "--grad_reg_strategy",
         type=str,
         default="none",
@@ -914,6 +926,8 @@ def parse_gen():
         raise ValueError(f"`pre_grad_lr` must be non-negative. Got {args.pre_grad_lr}.")
     if args.pre_final_layer_grad_lr is not None and args.pre_final_layer_grad_lr < 0:
         raise ValueError(f"`pre_final_layer_grad_lr` must be non-negative when provided. Got {args.pre_final_layer_grad_lr}.")
+    if args.grad_lr_layer_base_ratio < 0:
+        raise ValueError(f"`grad_lr_layer_base_ratio` must be non-negative. Got {args.grad_lr_layer_base_ratio}.")
     if args.pre_gd_steps > 0 and args.pre_clip and args.w_clip:
         effective_pre_final_lr = args.pre_final_layer_grad_lr if args.pre_final_layer_grad_lr is not None else args.pre_grad_lr
         if args.pre_grad_lr == 0 and effective_pre_final_lr == 0:

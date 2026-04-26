@@ -338,6 +338,12 @@ def compute_layer_lr_scale(layer_idx: int, num_layers: int, schedule: str) -> fl
     raise ValueError(f"Unknown grad_lr_layer_schedule={schedule!r}")
 
 
+def compute_scheduled_layer_lr(target_lr: float, layer_scale: float, base_ratio: float) -> float:
+    """Interpolate from a base LR to the target LR using the layer schedule."""
+    base_lr = float(target_lr) * float(base_ratio)
+    return base_lr + (float(target_lr) - base_lr) * float(layer_scale)
+
+
 class GPTQPlus:
     def __init__(self,
         layer,
@@ -401,6 +407,75 @@ class GPTQPlus:
         if max_blocks is None:
             return self.columns
         return min(self.columns, max_blocks * blocksize)
+
+    def _compute_hessian_inverse_with_fallback(
+        self,
+        H_sub,
+        percdamp=0.01,
+        damp_auto_increment=0.0015,
+        profile_recorder=None,
+        profile_section=None,
+        log_context="",
+    ):
+        """Return H^{-1} and its upper Cholesky factor for GPTQ updates.
+
+        If damping has to grow to >= 1, the Hessian estimate is too ill
+        conditioned to be useful. Fall back to an identity inverse, which keeps
+        per-column quantization running while disabling cross-column second
+        order propagation for this subgroup.
+        """
+        damp_percent = float(percdamp)
+        if damp_percent <= 0:
+            raise ValueError(
+                f"Quantization{log_context}: `damp_percent` must be positive. current is {damp_percent}"
+            )
+
+        H_work = H_sub.clone()
+        diag_idx = torch.arange(H_work.shape[0], device=H_work.device)
+        last_error = None
+        while 1 > damp_percent > 0:
+            try:
+                section = (
+                    profile_recorder.section(profile_section)
+                    if profile_recorder is not None and profile_section is not None
+                    else _NULL_CONTEXT
+                )
+                with section:
+                    damp = damp_percent * torch.mean(torch.diag(H_work))
+                    H_work[diag_idx, diag_idx] += damp
+                    chol = torch.linalg.cholesky(H_work)
+                    Hinv_init = torch.cholesky_inverse(chol)
+                    Hinv = torch.linalg.cholesky(Hinv_init, upper=True)
+                if not torch.isfinite(Hinv_init).all() or not torch.isfinite(Hinv).all():
+                    raise torch._C._LinAlgError(
+                        "Hinv contains non-finite values despite successful Cholesky"
+                    )
+                return Hinv_init, Hinv, damp_percent, False
+            except torch._C._LinAlgError as e:
+                last_error = e
+                logging.warning(
+                    "Quantization%s: Current `damp_percent = %.5f` is too low, "
+                    "auto-incrementing by `%.5f`",
+                    log_context,
+                    damp_percent,
+                    damp_auto_increment,
+                )
+                damp_percent += damp_auto_increment
+
+        if damp_percent >= 1:
+            eye = torch.eye(H_sub.shape[0], device=H_sub.device, dtype=H_sub.dtype)
+            logging.warning(
+                "Quantization%s: `damp_percent` reached %.5f; falling back to "
+                "identity Hessian inverse for this subgroup. Last Cholesky error: %s",
+                log_context,
+                damp_percent,
+                last_error,
+            )
+            return eye, eye, damp_percent, True
+
+        raise ValueError(
+            f"Quantization{log_context}: `damp_percent` must between 0 and 1. current is {damp_percent}"
+        )
 
     def _compute_gradient_terms(self, gradients_sub, Hinv_init, Hinv, enable_gradient_update):
         if enable_gradient_update and self.alpha > 0:
@@ -881,34 +956,15 @@ class GPTQPlus:
                         W_int_sub = torch.zeros_like(W_sub)
                         Scale_sub = torch.zeros_like(W_sub)
 
-                    damp_percent = percdamp
-                    damp_auto_increment = 0.0015
-                    while 1 > damp_percent > 0:
-                        try:
-                            with profile_recorder.section("fasterquant.subgroup.compute_hinv") if profile_recorder else _NULL_CONTEXT:
-                                damp = damp_percent * torch.mean(torch.diag(H_sub))
-                                diag = torch.arange(self.columns, device=self.dev)
-                                H_sub[diag, diag] += damp
-                                H_sub = torch.linalg.cholesky(H_sub)
-                                H_sub = torch.cholesky_inverse(H_sub)
-                                Hinv_init = H_sub
-                                H_sub = torch.linalg.cholesky(H_sub, upper=True)
-                                Hinv = H_sub
-                            if not torch.isfinite(Hinv).all():
-                                # Cholesky succeeded but Hinv has NaN/Inf —
-                                # H was close enough to singular that the
-                                # inverse overflowed. Route back into the
-                                # damp-autoincrement path.
-                                raise torch._C._LinAlgError(
-                                    "Hinv contains non-finite values despite successful Cholesky"
-                                )
-                            break
-                        except torch._C._LinAlgError as e:
-                            logging.warning(f"Quantization: Current `damp_percent = {damp_percent:.5f}` is too low, auto-incrementing by `{damp_auto_increment:.5f}`")
-                            damp_percent += damp_auto_increment
-
-                    if not (0 < damp_percent < 1):
-                        raise ValueError(f"Quantization: `damp_percent` must between 0 and 1. current is {damp_percent}")
+                    Hinv_init, Hinv, damp_percent, hessian_identity_fallback = (
+                        self._compute_hessian_inverse_with_fallback(
+                            H_sub,
+                            percdamp=percdamp,
+                            profile_recorder=profile_recorder,
+                            profile_section="fasterquant.subgroup.compute_hinv",
+                            log_context=f" subgroup={sub_idx}",
+                        )
+                    )
 
                     with profile_recorder.section("fasterquant.subgroup.init_ghinv") if profile_recorder else _NULL_CONTEXT:
                         beta, beta_view, Z, GHinv = self._compute_gradient_terms(
@@ -928,6 +984,7 @@ class GPTQPlus:
                         rec.save_subgroup(sub_idx, "H_sub_damped_but_original", None if hessian_reg is None else hessian_reg)
                         rec.save_subgroup(sub_idx, "Hinv_init", Hinv_init)
                         rec.save_subgroup(sub_idx, "Hinv_upper_cholesky", Hinv)
+                        rec.save_subgroup(sub_idx, "hessian_identity_fallback", torch.tensor(hessian_identity_fallback))
                         rec.save_subgroup(sub_idx, "beta", beta)
                         rec.save_subgroup(sub_idx, "Z_initial", Z)
                         rec.save_subgroup(sub_idx, "GHinv_initial", GHinv)
@@ -1763,24 +1820,13 @@ class GPTQPlus:
                 gradients_sub = gradients_sub[:, perm]
             selected_cols = self._selected_column_count(blocksize, max_blocks)
 
-            damp_percent = percdamp
-            damp_auto_increment = 0.0015
-            while 1 > damp_percent > 0:
-                try:
-                    damp = damp_percent * torch.mean(torch.diag(H_sub))
-                    diag = torch.arange(self.columns, device=self.dev)
-                    H_sub[diag, diag] += damp
-                    H_sub = torch.linalg.cholesky(H_sub)
-                    H_sub = torch.cholesky_inverse(H_sub)
-                    Hinv_init = H_sub
-                    H_sub = torch.linalg.cholesky(H_sub, upper=True)
-                    Hinv = H_sub
-                    break
-                except torch._C._LinAlgError:
-                    damp_percent += damp_auto_increment
-
-            if not (0 < damp_percent < 1):
-                raise ValueError(f"Quantization: `damp_percent` must between 0 and 1. current is {damp_percent}")
+            Hinv_init, Hinv, damp_percent, hessian_identity_fallback = (
+                self._compute_hessian_inverse_with_fallback(
+                    H_sub,
+                    percdamp=percdamp,
+                    log_context=f" analyze_ghinv_dynamics subgroup={sub_idx}",
+                )
+            )
 
             if enable_gradient_update and self.alpha > 0:
                 alpha = self.alpha / (self.rows * self.columns)
@@ -1816,6 +1862,7 @@ class GPTQPlus:
                 "sub_idx": sub_idx,
                 "row_start": row_start,
                 "row_end": row_end,
+                "hessian_identity_fallback": hessian_identity_fallback,
                 "beta": summarize_vector(beta),
                 "initial_raw_ghinv": summarize_tensor_rows(GHinv_raw[:, :selected_cols]),
                 "initial_ghinv": summarize_tensor_rows(GHinv[:, :selected_cols]),
@@ -2043,22 +2090,13 @@ class GPTQPlus:
                 gradients_sub = gradients_sub[:, perm]
             selected_cols = self._selected_column_count(blocksize, max_blocks)
 
-            damp_percent = percdamp
-            damp_auto_increment = 0.0015
-            while 1 > damp_percent > 0:
-                try:
-                    damp = damp_percent * torch.mean(torch.diag(H_sub))
-                    diag = torch.arange(self.columns, device=self.dev)
-                    H_sub[diag, diag] += damp
-                    H_sub = torch.linalg.cholesky(H_sub)
-                    H_sub = torch.cholesky_inverse(H_sub)
-                    Hinv_init = H_sub
-                    break
-                except torch._C._LinAlgError:
-                    damp_percent += damp_auto_increment
-
-            if not (0 < damp_percent < 1):
-                raise ValueError(f"Quantization: `damp_percent` must between 0 and 1. current is {damp_percent}")
+            Hinv_init, _, damp_percent, hessian_identity_fallback = (
+                self._compute_hessian_inverse_with_fallback(
+                    H_sub,
+                    percdamp=percdamp,
+                    log_context=f" summarize_ghinv subgroup={sub_idx}",
+                )
+            )
 
             if enable_gradient_update and self.alpha > 0:
                 alpha = self.alpha / (self.rows * self.columns)
@@ -2079,6 +2117,7 @@ class GPTQPlus:
                     "sub_idx": sub_idx,
                     "row_start": row_start,
                     "row_end": row_end,
+                    "hessian_identity_fallback": hessian_identity_fallback,
                     "beta": summarize_vector(beta),
                     "raw_ghinv": summarize_tensor_rows(GHinv_raw[:, :selected_cols]),
                     "ghinv": summarize_tensor_rows(GHinv[:, :selected_cols]),
@@ -5833,10 +5872,11 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                 num_layers=len(layers),
                 schedule=getattr(args, "grad_lr_layer_schedule", "none"),
             )
+            grad_lr_layer_base_ratio = float(getattr(args, "grad_lr_layer_base_ratio", 0.01))
             if getattr(args, "grad_lr_layer_schedule", "none") != "none":
                 logging.info(
-                    "Layer %d grad_lr schedule scale=%.4f (schedule=%s)",
-                    i, grad_lr_layer_scale, args.grad_lr_layer_schedule,
+                    "Layer %d grad_lr schedule scale=%.4f base_ratio=%.4f (schedule=%s)",
+                    i, grad_lr_layer_scale, grad_lr_layer_base_ratio, args.grad_lr_layer_schedule,
                 )
             layer_refresh_loss_type = get_effective_refresh_loss_type(
                 i,
@@ -6209,7 +6249,11 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                 pre_grad_lr = (
                     args.pre_final_layer_grad_lr
                     if i == final_layer_idx and args.pre_final_layer_grad_lr is not None
-                    else args.pre_grad_lr * grad_lr_layer_scale
+                    else compute_scheduled_layer_lr(
+                        args.pre_grad_lr,
+                        grad_lr_layer_scale,
+                        grad_lr_layer_base_ratio,
+                    )
                 )
                 # refined_mix: back-half layers use refined_residual_kl and get
                 # their own LR relative to the front half. Multiply by the
@@ -6839,7 +6883,11 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         base_grad_lr = (
                             args.final_layer_grad_lr
                             if i == final_layer_idx and args.final_layer_grad_lr is not None
-                            else args.grad_lr * grad_lr_layer_scale
+                            else compute_scheduled_layer_lr(
+                                args.grad_lr,
+                                grad_lr_layer_scale,
+                                grad_lr_layer_base_ratio,
+                            )
                         )
                         # refined_mix: back-half layers (refined_residual_kl) use
                         # `grad_lr * refined_mix_rkl_lr_ratio`. Final-layer override

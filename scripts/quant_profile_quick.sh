@@ -95,6 +95,7 @@ GLOBAL_LOSS_BSZ=${GLOBAL_LOSS_BSZ:-8}
 LOSS_SLIDE_WINDOW=${LOSS_SLIDE_WINDOW:-0}
 DP_GLOBAL_SHUFFLE=${DP_GLOBAL_SHUFFLE:-1}
 GRAD_LR_LAYER_SCHEDULE=${GRAD_LR_LAYER_SCHEDULE:-none}
+GRAD_LR_LAYER_BASE_RATIO=${GRAD_LR_LAYER_BASE_RATIO:-0.01}
 ALPHA=${ALPHA:-0.0}
 KL_TOPK=${KL_TOPK:-20}
 G_UPDATE_MODE=${G_UPDATE_MODE:-block_gd}
@@ -200,7 +201,10 @@ fi
 
 GRAD_LR_LAYER_SCHEDULE_ARGS=()
 if [[ "${GRAD_LR_LAYER_SCHEDULE}" != "none" ]]; then
-    GRAD_LR_LAYER_SCHEDULE_ARGS=(--grad_lr_layer_schedule "${GRAD_LR_LAYER_SCHEDULE}")
+    GRAD_LR_LAYER_SCHEDULE_ARGS=(
+        --grad_lr_layer_schedule "${GRAD_LR_LAYER_SCHEDULE}"
+        --grad_lr_layer_base_ratio "${GRAD_LR_LAYER_BASE_RATIO}"
+    )
 fi
 
 FSDP_ARGS=()
@@ -243,7 +247,7 @@ echo "  proj_s : ${PROJ_LR_SCALE}  down_s=${DOWN_PROJ_LR_SCALE}"
 echo "  preclip: ${PRE_CLIP}  pregd=${PRE_GD_STEPS}  prelr=${PRE_GRAD_LR}  preopt=${PRE_GRAD_OPTIMIZER}"
 echo "  preflr : ${PRE_FINAL_LAYER_GRAD_LR:-<default>}  prefo=${PRE_FINAL_LAYER_GRAD_OPTIMIZER:-<default>}"
 echo "  global : ${GLOBAL_LOSS}  gl_bsz=${GLOBAL_LOSS_BSZ}"
-echo "  slide  : ${LOSS_SLIDE_WINDOW}  gshuf=${DP_GLOBAL_SHUFFLE}  lrsched=${GRAD_LR_LAYER_SCHEDULE}"
+echo "  slide  : ${LOSS_SLIDE_WINDOW}  gshuf=${DP_GLOBAL_SHUFFLE}  lrsched=${GRAD_LR_LAYER_SCHEDULE} base_ratio=${GRAD_LR_LAYER_BASE_RATIO}"
 echo "  gradlr : ${GRAD_LR}  fllr=${FINAL_LAYER_GRAD_LR}  so_scl=${SECOND_ORDER_SCALE}  alpha=${ALPHA}"
 echo "  block  : ${BLOCKSIZE}  bsz=${BSZ}  fl_stb=${FINAL_LAYER_STATS_BSZ}  ha_bsz=${HESSIAN_ACCUM_BSZ}"
 echo "  bw_smp : ${BACKWARD_SAMPLES}  bw_bsz=${BACKWARD_BSZ}  fl_bwb=${FINAL_LAYER_BACKWARD_BSZ}"
