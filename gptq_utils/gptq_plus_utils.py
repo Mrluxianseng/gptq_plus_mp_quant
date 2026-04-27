@@ -60,6 +60,19 @@ def _quantile_large(tensor, q):
         return flat.kthvalue(k).values.item()
 
 
+def _scale_delta_by_abs_quantile(delta, ratio, profile_recorder=None):
+    if ratio >= 1.0:
+        return delta
+    with profile_recorder.section("compute_refresh_loss.fisher_diag_mse.a_loss_delta_scale") if profile_recorder else _NULL_CONTEXT:
+        abs_delta = delta.float().abs()
+        threshold = _quantile_large(abs_delta, float(ratio))
+        if threshold is None or not math.isfinite(float(threshold)):
+            return delta
+        threshold = torch.as_tensor(threshold, device=delta.device, dtype=abs_delta.dtype)
+        scale = torch.clamp(threshold / abs_delta.clamp_min(torch.finfo(abs_delta.dtype).tiny), max=1.0)
+        return delta * scale.to(delta.dtype).detach()
+
+
 def normalize_quant_module_name(name: str) -> str:
     return name[:-7] if name.endswith(".module") else name
 
@@ -3954,6 +3967,8 @@ def compute_refresh_loss(
                 return kl_loss.sum(dim=-1).mean()
 
     delta = _drop_sink(out_hidden - fp_hidden)
+    if refresh_loss_type in ("fisher_diag_mse", "refined_mse") and a_loss_ratio < 1.0:
+        delta = _scale_delta_by_abs_quantile(delta, a_loss_ratio, profile_recorder)
     if refresh_loss_type == "hidden_mse":
         with profile_recorder.section("compute_refresh_loss.hidden_mse") if profile_recorder else _NULL_CONTEXT:
             return 0.5 * delta.square().sum(dim=-1).mean()
@@ -4095,23 +4110,7 @@ def compute_refresh_loss(
             fisher = layer_output_fisher.to(device=delta.device, dtype=torch.float32)
             delta_flat = delta.float().reshape(-1, hidden_size)
             fisher_loss_per_token = 0.5 * (delta_flat.matmul(fisher) * delta_flat).sum(dim=-1)
-            if a_loss_ratio < 1.0:
-                fp_hidden_sliced = _drop_sink(fp_hidden)
-                act_scale = fp_hidden_sliced.float().abs().amax(dim=-1).reshape(-1)
-                keep_count = max(1, int(math.ceil(float(a_loss_ratio) * act_scale.numel())))
-                if keep_count < act_scale.numel():
-                    with profile_recorder.section("compute_refresh_loss.fisher_diag_mse.a_loss_filter") if profile_recorder else _NULL_CONTEXT:
-                        keep_indices = torch.topk(
-                            act_scale,
-                            k=keep_count,
-                            largest=False,
-                            sorted=False,
-                        ).indices
-                        fisher_loss = fisher_loss_per_token.index_select(0, keep_indices).mean()
-                else:
-                    fisher_loss = fisher_loss_per_token.mean()
-            else:
-                fisher_loss = fisher_loss_per_token.mean()
+            fisher_loss = fisher_loss_per_token.mean()
 
         if refresh_loss_type != "refined_mse":
             return fisher_loss

@@ -61,9 +61,9 @@ def parse_gen():
         type=float,
         default=1.0,
         help=(
-            "Fisher-MSE loss token ratio based on FP activation scale. "
-            "1.0 keeps all tokens; values <1 ignore the largest-activation tokens "
-            "when computing 1/2 * delta_y^T H delta_y. Independent of activation quantization."
+            "Fisher-MSE delta-y clipping quantile. 1.0 leaves delta_y unchanged; "
+            "values <1 scale elements with |delta_y| above that quantile down to "
+            "the quantile magnitude before computing the Fisher/refined MSE loss."
         ),
     )
     parser.add_argument("--k_clip_ratio", type=float, default=1.0, help="K cache clipping ratio")
@@ -85,6 +85,15 @@ def parse_gen():
             "GPTQ+ only: install K-cache quantization during the GPTQ+ student "
             "path so Hessian accumulation, refresh gradients, and layer replay see "
             "online K fake quantization. FP teacher paths keep K quantization disabled."
+        ),
+    )
+    parser.add_argument(
+        "--rtn_act_error_debug",
+        action="store_true",
+        help=(
+            "RTN only: run a temporary FP-weight activation-quantization diagnostic. "
+            "Use with --w_bits 16 and --a_bits/--v_bits <16 to print layer-output "
+            "relative error after enabling each linear layer's activation fake quant."
         ),
     )
     parser.add_argument("--export_to_et", action="store_true", help="Export quantized model (TODO)")
