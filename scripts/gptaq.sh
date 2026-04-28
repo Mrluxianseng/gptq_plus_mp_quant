@@ -5,7 +5,7 @@ MODEL_PATH=${1}     # ./modelzoo/Qwen3/Qwen3-0.6B
 DEVICE=${2}         # 0
 
 MODEL_NAME=$(basename ${MODEL_PATH})
-N_SAMPLES=512   # use smaller calib set due to OOM
+N_SAMPLES=2048   # use smaller calib set due to OOM
 SEQ_LEN=2048
 
 # Set environment variables
@@ -20,3 +20,7 @@ python -m torch.distributed.run \
     --w_method gptaq --w_bits 4 --w_clip --act_order \
     --lm_eval --lm_eval_batch_size 32 \
     --rotate \
+    --a_clip_ratio 0.9 --k_clip_ratio 0.9 --k_clip_ratio 0.9 \
+    --w_groupsize 128 \
+    --a_bits 4 --k_bits 4 --v_bits 4 \
+    --act_quant_aware_gptq --k_cache_quant_aware_gptq \

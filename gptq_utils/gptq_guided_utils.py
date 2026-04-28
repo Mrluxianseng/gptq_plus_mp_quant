@@ -9,6 +9,10 @@ import torch
 import torch.nn as nn
 
 from utils import quant_utils, memory_utils, model_utils
+from gptq_utils.quant_aware_utils import (
+    configure_activation_quantizers_for_gptq,
+    configure_k_cache_quantizers_for_gptq,
+)
 
 
 class GPTQGuided:
@@ -308,6 +312,28 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
 
     if args.offload_inps:
         inps = inps.cpu()
+
+    if bool(getattr(args, "act_quant_aware_gptq", False)):
+        input_q_count, v_q_count = configure_activation_quantizers_for_gptq(args, model)
+        logging.info(
+            "act_quant_aware_gptq enabled for GuidedQuant: student paths use A/V "
+            "fake quantization (input_wrappers=%d v_out_wrappers=%d, a_bits=%d, "
+            "v_bits=%d).",
+            input_q_count,
+            v_q_count,
+            args.a_bits,
+            args.v_bits,
+        )
+
+    if bool(getattr(args, "k_cache_quant_aware_gptq", False)):
+        k_q_count = configure_k_cache_quantizers_for_gptq(args, analyzer)
+        logging.info(
+            "k_cache_quant_aware_gptq enabled for GuidedQuant: student paths use "
+            "online K fake quantization after RoPE/QK rotation "
+            "(qk_wrappers=%d, k_bits=%d).",
+            k_q_count,
+            args.k_bits,
+        )
 
     quantizers = {}
     sequential = analyzer.get_sequential_quantizable_module_names()

@@ -9,6 +9,11 @@ import torch
 import torch.nn as nn
 
 from utils import quant_utils, memory_utils, model_utils
+from gptq_utils.quant_aware_utils import (
+    configure_activation_quantizers_for_gptq,
+    configure_k_cache_quantizers_for_gptq,
+    disable_fp_path_quant,
+)
 
 
 class GPTAQ:
@@ -264,6 +269,27 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
     fp_inputs_cache = FPInputsCache(sequential)
     fp_inps = inps.clone()
 
+    if bool(getattr(args, "act_quant_aware_gptq", False)):
+        input_q_count, v_q_count = configure_activation_quantizers_for_gptq(args, model)
+        logging.info(
+            "act_quant_aware_gptq enabled for GPTAQ: student paths use A/V fake "
+            "quantization after FP teacher caches are captured "
+            "(input_wrappers=%d v_out_wrappers=%d, a_bits=%d, v_bits=%d).",
+            input_q_count,
+            v_q_count,
+            args.a_bits,
+            args.v_bits,
+        )
+
+    if bool(getattr(args, "k_cache_quant_aware_gptq", False)):
+        k_q_count = configure_k_cache_quantizers_for_gptq(args, analyzer)
+        logging.info(
+            "k_cache_quant_aware_gptq enabled for GPTAQ: student paths use online "
+            "K fake quantization after RoPE/QK rotation (qk_wrappers=%d, k_bits=%d).",
+            k_q_count,
+            args.k_bits,
+        )
+
     if args.offload_inps:
         inps = inps.cpu()
         fp_inps = fp_inps.cpu()
@@ -273,13 +299,12 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
         layer = layers[i].to(dev)
         full = analyzer.get_quantizable_modules(layer)
 
-        bits_config = quant_utils.disable_act_quant(layer)
-        fp_inputs_cache.add_hook(full)
-        for j in range(args.nsamples):
-            fp_inps[j] = layer(fp_inps[j].unsqueeze(0).to(dev), attention_mask=attention_mask, position_ids=position_ids,
-                               position_embeddings=position_embeddings)[0].to(fp_inps.device)
-        fp_inputs_cache.clear_hook()
-        quant_utils.enable_act_quant(layer, bits_config)
+        with disable_fp_path_quant(layer):
+            fp_inputs_cache.add_hook(full)
+            for j in range(args.nsamples):
+                fp_inps[j] = layer(fp_inps[j].unsqueeze(0).to(dev), attention_mask=attention_mask, position_ids=position_ids,
+                                   position_embeddings=position_embeddings)[0].to(fp_inps.device)
+            fp_inputs_cache.clear_hook()
 
         for names in sequential:
             subset = {n: full.get(n, full.get(n + ".module", None)) for n in names}

@@ -72,28 +72,21 @@ def parse_gen():
         "--act_quant_aware_gptq",
         action="store_true",
         help=(
-            "GPTQ+ only: enable activation quantization during the GPTQ+ student "
-            "path so Hessian accumulation, refresh gradients, and layer replay see "
-            "the same A-quantized activations used at evaluation. FP teacher paths "
-            "still disable activation quantization."
+            "Enable activation/V fake quantization during supported GPTQ-family "
+            "student paths (gptaq, gptq_guided, gptq_plus), so Hessian "
+            "accumulation and layer replay see the same A/V-quantized activations "
+            "used at evaluation. FP teacher paths still disable activation "
+            "quantization."
         ),
     )
     parser.add_argument(
         "--k_cache_quant_aware_gptq",
         action="store_true",
         help=(
-            "GPTQ+ only: install K-cache quantization during the GPTQ+ student "
-            "path so Hessian accumulation, refresh gradients, and layer replay see "
-            "online K fake quantization. FP teacher paths keep K quantization disabled."
-        ),
-    )
-    parser.add_argument(
-        "--rtn_act_error_debug",
-        action="store_true",
-        help=(
-            "RTN only: run a temporary FP-weight activation-quantization diagnostic. "
-            "Use with --w_bits 16 and --a_bits/--v_bits <16 to print layer-output "
-            "relative error after enabling each linear layer's activation fake quant."
+            "Install K-cache quantization during supported GPTQ-family student "
+            "paths (gptaq, gptq_guided, gptq_plus), so Hessian accumulation and "
+            "layer replay see online K fake quantization. FP teacher paths keep "
+            "K quantization disabled."
         ),
     )
     parser.add_argument("--export_to_et", action="store_true", help="Export quantized model (TODO)")
@@ -790,20 +783,27 @@ def parse_gen():
         raise ValueError(f"`backward_bsz` must be positive or -1. Got {args.backward_bsz}.")
     if not (0.0 < args.a_loss_ratio <= 1.0):
         raise ValueError(f"`a_loss_ratio` must be in (0, 1]. Got {args.a_loss_ratio}.")
+    quant_aware_methods = {"gptaq", "gptq_guided", "gptq_plus"}
     if getattr(args, "act_quant_aware_gptq", False):
-        if args.w_method != "gptq_plus":
-            raise ValueError("--act_quant_aware_gptq is currently implemented only for --w_method=gptq_plus.")
-        if args.grad_refresh_loss == "refined_mse":
+        if args.w_method not in quant_aware_methods:
+            raise ValueError(
+                "--act_quant_aware_gptq is currently implemented only for "
+                "--w_method in {gptaq, gptq_guided, gptq_plus}."
+            )
+        if args.w_method == "gptq_plus" and args.grad_refresh_loss == "refined_mse":
             raise ValueError(
                 "--act_quant_aware_gptq does not support --grad_refresh_loss=refined_mse yet. "
                 "The refined_mse grad-pool path and layer-0 shortcut still assume an FP student path."
             )
     if getattr(args, "k_cache_quant_aware_gptq", False):
-        if args.w_method != "gptq_plus":
-            raise ValueError("--k_cache_quant_aware_gptq is currently implemented only for --w_method=gptq_plus.")
+        if args.w_method not in quant_aware_methods:
+            raise ValueError(
+                "--k_cache_quant_aware_gptq is currently implemented only for "
+                "--w_method in {gptaq, gptq_guided, gptq_plus}."
+            )
         if args.k_bits >= 16:
             raise ValueError("--k_cache_quant_aware_gptq requires --k_bits < 16.")
-        if args.grad_refresh_loss == "refined_mse":
+        if args.w_method == "gptq_plus" and args.grad_refresh_loss == "refined_mse":
             raise ValueError(
                 "--k_cache_quant_aware_gptq does not support --grad_refresh_loss=refined_mse yet. "
                 "The refined_mse grad-pool path still assumes an FP student path."

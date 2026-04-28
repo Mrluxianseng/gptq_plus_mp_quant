@@ -6,7 +6,7 @@ NUM_GROUPS=${2}     # 4
 DEVICE=${3}         # 0
 
 MODEL_NAME=$(basename ${MODEL_PATH})
-N_SAMPLES=512
+N_SAMPLES=2048
 SEQ_LEN=2048
 
 # Set environment variables
@@ -21,3 +21,7 @@ python -m torch.distributed.run \
     --w_method gptq_guided --w_bits 4 --w_clip --num_groups ${NUM_GROUPS} --act_order \
     --lm_eval --lm_eval_batch_size 32 \
     --rotate \
+    --a_clip_ratio 0.9 --k_clip_ratio 0.9 --k_clip_ratio 0.9 \
+    --w_groupsize 128 \
+    --a_bits 4 --k_bits 4 --v_bits 4 \
+    --act_quant_aware_gptq --k_cache_quant_aware_gptq \
