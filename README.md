@@ -33,6 +33,7 @@
 - FINAL_LAYER_FULL_BACKWARD：最后一层是否每个block都用上所有校准样本
 - BLOCKSIZE：列切块的大小
 - BLOCK_ATOMIC_QUANT：开启后一个block同时量化，内部不再列循环
+- GROUP_PARALLEL_QUANT：GPTQ+线性层内输出group并行量化模式。这里的group是`NUM_GROUPS`对应的Hessian/saliency输出通道group，不是`W_GROUPSIZE`对应的量化参数列group。`none`保持旧的逐group循环；`tensor`在单rank内把group堆成torch tensor并行跑block内/外更新和block_gd；`rank`要求每个线性层的输出行数能被`WORLD_SIZE`整除，在DP多rank时按连续输出行切分block内量化，每行仍映射回所属Hessian group使用对应Hessian，block结束后同步block结果，block外更新和block_gd仍在每个rank本地用完整group tensor并行执行。rank模式下线性层开始前的per-row weight quant params也按同一输出行段分给不同rank计算，随后同步scale/zero。
 - GRAD_OPTIMIZER：梯度下降用优化器
 - FINAL_LAYER_GRAD_OPTIMIZER：最后一层用的优化器
 - GRAD_CLIP：梯度下降用的逐元素clip

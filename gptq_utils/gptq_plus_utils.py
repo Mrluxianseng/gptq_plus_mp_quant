@@ -537,6 +537,197 @@ class GPTQPlus:
         GHinv = Z.matmul(Hinv)
         return beta, beta_view, Z, GHinv
 
+    def _compute_hessian_inverse_batched_with_fallback(
+        self,
+        H_subs,
+        percdamp=0.01,
+        damp_auto_increment=0.0015,
+        profile_recorder=None,
+        profile_section=None,
+        log_context="",
+    ):
+        """Batched version of `_compute_hessian_inverse_with_fallback`.
+
+        The normal path runs one Cholesky batch over all output-channel groups.
+        If only some groups fail, only those groups retry or fall back to an
+        identity inverse.
+        """
+        damp_percent_value = float(percdamp)
+        if damp_percent_value <= 0:
+            raise ValueError(
+                f"Quantization{log_context}: `damp_percent` must be positive. current is {damp_percent_value}"
+            )
+
+        num_groups, columns, _ = H_subs.shape
+        device = H_subs.device
+        dtype = H_subs.dtype
+        diag_idx = torch.arange(columns, device=device)
+        eye = torch.eye(columns, device=device, dtype=dtype)
+        H_work_all = H_subs.clone()
+        Hinv_init = torch.empty_like(H_subs)
+        Hinv = torch.empty_like(H_subs)
+        damp_percent = torch.full((num_groups,), damp_percent_value, device=device, dtype=torch.float32)
+        damp_used = damp_percent.clone()
+        fallback = torch.zeros(num_groups, device=device, dtype=torch.bool)
+        pending = torch.ones(num_groups, device=device, dtype=torch.bool)
+        last_info = torch.zeros(num_groups, device=device, dtype=torch.int32)
+
+        while bool(pending.any().item()):
+            active_idx = pending.nonzero(as_tuple=False).flatten()
+            H_work = H_work_all.index_select(0, active_idx).clone()
+            active_damp = damp_percent.index_select(0, active_idx).to(dtype)
+            active_diag_mean = torch.diagonal(H_work, dim1=-2, dim2=-1).mean(dim=1)
+            H_work[:, diag_idx, diag_idx] += (active_damp * active_diag_mean).unsqueeze(1)
+            H_work_all.index_copy_(0, active_idx, H_work)
+
+            section = (
+                profile_recorder.section(profile_section)
+                if profile_recorder is not None and profile_section is not None
+                else _NULL_CONTEXT
+            )
+            with section:
+                chol, info = torch.linalg.cholesky_ex(H_work)
+
+            ok = info == 0
+            failed = info != 0
+            if bool(ok.any().item()):
+                ok_local_idx = ok.nonzero(as_tuple=False).flatten()
+                ok_global_idx = active_idx.index_select(0, ok_local_idx)
+                hinit = torch.cholesky_inverse(chol.index_select(0, ok_local_idx))
+                hchol, hinfo = torch.linalg.cholesky_ex(hinit, upper=True)
+                finite = torch.isfinite(hinit).flatten(1).all(dim=1) & torch.isfinite(hchol).flatten(1).all(dim=1)
+                ok2 = (hinfo == 0) & finite
+                if bool(ok2.any().item()):
+                    ok2_local_idx = ok2.nonzero(as_tuple=False).flatten()
+                    ok2_global_idx = ok_global_idx.index_select(0, ok2_local_idx)
+                    Hinv_init.index_copy_(0, ok2_global_idx, hinit.index_select(0, ok2_local_idx))
+                    Hinv.index_copy_(0, ok2_global_idx, hchol.index_select(0, ok2_local_idx))
+                    damp_used.index_copy_(0, ok2_global_idx, damp_percent.index_select(0, ok2_global_idx))
+                    pending.index_fill_(0, ok2_global_idx, False)
+                failed_ok = ~ok2
+                if bool(failed_ok.any().item()):
+                    failed_ok_local_idx = ok_local_idx.index_select(0, failed_ok.nonzero(as_tuple=False).flatten())
+                    failed[failed_ok_local_idx] = True
+                    failed_global_idx = ok_global_idx.index_select(0, failed_ok.nonzero(as_tuple=False).flatten())
+                    last_info.index_copy_(0, failed_global_idx, hinfo.index_select(0, failed_ok.nonzero(as_tuple=False).flatten()).to(torch.int32))
+            failed_global_idx = active_idx.index_select(0, failed.nonzero(as_tuple=False).flatten())
+            if failed_global_idx.numel() > 0:
+                last_info.index_copy_(0, failed_global_idx, info.index_select(0, failed.nonzero(as_tuple=False).flatten()).to(torch.int32))
+                damp_percent.index_add_(
+                    0,
+                    failed_global_idx,
+                    torch.full((failed_global_idx.numel(),), damp_auto_increment, device=device, dtype=torch.float32),
+                )
+                still_retry = damp_percent.index_select(0, failed_global_idx) < 1
+                retry_idx = failed_global_idx.index_select(0, still_retry.nonzero(as_tuple=False).flatten())
+                giveup_idx = failed_global_idx.index_select(0, (~still_retry).nonzero(as_tuple=False).flatten())
+                if retry_idx.numel() > 0:
+                    for idx in retry_idx.detach().cpu().tolist():
+                        logging.warning(
+                            "Quantization%s subgroup=%d: Current `damp_percent = %.5f` is too low, "
+                            "auto-incrementing by `%.5f`",
+                            log_context,
+                            idx,
+                            float(damp_percent[idx].item()),
+                            damp_auto_increment,
+                        )
+                if giveup_idx.numel() > 0:
+                    Hinv_init.index_copy_(0, giveup_idx, eye.expand(giveup_idx.numel(), -1, -1))
+                    Hinv.index_copy_(0, giveup_idx, eye.expand(giveup_idx.numel(), -1, -1))
+                    damp_used.index_copy_(0, giveup_idx, damp_percent.index_select(0, giveup_idx))
+                    fallback.index_fill_(0, giveup_idx, True)
+                    pending.index_fill_(0, giveup_idx, False)
+                    for idx in giveup_idx.detach().cpu().tolist():
+                        logging.warning(
+                            "Quantization%s subgroup=%d: `damp_percent` reached %.5f; falling back to "
+                            "identity Hessian inverse for this subgroup. Last Cholesky info: %s",
+                            log_context,
+                            idx,
+                            float(damp_percent[idx].item()),
+                            int(last_info[idx].item()),
+                        )
+
+        return Hinv_init, Hinv, damp_used, fallback
+
+    def _compute_gradient_terms_batched(self, gradients_sub, Hinv_init, Hinv, enable_gradient_update):
+        GHinv_init = torch.bmm(gradients_sub, Hinv_init)
+        if enable_gradient_update and self.alpha > 0:
+            alpha = self.alpha / (self.rows * self.columns)
+            if self.reference_loss <= 0:
+                beta = torch.zeros(
+                    gradients_sub.shape[:2],
+                    device=gradients_sub.device,
+                    dtype=gradients_sub.dtype,
+                )
+            else:
+                diag = torch.diagonal(Hinv_init, dim1=-2, dim2=-1).unsqueeze(1)
+                c = (gradients_sub * GHinv_init).sum(dim=2) - ((GHinv_init ** 2) / diag).mean(dim=2)
+                target = 2 * alpha * self.reference_loss
+                c = torch.clamp(c, min=target)
+                ratio = torch.where(c > 0, target / c, torch.zeros_like(c))
+                ratio = torch.clamp(ratio, min=0.0, max=1.0)
+                beta = 1 - torch.sqrt(torch.clamp(1 - ratio, min=0.0))
+                beta = torch.nan_to_num(beta, nan=0.0, posinf=1.0, neginf=0.0)
+        else:
+            beta = torch.zeros(
+                gradients_sub.shape[:2],
+                device=gradients_sub.device,
+                dtype=gradients_sub.dtype,
+            )
+        beta_view = beta.unsqueeze(-1)
+        Z = torch.bmm(gradients_sub, Hinv.transpose(1, 2)) * beta_view
+        GHinv = torch.bmm(Z, Hinv)
+        return beta, beta_view, Z, GHinv
+
+    @staticmethod
+    def _make_grad_optimizer_state_batched(weight_sub, grad_optimizer):
+        if grad_optimizer not in {"sgd", "adam"}:
+            raise ValueError(f"Unsupported `grad_optimizer={grad_optimizer}`. Expected one of: sgd, adam.")
+        state = {"type": grad_optimizer, "step": 0}
+        if grad_optimizer == "adam":
+            state["exp_avg"] = torch.zeros_like(weight_sub)
+            state["exp_avg_sq"] = torch.zeros_like(weight_sub)
+        return state
+
+    @staticmethod
+    def _clear_grad_optimizer_state_batched(opt_state, col_start, col_end):
+        if opt_state is None or col_end <= col_start:
+            return
+        if opt_state["type"] == "adam":
+            opt_state["exp_avg"][:, :, col_start:col_end].zero_()
+            opt_state["exp_avg_sq"][:, :, col_start:col_end].zero_()
+
+    @staticmethod
+    def _compute_grad_optimizer_update_batched(
+        opt_state,
+        grad_sub,
+        col_start,
+        lr,
+        grad_clip=1.0,
+        adam_beta1=0.9,
+        adam_beta2=0.999,
+        adam_eps=1e-8,
+    ):
+        grad_slice = grad_sub[:, :, col_start:]
+        if grad_slice.numel() == 0:
+            return grad_slice
+        if grad_clip is not None and grad_clip > 0:
+            grad_slice = grad_slice.clamp(min=-grad_clip, max=grad_clip)
+        if opt_state["type"] == "sgd":
+            return lr * grad_slice
+
+        opt_state["step"] += 1
+        exp_avg = opt_state["exp_avg"][:, :, col_start:]
+        exp_avg_sq = opt_state["exp_avg_sq"][:, :, col_start:]
+        exp_avg.mul_(adam_beta1).add_(grad_slice, alpha=1 - adam_beta1)
+        exp_avg_sq.mul_(adam_beta2).addcmul_(grad_slice, grad_slice, value=1 - adam_beta2)
+        bias_correction1 = 1 - adam_beta1 ** opt_state["step"]
+        bias_correction2 = 1 - adam_beta2 ** opt_state["step"]
+        denom = exp_avg_sq.sqrt() / math.sqrt(bias_correction2)
+        denom.add_(adam_eps)
+        step_size = lr / bias_correction1
+        return step_size * (exp_avg / denom)
+
     @staticmethod
     def _current_ghinv(base, current_weight, ref_weight, beta_view, refresh_mode):
         if refresh_mode == "frozen":
@@ -733,6 +924,667 @@ class GPTQPlus:
         sine_update = grad_lr * sine_regularizer_update
         return gated_update + sine_update, gate_update, sine_update
 
+    def _apply_first_order_regularizer_batched(
+        self,
+        state,
+        current_effective_weight,
+        optimizer_update,
+        col_start,
+        grad_lr,
+        grad_reg_strategy,
+        grad_reg_lambda,
+        grad_gate_floor,
+        grad_gate_sharpness,
+        grad_gate_sine_amp,
+    ):
+        if optimizer_update.numel() == 0:
+            return optimizer_update, optimizer_update, torch.zeros_like(optimizer_update)
+
+        self._validate_grad_regularizer(
+            grad_reg_strategy,
+            grad_reg_lambda=grad_reg_lambda,
+            grad_gate_floor=grad_gate_floor,
+            grad_gate_sharpness=grad_gate_sharpness,
+            grad_gate_sine_amp=grad_gate_sine_amp,
+        )
+        trailing_current = current_effective_weight[:, :, col_start:]
+
+        if grad_reg_strategy == "none":
+            zero_update = torch.zeros_like(optimizer_update)
+            return optimizer_update, zero_update, zero_update
+
+        if grad_reg_strategy == "l2":
+            ref_trailing = state["full_precision_weight"][:, :, col_start:]
+            reg_update = grad_lr * grad_reg_lambda * (trailing_current - ref_trailing)
+            zero_update = torch.zeros_like(reg_update)
+            return optimizer_update + reg_update, reg_update, zero_update
+
+        if grad_reg_strategy == "hessian":
+            full_diff = current_effective_weight - state["full_precision_weight"]
+            reg_update = grad_lr * grad_reg_lambda * torch.bmm(
+                full_diff,
+                state["hessian_reg"][:, :, col_start:],
+            )
+            zero_update = torch.zeros_like(reg_update)
+            return optimizer_update + reg_update, reg_update, zero_update
+
+        scale_slice = state["gate_scale"][:, :, col_start:]
+        zero_slice = state["gate_zero"][:, :, col_start:]
+        q_nearest = self._nearest_quant_grid(
+            trailing_current,
+            scale_slice,
+            zero_slice,
+            int(self.quantizer.maxq.item()),
+            self.quantizer.sym,
+        )
+        distance = (trailing_current - q_nearest).abs() / scale_slice.clamp(min=1e-8)
+        gate = grad_gate_floor + (1.0 - grad_gate_floor) * (1.0 - torch.exp(-grad_gate_sharpness * distance))
+        gated_update = optimizer_update * gate
+        gate_update = gated_update - optimizer_update
+        if grad_reg_strategy == "quant_error_gate":
+            zero_update = torch.zeros_like(gate_update)
+            return gated_update, gate_update, zero_update
+
+        sine_regularizer_update = self._sine_quant_regularizer_update(
+            trailing_current,
+            scale_slice,
+            zero_slice,
+            self.quantizer.sym,
+            grad_gate_sine_amp,
+        )
+        sine_update = grad_lr * sine_regularizer_update
+        return gated_update + sine_update, gate_update, sine_update
+
+    @staticmethod
+    def _find_weight_params_row_parallel(quantizer, weight, row_start, row_end):
+        local_quantizer = copy.deepcopy(quantizer)
+        local_quantizer.find_params(weight[row_start:row_end])
+
+        scale = torch.zeros(
+            (weight.shape[0],) + tuple(local_quantizer.scale.shape[1:]),
+            device=weight.device,
+            dtype=local_quantizer.scale.dtype,
+        )
+        zero = torch.zeros(
+            (weight.shape[0],) + tuple(local_quantizer.zero.shape[1:]),
+            device=weight.device,
+            dtype=local_quantizer.zero.dtype,
+        )
+        scale[row_start:row_end] = local_quantizer.scale
+        zero[row_start:row_end] = local_quantizer.zero
+        dist_utils.allreduce_sum_(scale)
+        dist_utils.allreduce_sum_(zero)
+        quantizer.scale = scale
+        quantizer.zero = zero
+        quantizer.maxq = quantizer.maxq.to(weight.device)
+
+    def _fasterquant_group_parallel(
+        self,
+        blocksize=128,
+        percdamp=0.01,
+        groupsize=-1,
+        actorder=False,
+        static_groups=False,
+        enable_gradient_update=True,
+        g_update_mode="frozen",
+        export_to_et=False,
+        profile_recorder=None,
+        gradient_refresh_fn=None,
+        grad_lr=1e-3,
+        grad_optimizer="sgd",
+        grad_reg_strategy="none",
+        grad_reg_lambda=0.0,
+        grad_gate_floor=0.1,
+        grad_gate_sharpness=1.0,
+        grad_gate_sine_amp=0.0,
+        second_order_scale=1.0,
+        block_atomic_quant=False,
+        block_observer=None,
+        grad_clip=1.0,
+        slide_refresh_start=0,
+        slide_refresh_block_total=None,
+        refresh_full_metrics=False,
+        group_parallel_mode="tensor",
+    ):
+        W = self.layer.weight.data.clone().float()
+        block_gd_mode = g_update_mode == "block_gd"
+        dynamic_groups = groupsize != -1 and not static_groups
+        if dynamic_groups:
+            raise ValueError("group-parallel fasterquant does not support dynamic weight groups.")
+        if not self.quantizer.sym:
+            raise ValueError("group-parallel fasterquant currently supports symmetric weight quantization only.")
+        if grad_reg_strategy in {"quant_error_gate", "quant_error_gate_optimized"}:
+            raise ValueError("group-parallel fasterquant does not support quantization-error gate regularizers yet.")
+        if self.quantizer.bits >= 16:
+            raise ValueError("group-parallel fasterquant requires weight quantization bits < 16.")
+        if g_update_mode not in {"frozen", "surrogate_block", "surrogate_online", "block_backward", "block_gd"}:
+            raise ValueError(f"Unsupported `g_update_mode={g_update_mode}`.")
+
+        with profile_recorder.section("fasterquant_group_parallel.total") if profile_recorder else _NULL_CONTEXT:
+            rows_per_sub = self.rows // self.num_groups
+            dev = self.dev
+            G = self.num_groups
+            R = rows_per_sub
+            C = self.columns
+            if group_parallel_mode == "rank" and dist_utils.get_world_size() > 1:
+                world = dist_utils.get_world_size()
+                rank = dist_utils.get_rank()
+                if self.rows % world != 0:
+                    raise ValueError(
+                        "group_parallel_mode='rank' requires output rows "
+                        f"({self.rows}) to be divisible by world_size ({world})."
+                    )
+                local_row_start = rank * self.rows // world
+                local_row_end = (rank + 1) * self.rows // world
+            else:
+                world = 1
+                local_row_start = 0
+                local_row_end = self.rows
+            local_rows = torch.arange(local_row_start, local_row_end, device=dev)
+            local_group_idx = torch.div(local_rows, R, rounding_mode="floor").to(torch.long)
+            local_row_idx = torch.remainder(local_rows, R).to(torch.long)
+            has_local_rows = local_rows.numel() > 0
+
+            if not self.quantizer.ready():
+                with profile_recorder.section("fasterquant_group_parallel.quantizer_find_params_initial") if profile_recorder else _NULL_CONTEXT:
+                    if group_parallel_mode == "rank" and dist_utils.get_world_size() > 1:
+                        self._find_weight_params_row_parallel(
+                            self.quantizer,
+                            W,
+                            local_row_start,
+                            local_row_end,
+                        )
+                    else:
+                        self.quantizer.find_params(W)
+
+            shared_groups = None
+            if groupsize != -1 and static_groups:
+                with profile_recorder.section("fasterquant_group_parallel.quantizer_build_groups") if profile_recorder else _NULL_CONTEXT:
+                    shared_groups = []
+                    for col_start in range(0, self.columns, groupsize):
+                        col_end = min(col_start + groupsize, self.columns)
+                        quantizer = copy.deepcopy(self.quantizer)
+                        if group_parallel_mode == "rank" and dist_utils.get_world_size() > 1:
+                            self._find_weight_params_row_parallel(
+                                quantizer,
+                                W[:, col_start:col_end],
+                                local_row_start,
+                                local_row_end,
+                            )
+                        else:
+                            quantizer.find_params(W[:, col_start:col_end])
+                        shared_groups.append(quantizer)
+
+            maxq = int(self.quantizer.maxq.item())
+            q_lo = -(maxq + 1)
+
+            with profile_recorder.section("fasterquant_group_parallel.prepare_state") if profile_recorder else _NULL_CONTEXT:
+                W_sub = W.reshape(G, R, C).clone()
+                H_sub = self.H.clone()
+                gradients_sub = self.gradients.to(dev).float().reshape(G, R, C).clone()
+
+                diag_idx = torch.arange(C, device=dev)
+                dead = torch.diagonal(H_sub, dim1=-2, dim2=-1) == 0
+                H_diag = torch.diagonal(H_sub, dim1=-2, dim2=-1)
+                H_diag[dead] = 1
+                W_sub = W_sub.masked_fill(dead.unsqueeze(1), 0)
+
+                perm = None
+                invperm = None
+                if actorder:
+                    perm = torch.argsort(self.act_square, descending=True)
+                    W_sub = W_sub[:, :, perm]
+                    H_sub = H_sub[:, perm][:, :, perm]
+                    gradients_sub = gradients_sub[:, :, perm]
+                    invperm = torch.argsort(perm)
+
+                hessian_reg = H_sub.clone() if grad_reg_strategy == "hessian" else None
+                full_precision_weight = W_sub.clone() if grad_reg_strategy in {"l2", "hessian"} else None
+                anchor_weight = W_sub.clone()
+                Q = torch.zeros_like(W_sub)
+                W_int_sub = torch.zeros_like(W_sub)
+                Scale_sub = torch.zeros_like(W_sub)
+
+            with profile_recorder.section("fasterquant_group_parallel.compute_hinv") if profile_recorder else _NULL_CONTEXT:
+                Hinv_init, Hinv, damp_percent, hessian_identity_fallback = (
+                    self._compute_hessian_inverse_batched_with_fallback(
+                        H_sub,
+                        percdamp=percdamp,
+                        profile_recorder=profile_recorder,
+                        profile_section="fasterquant_group_parallel.compute_hinv.cholesky",
+                    )
+                )
+            with profile_recorder.section("fasterquant_group_parallel.init_ghinv") if profile_recorder else _NULL_CONTEXT:
+                beta, beta_view, Z, GHinv = self._compute_gradient_terms_batched(
+                    gradients_sub,
+                    Hinv_init,
+                    Hinv,
+                    enable_gradient_update,
+                )
+
+            state = {
+                "W_sub": W_sub,
+                "Q": Q,
+                "W_int_sub": W_int_sub,
+                "Scale_sub": Scale_sub,
+                "gradients_sub": gradients_sub,
+                "Hinv_init": Hinv_init,
+                "Hinv": Hinv,
+                "Z": Z,
+                "GHinv": GHinv,
+                "beta": beta,
+                "beta_view": beta_view,
+                "anchor_weight": anchor_weight,
+                "full_precision_weight": full_precision_weight,
+                "hessian_reg": hessian_reg,
+                "gate_scale": None,
+                "gate_zero": None,
+                "grad_optimizer_state": self._make_grad_optimizer_state_batched(W_sub, grad_optimizer) if block_gd_mode else None,
+            }
+
+            base_scale = self.quantizer.scale.to(dev).reshape(G, R, -1)
+            if base_scale.shape[-1] != 1:
+                base_scale = base_scale[:, :, :1]
+            static_group_scales = None
+            if shared_groups is not None:
+                static_group_scales = torch.stack(
+                    [q.scale.to(dev).reshape(G, R, -1)[:, :, :1] for q in shared_groups],
+                    dim=0,
+                )
+
+            def scale_for_block(col_start, col_end):
+                count = col_end - col_start
+                if groupsize == -1:
+                    return base_scale.expand(-1, -1, count)
+                scale = torch.empty((G, R, count), device=dev, dtype=W_sub.dtype)
+                cols = torch.arange(col_start, col_end, device=dev)
+                original_cols = perm[cols] if perm is not None else cols
+                group_ids = torch.div(original_cols, groupsize, rounding_mode="floor").to(torch.long)
+                for local_col, group_id in enumerate(group_ids.detach().cpu().tolist()):
+                    scale[:, :, local_col] = static_group_scales[group_id].squeeze(-1)
+                return scale
+
+            def sync_block_tensors(Q1, W_int1, Scale1, Err1):
+                if group_parallel_mode != "rank" or dist_utils.get_world_size() <= 1:
+                    return Q1, W_int1, Scale1, Err1
+                with profile_recorder.section("fasterquant_group_parallel.block.rank_all_gather") if profile_recorder else _NULL_CONTEXT:
+                    local_packed = torch.cat(
+                        [
+                            tensor.reshape(self.rows, count)[local_row_start:local_row_end]
+                            for tensor in (Q1, W_int1, Scale1, Err1)
+                        ],
+                        dim=1,
+                    ).contiguous()
+                    gathered = [torch.empty_like(local_packed) for _ in range(world)]
+                    dist.all_gather(gathered, local_packed)
+                    packed = torch.cat(gathered, dim=0)
+                    return [
+                        piece.contiguous().view(G, R, count)
+                        for piece in packed.split(count, dim=1)
+                    ]
+
+            def natural_order(weight_groups):
+                if actorder:
+                    weight_groups = weight_groups[:, :, invperm]
+                return weight_groups.reshape(self.rows, self.columns)
+
+            n_blocks_total = (C + blocksize - 1) // blocksize
+            n_refresh_total = max(n_blocks_total - 1, 0)
+
+            for i1 in range(0, C, blocksize):
+                with profile_recorder.section("fasterquant_group_parallel.block.total") if profile_recorder else _NULL_CONTEXT:
+                    i2 = min(i1 + blocksize, C)
+                    count = i2 - i1
+                    is_last_block = i2 >= C
+                    use_atomic_quant = block_atomic_quant and not is_last_block
+                    D = torch.arange(count - 1, -1, -1, device=dev, dtype=W_sub.dtype)
+
+                    with profile_recorder.section("fasterquant_group_parallel.block.setup") if profile_recorder else _NULL_CONTEXT:
+                        W1 = state["W_sub"][:, :, i1:i2].clone()
+                        W_ref1 = state["anchor_weight"][:, :, i1:i2]
+                        W_block_start = W1.clone()
+                        Q1 = torch.zeros_like(W1)
+                        W_int1 = torch.zeros_like(W1)
+                        Scale1 = torch.zeros_like(W1)
+                        Err1 = torch.zeros_like(W1)
+                        Hinv1 = state["Hinv"][:, i1:i2, i1:i2]
+                        GHinv1 = state["GHinv"][:, :, i1:i2].clone()
+                        Z1 = state["Z"][:, :, i1:i2]
+                        inner_update_mode = "surrogate_online" if g_update_mode == "block_backward" else "frozen" if block_gd_mode else g_update_mode
+                        is_frozen_inner = inner_update_mode == "frozen"
+                        is_surrogate_online = inner_update_mode == "surrogate_online"
+                        GHinv1_eff = self._current_ghinv(
+                            GHinv1,
+                            W1 if is_surrogate_online else W_block_start,
+                            W_ref1,
+                            state["beta_view"],
+                            inner_update_mode,
+                        )
+                        Scale_block = scale_for_block(i1, i2)
+                        if has_local_rows:
+                            Scale1[local_group_idx, local_row_idx, :] = Scale_block[
+                                local_group_idx,
+                                local_row_idx,
+                                :,
+                            ]
+
+                    if use_atomic_quant:
+                        with profile_recorder.section("fasterquant_group_parallel.block.atomic_inner") if profile_recorder else _NULL_CONTEXT:
+                            if has_local_rows:
+                                scale_local = Scale_block[local_group_idx, local_row_idx, :]
+                                W_block_start_l = W_block_start[local_group_idx, local_row_idx, :]
+                                GHinv1_eff_l = GHinv1_eff[local_group_idx, local_row_idx, :]
+                                q_int = torch.clamp(
+                                    torch.round(W_block_start_l / scale_local),
+                                    q_lo,
+                                    maxq,
+                                )
+                                q = (scale_local * q_int).to(W_block_start.dtype)
+                                Q1[local_group_idx, local_row_idx, :] = q
+                                W_int1[local_group_idx, local_row_idx, :] = q_int
+                                residual_block = W_block_start_l - q - GHinv1_eff_l
+                                solved = torch.linalg.solve_triangular(
+                                    Hinv1[local_group_idx].transpose(1, 2),
+                                    residual_block.unsqueeze(-1),
+                                    upper=False,
+                                ).squeeze(-1)
+                                Err1[local_group_idx, local_row_idx, :] = solved
+                    else:
+                        with profile_recorder.section("fasterquant_group_parallel.block.inner_loop") if profile_recorder else _NULL_CONTEXT:
+                            if has_local_rows:
+                                W1_l = W1[local_group_idx, local_row_idx, :].clone()
+                                Hinv1_l = Hinv1[local_group_idx]
+                                GHinv1_l = GHinv1[local_group_idx, local_row_idx, :].clone()
+                                Z1_l = Z1[local_group_idx, local_row_idx, :]
+                                GHinv1_eff_l = (
+                                    GHinv1_l
+                                    if is_frozen_inner
+                                    else GHinv1_eff[local_group_idx, local_row_idx, :].clone()
+                                )
+                                W_block_start_l = W_block_start[local_group_idx, local_row_idx, :]
+                                W_ref1_l = W_ref1[local_group_idx, local_row_idx, :]
+                                beta_view_l = state["beta_view"][local_group_idx, local_row_idx, :]
+                                scale_l = Scale_block[local_group_idx, local_row_idx, :]
+                                Q1_l = torch.zeros_like(W1_l)
+                                W_int1_l = torch.zeros_like(W1_l)
+                                Err1_l = torch.zeros_like(W1_l)
+                                for i in range(count):
+                                    w = W1_l[:, i]
+                                    q_int = torch.clamp(
+                                        torch.round(w / scale_l[:, i]),
+                                        q_lo,
+                                        maxq,
+                                    )
+                                    q = (scale_l[:, i] * q_int).to(w.dtype)
+                                    Q1_l[:, i] = q
+                                    W_int1_l[:, i] = q_int
+                                    d = Hinv1_l[:, i, i]
+                                    err1 = (w - q - GHinv1_eff_l[:, i]) / d
+                                    Err1_l[:, i] = err1
+                                    second_order_inner_update = (
+                                        err1.unsqueeze(1) * Hinv1_l[:, i, i:]
+                                    )
+                                    if block_gd_mode:
+                                        W1_l[:, i:] -= second_order_scale * (
+                                            second_order_inner_update + GHinv1_eff_l[:, i:]
+                                        )
+                                    else:
+                                        W1_l[:, i:] -= second_order_inner_update + GHinv1_eff_l[:, i:]
+                                    GHinv1_l[:, i:].sub_(
+                                        Z1_l[:, i].unsqueeze(1) * Hinv1_l[:, i, i:]
+                                    )
+                                    if not is_frozen_inner:
+                                        GHinv1_eff_l = self._current_ghinv(
+                                            GHinv1_l,
+                                            W1_l if is_surrogate_online else W_block_start_l,
+                                            W_ref1_l,
+                                            beta_view_l,
+                                            inner_update_mode,
+                                        )
+                                Q1[local_group_idx, local_row_idx, :] = Q1_l
+                                W_int1[local_group_idx, local_row_idx, :] = W_int1_l
+                                Err1[local_group_idx, local_row_idx, :] = Err1_l
+
+                    Q1, W_int1, Scale1, Err1 = sync_block_tensors(Q1, W_int1, Scale1, Err1)
+                    state["Q"][:, :, i1:i2] = Q1
+                    state["W_int_sub"][:, :, i1:i2] = W_int1
+                    state["Scale_sub"][:, :, i1:i2] = Scale1
+
+                    if g_update_mode == "block_backward" and enable_gradient_update:
+                        if gradient_refresh_fn is None:
+                            raise ValueError("`gradient_refresh_fn` must be provided for g_update_mode='block_backward'.")
+                        with profile_recorder.section("fasterquant_group_parallel.block.block_backward_refresh") if profile_recorder else _NULL_CONTEXT:
+                            current_sub_weight = state["W_sub"].clone()
+                            if i1 > 0:
+                                current_sub_weight[:, :, :i1] = state["Q"][:, :, :i1]
+                            current_sub_weight[:, :, i1:i2] = Q1
+                            refreshed_grad, refresh_meta = gradient_refresh_fn(natural_order(current_sub_weight))
+                            refreshed_grad = refreshed_grad.to(dev).float().reshape(G, R, C)
+                            if actorder:
+                                refreshed_grad = refreshed_grad[:, :, perm]
+                            state["gradients_sub"] = refreshed_grad
+                            beta, beta_view, Z, GHinv = self._compute_gradient_terms_batched(
+                                refreshed_grad,
+                                state["Hinv_init"],
+                                state["Hinv"],
+                                enable_gradient_update,
+                            )
+                            state["beta"] = beta
+                            state["beta_view"] = beta_view
+                            state["Z"] = Z
+                            state["GHinv"] = GHinv
+                            state["anchor_weight"] = current_sub_weight.clone()
+                            Z1 = Z[:, :, i1:i2]
+                            if block_observer is not None:
+                                block_observer(
+                                    {
+                                        "block_idx": i1 // blocksize,
+                                        "col_start": i1,
+                                        "col_end": i2,
+                                        "remaining_columns": C - i2,
+                                        "remaining_grad_abs_mean": None,
+                                        "remaining_grad_clipped_abs_mean": None,
+                                        "remaining_grad_mean_row_l2": None,
+                                        "second_order_update_abs_mean": None,
+                                        "second_order_update_mean_row_l2": None,
+                                        "second_order_update_abs_max": None,
+                                        "second_order_update_abs_q99": None,
+                                        "first_order_raw_abs_mean": None,
+                                        "first_order_raw_mean_row_l2": None,
+                                        "first_order_update_abs_mean": None,
+                                        "first_order_update_mean_row_l2": None,
+                                        "first_order_update_abs_max": None,
+                                        "first_order_update_abs_q99": None,
+                                        "regularizer_update_abs_mean": None,
+                                        "regularizer_update_mean_row_l2": None,
+                                        "sine_regularizer_update_abs_mean": None,
+                                        "sine_regularizer_update_mean_row_l2": None,
+                                        "mean_refresh_loss": None if refresh_meta is None else refresh_meta.get("mean_refresh_loss"),
+                                        "train_mean_refresh_loss": None if refresh_meta is None else refresh_meta.get("train_mean_refresh_loss"),
+                                        "val_mean_refresh_loss": None if refresh_meta is None else refresh_meta.get("val_mean_refresh_loss"),
+                                        "refresh_subset_mean_refresh_loss": None if refresh_meta is None else refresh_meta.get("refresh_subset_mean_refresh_loss"),
+                                    }
+                                )
+
+                    with profile_recorder.section("fasterquant_group_parallel.block.outer_update") if profile_recorder else _NULL_CONTEXT:
+                        outer_mode = "frozen" if g_update_mode in {"frozen", "block_backward", "block_gd"} else "surrogate_block"
+                        Hrest = state["Hinv"][:, i1:i2, i2:]
+                        GHinv_rest = self._current_ghinv(
+                            state["GHinv"][:, :, i2:],
+                            state["W_sub"][:, :, i2:],
+                            state["anchor_weight"][:, :, i2:],
+                            state["beta_view"],
+                            outer_mode,
+                        )
+                        G_Update = count * GHinv_rest - torch.einsum("grj,j,gjk->grk", Z1, D, Hrest)
+                        second_order_update = torch.bmm(Err1, Hrest)
+                        total_outer_update = second_order_update + G_Update
+                        if block_gd_mode:
+                            applied_second_order_update = second_order_scale * second_order_update
+                            state["W_sub"][:, :, i2:] -= second_order_scale * total_outer_update
+                        else:
+                            applied_second_order_update = second_order_update
+                            state["W_sub"][:, :, i2:] -= total_outer_update
+                        state["GHinv"][:, :, i2:] -= torch.bmm(state["Z"][:, :, i1:i2], Hrest)
+                        if block_gd_mode:
+                            self._clear_grad_optimizer_state_batched(state["grad_optimizer_state"], i1, i2)
+
+                    if block_gd_mode and enable_gradient_update and i2 < C:
+                        if gradient_refresh_fn is None:
+                            raise ValueError("`gradient_refresh_fn` must be provided for g_update_mode='block_gd'.")
+                        with profile_recorder.section("fasterquant_group_parallel.block.block_gd_refresh") if profile_recorder else _NULL_CONTEXT:
+                            current_sub_weight = state["W_sub"].clone()
+                            current_sub_weight[:, :, :i2] = state["Q"][:, :, :i2]
+                            refresh_idx = i1 // blocksize
+                            effective_total = (
+                                slide_refresh_block_total
+                                if slide_refresh_block_total is not None
+                                else n_refresh_total
+                            )
+                            effective_idx = slide_refresh_start + refresh_idx
+                            slide_alpha = (
+                                1.0 - effective_idx / max(effective_total - 1, 1)
+                                if effective_total > 1 else 1.0
+                            )
+                            refreshed_grad, refresh_meta = gradient_refresh_fn(
+                                natural_order(current_sub_weight),
+                                slide_alpha=slide_alpha,
+                            )
+                            refreshed_grad = refreshed_grad.to(dev).float().reshape(G, R, C)
+                            if actorder:
+                                refreshed_grad = refreshed_grad[:, :, perm]
+
+                            trailing_grad_abs_mean = None
+                            trailing_grad_mean_row_l2 = None
+                            trailing_grad_clipped_abs_mean = None
+                            second_order_abs_mean = None
+                            second_order_mean_row_l2 = None
+                            second_order_abs_max = None
+                            second_order_abs_q99 = None
+                            first_order_raw_abs_mean = None
+                            first_order_raw_mean_row_l2 = None
+                            first_order_abs_mean = None
+                            first_order_mean_row_l2 = None
+                            first_order_abs_max = None
+                            first_order_abs_q99 = None
+                            regularizer_abs_mean = None
+                            regularizer_mean_row_l2 = None
+                            sine_regularizer_abs_mean = None
+                            sine_regularizer_mean_row_l2 = None
+
+                            if refresh_full_metrics:
+                                trailing_grad = refreshed_grad[:, :, i2:]
+                                if trailing_grad.numel() > 0:
+                                    trailing_grad_2d = trailing_grad.reshape(G * R, -1).float()
+                                    trailing_grad_abs_mean = trailing_grad_2d.abs().mean().item()
+                                    trailing_grad_mean_row_l2 = torch.linalg.norm(trailing_grad_2d, dim=1).mean().item()
+                                    if grad_clip is not None and grad_clip > 0:
+                                        trailing_grad_clipped_abs_mean = (
+                                            trailing_grad_2d.clamp(min=-grad_clip, max=grad_clip).abs().mean().item()
+                                        )
+                                    else:
+                                        trailing_grad_clipped_abs_mean = trailing_grad_abs_mean
+                                if applied_second_order_update.numel() > 0:
+                                    second_2d = applied_second_order_update.reshape(G * R, -1).float()
+                                    second_abs = second_2d.abs()
+                                    second_order_abs_mean = second_abs.mean().item()
+                                    second_order_mean_row_l2 = torch.linalg.norm(second_2d, dim=1).mean().item()
+                                    second_order_abs_max = second_abs.max().item()
+                                    second_order_abs_q99 = _quantile_large(second_abs, 0.99)
+
+                            optimizer_update_raw = self._compute_grad_optimizer_update_batched(
+                                state["grad_optimizer_state"],
+                                refreshed_grad,
+                                i2,
+                                grad_lr,
+                                grad_clip=grad_clip,
+                            )
+                            optimizer_update, gate_regularizer_update, sine_regularizer_update = self._apply_first_order_regularizer_batched(
+                                state,
+                                current_sub_weight,
+                                optimizer_update_raw,
+                                i2,
+                                grad_lr,
+                                grad_reg_strategy,
+                                grad_reg_lambda,
+                                grad_gate_floor,
+                                grad_gate_sharpness,
+                                grad_gate_sine_amp,
+                            )
+                            if optimizer_update.numel() > 0:
+                                state["W_sub"][:, :, i2:] -= optimizer_update
+
+                            if refresh_full_metrics:
+                                if optimizer_update_raw.numel() > 0:
+                                    raw_2d = optimizer_update_raw.reshape(G * R, -1).float()
+                                    first_order_raw_abs_mean = raw_2d.abs().mean().item()
+                                    first_order_raw_mean_row_l2 = torch.linalg.norm(raw_2d, dim=1).mean().item()
+                                if optimizer_update.numel() > 0:
+                                    upd_2d = optimizer_update.reshape(G * R, -1).float()
+                                    upd_abs = upd_2d.abs()
+                                    first_order_abs_mean = upd_abs.mean().item()
+                                    first_order_mean_row_l2 = torch.linalg.norm(upd_2d, dim=1).mean().item()
+                                    first_order_abs_max = upd_abs.max().item()
+                                    first_order_abs_q99 = _quantile_large(upd_abs, 0.99)
+                                if gate_regularizer_update.numel() > 0:
+                                    reg_2d = gate_regularizer_update.reshape(G * R, -1).float()
+                                    regularizer_abs_mean = reg_2d.abs().mean().item()
+                                    regularizer_mean_row_l2 = torch.linalg.norm(reg_2d, dim=1).mean().item()
+                                if sine_regularizer_update.numel() > 0:
+                                    sine_2d = sine_regularizer_update.reshape(G * R, -1).float()
+                                    sine_regularizer_abs_mean = sine_2d.abs().mean().item()
+                                    sine_regularizer_mean_row_l2 = torch.linalg.norm(sine_2d, dim=1).mean().item()
+
+                            if block_observer is not None:
+                                block_observer(
+                                    {
+                                        "block_idx": i1 // blocksize,
+                                        "col_start": i1,
+                                        "col_end": i2,
+                                        "remaining_columns": C - i2,
+                                        "remaining_grad_abs_mean": trailing_grad_abs_mean,
+                                        "remaining_grad_clipped_abs_mean": trailing_grad_clipped_abs_mean,
+                                        "remaining_grad_mean_row_l2": trailing_grad_mean_row_l2,
+                                        "second_order_update_abs_mean": second_order_abs_mean,
+                                        "second_order_update_mean_row_l2": second_order_mean_row_l2,
+                                        "second_order_update_abs_max": second_order_abs_max,
+                                        "second_order_update_abs_q99": second_order_abs_q99,
+                                        "first_order_raw_abs_mean": first_order_raw_abs_mean,
+                                        "first_order_raw_mean_row_l2": first_order_raw_mean_row_l2,
+                                        "first_order_update_abs_mean": first_order_abs_mean,
+                                        "first_order_update_mean_row_l2": first_order_mean_row_l2,
+                                        "first_order_update_abs_max": first_order_abs_max,
+                                        "first_order_update_abs_q99": first_order_abs_q99,
+                                        "regularizer_update_abs_mean": regularizer_abs_mean,
+                                        "regularizer_update_mean_row_l2": regularizer_mean_row_l2,
+                                        "sine_regularizer_update_abs_mean": sine_regularizer_abs_mean,
+                                        "sine_regularizer_update_mean_row_l2": sine_regularizer_mean_row_l2,
+                                        "mean_refresh_loss": None if refresh_meta is None else refresh_meta.get("mean_refresh_loss"),
+                                        "train_mean_refresh_loss": None if refresh_meta is None else refresh_meta.get("train_mean_refresh_loss"),
+                                        "val_mean_refresh_loss": None if refresh_meta is None else refresh_meta.get("val_mean_refresh_loss"),
+                                        "refresh_subset_mean_refresh_loss": None if refresh_meta is None else refresh_meta.get("refresh_subset_mean_refresh_loss"),
+                                        "slide_alpha": None if refresh_meta is None else refresh_meta.get("slide_alpha"),
+                                        "mean_refresh_loss_current": None if refresh_meta is None else refresh_meta.get("mean_refresh_loss_current"),
+                                        "mean_refresh_loss_next": None if refresh_meta is None else refresh_meta.get("mean_refresh_loss_next"),
+                                    }
+                                )
+
+            with profile_recorder.section("fasterquant_group_parallel.finalize") if profile_recorder else _NULL_CONTEXT:
+                Q_final = natural_order(state["Q"])
+                W_int_final = natural_order(state["W_int_sub"])
+                Scale_final = natural_order(state["Scale_sub"])
+                if export_to_et:
+                    self.layer.register_buffer(
+                        "int_weight", W_int_final.reshape(self.layer.weight.shape)
+                    )
+                    self.layer.register_buffer("scale", Scale_final)
+                self.layer.weight.data = Q_final.reshape(self.layer.weight.shape).to(
+                    self.layer.weight.data.dtype
+                )
+                if torch.any(torch.isnan(self.layer.weight.data)):
+                    logging.warning("NaN in weights")
+                    raise ValueError("NaN in weights")
+
     @torch.no_grad()
     def add_batch(self, inp: torch.Tensor, out):
         """
@@ -872,6 +1724,7 @@ class GPTQPlus:
         slide_refresh_start=0,
         slide_refresh_block_total=None,
         refresh_full_metrics=False,
+        group_parallel_mode="none",
     ):
         profile_recorder = profile_recorder or self.profile_recorder
         # Alias the recorder so call sites can do `rec and rec.save_block(...)`.
@@ -883,6 +1736,58 @@ class GPTQPlus:
             grad_gate_sharpness=grad_gate_sharpness,
             grad_gate_sine_amp=grad_gate_sine_amp,
         )
+        group_parallel_mode = (group_parallel_mode or "none").lower()
+        if group_parallel_mode not in {"none", "tensor", "rank"}:
+            raise ValueError(
+                f"Unsupported `group_parallel_mode={group_parallel_mode}`. "
+                "Expected one of: none, tensor, rank."
+            )
+        if group_parallel_mode != "none":
+            dynamic_groups = groupsize != -1 and not static_groups
+            fallback_reason = None
+            if rec is not None:
+                fallback_reason = "diagnostic recorder is active"
+            elif dynamic_groups:
+                fallback_reason = "dynamic weight groups are not supported"
+            elif not getattr(self.quantizer, "sym", True):
+                fallback_reason = "asymmetric weight quantization is not supported"
+            elif self.quantizer.bits >= 16:
+                fallback_reason = "weight quantization is disabled"
+            elif grad_reg_strategy in {"quant_error_gate", "quant_error_gate_optimized"}:
+                fallback_reason = "quantization-error gate regularizers are not supported"
+            if fallback_reason is None:
+                return self._fasterquant_group_parallel(
+                    blocksize=blocksize,
+                    percdamp=percdamp,
+                    groupsize=groupsize,
+                    actorder=actorder,
+                    static_groups=static_groups,
+                    enable_gradient_update=enable_gradient_update,
+                    g_update_mode=g_update_mode,
+                    export_to_et=export_to_et,
+                    profile_recorder=profile_recorder,
+                    gradient_refresh_fn=gradient_refresh_fn,
+                    grad_lr=grad_lr,
+                    grad_optimizer=grad_optimizer,
+                    grad_reg_strategy=grad_reg_strategy,
+                    grad_reg_lambda=grad_reg_lambda,
+                    grad_gate_floor=grad_gate_floor,
+                    grad_gate_sharpness=grad_gate_sharpness,
+                    grad_gate_sine_amp=grad_gate_sine_amp,
+                    second_order_scale=second_order_scale,
+                    block_atomic_quant=block_atomic_quant,
+                    block_observer=block_observer,
+                    grad_clip=grad_clip,
+                    slide_refresh_start=slide_refresh_start,
+                    slide_refresh_block_total=slide_refresh_block_total,
+                    refresh_full_metrics=refresh_full_metrics,
+                    group_parallel_mode=group_parallel_mode,
+                )
+            logging.warning(
+                "group_parallel_mode=%s requested but falling back to legacy fasterquant: %s",
+                group_parallel_mode,
+                fallback_reason,
+            )
         with profile_recorder.section("fasterquant.total") if profile_recorder else _NULL_CONTEXT:
             W = self.layer.weight.data.clone()
             W = W.float()
@@ -2513,6 +3418,7 @@ def collect_static_end_to_end_saliency_and_fisher(
     fp_final_store_dtype=torch.bfloat16,
     fisher_layer_ids=None,
     refined_rkl_layer_ids=None,
+    collect_saliency=True,
     collect_dynsal=False,
     dynsal_rank=16,
     dynsal_evd_thresh=1e-6,
@@ -2537,6 +3443,7 @@ def collect_static_end_to_end_saliency_and_fisher(
             "≈ H×-smaller than full refined_residual_kl per sub-A when H>>seq_len.",
             refined_rkl_num_A, str(refined_diag_rkl_store_dtype).replace("torch.", ""),
         )
+    collect_saliency = bool(collect_saliency or collect_dynsal)
     layers = analyzer.get_layers()
     # Wrap model with FSDP2 so the full-model backward fits on many small GPUs.
     # Params + grads are sharded across the current default process group; each
@@ -2596,10 +3503,13 @@ def collect_static_end_to_end_saliency_and_fisher(
                     )
                 normalized_module_dict[canonical_name] = module
             module_dicts.append(normalized_module_dict)
-    saliency_data = [
-        {module_name: [] for module_name in module_dict.keys()}
-        for module_dict in module_dicts
-    ]
+    saliency_data = (
+        [
+            {module_name: [] for module_name in module_dict.keys()}
+            for module_dict in module_dicts
+        ]
+        if collect_saliency else None
+    )
     fisher_data = [None for _ in layers]
     # Any refined-rkl variant reuses the same num_A / samples_per_A partitioning
     # and the shared dy capture at the last transformer block's output.
@@ -2758,9 +3668,10 @@ def collect_static_end_to_end_saliency_and_fisher(
                     # (batch * seq * NG elements per hook call), so negligible.
                     cap = torch.quantile(flat, saliency_clip_percentile)
                     sal_per_group = torch.clamp(sal_per_group, max=cap)
-                saliency_data[layer_idx][module_name].append(
-                    sal_per_group.detach().cpu()
-                )
+                if collect_saliency:
+                    saliency_data[layer_idx][module_name].append(
+                        sal_per_group.detach().cpu()
+                    )
                 # --- dynsal branch: streaming randomized SVD sketch ---
                 # `grad` is produced by a scalar loss that is summed over output
                 # samples/tokens. Rows below are middle-layer tokens; the sketch is
@@ -2954,11 +3865,12 @@ def collect_static_end_to_end_saliency_and_fisher(
     for layer_idx, (layer, module_dict) in enumerate(zip(layers, module_dicts)):
         if collect_fisher and (fisher_layer_ids is None or layer_idx in fisher_layer_ids):
             handles.append(layer.register_forward_hook(make_layer_hook(layer_idx)))
-        for module_name, module in module_dict.items():
-            # `make_module_hook` handles both saliency and (if collect_dynsal)
-            # dynsal G^T G accumulation in a single grad hook to share the fp32
-            # cast and halve the number of grad-hook invocations per backward.
-            handles.append(module.register_forward_hook(make_module_hook(layer_idx, module_name)))
+        if collect_saliency:
+            for module_name, module in module_dict.items():
+                # `make_module_hook` handles both saliency and (if collect_dynsal)
+                # dynsal G^T G accumulation in a single grad hook to share the fp32
+                # cast and halve the number of grad-hook invocations per backward.
+                handles.append(module.register_forward_hook(make_module_hook(layer_idx, module_name)))
     if _collect_any_refined:
         # Register the last-layer "dy capture" hook FIRST in the hook list so
         # it runs first in the forward pass; that way `register_hook` attaches
@@ -3532,19 +4444,20 @@ def collect_static_end_to_end_saliency_and_fisher(
         static_fisher = []
         for layer_idx, module_dict in enumerate(module_dicts):
             layer_saliency = {}
-            for module_name in module_dict.keys():
-                if not saliency_data[layer_idx][module_name]:
-                    raise ValueError(
-                        f"Failed to collect static end-to-end saliency for layer={layer_idx} module={module_name}."
-                    )
-                # Rank-local shard of shape (n_local, T, G). Not gathered.
-                layer_saliency[module_name] = torch.cat(saliency_data[layer_idx][module_name], dim=0)
-                # Free the per-batch chunks right after concat. Otherwise both
-                # the list (~14 GB for 8B across all layers) AND the catted
-                # tensor (~14 GB) are alive simultaneously until function exit,
-                # which adds a transient 14 GB CPU peak right at the boundary
-                # where the quant phase also starts allocating inps/fp_inps.
-                saliency_data[layer_idx][module_name] = None
+            if collect_saliency:
+                for module_name in module_dict.keys():
+                    if not saliency_data[layer_idx][module_name]:
+                        raise ValueError(
+                            f"Failed to collect static end-to-end saliency for layer={layer_idx} module={module_name}."
+                        )
+                    # Rank-local shard of shape (n_local, T, G). Not gathered.
+                    layer_saliency[module_name] = torch.cat(saliency_data[layer_idx][module_name], dim=0)
+                    # Free the per-batch chunks right after concat. Otherwise both
+                    # the list (~14 GB for 8B across all layers) AND the catted
+                    # tensor (~14 GB) are alive simultaneously until function exit,
+                    # which adds a transient 14 GB CPU peak right at the boundary
+                    # where the quant phase also starts allocating inps/fp_inps.
+                    saliency_data[layer_idx][module_name] = None
             static_saliency.append(layer_saliency)
             if collect_fisher:
                 want_fisher_this_layer = (
@@ -3565,8 +4478,22 @@ def collect_static_end_to_end_saliency_and_fisher(
                     # Token count: derive from the already-catted saliency tensor
                     # rather than from the per-batch chunks (which we freed above
                     # to cut a 14 GB transient CPU peak). Same value either way.
-                    _any_cat = next(iter(layer_saliency.values()))
-                    local_tokens = int(_any_cat.shape[0] * _any_cat.shape[1])
+                    if collect_saliency:
+                        _any_cat = next(iter(layer_saliency.values()))
+                        local_tokens = int(_any_cat.shape[0] * _any_cat.shape[1])
+                    else:
+                        token_batches = [batch[0] for batch in dataloader]
+                        eff_seq_len = max(1, token_batches[0].shape[1] - max(0, sink_size))
+                        local_tokens = sum(
+                            int(batch.shape[0] * eff_seq_len)
+                            for batch in token_batches[
+                                dist_utils.shard_slice(
+                                    len(token_batches),
+                                    dist_utils.get_rank(),
+                                    dist_utils.get_world_size(),
+                                )
+                            ]
+                        )
                     total_tokens = dist_utils.allreduce_sum_scalar(local_tokens)
                     static_fisher.append((fisher_sum / float(total_tokens)).to(torch.bfloat16).cpu())
                     # Release the per-layer GPU fp32 Fisher immediately. For
@@ -7252,6 +8179,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             slide_refresh_start=slide_refresh_cursor,
                             slide_refresh_block_total=slide_refresh_block_total,
                             refresh_full_metrics=bool(getattr(args, "refresh_full_metrics", False)),
+                            group_parallel_mode=getattr(args, "group_parallel_quant", "none"),
                         )
                         slide_refresh_cursor += slide_refreshes_per_module[name]
                         # DP correctness check (debug only): fasterquant is meant

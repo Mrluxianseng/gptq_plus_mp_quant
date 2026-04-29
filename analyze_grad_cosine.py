@@ -1,9 +1,9 @@
 # coding=utf-8
 """Gradient cosine diagnostic for Fisher-matrix / residual_kl surrogates.
 
-Runs a full GPTQ+ quantization pass (rotate + w_clip + act_order, aligned with
-scripts/gptq_plus_lr_sweep.sh) and, after each transformer block in
-`--target_layers` is quantized, measures the cosine similarity between:
+Runs a reference quantization pass selected by `--analysis_quant_method`
+(default: RTN) and, after each transformer block in `--target_layers` is
+quantized, measures the cosine similarity between:
   * true KL gradient wrt this layer's linear weights (end-to-end backward)
   * Fisher-matrix surrogate gradient
   * residual_kl  surrogate gradient
@@ -16,8 +16,9 @@ averaged across batches. Measurement runs immediately after the target layer is
 quantized: upstream layers and the target layer are quantized, downstream layers
 are still FP.
 
-The production GPTQ+ path only sees a default-off analysis hook. Normal
-quantization runs do not collect these diagnostic gradients.
+The production GPTQ+ path only sees a default-off analysis hook. The RTN
+reference path is implemented inside this diagnostic. Normal quantization runs
+do not collect these diagnostic gradients.
 """
 
 import os
@@ -43,7 +44,9 @@ from utils import (
 )
 from gptq_utils.gptq_plus_utils import gptq_fwrd as gptq_plus_fwrd
 from gptq_utils.gptq_plus_utils import (
+    clip_module_weight_to_quant_bounds_,
     collect_layer_output_grad_for_refined_mse,
+    collect_static_end_to_end_saliency_and_fisher,
     compute_refresh_loss,
     hidden2logits,
     temporary_requires_grad,
@@ -218,6 +221,120 @@ def _summarize_loss_series(per_loss_values):
     return summary
 
 
+def _tensor_stats(values):
+    t = torch.tensor(values, dtype=torch.float32)
+    return (
+        t.mean().item(),
+        t.std(unbiased=False).item() if t.numel() > 1 else 0.0,
+    )
+
+
+_ENTRY_SERIES_TO_STATS = {
+    "per_batch_true_kl_grad_norm": ("true_kl_grad_norm_mean", None),
+    "per_batch_reg_cos": ("reg_cos_mean", "reg_cos_std"),
+    "per_batch_fisher": ("fisher_mean", "fisher_std"),
+    "per_batch_fisher_grad_norm": ("fisher_grad_norm_mean", None),
+    "per_batch_residual_kl": ("residual_kl_mean", "residual_kl_std"),
+    "per_batch_residual_kl_grad_norm": ("residual_kl_grad_norm_mean", None),
+    "per_batch_refined_residual_kl": (
+        "refined_residual_kl_mean", "refined_residual_kl_std",
+    ),
+    "per_batch_refined_residual_kl_grad_norm": (
+        "refined_residual_kl_grad_norm_mean", None,
+    ),
+    "per_batch_refined_diag_residual_kl": (
+        "refined_diag_residual_kl_mean", "refined_diag_residual_kl_std",
+    ),
+    "per_batch_refined_diag_residual_kl_grad_norm": (
+        "refined_diag_residual_kl_grad_norm_mean", None,
+    ),
+    "per_batch_refined_mse": ("refined_mse_mean", "refined_mse_std"),
+    "per_batch_refined_mse_grad_norm": ("refined_mse_grad_norm_mean", None),
+    "per_batch_layer_mse": ("layer_mse_mean", "layer_mse_std"),
+    "per_batch_layer_mse_grad_norm": ("layer_mse_grad_norm_mean", None),
+    "per_batch_module_mse": ("module_mse_mean", "module_mse_std"),
+    "per_batch_module_mse_grad_norm": ("module_mse_grad_norm_mean", None),
+}
+for _loss_name in _LOSS_REPORT_ORDER:
+    _ENTRY_SERIES_TO_STATS[f"per_batch_{_loss_name}_combined_cos"] = (
+        f"{_loss_name}_combined_cos_mean",
+        f"{_loss_name}_combined_cos_std",
+    )
+    _ENTRY_SERIES_TO_STATS[f"per_batch_{_loss_name}_combined_grad_norm"] = (
+        f"{_loss_name}_combined_grad_norm_mean",
+        None,
+    )
+
+
+def _merge_cosine_results_across_ranks(per_rank_results):
+    merged = {}
+    for rank_result in per_rank_results:
+        if not rank_result:
+            continue
+        for layer_idx, per_layer in rank_result.items():
+            layer_out = merged.setdefault(layer_idx, {})
+            for module_name, entry in per_layer.items():
+                out_entry = layer_out.setdefault(module_name, {})
+                for key, value in entry.items():
+                    if key.startswith("per_batch_"):
+                        out_entry.setdefault(key, []).extend(list(value))
+                    elif key not in out_entry:
+                        out_entry[key] = value
+    for per_layer in merged.values():
+        for entry in per_layer.values():
+            true_norms = entry.get("per_batch_true_kl_grad_norm", [])
+            entry["n_batches"] = len(true_norms)
+            for per_batch_key, (mean_key, std_key) in _ENTRY_SERIES_TO_STATS.items():
+                values = entry.get(per_batch_key, [])
+                if not values:
+                    continue
+                mean, std = _tensor_stats(values)
+                entry[mean_key] = mean
+                if std_key is not None:
+                    entry[std_key] = std
+            if not entry.get("reg_enabled", False):
+                entry["reg_cos_mean"] = float("nan")
+                entry["reg_cos_std"] = float("nan")
+                entry.setdefault("per_batch_reg_cos", [])
+    return merged
+
+
+def _merge_layer_losses_across_ranks(per_rank_losses):
+    merged_values = {}
+    for rank_losses in per_rank_losses:
+        if not rank_losses:
+            continue
+        for layer_idx, per_loss in rank_losses.items():
+            layer_out = merged_values.setdefault(layer_idx, {})
+            for loss_name, stats in per_loss.items():
+                layer_out.setdefault(loss_name, []).extend(stats.get("per_batch", []))
+    merged = {}
+    for layer_idx, per_loss in merged_values.items():
+        merged[layer_idx] = _summarize_loss_series(per_loss)
+    return merged
+
+
+def _gather_analysis_results(cosine_results, layer_loss_results):
+    if not dist.is_available() or not dist.is_initialized() or dist.get_world_size() == 1:
+        return cosine_results, layer_loss_results
+    payload = {
+        "cosine_results": cosine_results,
+        "layer_loss_results": layer_loss_results,
+    }
+    gathered = [None for _ in range(dist.get_world_size())]
+    dist.all_gather_object(gathered, payload)
+    if not dist_utils.is_main():
+        return cosine_results, layer_loss_results
+    return (
+        _merge_cosine_results_across_ranks(
+            [item["cosine_results"] for item in gathered if item is not None]
+        ),
+        _merge_layer_losses_across_ranks(
+            [item["layer_loss_results"] for item in gathered if item is not None]
+        ),
+    )
+
+
 def _format_layer_loss_summary(loss_summary):
     bits = []
     for loss_name in _LOSS_REPORT_ORDER:
@@ -344,6 +461,7 @@ def run_cosine_measurement(
     position_embeddings,
     measure_samples,
     measure_batch_size,
+    sample_offset=0,
     kl_topk,
     dev,
     measure_losses,
@@ -637,10 +755,11 @@ def run_cosine_measurement(
                 # Pick the sub-A that owns this batch's samples. We enforce
                 # `samples_per_A % measure_batch_size == 0` above so the batch
                 # sits fully inside one bucket.
-                a_idx = 0 if samples_per_A <= 0 else (start // samples_per_A)
+                global_start = int(sample_offset) + start
+                a_idx = 0 if samples_per_A <= 0 else (global_start // samples_per_A)
                 if a_idx >= len(refined_A_list):
                     raise RuntimeError(
-                        f"refined_rkl: batch start={start} resolves to a_idx={a_idx} "
+                        f"refined_rkl: global batch start={global_start} resolves to a_idx={a_idx} "
                         f"which exceeds num_A={len(refined_A_list)}."
                     )
                 refined_A_slot = refined_A_list[a_idx]
@@ -670,10 +789,11 @@ def run_cosine_measurement(
             # ---------- (5) refined_diag_residual_kl ----------
             grads_refined_diag = None
             if has_refined_diag:
-                a_idx_d = 0 if samples_per_A <= 0 else (start // samples_per_A)
+                global_start = int(sample_offset) + start
+                a_idx_d = 0 if samples_per_A <= 0 else (global_start // samples_per_A)
                 if a_idx_d >= len(refined_diag_A_list):
                     raise RuntimeError(
-                        f"refined_diag_rkl: batch start={start} resolves to "
+                        f"refined_diag_rkl: global batch start={global_start} resolves to "
                         f"a_idx={a_idx_d} which exceeds num_A={len(refined_diag_A_list)}."
                     )
                 refined_diag_slot = refined_diag_A_list[a_idx_d]
@@ -1039,6 +1159,7 @@ def _collect_refined_mse_state_for_loss_report(
     position_ids,
     position_embeddings,
     dev,
+    measure_samples_local,
 ):
     import random as _rng_mod
 
@@ -1047,19 +1168,30 @@ def _collect_refined_mse_state_for_loss_report(
         raise ValueError(
             f"num_samples_for_refined_mse must be > 0 when measuring refined_mse, got {n_pool}."
         )
+    n_pool = min(n_pool, measure_samples_local, inps.shape[0])
+    if n_pool % args.measure_batch_size != 0:
+        n_pool = (n_pool // args.measure_batch_size) * args.measure_batch_size
+    if n_pool <= 0:
+        raise ValueError(
+            "num_samples_for_refined_mse is smaller than the local measurement "
+            f"batch size ({args.measure_batch_size}) after DP sharding."
+        )
     if n_pool > inps.shape[0]:
         raise ValueError(
             f"num_samples_for_refined_mse ({n_pool}) exceeds calibration pool ({inps.shape[0]})."
         )
-    rm_bwd_bsz = args.global_loss_bsz
+    rm_bwd_bsz = max(1, args.global_loss_bsz // max(dist_utils.get_world_size(), 1))
+    rm_bwd_bsz = min(rm_bwd_bsz, n_pool)
+    if n_pool % rm_bwd_bsz != 0:
+        rm_bwd_bsz = args.measure_batch_size
     if n_pool % rm_bwd_bsz != 0:
         raise ValueError(
             f"num_samples_for_refined_mse ({n_pool}) must be divisible by "
-            f"global_loss_bsz ({rm_bwd_bsz})."
+            f"local refined-mse backward batch size ({rm_bwd_bsz})."
         )
 
     rng = _rng_mod.Random(args.seed + layer_idx)
-    sample_ids_local = sorted(rng.sample(range(inps.shape[0]), n_pool))
+    sample_ids_local = sorted(rng.sample(range(measure_samples_local), n_pool))
     (
         refined_mse_grad_pool,
         refined_mse_mean_grad,
@@ -1105,6 +1237,7 @@ def measure_layer_losses_after_quant(
     position_embeddings,
     measure_samples,
     measure_batch_size,
+    sample_offset=0,
     kl_topk,
     dev,
     measure_losses,
@@ -1218,7 +1351,8 @@ def measure_layer_losses_after_quant(
             per_loss_values["residual_kl"].append(loss.item())
         if has_refined:
             refined_A = _select_refined_A_for_batch(
-                refined_A_list, samples_per_A, start, "refined_residual_kl",
+                refined_A_list, samples_per_A, int(sample_offset) + start,
+                "refined_residual_kl",
             ).to(dev)
             loss = compute_refresh_loss(
                 refresh_loss_type="refined_residual_kl",
@@ -1234,7 +1368,7 @@ def measure_layer_losses_after_quant(
             del refined_A
         if has_refined_diag:
             refined_diag_A = _select_refined_A_for_batch(
-                refined_diag_A_list, samples_per_A, start,
+                refined_diag_A_list, samples_per_A, int(sample_offset) + start,
                 "refined_diag_residual_kl",
             ).to(dev)
             loss = compute_refresh_loss(
@@ -1348,55 +1482,29 @@ def measure_layer_losses_after_quant(
 
 
 # ---------------------------------------------------------------------------
-# main pipeline — GPTQ+ per-layer hook with measurement
+# analysis hook shared by reference quantization paths
 # ---------------------------------------------------------------------------
 
-@torch.no_grad()
-def quantize_and_measure(args, analyzer, trainloader, dev, target_layers, measure_losses):
-    logging.info("----- GPTQ+ + grad-cosine analysis -----")
-    if getattr(args, "w_method", None) != "gptq_plus":
-        logging.info(
-            "analyze_grad_cosine uses GPTQ+ as the reference quantization path; "
-            "overriding w_method=%s -> gptq_plus.",
-            getattr(args, "w_method", None),
-        )
-        args.w_method = "gptq_plus"
-    layers = analyzer.get_layers()
-    cosine_results = {}
-    layer_loss_results = {}
+def _build_cosine_analysis_hook(
+    *,
+    args,
+    analyzer,
+    layers,
+    target_layers,
+    measure_losses,
+    measure_samples_local,
+    sample_offset,
+    dev,
+    cosine_results,
+    layer_loss_results,
+):
     fp_module_outputs_by_layer = {}
-
     refined_rkl_num_A = int(getattr(args, "refined_rkl_num_A", 1))
     samples_per_A = (
         args.nsamples // refined_rkl_num_A
         if refined_rkl_num_A > 0 else args.nsamples
     )
-    want_fisher = "fisher_diag_mse" in measure_losses or "refined_mse" in measure_losses
-    want_refined_full = "refined_residual_kl" in measure_losses
-    want_refined_diag = "refined_diag_residual_kl" in measure_losses
     want_module_mse = "module_mse" in measure_losses
-    need_fp_final = bool(
-        target_layers
-        or measure_losses.intersection(
-            {"residual_kl", "refined_residual_kl", "refined_diag_residual_kl", "refined_mse"}
-        )
-    )
-    if (want_fisher or want_refined_full or want_refined_diag) and not args.global_loss:
-        logging.info(
-            "analyze_grad_cosine requires GPTQ+ global static stats for selected losses; "
-            "forcing --global_loss for this diagnostic run."
-        )
-        args.global_loss = True
-    if want_module_mse and args.measure_samples % args.measure_batch_size != 0:
-        raise ValueError(
-            f"measure_samples ({args.measure_samples}) must be divisible by "
-            f"measure_batch_size ({args.measure_batch_size}) for module_mse."
-        )
-    if args.measure_samples > args.nsamples:
-        raise ValueError(
-            f"measure_samples ({args.measure_samples}) must be <= nsamples "
-            f"({args.nsamples})."
-        )
 
     def _layer_grad_clip(layer_idx):
         final_layer_idx = len(layers) - 1
@@ -1422,13 +1530,14 @@ def quantize_and_measure(args, analyzer, trainloader, dev, target_layers, measur
             position_ids=payload["position_ids"],
             position_embeddings=payload["position_embeddings"],
             dev=payload["dev"],
+            measure_samples_local=measure_samples_local,
         )
 
     def _log_layer_summary(layer_idx, layer_loss_summary):
         logging.info(
-            "Layer %d loss after quantization (batch-avg over %d samples): %s",
+            "Layer %d loss after quantization (rank-local batch-avg over %d samples): %s",
             layer_idx,
-            args.measure_samples,
+            measure_samples_local,
             _format_layer_loss_summary(layer_loss_summary),
         )
 
@@ -1488,7 +1597,7 @@ def quantize_and_measure(args, analyzer, trainloader, dev, target_layers, measur
                     attention_mask=payload["attention_mask"],
                     position_ids=payload["position_ids"],
                     position_embeddings=payload["position_embeddings"],
-                    measure_samples=args.measure_samples,
+                    measure_samples=measure_samples_local,
                     measure_batch_size=args.measure_batch_size,
                     dev=payload["dev"],
                 )
@@ -1536,12 +1645,13 @@ def quantize_and_measure(args, analyzer, trainloader, dev, target_layers, measur
                         fisher_tensor=payload["static_fisher_by_layer"][layer_idx],
                         refined_A_list=refined_A_list_i,
                         refined_diag_A_list=refined_diag_A_list_i,
-                        samples_per_A=payload["samples_per_A"],
+                        samples_per_A=payload.get("samples_per_A", samples_per_A),
                         attention_mask=payload["attention_mask"],
                         position_ids=payload["position_ids"],
                         position_embeddings=payload["position_embeddings"],
-                        measure_samples=args.measure_samples,
+                        measure_samples=measure_samples_local,
                         measure_batch_size=args.measure_batch_size,
+                        sample_offset=sample_offset,
                         kl_topk=args.kl_topk,
                         dev=payload["dev"],
                         measure_losses=measure_losses,
@@ -1558,7 +1668,7 @@ def quantize_and_measure(args, analyzer, trainloader, dev, target_layers, measur
                 layer_loss_results[layer_idx] = layer_loss_summary
                 _log_layer_summary(layer_idx, layer_loss_summary)
                 logging.info(
-                    "Layer %d cosine+grad-norm (batch-avg): %s",
+                    "Layer %d cosine+grad-norm (rank-local batch-avg): %s",
                     layer_idx,
                     ", ".join(
                         _fmt_entry(n, r)
@@ -1592,12 +1702,13 @@ def quantize_and_measure(args, analyzer, trainloader, dev, target_layers, measur
                 fisher_tensor=payload["static_fisher_by_layer"][layer_idx],
                 refined_A_list=refined_A_list_i,
                 refined_diag_A_list=refined_diag_A_list_i,
-                samples_per_A=payload["samples_per_A"],
+                samples_per_A=payload.get("samples_per_A", samples_per_A),
                 attention_mask=payload["attention_mask"],
                 position_ids=payload["position_ids"],
                 position_embeddings=payload["position_embeddings"],
-                measure_samples=args.measure_samples,
+                measure_samples=measure_samples_local,
                 measure_batch_size=args.measure_batch_size,
+                sample_offset=sample_offset,
                 kl_topk=args.kl_topk,
                 dev=payload["dev"],
                 measure_losses=measure_losses,
@@ -1611,9 +1722,625 @@ def quantize_and_measure(args, analyzer, trainloader, dev, target_layers, measur
             memory_utils.cleanup_memory()
         return None
 
+    def _clear():
+        fp_module_outputs_by_layer.clear()
+
+    return _analysis_hook, _clear
+
+
+# ---------------------------------------------------------------------------
+# reference quantization helpers
+# ---------------------------------------------------------------------------
+
+def _apply_rtn_quant_to_module(args, module):
+    quantizer = quant_utils.WeightQuantizer()
+    quantizer.configure(
+        args.w_bits,
+        perchannel=True,
+        sym=not args.w_asym,
+        mse=args.w_clip,
+        weight_groupsize=args.w_groupsize,
+    )
+    W = module.weight.data
+    quantizer.find_params(W)
+    q, _int_weight, _scale = quantizer.fake_quantize(W)
+    module.weight.data = q.to(module.weight.data.dtype)
+    return quantizer.cpu()
+
+
+def _collect_layer_hessians_for_reg(args, analyzer, layer, inps, attention_mask,
+                                    position_ids, position_embeddings, dev):
+    if getattr(args, "grad_reg_strategy", "none") != "hessian" or getattr(args, "grad_reg_lambda", 0.0) <= 0:
+        return None
+    hessians = {}
+    modules = _canonical_module_dict(analyzer, layer)
+    accum = {name: None for name in modules}
+    counts = {name: 0 for name in modules}
+    handles = []
+
+    def _hook(name):
+        def _tmp(_module, inp, _out):
+            x = inp[0].detach()
+            if x.dim() == 3:
+                x = x.reshape(-1, x.shape[-1])
+            elif x.dim() == 2:
+                pass
+            else:
+                raise RuntimeError(
+                    f"hessian regularizer capture expected 2D/3D input for {name}, "
+                    f"got {tuple(x.shape)}."
+                )
+            x = x.float()
+            block = x.t().matmul(x)
+            if accum[name] is None:
+                accum[name] = block
+            else:
+                accum[name].add_(block)
+            counts[name] += int(x.shape[0])
+        return _tmp
+
+    for name, module in modules.items():
+        handles.append(module.register_forward_hook(_hook(name)))
+    try:
+        bsz = int(getattr(args, "bsz", 1))
+        bsz = max(1, min(bsz, inps.shape[0]))
+        with disable_fp_path_quant(layer):
+            for start in range(0, inps.shape[0], bsz):
+                cur_bsz = min(bsz, inps.shape[0] - start)
+                b_attn, b_pos_ids, b_pos_emb = _expand_batch_kwargs(
+                    attention_mask, position_ids, position_embeddings, cur_bsz,
+                )
+                _ = _layer_out(layer(
+                    inps[start:start + cur_bsz].to(dev),
+                    attention_mask=b_attn,
+                    position_ids=b_pos_ids,
+                    position_embeddings=b_pos_emb,
+                ))
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    for name, block in accum.items():
+        if block is None or counts[name] <= 0:
+            raise RuntimeError(f"Failed to collect hessian regularizer state for {name}.")
+        dist_utils.allreduce_sum_(block)
+        total_count = dist_utils.allreduce_sum_scalar(counts[name])
+        hessians[name] = (block / float(total_count)).detach().cpu()
+    return hessians
+
+
+def _load_or_collect_static_analysis_stats(
+    *,
+    args,
+    analyzer,
+    trainloader,
+    dev,
+    layers,
+    want_fisher,
+    want_refined_full,
+    want_refined_diag,
+    need_fp_final,
+):
+    model = analyzer.model
+    if (
+        bool(getattr(args, "global_loss", False))
+        and bool(getattr(args, "static_cache_path", None))
+    ):
+        static_cache_dir = getattr(args, "static_cache_path", None)
+    else:
+        static_cache_dir = None
+
+    static_cache_file = None
+    if static_cache_dir is not None:
+        import hashlib
+
+        dataset_id = getattr(args, "dataset", "unknown")
+        rotate_flag = int(bool(getattr(args, "rotate", False)))
+        rkl_na = int(getattr(args, "refined_rkl_num_A", 1))
+        sink_size = (
+            int(getattr(args, "attention_sink_size", 256))
+            if bool(getattr(args, "ignore_attention_sink", False))
+            else 0
+        )
+        key_bits = [
+            getattr(args, "model_name", "model"),
+            dataset_id,
+            f"s{args.nsamples}",
+            f"blk{args.seq_len}",
+            f"rot{rotate_flag}",
+            f"g{args.num_groups}",
+            f"ghtk{args.grad_hessian_topk}",
+            f"glbsz{args.global_loss_bsz}",
+            f"seed{args.seed}",
+            f"salclip{getattr(args, 'saliency_clip_percentile', 0.99)}",
+            f"rklNA{rkl_na}",
+            f"fisher{int(want_fisher)}",
+            f"rkl{int(want_refined_full)}",
+            f"diagrkl{int(want_refined_diag)}",
+            f"fpfinal{int(need_fp_final)}",
+            f"sink{sink_size}",
+            f"world{dist_utils.get_world_size()}",
+            f"rank{dist_utils.get_rank()}",
+        ]
+        key = "anagrad_" + hashlib.sha1("|".join(map(str, key_bits)).encode()).hexdigest()
+        os.makedirs(static_cache_dir, exist_ok=True)
+        static_cache_file = os.path.join(static_cache_dir, f"{key}.pt")
+        if os.path.exists(static_cache_file):
+            logging.info("Loading analyze static fisher/fp-final cache from %s", static_cache_file)
+            loaded = torch.load(static_cache_file, map_location="cpu", weights_only=True)
+            static_fisher_by_layer = loaded["fisher"]
+            static_refined_A_by_layer = loaded.get("refined_A", None)
+            static_refined_diag_A_by_layer = loaded.get("refined_diag_A", None)
+            fp_inps_final_cpu = loaded.get("fp_inps_final", None)
+            if want_fisher and not static_fisher_by_layer:
+                raise RuntimeError(
+                    f"Cached analyze stats at {static_cache_file} do not contain fisher."
+                )
+            if want_refined_full and not static_refined_A_by_layer:
+                raise RuntimeError(
+                    f"Cached analyze stats at {static_cache_file} do not contain refined_A."
+                )
+            if want_refined_diag and not static_refined_diag_A_by_layer:
+                raise RuntimeError(
+                    f"Cached analyze stats at {static_cache_file} do not contain refined_diag_A."
+                )
+            if need_fp_final and fp_inps_final_cpu is None:
+                raise RuntimeError(
+                    f"Cached analyze stats at {static_cache_file} do not contain fp_inps_final."
+                )
+            del loaded
+            return (
+                static_fisher_by_layer,
+                static_refined_A_by_layer,
+                static_refined_diag_A_by_layer,
+                fp_inps_final_cpu,
+            )
+
+    if want_fisher or want_refined_full or want_refined_diag or need_fp_final:
+        logging.info("Collecting analyze static fisher/fp-final caches for reference quantization.")
+        (
+            _static_saliency_unused,
+            static_fisher_by_layer,
+            static_refined_A_by_layer,
+            static_refined_diag_A_by_layer,
+            fp_inps_final_cpu,
+            _static_dynsal_unused,
+        ) = collect_static_end_to_end_saliency_and_fisher(
+            model=model,
+            analyzer=analyzer,
+            dataloader=trainloader,
+            dev=dev,
+            saliency_num_groups=args.num_groups,
+            grad_hessian_topk=args.grad_hessian_topk,
+            batch_size=args.global_loss_bsz,
+            collect_fisher=want_fisher,
+            collect_refined_rkl=want_refined_full,
+            refined_rkl_damp=getattr(args, "refined_rkl_damp", 0.01),
+            refined_rkl_num_A=int(getattr(args, "refined_rkl_num_A", 1)),
+            collect_refined_diag_rkl=want_refined_diag,
+            use_fsdp=bool(getattr(args, "fsdp_precompute", False)),
+            fsdp_cpu_offload=bool(getattr(args, "fsdp_cpu_offload", False)),
+            saliency_clip_percentile=getattr(args, "saliency_clip_percentile", 0.99),
+            capture_fp_final=need_fp_final,
+            collect_saliency=False,
+            collect_dynsal=False,
+            sink_size=(
+                int(getattr(args, "attention_sink_size", 256))
+                if bool(getattr(args, "ignore_attention_sink", False))
+                else 0
+            ),
+        )
+        if bool(getattr(args, "exit_after_precompute", False)):
+            logging.info(
+                "exit_after_precompute=1 -> finished analyze static precompute, exiting."
+            )
+            if dist.is_initialized():
+                dist.barrier()
+                dist.destroy_process_group()
+            raise SystemExit(0)
+    else:
+        static_fisher_by_layer = [None] * len(layers)
+        static_refined_A_by_layer = None
+        static_refined_diag_A_by_layer = None
+        fp_inps_final_cpu = None
+
+    if static_cache_file is not None:
+        logging.info("Saving analyze static fisher/fp-final cache to %s", static_cache_file)
+        payload = {"fisher": static_fisher_by_layer}
+        if static_refined_A_by_layer is not None:
+            payload["refined_A"] = static_refined_A_by_layer
+        if static_refined_diag_A_by_layer is not None:
+            payload["refined_diag_A"] = static_refined_diag_A_by_layer
+        if fp_inps_final_cpu is not None:
+            payload["fp_inps_final"] = fp_inps_final_cpu
+        torch.save(payload, static_cache_file)
+        del payload
+
+    return (
+        static_fisher_by_layer,
+        static_refined_A_by_layer,
+        static_refined_diag_A_by_layer,
+        fp_inps_final_cpu,
+    )
+
+
+@torch.no_grad()
+def _rtn_fwrd_with_analysis(
+    args,
+    analyzer,
+    trainloader,
+    dev,
+    analysis_hook,
+    *,
+    want_fisher,
+    want_refined_full,
+    want_refined_diag,
+    need_fp_final,
+):
+    logging.info("-----RTN + grad-cosine analysis quantization-----")
+    model = analyzer.model
+    use_cache = model.config.use_cache
+    model.config.use_cache = False
+    layers = analyzer.get_layers()
+    orig_device = next(model.parameters()).device
+    if args.offload_inps:
+        raise NotImplementedError(
+            "analyze_grad_cosine --analysis_quant_method=rtn does not support "
+            "--offload_inps yet. Disable offload_inps or use gptq_plus."
+        )
+    if bool(getattr(args, "act_quant_aware_gptq", False)) or bool(
+        getattr(args, "k_cache_quant_aware_gptq", False)
+    ):
+        raise ValueError(
+            "RTN reference quantization in analyze_grad_cosine does not support "
+            "act/K-cache quant-aware GPTQ options."
+        )
+
+    if not getattr(args, "global_loss", False):
+        logging.info(
+            "analyze_grad_cosine RTN reference needs static end-to-end stats for "
+            "the selected losses; forcing --global_loss for this diagnostic run."
+        )
+        args.global_loss = True
+
+    (
+        static_fisher_by_layer,
+        static_refined_A_by_layer,
+        static_refined_diag_A_by_layer,
+        fp_inps_final_cpu,
+    ) = _load_or_collect_static_analysis_stats(
+        args=args,
+        analyzer=analyzer,
+        trainloader=trainloader,
+        dev=dev,
+        layers=layers,
+        want_fisher=want_fisher,
+        want_refined_full=want_refined_full,
+        want_refined_diag=want_refined_diag,
+        need_fp_final=need_fp_final,
+    )
+
+    per_layer_runtime_modules = list(analyzer.get_pre_block_modules())
+    per_layer_runtime_modules.extend(
+        [analyzer.get_layernorm_before_head(), analyzer.get_lm_head()]
+    )
+    for module in per_layer_runtime_modules:
+        module.to(dev)
+    layers[0] = layers[0].to(dev)
+
+    dtype = next(iter(model.parameters())).dtype
+    dp_world = dist_utils.get_world_size()
+    dp_rank = dist_utils.get_rank()
+    if args.nsamples % dp_world != 0:
+        raise ValueError(
+            f"nsamples ({args.nsamples}) must be divisible by world_size ({dp_world}) for DP."
+        )
+    n_local = args.nsamples // dp_world
+    dp_shard = slice(dp_rank * n_local, (dp_rank + 1) * n_local)
+    inps = torch.zeros(
+        (n_local, model.seqlen, model.config.hidden_size),
+        dtype=dtype,
+        device=dev,
+    )
+    cache = {"global_i": 0, "attention_mask": None}
+
+    class Catcher(nn.Module):
+        def __init__(self, module):
+            super().__init__()
+            self.module = module
+            if hasattr(module, "attention_type"):
+                self.attention_type = module.attention_type
+
+        def forward(self, inp, **kwargs):
+            global_i = cache["global_i"]
+            if dp_shard.start <= global_i < dp_shard.stop:
+                inps[global_i - dp_shard.start] = inp
+            cache["global_i"] += 1
+            cache["attention_mask"] = kwargs["attention_mask"]
+            cache["position_ids"] = kwargs["position_ids"]
+            cache["position_embeddings"] = kwargs["position_embeddings"]
+            raise ValueError
+
+    layers[0] = Catcher(layers[0])
+    for batch in trainloader:
+        try:
+            model(batch[0].to(dev))
+        except ValueError:
+            pass
+    layers[0] = layers[0].module
+    layers[0] = layers[0].to(orig_device)
+    memory_utils.cleanup_memory(False)
+
+    attention_mask = cache["attention_mask"]
+    position_ids = cache["position_ids"]
+    position_embeddings = cache["position_embeddings"]
+    fp_inps = inps.clone()
+    fp_inps_final = (
+        None
+        if fp_inps_final_cpu is None
+        else fp_inps_final_cpu.to(device=fp_inps.device, dtype=fp_inps.dtype)
+    )
+    fp_inps_final_cpu = None
+
+    quantizers = {}
+    refined_rkl_num_A = int(getattr(args, "refined_rkl_num_A", 1))
+    samples_per_A = (
+        args.nsamples // refined_rkl_num_A
+        if refined_rkl_num_A > 1 else 0
+    )
+    preclip_enabled = bool(args.w_clip and getattr(args, "pre_clip", True))
+
+    pbar = tqdm(range(len(layers)), ncols=120, desc="RTN Quantizing Layers", position=0)
+    for i in pbar:
+        layer = layers[i].to(dev)
+        full = analyzer.get_quantizable_modules(layer)
+        analysis_is_target = bool(analysis_hook("before_layer", {
+            "args": args,
+            "analyzer": analyzer,
+            "layer": layer,
+            "layer_idx": i,
+            "layers": layers,
+            "full": full,
+            "inps": inps,
+            "fp_inps": fp_inps,
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
+            "position_embeddings": position_embeddings,
+            "dev": dev,
+            "orig_device": orig_device,
+        }))
+
+        if preclip_enabled:
+            for name, module in full.items():
+                if module is None or "lm_head" in name:
+                    continue
+                clip_module_weight_to_quant_bounds_(
+                    module,
+                    bits=args.w_bits,
+                    sym=not args.w_asym,
+                    mse=args.w_clip,
+                )
+
+        analysis_fp_weights = None
+        if analysis_is_target:
+            analysis_fp_weights = {
+                raw_name[:-7] if raw_name.endswith(".module") else raw_name:
+                mod.weight.detach().clone().cpu()
+                for raw_name, mod in full.items()
+                if mod is not None and hasattr(mod, "weight")
+            }
+        analysis_hessians = _collect_layer_hessians_for_reg(
+            args,
+            analyzer,
+            layer,
+            inps,
+            attention_mask,
+            position_ids,
+            position_embeddings,
+            dev,
+        ) if analysis_is_target else None
+
+        analysis_hook("before_fp_reference", {
+            "args": args,
+            "analyzer": analyzer,
+            "layer": layer,
+            "layer_idx": i,
+            "layers": layers,
+            "full": full,
+            "inps": inps,
+            "fp_inps": fp_inps,
+            "fp_inps_final": fp_inps_final,
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
+            "position_embeddings": position_embeddings,
+            "dev": dev,
+            "orig_device": orig_device,
+            "is_target": analysis_is_target,
+        })
+
+        with disable_fp_path_quant(layer):
+            for j in range(inps.shape[0]):
+                fp_inps[j] = _layer_out(layer(
+                    fp_inps[j].unsqueeze(0).to(dev),
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    position_embeddings=position_embeddings,
+                )).squeeze(0).to(fp_inps.device)
+
+        for name, module in full.items():
+            if module is None or "lm_head" in name:
+                continue
+            pbar.set_postfix(module=f"layers.{i}." + name)
+            quantizers["model.layers.%d.%s" % (i, name)] = _apply_rtn_quant_to_module(
+                args,
+                module,
+            )
+
+        analysis_hook("after_layer_quantized", {
+            "args": args,
+            "analyzer": analyzer,
+            "layer": layer,
+            "layer_idx": i,
+            "layers": layers,
+            "full": full,
+            "inps": inps,
+            "fp_inps": fp_inps,
+            "fp_inps_final": fp_inps_final,
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
+            "position_embeddings": position_embeddings,
+            "dev": dev,
+            "orig_device": orig_device,
+            "static_fisher_by_layer": static_fisher_by_layer,
+            "static_refined_A_by_layer": static_refined_A_by_layer,
+            "static_refined_diag_A_by_layer": static_refined_diag_A_by_layer,
+            "samples_per_A": samples_per_A,
+            "fp_weights": analysis_fp_weights,
+            "hessians": analysis_hessians,
+            "is_target": analysis_is_target,
+        })
+
+        for j in range(inps.shape[0]):
+            inps[j] = _layer_out(layer(
+                inps[j].unsqueeze(0).to(dev),
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                position_embeddings=position_embeddings,
+            )).squeeze(0).to(inps.device)
+
+        layers[i] = layer.to(orig_device)
+        del layer, full, analysis_fp_weights, analysis_hessians
+        memory_utils.cleanup_memory()
+
+    for module in per_layer_runtime_modules:
+        module.to(orig_device)
+    model.config.use_cache = use_cache
+    memory_utils.cleanup_memory(verbos=True)
+    logging.info("-----RTN + grad-cosine analysis done-----")
+    return quantizers
+
+
+# ---------------------------------------------------------------------------
+# main pipeline — selectable reference quantization with measurement
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def quantize_and_measure(args, analyzer, trainloader, dev, target_layers, measure_losses):
+    analysis_quant_method = getattr(args, "analysis_quant_method", "rtn")
+    logging.info(
+        "----- %s + grad-cosine analysis -----",
+        analysis_quant_method.upper(),
+    )
+    if analysis_quant_method not in {"rtn", "gptq_plus"}:
+        raise ValueError(
+            "--analysis_quant_method currently supports {'rtn', 'gptq_plus'} "
+            f"for target-layer cosine measurement, got {analysis_quant_method!r}."
+        )
+    layers = analyzer.get_layers()
+    cosine_results = {}
+    layer_loss_results = {}
+    dp_world = dist_utils.get_world_size()
+    if args.measure_samples % dp_world != 0:
+        raise ValueError(
+            f"measure_samples ({args.measure_samples}) must be divisible by "
+            f"WORLD_SIZE ({dp_world}) for DP cosine analysis."
+        )
+    measure_samples_local = args.measure_samples // dp_world
+    if measure_samples_local <= 0:
+        raise ValueError(
+            f"measure_samples ({args.measure_samples}) gives zero samples per rank "
+            f"with WORLD_SIZE={dp_world}."
+        )
+    if measure_samples_local % args.measure_batch_size != 0:
+        raise ValueError(
+            f"local measure_samples ({measure_samples_local} = global "
+            f"{args.measure_samples} / WORLD_SIZE {dp_world}) must be divisible by "
+            f"measure_batch_size ({args.measure_batch_size})."
+        )
+    if args.nsamples % dp_world != 0:
+        raise ValueError(
+            f"nsamples ({args.nsamples}) must be divisible by WORLD_SIZE "
+            f"({dp_world}) for DP cosine analysis."
+        )
+    rank_sample_start = dist_utils.get_rank() * (args.nsamples // dp_world)
+    logging.info(
+        "Cosine measurement uses %d global samples = %d rank-local samples "
+        "per rank (world_size=%d, rank%d shard starts at global sample %d).",
+        args.measure_samples,
+        measure_samples_local,
+        dp_world,
+        dist_utils.get_rank(),
+        rank_sample_start,
+    )
+    sample_offset = rank_sample_start
+
+    want_fisher = "fisher_diag_mse" in measure_losses or "refined_mse" in measure_losses
+    want_refined_full = "refined_residual_kl" in measure_losses
+    want_refined_diag = "refined_diag_residual_kl" in measure_losses
+    want_module_mse = "module_mse" in measure_losses
+    need_fp_final = bool(
+        target_layers
+        or measure_losses.intersection(
+            {"residual_kl", "refined_residual_kl", "refined_diag_residual_kl", "refined_mse"}
+        )
+    )
+    if (want_fisher or want_refined_full or want_refined_diag) and not args.global_loss:
+        logging.info(
+            "analyze_grad_cosine requires global static stats for selected losses; "
+            "forcing --global_loss for this diagnostic run."
+        )
+        args.global_loss = True
+    if want_module_mse and measure_samples_local % args.measure_batch_size != 0:
+        raise ValueError(
+            f"local measure_samples ({measure_samples_local}) must be divisible by "
+            f"measure_batch_size ({args.measure_batch_size}) for module_mse."
+        )
+    if args.measure_samples > args.nsamples:
+        raise ValueError(
+            f"measure_samples ({args.measure_samples}) must be <= nsamples "
+            f"({args.nsamples})."
+        )
+    analysis_hook, clear_analysis_state = _build_cosine_analysis_hook(
+        args=args,
+        analyzer=analyzer,
+        layers=layers,
+        target_layers=target_layers,
+        measure_losses=measure_losses,
+        measure_samples_local=measure_samples_local,
+        sample_offset=sample_offset,
+        dev=dev,
+        cosine_results=cosine_results,
+        layer_loss_results=layer_loss_results,
+    )
+
+    if analysis_quant_method == "rtn":
+        quantizers = _rtn_fwrd_with_analysis(
+            args,
+            analyzer,
+            trainloader,
+            dev,
+            analysis_hook,
+            want_fisher=want_fisher,
+            want_refined_full=want_refined_full,
+            want_refined_diag=want_refined_diag,
+            need_fp_final=need_fp_final,
+        )
+        clear_analysis_state()
+        memory_utils.cleanup_memory()
+        logging.info("----- %s + grad-cosine done -----", analysis_quant_method.upper())
+        return quantizers, cosine_results, layer_loss_results
+
+    if getattr(args, "w_method", None) != "gptq_plus":
+        logging.info(
+            "analysis_quant_method=gptq_plus requires GPTQ+ reference path; "
+            "overriding w_method=%s -> gptq_plus.",
+            getattr(args, "w_method", None),
+        )
+        args.w_method = "gptq_plus"
+
     old_attrs = {}
     for name, value in {
-        "_analysis_hook": _analysis_hook,
+        "_analysis_hook": analysis_hook,
         "_analysis_collect_fisher": want_fisher,
         "_analysis_collect_refined_rkl": want_refined_full,
         "_analysis_collect_refined_diag_rkl": want_refined_diag,
@@ -1633,7 +2360,7 @@ def quantize_and_measure(args, analyzer, trainloader, dev, target_layers, measur
                     pass
             else:
                 setattr(args, name, old_value)
-        fp_module_outputs_by_layer.clear()
+        clear_analysis_state()
         memory_utils.cleanup_memory()
 
     logging.info("----- GPTQ+ + grad-cosine done -----")
@@ -1648,6 +2375,19 @@ def main(args):
     if "LOCAL_RANK" in os.environ and torch.cuda.is_available():
         torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     dist_utils.init_process_group()
+    dp_world = dist_utils.get_world_size()
+    if args.measure_samples % dp_world != 0:
+        raise ValueError(
+            f"measure_samples ({args.measure_samples}) must be divisible by "
+            f"WORLD_SIZE ({dp_world}) for DP cosine analysis."
+        )
+    _measure_samples_local = args.measure_samples // dp_world
+    if _measure_samples_local % args.measure_batch_size != 0:
+        raise ValueError(
+            f"local measure_samples ({_measure_samples_local} = global "
+            f"{args.measure_samples} / WORLD_SIZE {dp_world}) must be divisible "
+            f"by measure_batch_size ({args.measure_batch_size})."
+        )
 
     analyzer = model_utils.ModelAnalyzer(args.model, args.seq_len)
     model = analyzer.model
@@ -1738,6 +2478,10 @@ def main(args):
     _, cosine_results, layer_loss_results = quantize_and_measure(
         args, analyzer, trainloader, dp_dev, target_layers, measure_losses,
     )
+    cosine_results, layer_loss_results = _gather_analysis_results(
+        cosine_results,
+        layer_loss_results,
+    )
 
     if dist_utils.is_main():
         out_dir = args.output_dir
@@ -1798,10 +2542,11 @@ def main(args):
         header_lines = [
             f"# analyze_grad_cosine results",
             f"# model={args.model}  exp={args.exp}",
+            f"# analysis_quant_method={args.analysis_quant_method}",
             f"# reg_strategy={args.grad_reg_strategy}  reg_lambda={args.grad_reg_lambda}",
             f"# measure_losses={args.measure_losses}  target_layers={args.target_layers}",
             f"# measure_samples={args.measure_samples}  measure_batch_size={args.measure_batch_size}",
-            f"# columns: cos_* are batch-mean cosine(true_KL_grad, ·); "
+            f"# columns: cos_* are global batch-mean cosine(true_KL_grad, ·); "
             f"norm_* are batch-mean L2 norm of the flattened grad.",
             f"# cos_reg/norm_reg repeat across loss rows within the same (layer, module).",
             f"# cos_with_reg = cos(true, surrogate + reg_grad); "
@@ -1862,16 +2607,17 @@ def main(args):
                     f"{stats['mean']:.8g}",
                     f"{stats['std']:.8g}",
                     str(stats["n_batches"]),
-                ])
+        ])
         with open(out_loss_tsv, "w") as f:
             f.write("# analyze_grad_cosine per-layer post-quantization losses\n")
+            f.write(f"# analysis_quant_method={args.analysis_quant_method}\n")
             f.write(f"# measure_samples={args.measure_samples}  measure_batch_size={args.measure_batch_size}\n")
             f.write("\t".join(["layer", "loss", "mean", "std", "n_batches"]) + "\n")
             for row in loss_rows:
                 f.write("\t".join(row) + "\n")
         logging.info("Wrote layer-loss table to %s (%d rows)", out_loss_tsv, len(loss_rows))
 
-        logging.info("==== cosine summary (batch-avg) ====")
+        logging.info("==== cosine summary (global merged batch-avg) ====")
         def _summary_entry(r):
             out = {"gnorm_true": f"{r['true_kl_grad_norm_mean']:.3e}"}
             if "fisher_mean" in r:

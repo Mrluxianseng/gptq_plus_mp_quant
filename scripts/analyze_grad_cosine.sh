@@ -8,16 +8,16 @@ DEVICE=${2}
 TARGET_LAYERS=${3:-"5,10,15,20,25,30"}
 
 MODEL_NAME=$(basename ${MODEL_PATH})
-N_SAMPLES=128
+N_SAMPLES=256
 SEQ_LEN=2048
-MEASURE_SAMPLES=128
+MEASURE_SAMPLES=256
 MEASURE_BSZ=4
 BSZ=${BSZ:-32}
-GLOBAL_LOSS_BSZ=${GLOBAL_LOSS_BSZ:-2}
-BACKWARD_SAMPLES=${BACKWARD_SAMPLES:-8}
-BACKWARD_BSZ=${BACKWARD_BSZ:-8}
-BLOCKSIZE=${BLOCKSIZE:-256}
-GRAD_LR=${GRAD_LR:-0.0001}
+GLOBAL_LOSS_BSZ=${GLOBAL_LOSS_BSZ:-16}
+BACKWARD_SAMPLES=${BACKWARD_SAMPLES:-32}
+BACKWARD_BSZ=${BACKWARD_BSZ:-32}
+BLOCKSIZE=${BLOCKSIZE:-128}
+GRAD_LR=${GRAD_LR:-0.0002}
 FINAL_LAYER_GRAD_LR=${FINAL_LAYER_GRAD_LR:-0.00001}
 GRAD_OPTIMIZER=${GRAD_OPTIMIZER:-adam}
 FINAL_LAYER_GRAD_OPTIMIZER=${FINAL_LAYER_GRAD_OPTIMIZER:-adam}
@@ -29,6 +29,9 @@ PRE_CLIP=${PRE_CLIP:-0}
 # refined_diag_residual_kl, refined_mse, layer_mse, module_mse.
 # Skipping refined_residual_kl avoids the H×H A fit (big CPU-RAM win on 70B).
 MEASURE_LOSSES=${MEASURE_LOSSES:-"fisher_diag_mse,layer_mse,module_mse"}
+# Reference quantization path used before measuring target-layer cosine.
+# Choices: rtn (default) / gptq_plus.
+ANALYSIS_QUANT_METHOD=${ANALYSIS_QUANT_METHOD:-rtn}
 # Grad clip applied element-wise to every captured gradient before cosine /
 # L2-norm measurement. Mirrors the main pipeline so the diagnostic reflects
 # what block_gd actually sees. Negative → disable. FINAL_LAYER_GRAD_CLIP is
@@ -68,13 +71,15 @@ GRAD_REG_STRATEGY=${GRAD_REG_STRATEGY:-none}
 GRAD_REG_LAMBDA=${GRAD_REG_LAMBDA:-0.0}
 
 export CUDA_VISIBLE_DEVICES=${DEVICE}
+NPROC_PER_NODE=${NPROC_PER_NODE:-$(awk -F',' '{print NF}' <<< "${DEVICE}")}
 
 python -m torch.distributed.run \
-    --nnodes=1 --nproc_per_node=1 --rdzv_endpoint=localhost:2960${DEVICE} ./analyze_grad_cosine.py \
+    --nnodes=1 --nproc_per_node="${NPROC_PER_NODE}" --rdzv_endpoint=localhost:29600 ./analyze_grad_cosine.py \
     --model ${MODEL_PATH} \
     --exp grad_cosine \
     --dataset wikitext2 --nsamples ${N_SAMPLES} --seq_len ${SEQ_LEN} \
-    --w_method gptq_plus --w_bits 4 --w_clip --act_order \
+    --w_method "${ANALYSIS_QUANT_METHOD}" --analysis_quant_method "${ANALYSIS_QUANT_METHOD}" \
+    --w_bits 4 --w_clip --act_order \
     --rotate \
     --skip_eval \
     --kl_topk 20 --grad_hessian_topk 20 \
@@ -94,4 +99,5 @@ python -m torch.distributed.run \
     --grad_clip "${GRAD_CLIP}" \
     --grad_reg_strategy "${GRAD_REG_STRATEGY}" \
     --grad_reg_lambda "${GRAD_REG_LAMBDA}" \
+    --dp_global_shuffle \
     "${FINAL_LAYER_GRAD_CLIP_ARGS[@]}"

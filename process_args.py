@@ -121,7 +121,7 @@ def parse_gen():
     parser.add_argument(
         "--grad_optimizer",
         type=str,
-        default="sgd",
+        default="adam",
         choices=["sgd", "adam"],
         help="Optimizer used for the block-wise first-order update after each refresh.",
     )
@@ -153,7 +153,7 @@ def parse_gen():
     parser.add_argument(
         "--grad_refresh_loss",
         type=str,
-        default="kl",
+        default="fisher_diag_mse",
         choices=["kl", "hidden_mse", "fisher_diag_mse", "residual_kl", "refined_residual_kl", "refined_mse", "refined_mix"],
         help=(
             "Loss used to compute the true refresh gradient in block_backward/block_gd. "
@@ -240,7 +240,7 @@ def parse_gen():
     parser.add_argument(
         "--global_loss_bsz",
         type=int,
-        default=None,
+        default=8,
         help=(
             "Batch size used only for the frozen end-to-end global-loss backward pass that collects static "
             "saliency/Fisher caches. Defaults to --bsz when not provided."
@@ -336,19 +336,19 @@ def parse_gen():
     parser.add_argument(
         "--proj_lr_scale",
         type=float,
-        default=0.1,
+        default=1.0,
         help="Multiplier applied to block_gd lr for attention output projections (o_proj).",
     )
     parser.add_argument(
         "--down_proj_lr_scale",
         type=float,
-        default=0.1,
+        default=1.0,
         help="Multiplier applied to block_gd lr for MLP down projections.",
     )
     parser.add_argument(
         "--grad_lr_layer_schedule",
         type=str,
-        default="none",
+        default="cosine",
         choices=["none", "cosine", "linear", "sqrt"],
         help=(
             "Per-layer ramp for --grad_lr and --pre_grad_lr. "
@@ -421,17 +421,29 @@ def parse_gen():
         help="Quantize each block atomically without any block-internal GPTQ/GPTQ+ updates; only apply cross-block updates after the block is quantized.",
     )
     parser.add_argument(
+        "--group_parallel_quant",
+        type=str,
+        default="none",
+        choices=["none", "tensor", "rank"],
+        help=(
+            "GPTQ+ output-channel group parallelization mode. "
+            "'tensor' stacks all groups in one local tensor path; "
+            "'rank' additionally splits block-internal quantization across DP ranks "
+            "and synchronizes each block before local tensor-parallel outer/block_gd updates."
+        ),
+    )
+    parser.add_argument(
         "--g_update_mode",
         type=str,
-        default="frozen",
+        default="block_gd",
         choices=["frozen", "surrogate_block", "surrogate_online", "block_backward", "block_gd"],
         help="How to update the first-order term during GPTQ+ quantization.",
     )
-    parser.add_argument("--kl_topk", type=int, default=-1, help="Top-k KL loss")
+    parser.add_argument("--kl_topk", type=int, default=20, help="Top-k KL loss")
     parser.add_argument(
         "--grad_hessian_topk",
         type=int,
-        default=-1,
+        default=20,
         help=(
             "When > 0, restrict the grad/hessian label sampling, saliency NLL, and KL loss "
             "to the full-precision top-k logits support. Disabled when <= 0."
@@ -440,7 +452,7 @@ def parse_gen():
     parser.add_argument(
         "--saliency_clip_percentile",
         type=float,
-        default=0.99,
+        default=1.0,
         help=(
             "In `collect_static_end_to_end_saliency_and_fisher`, clip per-token saliency "
             "(grad² of end-to-end NLL wrt module output) to this percentile before caching. "
@@ -449,17 +461,17 @@ def parse_gen():
             "makes Cholesky fail even with large damp. Set to 1.0 to disable clipping."
         ),
     )
-    parser.add_argument("--bsz", type=int, default=1, help="Batch size for computing hessians and gradients")
+    parser.add_argument("--bsz", type=int, default=128, help="Batch size for computing hessians and gradients")
     parser.add_argument(
         "--final_layer_stats_bsz",
         type=int,
-        default=None,
+        default=16,
         help="Optional override for the statistics-collection batch size used only in the final transformer layer.",
     )
     parser.add_argument(
         "--hessian_accum_bsz",
         type=int,
-        default=None,
+        default=64,
         help=(
             "Batch size for the Hessian accumulation forward loop (add_batch). "
             "Defaults to --bsz when unset. Independent of stats collection bsz "
@@ -469,7 +481,7 @@ def parse_gen():
     parser.add_argument(
         "--enable_gptq_plus",
         type=int,
-        default=1,
+        default=0,
         choices=[0, 1],
         help=(
             "When 0, bypass all GPTQ+ first-order extensions and run pure GPTQ: "
@@ -481,19 +493,19 @@ def parse_gen():
     parser.add_argument(
         "--backward_samples",
         type=int,
-        default=-1,
+        default=32,
         help="Number of calibration samples used in each block-backward refresh (-1 means all samples).",
     )
     parser.add_argument(
         "--backward_bsz",
         type=int,
-        default=-1,
+        default=32,
         help="Batch size used inside each block-backward refresh (-1 means reuse --bsz).",
     )
     parser.add_argument(
         "--final_layer_backward_bsz",
         type=int,
-        default=None,
+        default=8,
         help="Optional override for the refresh backward batch size used only in the final transformer layer.",
     )
     parser.add_argument(
@@ -564,6 +576,18 @@ def parse_gen():
         type=int,
         default=4,
         help="Batch size for each backward pass in the cosine measurement loop.",
+    )
+    parser.add_argument(
+        "--analysis_quant_method",
+        type=str,
+        default="rtn",
+        choices=["rtn", "gptq_plus"],
+        help=(
+            "Reference quantization path used by analyze_grad_cosine before "
+            "measuring target-layer cosine. Default rtn keeps the target-layer "
+            "cosine measurement method unchanged while using RTN weights; "
+            "gptq_plus restores the GPTQ+ reference path."
+        ),
     )
     parser.add_argument(
         "--refined_rkl_damp",
@@ -743,6 +767,8 @@ def parse_gen():
                 "--w_groupsize must be -1 or equal to --blocksize for now. "
                 f"Got w_groupsize={args.w_groupsize}, blocksize={args.blocksize}."
             )
+    if args.group_parallel_quant != "none" and args.w_method != "gptq_plus":
+        raise ValueError("--group_parallel_quant is currently implemented only for --w_method=gptq_plus.")
 
     if args.backward_samples == -1:
         args.backward_samples = args.nsamples
