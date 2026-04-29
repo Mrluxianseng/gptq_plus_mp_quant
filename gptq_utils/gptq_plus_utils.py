@@ -40,6 +40,7 @@ _E2E_PRECOMPUTE_LOSS_GRAD_SCALE = 1000.0
 _E2E_PRECOMPUTE_QUADRATIC_SCALE = (
     _E2E_PRECOMPUTE_LOSS_GRAD_SCALE * _E2E_PRECOMPUTE_LOSS_GRAD_SCALE
 )
+_TORCH_QUANTILE_SAFE_NUMEL = 16 * 1024 * 1024
 
 
 def format_log_value(value, digits=6):
@@ -65,17 +66,41 @@ def _quantile_large(tensor, q):
         return flat.kthvalue(k).values.item()
 
 
+def _activation_clip_threshold(tensor, q):
+    """Return the old activation-loss clip threshold without host sync.
+
+    Small tensors keep torch.quantile's interpolation semantics. Large tensors
+    use the old fallback's order statistic, but select only the smaller tail;
+    q is usually 0.95/0.99 so this avoids kthvalue over the full activation.
+    """
+    flat = tensor.reshape(-1)
+    n = flat.numel()
+    if n == 0:
+        return None
+    if n <= _TORCH_QUANTILE_SAFE_NUMEL:
+        try:
+            return torch.quantile(flat, q)
+        except RuntimeError:
+            pass
+    k = max(1, min(n, int(n * q + 0.5)))
+    upper_count = n - k + 1
+    if k <= upper_count:
+        return flat.topk(k, largest=False, sorted=False).values.max()
+    return flat.topk(upper_count, largest=True, sorted=False).values.min()
+
+
 def _scale_delta_by_abs_quantile(delta, ratio, profile_recorder=None):
     if ratio >= 1.0:
         return delta
     with profile_recorder.section("compute_refresh_loss.fisher_diag_mse.a_loss_delta_scale") if profile_recorder else _NULL_CONTEXT:
-        abs_delta = delta.float().abs()
-        threshold = _quantile_large(abs_delta, float(ratio))
-        if threshold is None or not math.isfinite(float(threshold)):
+        abs_delta = delta.detach().float().abs()
+        threshold = _activation_clip_threshold(abs_delta, float(ratio))
+        if threshold is None:
             return delta
-        threshold = torch.as_tensor(threshold, device=delta.device, dtype=abs_delta.dtype)
-        scale = torch.clamp(threshold / abs_delta.clamp_min(torch.finfo(abs_delta.dtype).tiny), max=1.0)
-        return delta * scale.to(delta.dtype).detach()
+        scale = abs_delta.clamp_min_(torch.finfo(abs_delta.dtype).tiny)
+        scale.reciprocal_().mul_(threshold.detach()).clamp_(max=1.0)
+        scale.nan_to_num_(nan=1.0, posinf=1.0, neginf=1.0)
+        return delta * scale.to(delta.dtype)
 
 
 def normalize_quant_module_name(name: str) -> str:
