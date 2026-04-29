@@ -12,10 +12,23 @@ N_SAMPLES=128
 SEQ_LEN=2048
 MEASURE_SAMPLES=128
 MEASURE_BSZ=4
+BSZ=${BSZ:-32}
+GLOBAL_LOSS_BSZ=${GLOBAL_LOSS_BSZ:-2}
+BACKWARD_SAMPLES=${BACKWARD_SAMPLES:-8}
+BACKWARD_BSZ=${BACKWARD_BSZ:-8}
+BLOCKSIZE=${BLOCKSIZE:-256}
+GRAD_LR=${GRAD_LR:-0.0001}
+FINAL_LAYER_GRAD_LR=${FINAL_LAYER_GRAD_LR:-0.00001}
+GRAD_OPTIMIZER=${GRAD_OPTIMIZER:-adam}
+FINAL_LAYER_GRAD_OPTIMIZER=${FINAL_LAYER_GRAD_OPTIMIZER:-adam}
+ENABLE_GPTQ_PLUS=${ENABLE_GPTQ_PLUS:-0}
+ALPHA=${ALPHA:-0.0}
+PRE_CLIP=${PRE_CLIP:-0}
 # Subset of surrogate losses to measure against the true end-to-end KL gradient.
-# Choices: fisher_diag_mse, residual_kl, refined_residual_kl, refined_diag_residual_kl.
+# Choices: fisher_diag_mse, residual_kl, refined_residual_kl,
+# refined_diag_residual_kl, refined_mse, layer_mse, module_mse.
 # Skipping refined_residual_kl avoids the H×H A fit (big CPU-RAM win on 70B).
-MEASURE_LOSSES=${MEASURE_LOSSES:-"fisher_diag_mse"}
+MEASURE_LOSSES=${MEASURE_LOSSES:-"fisher_diag_mse,layer_mse,module_mse"}
 # Grad clip applied element-wise to every captured gradient before cosine /
 # L2-norm measurement. Mirrors the main pipeline so the diagnostic reflects
 # what block_gd actually sees. Negative → disable. FINAL_LAYER_GRAD_CLIP is
@@ -27,6 +40,23 @@ FINAL_LAYER_GRAD_CLIP=${FINAL_LAYER_GRAD_CLIP:-}
 FINAL_LAYER_GRAD_CLIP_ARGS=()
 if [[ -n "${FINAL_LAYER_GRAD_CLIP}" && "${FINAL_LAYER_GRAD_CLIP}" != "none" ]]; then
     FINAL_LAYER_GRAD_CLIP_ARGS=(--final_layer_grad_clip "${FINAL_LAYER_GRAD_CLIP}")
+fi
+
+FINAL_LAYER_GRAD_OPTIMIZER_ARGS=()
+if [[ -n "${FINAL_LAYER_GRAD_OPTIMIZER}" && "${FINAL_LAYER_GRAD_OPTIMIZER}" != "none" ]]; then
+    FINAL_LAYER_GRAD_OPTIMIZER_ARGS=(--final_layer_grad_optimizer "${FINAL_LAYER_GRAD_OPTIMIZER}")
+fi
+
+FINAL_LAYER_GRAD_LR_ARGS=()
+if [[ -n "${FINAL_LAYER_GRAD_LR}" && "${FINAL_LAYER_GRAD_LR}" != "none" ]]; then
+    FINAL_LAYER_GRAD_LR_ARGS=(--final_layer_grad_lr "${FINAL_LAYER_GRAD_LR}")
+fi
+
+PRE_CLIP_ARGS=()
+if [[ "${PRE_CLIP}" == "1" ]]; then
+    PRE_CLIP_ARGS=(--pre_clip)
+else
+    PRE_CLIP_ARGS=(--no_pre_clip)
 fi
 
 # Regularizer added to the surrogate gradient before cosine measurement.
@@ -44,11 +74,20 @@ python -m torch.distributed.run \
     --model ${MODEL_PATH} \
     --exp grad_cosine \
     --dataset wikitext2 --nsamples ${N_SAMPLES} --seq_len ${SEQ_LEN} \
-    --w_method gptaq --w_bits 4 --w_clip --act_order \
+    --w_method gptq_plus --w_bits 4 --w_clip --act_order \
     --rotate \
     --skip_eval \
     --kl_topk 20 --grad_hessian_topk 20 \
-    --num_groups 4  --bsz 32 --global_loss_bsz 2 \
+    --num_groups 4 --bsz "${BSZ}" --global_loss_bsz "${GLOBAL_LOSS_BSZ}" \
+    --global_loss --enable_gptq_plus "${ENABLE_GPTQ_PLUS}" \
+    --g_update_mode block_gd --grad_refresh_loss fisher_diag_mse \
+    --backward_samples "${BACKWARD_SAMPLES}" --backward_bsz "${BACKWARD_BSZ}" \
+    --blocksize "${BLOCKSIZE}" \
+    --grad_lr "${GRAD_LR}" --grad_optimizer "${GRAD_OPTIMIZER}" \
+    "${FINAL_LAYER_GRAD_LR_ARGS[@]}" \
+    "${FINAL_LAYER_GRAD_OPTIMIZER_ARGS[@]}" \
+    --pre_gd_steps 0 --alpha "${ALPHA}" \
+    "${PRE_CLIP_ARGS[@]}" \
     --target_layers ${TARGET_LAYERS} \
     --measure_samples ${MEASURE_SAMPLES} --measure_batch_size ${MEASURE_BSZ} \
     --measure_losses "${MEASURE_LOSSES}" \

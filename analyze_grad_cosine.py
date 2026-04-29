@@ -1,29 +1,28 @@
 # coding=utf-8
 """Gradient cosine diagnostic for Fisher-matrix / residual_kl surrogates.
 
-Runs a full GPTAQ quantization pass (rotate + w_clip + act_order, aligned with
-scripts/gptaq.sh) and, immediately BEFORE quantizing each transformer block in
-`--target_layers`, measures the cosine similarity between:
+Runs a full GPTQ+ quantization pass (rotate + w_clip + act_order, aligned with
+scripts/gptq_plus_lr_sweep.sh) and, after each transformer block in
+`--target_layers` is quantized, measures the cosine similarity between:
   * true KL gradient wrt this layer's linear weights (end-to-end backward)
   * Fisher-matrix surrogate gradient
   * residual_kl  surrogate gradient
+  * layer-output MSE surrogate gradient
+  * per-linear-output MSE surrogate gradient
 
 Per target layer, batches of `--measure_batch_size` samples are averaged inside
 each backward; cosine is computed per linear (q/k/v/o/gate/up/down_proj) then
-averaged across batches. Target layer is left in FP during the measurement
-(upstream layers already quantized, downstream layers in FP).
+averaged across batches. Measurement runs immediately after the target layer is
+quantized: upstream layers and the target layer are quantized, downstream layers
+are still FP.
 
-This script does NOT touch gptq_utils/gptaq_utils.py — the GPTAQ inner loop is
-copied locally so we can interleave measurement without risk of breaking the
-production path.
+The production GPTQ+ path only sees a default-off analysis hook. Normal
+quantization runs do not collect these diagnostic gradients.
 """
 
 import os
 import logging
 import pprint
-import math
-import copy
-import functools
 
 import torch
 import torch.nn as nn
@@ -41,16 +40,15 @@ from utils import (
     quant_utils,
     rotation_utils,
     memory_utils,
-    hadamard_utils,
 )
-from gptq_utils.gptaq_utils import GPTAQ, FPInputsCache
+from gptq_utils.gptq_plus_utils import gptq_fwrd as gptq_plus_fwrd
 from gptq_utils.gptq_plus_utils import (
-    collect_static_end_to_end_saliency_and_fisher,
     collect_layer_output_grad_for_refined_mse,
     compute_refresh_loss,
     hidden2logits,
     temporary_requires_grad,
 )
+from gptq_utils.quant_aware_utils import disable_fp_path_quant
 
 torch.backends.cuda.matmul.allow_tf32 = False
 
@@ -65,6 +63,8 @@ _VALID_MEASURE_LOSSES = {
     "refined_residual_kl",
     "refined_diag_residual_kl",
     "refined_mse",
+    "layer_mse",
+    "module_mse",
 }
 
 _LOSS_REPORT_ORDER = (
@@ -73,6 +73,8 @@ _LOSS_REPORT_ORDER = (
     "refined_residual_kl",
     "refined_diag_residual_kl",
     "refined_mse",
+    "layer_mse",
+    "module_mse",
 )
 
 
@@ -92,7 +94,7 @@ def _parse_measure_losses(spec: str):
 
 
 def _parse_target_layers(spec: str, num_layers: int):
-    """Parse --target_layers. Strips 0 with a warning (delta=0 there)."""
+    """Parse --target_layers."""
     if spec is None or spec.strip() == "":
         return []
     if spec.strip().lower() == "all":
@@ -110,96 +112,7 @@ def _parse_target_layers(spec: str, num_layers: int):
                 )
             ids.append(idx)
     ids = sorted(set(ids))
-    if 0 in ids:
-        logging.warning(
-            "target_layers contains 0; at layer 0 there is no upstream quantization so "
-            "inps == fp_inps, delta = 0, and all three gradients are zero (cosine = nan). "
-            "Dropping 0 from the target set."
-        )
-        ids = [i for i in ids if i != 0]
     return ids
-
-
-# ---------------------------------------------------------------------------
-# forward-kwargs catcher (re-implementation of gptaq_utils pattern)
-# ---------------------------------------------------------------------------
-
-def _prepare_calib_inps(analyzer, trainloader, dev):
-    """Run embed + first-block-catcher to extract inps / attention_mask / positions."""
-    model = analyzer.model
-    layers = analyzer.get_layers()
-    orig_device = next(model.parameters()).device
-
-    for module in analyzer.get_pre_block_modules():
-        module.to(dev)
-    layers[0] = layers[0].to(dev)
-
-    dtype = next(iter(model.parameters())).dtype
-    nsamples = len(trainloader)
-    inps = torch.zeros(
-        (nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device=dev
-    )
-    cache = {"i": 0, "attention_mask": None}
-
-    class Catcher(nn.Module):
-        def __init__(self, module):
-            super().__init__()
-            self.module = module
-            if hasattr(module, "attention_type"):
-                self.attention_type = module.attention_type
-
-        def forward(self, inp, **kwargs):
-            inps[cache["i"]] = inp
-            cache["i"] += 1
-            cache["attention_mask"] = kwargs["attention_mask"]
-            cache["position_ids"] = kwargs["position_ids"]
-            cache["position_embeddings"] = kwargs["position_embeddings"]
-            raise ValueError
-
-    layers[0] = Catcher(layers[0])
-    for batch in trainloader:
-        try:
-            model(batch[0].to(dev))
-        except ValueError:
-            pass
-    layers[0] = layers[0].module
-    layers[0] = layers[0].to(orig_device)
-
-    return (
-        inps,
-        cache["attention_mask"],
-        cache["position_ids"],
-        cache["position_embeddings"],
-        orig_device,
-    )
-
-
-# ---------------------------------------------------------------------------
-# fp_inps_final precompute (copy of gptq_plus_utils:3657-3692 pattern)
-# ---------------------------------------------------------------------------
-
-def _precompute_fp_inps_final(analyzer, inps, attention_mask, position_ids,
-                              position_embeddings, dev, orig_device):
-    """Per-sample per-layer FP forward. Each layer restored to orig_device after."""
-    layers = analyzer.get_layers()
-    logging.info(
-        "Precomputing FP final-layer hidden states for residual_kl "
-        "(nsamples=%d, layers=%d).", inps.shape[0], len(layers),
-    )
-    scratch = inps.detach().clone().to(dev)
-    for idx in range(len(layers)):
-        lay = layers[idx].to(dev)
-        bits_cfg = quant_utils.disable_act_quant(lay)
-        for j in range(scratch.shape[0]):
-            scratch[j] = lay(
-                scratch[j].unsqueeze(0),
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                position_embeddings=position_embeddings,
-            )[0].squeeze(0)
-        quant_utils.enable_act_quant(lay, bits_cfg)
-        layers[idx] = lay.to(orig_device)
-    return scratch.to(inps.device)
 
 
 # ---------------------------------------------------------------------------
@@ -269,6 +182,15 @@ def _capture_grads(name_to_weight, grad_clip=None):
     return grads
 
 
+def _capture_one_grad(weight, name, grad_clip=None):
+    if weight.grad is None:
+        raise RuntimeError(f"weight `{name}` received no gradient.")
+    g = weight.grad.detach().float().clone()
+    if grad_clip is not None and grad_clip > 0:
+        g.clamp_(min=-grad_clip, max=grad_clip)
+    return g
+
+
 def _cosine_per_linear(grads_true, grads_surrogate):
     out = {}
     for name, g_true in grads_true.items():
@@ -320,6 +242,90 @@ def _select_refined_A_for_batch(refined_A_list, samples_per_A, start, loss_name)
     return refined_A_slot
 
 
+def _canonical_module_dict(analyzer, layer):
+    raw_modules = analyzer.get_quantizable_modules(layer)
+    out = {}
+    for raw_name, mod in raw_modules.items():
+        out[raw_name[:-7] if raw_name.endswith(".module") else raw_name] = mod
+    return out
+
+
+def _unwrap_module_output(out):
+    return out[0] if isinstance(out, (tuple, list)) else out
+
+
+@torch.no_grad()
+def _collect_fp_module_outputs(
+    *,
+    analyzer,
+    layer,
+    inps,
+    attention_mask,
+    position_ids,
+    position_embeddings,
+    measure_samples,
+    measure_batch_size,
+    dev,
+):
+    if measure_samples % measure_batch_size != 0:
+        raise ValueError(
+            f"measure_samples ({measure_samples}) must be divisible by "
+            f"measure_batch_size ({measure_batch_size})."
+        )
+    modules = _canonical_module_dict(analyzer, layer)
+    outputs = {name: [] for name in modules}
+    handles = []
+
+    def _hook(name):
+        def _tmp(_, _inp, out):
+            outputs[name].append(_unwrap_module_output(out).detach().cpu())
+        return _tmp
+
+    for name, module in modules.items():
+        handles.append(module.register_forward_hook(_hook(name)))
+
+    try:
+        b_attn, b_pos_ids, b_pos_emb = _expand_batch_kwargs(
+            attention_mask, position_ids, position_embeddings, measure_batch_size,
+        )
+        with disable_fp_path_quant(layer):
+            for start in range(0, measure_samples, measure_batch_size):
+                _ = _layer_out(layer(
+                    inps[start:start + measure_batch_size].to(dev),
+                    attention_mask=b_attn,
+                    position_ids=b_pos_ids,
+                    position_embeddings=b_pos_emb,
+                ))
+    finally:
+        for h in handles:
+            h.remove()
+
+    for name, chunks in outputs.items():
+        if not chunks:
+            raise RuntimeError(
+                f"module_mse: no FP output captured for module {name!r}. "
+                "This diagnostic currently expects every quantizable module to run "
+                "on the measurement samples."
+            )
+        expected_chunks = measure_samples // measure_batch_size
+        if len(chunks) != expected_chunks:
+            raise RuntimeError(
+                f"module_mse: expected {expected_chunks} FP output chunks for "
+                f"module {name!r}, captured {len(chunks)}. This usually means the "
+                "module is conditionally executed (for example an MoE expert); "
+                "the per-module MSE diagnostic currently requires dense modules."
+            )
+        for chunk in chunks:
+            if chunk.dim() != 3 or chunk.shape[0] != measure_batch_size or chunk.shape[1] != inps.shape[1]:
+                raise RuntimeError(
+                    f"module_mse: module {name!r} produced FP output shape "
+                    f"{tuple(chunk.shape)}; expected (batch, seq, hidden) with "
+                    f"batch={measure_batch_size}, seq={inps.shape[1]}. This "
+                    "diagnostic currently supports dense transformer linear modules."
+                )
+    return outputs
+
+
 def run_cosine_measurement(
     *,
     analyzer,
@@ -345,6 +351,7 @@ def run_cosine_measurement(
     refined_mse_pool_ids=None,
     refined_mse_grad_pool=None,
     refined_mse_mean_grad=None,
+    fp_module_outputs=None,
     fp_weights=None,
     hessians=None,
     reg_strategy="none",
@@ -369,6 +376,8 @@ def run_cosine_measurement(
     want_refined_full = "refined_residual_kl" in measure_losses
     want_refined_diag = "refined_diag_residual_kl" in measure_losses
     want_refined_mse = "refined_mse" in measure_losses
+    want_layer_mse = "layer_mse" in measure_losses
+    want_module_mse = "module_mse" in measure_losses
     # refined_mse's second-order term is fisher_diag_mse, so it shares the
     # same batch-level fisher slice. Use a broader "needs fisher slice" gate
     # for the per-batch indexing below without touching `want_fisher` (which
@@ -455,6 +464,29 @@ def run_cosine_measurement(
                         f"Have: {sorted(hessians.keys())}."
                     )
                 H = hessians[canon].to(dev).float()
+                if H.dim() == 3:
+                    rows = diff.shape[0]
+                    if H.shape[1] != H.shape[2] or H.shape[1] != diff.shape[1]:
+                        raise ValueError(
+                            f"grouped hessian for {canon!r} must have shape "
+                            f"(G, in_features, in_features); got {tuple(H.shape)} "
+                            f"vs diff {tuple(diff.shape)}"
+                        )
+                    if rows % H.shape[0] != 0:
+                        raise ValueError(
+                            f"rows ({rows}) must be divisible by hessian groups "
+                            f"({H.shape[0]}) for {canon!r}."
+                        )
+                    rows_per_group = rows // H.shape[0]
+                    rg_parts = []
+                    for g in range(H.shape[0]):
+                        row_start = g * rows_per_group
+                        row_end = row_start + rows_per_group
+                        rg_parts.append(diff[row_start:row_end].matmul(H[g]))
+                    rg = reg_lambda * torch.cat(rg_parts, dim=0)
+                    reg_grads[canon] = rg
+                    reg_grad_norm[canon] = rg.flatten().norm(p=2).item()
+                    continue
                 if H.dim() != 2 or H.shape[0] != H.shape[1] or H.shape[0] != diff.shape[1]:
                     raise ValueError(
                         f"hessian matrix for {canon!r} must be square and match in_features; got {tuple(H.shape)} vs diff {tuple(diff.shape)}"
@@ -468,12 +500,16 @@ def run_cosine_measurement(
     per_batch_refined_cos = {n: [] for n in name_to_weight}
     per_batch_refined_diag_cos = {n: [] for n in name_to_weight}
     per_batch_refined_mse_cos = {n: [] for n in name_to_weight}
+    per_batch_layer_mse_cos = {n: [] for n in name_to_weight}
+    per_batch_module_mse_cos = {n: [] for n in name_to_weight}
     per_batch_true_norm = {n: [] for n in name_to_weight}
     per_batch_fisher_norm = {n: [] for n in name_to_weight}
     per_batch_residual_norm = {n: [] for n in name_to_weight}
     per_batch_refined_norm = {n: [] for n in name_to_weight}
     per_batch_refined_diag_norm = {n: [] for n in name_to_weight}
     per_batch_refined_mse_norm = {n: [] for n in name_to_weight}
+    per_batch_layer_mse_norm = {n: [] for n in name_to_weight}
+    per_batch_module_mse_norm = {n: [] for n in name_to_weight}
     # Per-batch cos(true, reg_grad). Varies per batch because `grads_true`
     # changes even though reg_grad is constant; same value shared across all
     # loss types within a (layer, module, batch) cell.
@@ -484,13 +520,13 @@ def run_cosine_measurement(
         loss: {n: [] for n in name_to_weight}
         for loss in ("fisher_diag_mse", "residual_kl",
                      "refined_residual_kl", "refined_diag_residual_kl",
-                     "refined_mse")
+                     "refined_mse", "layer_mse", "module_mse")
     }
     per_batch_combined_norm = {
         loss: {n: [] for n in name_to_weight}
         for loss in ("fisher_diag_mse", "residual_kl",
                      "refined_residual_kl", "refined_diag_residual_kl",
-                     "refined_mse")
+                     "refined_mse", "layer_mse", "module_mse")
     }
     # Per-batch loss VALUES (the scalar each loss reduces to in this batch).
     # One series per loss type; only filled for losses we actually evaluated.
@@ -500,6 +536,8 @@ def run_cosine_measurement(
     per_batch_refined_loss = []
     per_batch_refined_diag_loss = []
     per_batch_refined_mse_loss = []
+    per_batch_layer_mse_loss = []
+    per_batch_module_mse_loss = []
 
     def _call_layer(h_in):
         return _layer_out(layer(
@@ -527,6 +565,11 @@ def run_cosine_measurement(
             fp_hidden_cached = fp_inps[start:end].to(dev)
             # Keep fp_final in model dtype (bf16) so hidden2logits can run through
             # the bf16 norm + lm_head without a dtype mismatch.
+            if fp_inps_final is None:
+                raise RuntimeError(
+                    "run_cosine_measurement requires fp_inps_final for true KL "
+                    "measurement, but GPTQ+ did not provide it."
+                )
             fp_final_batch = fp_inps_final[start:end].to(dev)
             fisher_batch = fisher_tensor.to(dev).float() if need_fisher_slice and fisher_tensor is not None else None
 
@@ -702,12 +745,82 @@ def run_cosine_measurement(
                 if layer_output_grad_exact is not None:
                     del layer_output_grad_exact
 
+            # ---------- (7) layer_mse ----------
+            grads_layer_mse = None
+            if want_layer_mse:
+                _zero_grads(target_params)
+                out_hidden = _call_layer(inp_batch)
+                layer_mse_loss = compute_refresh_loss(
+                    refresh_loss_type="hidden_mse",
+                    out_hidden=out_hidden,
+                    fp_hidden=fp_hidden_cached,
+                    analyzer=analyzer,
+                    kl_topk=kl_topk,
+                    layer_output_fisher=None,
+                    fp_final_hidden=None,
+                )
+                layer_mse_loss.backward()
+                per_batch_layer_mse_loss.append(layer_mse_loss.item())
+                grads_layer_mse = _capture_grads(name_to_weight, grad_clip=grad_clip)
+                del out_hidden, layer_mse_loss
+
+            # ---------- (8) module_mse ----------
+            grads_module_mse = None
+            if want_module_mse:
+                if fp_module_outputs is None:
+                    raise RuntimeError(
+                        "measure_losses requested module_mse but FP module outputs "
+                        "were not collected."
+                    )
+                grads_module_mse = {}
+                module_loss_sum = 0.0
+                for module_name, module in name_to_module.items():
+                    if module_name not in fp_module_outputs:
+                        raise RuntimeError(
+                            f"module_mse: missing FP output for module {module_name!r}."
+                        )
+                    _zero_grads(target_params)
+                    captured = []
+
+                    def _capture_out(_module, _inp, out):
+                        captured.append(_unwrap_module_output(out))
+
+                    handle = module.register_forward_hook(_capture_out)
+                    try:
+                        _ = _call_layer(inp_batch)
+                    finally:
+                        handle.remove()
+                    if len(captured) != 1:
+                        raise RuntimeError(
+                            f"module_mse: expected exactly one output from {module_name!r}, "
+                            f"captured {len(captured)}."
+                        )
+                    fp_module_out = fp_module_outputs[module_name][b].to(
+                        dev, dtype=captured[0].dtype
+                    )
+                    module_mse_loss = 0.5 * (
+                        captured[0] - fp_module_out
+                    ).square().sum(dim=-1).mean()
+                    module_mse_loss.backward()
+                    module_loss_sum += module_mse_loss.item()
+                    grads_module_mse[module_name] = _capture_one_grad(
+                        name_to_weight[module_name],
+                        module_name,
+                        grad_clip=grad_clip,
+                    )
+                    del captured, fp_module_out, module_mse_loss
+                per_batch_module_mse_loss.append(
+                    module_loss_sum / max(len(name_to_module), 1)
+                )
+
             # ---------- cosine + grad L2 per linear ----------
             cos_f = _cosine_per_linear(grads_true, grads_fisher) if grads_fisher is not None else None
             cos_r = _cosine_per_linear(grads_true, grads_residual) if grads_residual is not None else None
             cos_rf = _cosine_per_linear(grads_true, grads_refined) if grads_refined is not None else None
             cos_rfd = _cosine_per_linear(grads_true, grads_refined_diag) if grads_refined_diag is not None else None
             cos_rm = _cosine_per_linear(grads_true, grads_refined_mse) if grads_refined_mse is not None else None
+            cos_lm = _cosine_per_linear(grads_true, grads_layer_mse) if grads_layer_mse is not None else None
+            cos_mm = _cosine_per_linear(grads_true, grads_module_mse) if grads_module_mse is not None else None
             # cos(true, reg_grad) per module. Constant reg_grad but varying
             # true_grad → recompute per batch.
             cos_reg = (
@@ -721,6 +834,8 @@ def run_cosine_measurement(
                 ("refined_residual_kl", grads_refined),
                 ("refined_diag_residual_kl", grads_refined_diag),
                 ("refined_mse", grads_refined_mse),
+                ("layer_mse", grads_layer_mse),
+                ("module_mse", grads_module_mse),
             ]
             for n in name_to_weight:
                 if cos_f is not None:
@@ -733,6 +848,10 @@ def run_cosine_measurement(
                     per_batch_refined_diag_cos[n].append(cos_rfd[n])
                 if cos_rm is not None:
                     per_batch_refined_mse_cos[n].append(cos_rm[n])
+                if cos_lm is not None:
+                    per_batch_layer_mse_cos[n].append(cos_lm[n])
+                if cos_mm is not None:
+                    per_batch_module_mse_cos[n].append(cos_mm[n])
                 # Per-batch grad Frobenius / L2 norms (flattened). Useful to see
                 # not just whether surrogate grads point the right way (cosine)
                 # but also how their magnitude compares to the true KL grad's.
@@ -768,6 +887,10 @@ def run_cosine_measurement(
                         )
                 if grads_refined_mse is not None:
                     per_batch_refined_mse_norm[n].append(grads_refined_mse[n].flatten().norm(p=2).item())
+                if grads_layer_mse is not None:
+                    per_batch_layer_mse_norm[n].append(grads_layer_mse[n].flatten().norm(p=2).item())
+                if grads_module_mse is not None:
+                    per_batch_module_mse_norm[n].append(grads_module_mse[n].flatten().norm(p=2).item())
             del grads_true
             if grads_fisher is not None:
                 del grads_fisher
@@ -779,6 +902,10 @@ def run_cosine_measurement(
                 del grads_refined_diag
             if grads_refined_mse is not None:
                 del grads_refined_mse
+            if grads_layer_mse is not None:
+                del grads_layer_mse
+            if grads_module_mse is not None:
+                del grads_module_mse
             torch.cuda.empty_cache()
 
         _zero_grads(target_params)
@@ -789,6 +916,8 @@ def run_cosine_measurement(
         "refined_residual_kl": per_batch_refined_loss,
         "refined_diag_residual_kl": per_batch_refined_diag_loss,
         "refined_mse": per_batch_refined_mse_loss,
+        "layer_mse": per_batch_layer_mse_loss,
+        "module_mse": per_batch_module_mse_loss,
     })
 
     results = {}
@@ -857,12 +986,28 @@ def run_cosine_measurement(
             entry["per_batch_refined_mse"] = rm.tolist()
             entry["refined_mse_grad_norm_mean"] = rmn.mean().item()
             entry["per_batch_refined_mse_grad_norm"] = rmn.tolist()
+        if want_layer_mse and per_batch_layer_mse_cos[n]:
+            lm = torch.tensor(per_batch_layer_mse_cos[n])
+            lmn = torch.tensor(per_batch_layer_mse_norm[n])
+            entry["layer_mse_mean"] = lm.mean().item()
+            entry["layer_mse_std"] = lm.std(unbiased=False).item() if len(lm) > 1 else 0.0
+            entry["per_batch_layer_mse"] = lm.tolist()
+            entry["layer_mse_grad_norm_mean"] = lmn.mean().item()
+            entry["per_batch_layer_mse_grad_norm"] = lmn.tolist()
+        if want_module_mse and per_batch_module_mse_cos[n]:
+            mm = torch.tensor(per_batch_module_mse_cos[n])
+            mmn = torch.tensor(per_batch_module_mse_norm[n])
+            entry["module_mse_mean"] = mm.mean().item()
+            entry["module_mse_std"] = mm.std(unbiased=False).item() if len(mm) > 1 else 0.0
+            entry["per_batch_module_mse"] = mm.tolist()
+            entry["module_mse_grad_norm_mean"] = mmn.mean().item()
+            entry["per_batch_module_mse_grad_norm"] = mmn.tolist()
         # Combined (surrogate + reg_grad) metrics, one set per loss that ran.
         if reg_enabled:
             for loss_name in (
                 "fisher_diag_mse", "residual_kl",
                 "refined_residual_kl", "refined_diag_residual_kl",
-                "refined_mse",
+                "refined_mse", "layer_mse", "module_mse",
             ):
                 cos_list = per_batch_combined_cos[loss_name][n]
                 norm_list = per_batch_combined_norm[loss_name][n]
@@ -896,17 +1041,6 @@ def _collect_refined_mse_state_for_loss_report(
     dev,
 ):
     import random as _rng_mod
-
-    if layer_idx == 0:
-        return (
-            torch.tensor([], dtype=torch.long),
-            None,
-            torch.zeros(
-                analyzer.model.config.hidden_size,
-                dtype=torch.float32,
-                device=dev,
-            ),
-        )
 
     n_pool = int(getattr(args, "num_samples_for_refined_mse", 32))
     if n_pool <= 0:
@@ -977,6 +1111,7 @@ def measure_layer_losses_after_quant(
     refined_mse_pool_ids=None,
     refined_mse_grad_pool=None,
     refined_mse_mean_grad=None,
+    fp_module_outputs=None,
 ):
     if measure_samples % measure_batch_size != 0:
         raise ValueError(
@@ -991,6 +1126,8 @@ def measure_layer_losses_after_quant(
     want_fisher = "fisher_diag_mse" in measure_losses
     want_refined_mse = "refined_mse" in measure_losses
     need_fisher = want_fisher or want_refined_mse
+    want_layer_mse = "layer_mse" in measure_losses
+    want_module_mse = "module_mse" in measure_losses
     want_residual = "residual_kl" in measure_losses
     has_refined = (
         "refined_residual_kl" in measure_losses
@@ -1038,7 +1175,17 @@ def measure_layer_losses_after_quant(
         end = start + measure_batch_size
         inp_batch = inps[start:end].to(dev)
         fp_hidden_cached = fp_inps[start:end].to(dev)
-        fp_final_batch = fp_inps_final[start:end].to(dev)
+        fp_final_batch = (
+            None if fp_inps_final is None else fp_inps_final[start:end].to(dev)
+        )
+        if (
+            fp_final_batch is None
+            and (want_residual or has_refined or has_refined_diag)
+        ):
+            raise RuntimeError(
+                "measure_layer_losses_after_quant requires fp_inps_final for "
+                "residual/refined residual losses, but GPTQ+ did not provide it."
+            )
 
         out_hidden = _layer_out(layer(
             inp_batch,
@@ -1136,6 +1283,64 @@ def measure_layer_losses_after_quant(
             per_loss_values["refined_mse"].append(loss.item())
             if layer_output_grad_exact is not None:
                 del layer_output_grad_exact
+        if want_layer_mse:
+            loss = compute_refresh_loss(
+                refresh_loss_type="hidden_mse",
+                out_hidden=out_hidden,
+                fp_hidden=fp_hidden_cached,
+                analyzer=analyzer,
+                kl_topk=kl_topk,
+                layer_output_fisher=None,
+                fp_final_hidden=None,
+            )
+            per_loss_values["layer_mse"].append(loss.item())
+        if want_module_mse:
+            if fp_module_outputs is None:
+                raise RuntimeError(
+                    "measure_losses requested module_mse but FP module outputs "
+                    "were not collected."
+                )
+            module_losses = []
+            captured = {}
+            handles = []
+            modules = _canonical_module_dict(analyzer, layer)
+
+            def _capture(name):
+                def _tmp(_module, _inp, out):
+                    captured[name] = _unwrap_module_output(out).detach()
+                return _tmp
+
+            for name, module in modules.items():
+                handles.append(module.register_forward_hook(_capture(name)))
+            try:
+                _ = _layer_out(layer(
+                    inp_batch,
+                    attention_mask=b_attn,
+                    position_ids=b_pos_ids,
+                    position_embeddings=b_pos_emb,
+                ))
+            finally:
+                for h in handles:
+                    h.remove()
+            missing = sorted(set(modules) - set(captured))
+            if missing:
+                raise RuntimeError(
+                    f"module_mse: quantized forward did not capture outputs for "
+                    f"modules {missing}. This diagnostic currently requires every "
+                    "quantizable module to run exactly once per measurement batch."
+                )
+            for name, out_q in captured.items():
+                if name not in fp_module_outputs:
+                    raise RuntimeError(
+                        f"module_mse: missing FP output for module {name!r}."
+                    )
+                out_fp = fp_module_outputs[name][b].to(dev, dtype=out_q.dtype)
+                module_losses.append(
+                    0.5 * (out_q - out_fp).square().sum(dim=-1).mean().item()
+                )
+            per_loss_values["module_mse"].append(
+                sum(module_losses) / max(len(module_losses), 1)
+            )
 
         del inp_batch, fp_hidden_cached, fp_final_batch, out_hidden
 
@@ -1143,418 +1348,295 @@ def measure_layer_losses_after_quant(
 
 
 # ---------------------------------------------------------------------------
-# main pipeline — GPTAQ per-layer loop with measurement hook
+# main pipeline — GPTQ+ per-layer hook with measurement
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
 def quantize_and_measure(args, analyzer, trainloader, dev, target_layers, measure_losses):
-    logging.info("----- GPTAQ + grad-cosine analysis -----")
-    model = analyzer.model
-    use_cache = model.config.use_cache
-    model.config.use_cache = False
+    logging.info("----- GPTQ+ + grad-cosine analysis -----")
+    if getattr(args, "w_method", None) != "gptq_plus":
+        logging.info(
+            "analyze_grad_cosine uses GPTQ+ as the reference quantization path; "
+            "overriding w_method=%s -> gptq_plus.",
+            getattr(args, "w_method", None),
+        )
+        args.w_method = "gptq_plus"
     layers = analyzer.get_layers()
+    cosine_results = {}
+    layer_loss_results = {}
+    fp_module_outputs_by_layer = {}
 
-    inps, attention_mask, position_ids, position_embeddings, orig_device = \
-        _prepare_calib_inps(analyzer, trainloader, dev)
-
-    # Offload the big calibration activation buffer to CPU. For 7B at
-    # nsamples=1024/seq=2048/hidden=4096/bf16 this is 16 GB per buffer; we have
-    # three (inps/fp_inps/fp_inps_final) so 48 GB of headroom is freed. Per-use
-    # slices are moved to `dev` in the inner loops (already the pattern).
-    inps = inps.cpu()
-
-    memory_utils.cleanup_memory(False)
-
-    # fisher (end-to-end sampled-NLL empirical Fisher) + refined_residual_kl A (LS fit).
     refined_rkl_num_A = int(getattr(args, "refined_rkl_num_A", 1))
     samples_per_A = (
         args.nsamples // refined_rkl_num_A
         if refined_rkl_num_A > 0 else args.nsamples
     )
-    # Only run the fits/accumulators actually needed by `measure_losses`. The
-    # full refined A fit is particularly heavy (H×H per sub-A) so skipping it
-    # when the user only asked for diag/residual variants is the usual win.
-    _want_fisher = "fisher_diag_mse" in measure_losses or "refined_mse" in measure_losses
-    _want_refined_full = "refined_residual_kl" in measure_losses
-    _want_refined_diag = "refined_diag_residual_kl" in measure_losses
-    logging.info(
-        "Measurement plan: losses=%s  → collect_fisher=%s, collect_refined_rkl=%s, "
-        "collect_refined_diag_rkl=%s  grad_clip=%s final_layer_grad_clip=%s",
-        sorted(measure_losses), _want_fisher, _want_refined_full, _want_refined_diag,
-        getattr(args, "grad_clip", None),
-        getattr(args, "final_layer_grad_clip", None),
-    )
-    static_saliency, static_fisher_by_layer, static_refined_A_by_layer, static_refined_diag_A_by_layer, _fp_inps_final, _dynsal = \
-        collect_static_end_to_end_saliency_and_fisher(
-            model=model,
-            analyzer=analyzer,
-            dataloader=trainloader,
-            dev=dev,
-            saliency_num_groups=args.num_groups,
-            grad_hessian_topk=args.grad_hessian_topk,
-            batch_size=args.global_loss_bsz,
-            collect_fisher=_want_fisher,
-            collect_refined_rkl=_want_refined_full,
-            refined_rkl_damp=args.refined_rkl_damp,
-            refined_rkl_num_A=refined_rkl_num_A,
-            collect_refined_diag_rkl=_want_refined_diag,
-            use_fsdp=False,
-            fsdp_cpu_offload=False,
-            saliency_clip_percentile=args.saliency_clip_percentile,
+    want_fisher = "fisher_diag_mse" in measure_losses or "refined_mse" in measure_losses
+    want_refined_full = "refined_residual_kl" in measure_losses
+    want_refined_diag = "refined_diag_residual_kl" in measure_losses
+    want_module_mse = "module_mse" in measure_losses
+    need_fp_final = bool(
+        target_layers
+        or measure_losses.intersection(
+            {"residual_kl", "refined_residual_kl", "refined_diag_residual_kl", "refined_mse"}
         )
-    del static_saliency
-    memory_utils.cleanup_memory()
-
-    # Pre-block modules back to dev (collect_static... left them on CPU).
-    for module in analyzer.get_pre_block_modules():
-        module.to(dev)
-    # Final norm + lm_head on dev so hidden2logits works during measurement.
-    analyzer.get_layernorm_before_head().to(dev)
-    analyzer.get_lm_head().to(dev)
-
-    fp_inps_final = _precompute_fp_inps_final(
-        analyzer, inps, attention_mask, position_ids, position_embeddings,
-        dev, orig_device,
     )
+    if (want_fisher or want_refined_full or want_refined_diag) and not args.global_loss:
+        logging.info(
+            "analyze_grad_cosine requires GPTQ+ global static stats for selected losses; "
+            "forcing --global_loss for this diagnostic run."
+        )
+        args.global_loss = True
+    if want_module_mse and args.measure_samples % args.measure_batch_size != 0:
+        raise ValueError(
+            f"measure_samples ({args.measure_samples}) must be divisible by "
+            f"measure_batch_size ({args.measure_batch_size}) for module_mse."
+        )
+    if args.measure_samples > args.nsamples:
+        raise ValueError(
+            f"measure_samples ({args.measure_samples}) must be <= nsamples "
+            f"({args.nsamples})."
+        )
 
-    quantizers = {}
-    sequential = analyzer.get_sequential_quantizable_module_names()
-    fp_inputs_cache = FPInputsCache(sequential)
-    fp_inps = inps.clone()
-    cosine_results = {}
-    layer_loss_results = {}
+    def _layer_grad_clip(layer_idx):
+        final_layer_idx = len(layers) - 1
+        fl_clip = getattr(args, "final_layer_grad_clip", None)
+        return (
+            fl_clip
+            if layer_idx == final_layer_idx and fl_clip is not None
+            else getattr(args, "grad_clip", None)
+        )
 
-    pbar = tqdm(range(len(layers)), ncols=120, desc="Quantizing Layers")
-    for i in pbar:
-        layer = layers[i].to(dev)
-        full = analyzer.get_quantizable_modules(layer)
-        is_target = i in target_layers
+    def _collect_refined_mse_for_layer(payload):
+        if "refined_mse" not in measure_losses:
+            return (None, None, None)
+        return _collect_refined_mse_state_for_loss_report(
+            args=args,
+            analyzer=analyzer,
+            layer=payload["layer"],
+            layer_idx=payload["layer_idx"],
+            layers=payload["layers"],
+            inps=payload["inps"],
+            fp_inps_final=payload["fp_inps_final"],
+            attention_mask=payload["attention_mask"],
+            position_ids=payload["position_ids"],
+            position_embeddings=payload["position_embeddings"],
+            dev=payload["dev"],
+        )
 
-        # ---------- (A) Cache FP weights BEFORE any quantization mutation ----------
-        # Only when this layer is a measurement target. We need (W_q - W_fp) later
-        # for the regularization gradient. Stored on CPU to keep GPU footprint flat.
-        fp_weights = None
-        if is_target:
-            fp_weights = {}
-            for raw_name, mod in full.items():
-                canon = raw_name[:-7] if raw_name.endswith(".module") else raw_name
-                fp_weights[canon] = mod.weight.detach().clone().cpu()
+    def _log_layer_summary(layer_idx, layer_loss_summary):
+        logging.info(
+            "Layer %d loss after quantization (batch-avg over %d samples): %s",
+            layer_idx,
+            args.measure_samples,
+            _format_layer_loss_summary(layer_loss_summary),
+        )
 
-        # ---------- (B) FP forward advance (fp_inps: target-input → target-output) ----------
-        bits_config = quant_utils.disable_act_quant(layer)
-        fp_inputs_cache.add_hook(full)
-        for j in range(args.nsamples):
-            fp_inps[j] = layer(
-                fp_inps[j].unsqueeze(0).to(dev),
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                position_embeddings=position_embeddings,
-            )[0].to(fp_inps.device)
-        fp_inputs_cache.clear_hook()
-        quant_utils.enable_act_quant(layer, bits_config)
+    def _fmt_entry(name, r):
+        loss_specs = [
+            ("fisher_mean", "fisher"),
+            ("residual_kl_mean", "res_kl"),
+            ("refined_residual_kl_mean", "refined_res_kl"),
+            ("refined_diag_residual_kl_mean", "refined_diag_res_kl"),
+            ("refined_mse_mean", "refined_mse"),
+            ("layer_mse_mean", "layer_mse"),
+            ("module_mse_mean", "module_mse"),
+        ]
+        norm_specs = [
+            ("fisher_grad_norm_mean", "fisher"),
+            ("residual_kl_grad_norm_mean", "res_kl"),
+            ("refined_residual_kl_grad_norm_mean", "refined_res_kl"),
+            ("refined_diag_residual_kl_grad_norm_mean", "refined_diag_res_kl"),
+            ("refined_mse_grad_norm_mean", "refined_mse"),
+            ("layer_mse_grad_norm_mean", "layer_mse"),
+            ("module_mse_grad_norm_mean", "module_mse"),
+        ]
+        cos_bits = [f"{label}={r[key]:.4f}" for key, label in loss_specs if key in r]
+        if r.get("reg_enabled"):
+            cos_bits.append(f"reg={r['reg_cos_mean']:.4f}")
+            for loss_key, loss_short in (
+                ("fisher_diag_mse", "fisher+reg"),
+                ("residual_kl", "res_kl+reg"),
+                ("refined_residual_kl", "refined_res_kl+reg"),
+                ("refined_diag_residual_kl", "refined_diag_res_kl+reg"),
+                ("refined_mse", "refined_mse+reg"),
+                ("layer_mse", "layer_mse+reg"),
+                ("module_mse", "module_mse+reg"),
+            ):
+                key = f"{loss_key}_combined_cos_mean"
+                if key in r:
+                    cos_bits.append(f"{loss_short}={r[key]:.4f}")
+        norm_bits = [f"true={r['true_kl_grad_norm_mean']:.3e}"]
+        norm_bits.extend(
+            f"{label}={r[key]:.3e}" for key, label in norm_specs if key in r
+        )
+        if r.get("reg_enabled"):
+            norm_bits.append(f"reg={r['reg_grad_norm']:.3e}")
+        return f"{name} cos[{' '.join(cos_bits)}] norm[{' '.join(norm_bits)}]"
 
-        # ---------- (C) GPTAQ quantization + (optional) H capture ----------
-        hessians = {} if is_target else None
-        for names in sequential:
-            subset = {n: full.get(n, full.get(n + ".module", None)) for n in names}
-            gptq = {}
-            for name in subset:
-                layer_weight_bits = args.w_bits
-                layer_weight_sym = not args.w_asym
-                if "lm_head" in name:
-                    continue
-                gptq[name] = GPTAQ(subset[name])
-                gptq[name].quantizer = quant_utils.WeightQuantizer()
-                gptq[name].quantizer.configure(
-                    layer_weight_bits,
-                    perchannel=True,
-                    sym=layer_weight_sym,
-                    mse=args.w_clip,
+    def _analysis_hook(event, payload):
+        layer_idx = payload["layer_idx"]
+        if event == "before_layer":
+            return layer_idx in target_layers
+
+        if event == "before_fp_reference":
+            if want_module_mse:
+                fp_module_outputs_by_layer[layer_idx] = _collect_fp_module_outputs(
+                    analyzer=analyzer,
+                    layer=payload["layer"],
+                    inps=payload["fp_inps"],
+                    attention_mask=payload["attention_mask"],
+                    position_ids=payload["position_ids"],
+                    position_embeddings=payload["position_embeddings"],
+                    measure_samples=args.measure_samples,
+                    measure_batch_size=args.measure_batch_size,
+                    dev=payload["dev"],
                 )
-                gptq[name].fp_inp = fp_inputs_cache.fp_cache[name]
+            return None
 
-            def add_batch(name):
-                def tmp(_, inp, out):
-                    gptq[name].add_batch(inp[0].data, out.data)
-                return tmp
+        if event != "after_layer_quantized":
+            return None
 
-            first_module_name = list(subset.keys())[0]
-            handle = subset[first_module_name].register_forward_hook(
-                add_batch(first_module_name)
-            )
-            for j in range(args.nsamples):
-                _ = layer(
-                    inps[j].unsqueeze(0).to(dev),
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    position_embeddings=position_embeddings,
-                )[0]
-            handle.remove()
+        layer = payload["layer"]
+        layers_local = payload["layers"]
+        is_target = bool(payload.get("is_target", False))
+        refined_A_list_i = (
+            payload["static_refined_A_by_layer"][layer_idx]
+            if payload.get("static_refined_A_by_layer") is not None
+            else None
+        )
+        refined_diag_A_list_i = (
+            payload["static_refined_diag_A_by_layer"][layer_idx]
+            if payload.get("static_refined_diag_A_by_layer") is not None
+            else None
+        )
+        fp_module_outputs_i = fp_module_outputs_by_layer.pop(layer_idx, None)
+        refined_mse_pool_ids_i = None
+        refined_mse_grad_pool_i = None
+        refined_mse_mean_grad_i = None
 
-            for name in subset:
-                if name != first_module_name:
-                    gptq[name].H = gptq[first_module_name].H
-                    gptq[name].dXXT = gptq[first_module_name].dXXT
-
-            # Capture raw Fisher/Hessian matrix before fasterquant mutates it.
-            # Stored on CPU.
-            if is_target:
-                for name in subset:
-                    if name not in gptq:
-                        # lm_head (etc.) is skipped during GPTAQ init; no H to
-                        # capture. We also don't quantize/measure it.
-                        continue
-                    hessians[name] = gptq[name].H.detach().clone().cpu()
-
-            for name in subset:
-                pbar.set_postfix(module=f"layers.{i}." + name)
-                gptq[name].fasterquant(
-                    percdamp=args.percdamp,
-                    groupsize=args.w_groupsize,
-                    actorder=args.act_order,
-                    static_groups=args.act_order,
-                )
-                quantizers["model.layers.%d.%s" % (i, name)] = gptq[name].quantizer
-                gptq[name].free()
-
-        # ---------- (D) LOSS REPORT / MEASUREMENT (after target layer is fully quantized) ----------
-        layer_loss_summary = None
         if is_target:
-            # Downstream layers to dev for tail forward.
-            for k in range(i + 1, len(layers)):
-                layers[k].to(dev)
+            for k in range(layer_idx + 1, len(layers_local)):
+                layers_local[k].to(payload["dev"])
             try:
                 with torch.enable_grad():
-                    # `static_refined_A_by_layer[i]` is a list of A matrices
-                    # (length = refined_rkl_num_A). Pass the whole list; the
-                    # measurement routine picks per-batch by sample id.
-                    refined_A_list_i = (
-                        static_refined_A_by_layer[i]
-                        if static_refined_A_by_layer is not None
-                        else None
-                    )
-                    refined_diag_A_list_i = (
-                        static_refined_diag_A_by_layer[i]
-                        if static_refined_diag_A_by_layer is not None
-                        else None
-                    )
-                    # Same per-layer selection as the main pipeline: final
-                    # layer uses `--final_layer_grad_clip` if set; everyone
-                    # else uses `--grad_clip`. Negative value → disabled.
-                    final_layer_idx = len(layers) - 1
-                    fl_clip = getattr(args, "final_layer_grad_clip", None)
-                    layer_grad_clip = (
-                        fl_clip
-                        if i == final_layer_idx and fl_clip is not None
-                        else getattr(args, "grad_clip", None)
-                    )
-                    # refined_mse: collect per-layer grad pool at the same
-                    # upstream-quantized state we are measuring in. With the
-                    # post-quantization measurement reorder, the pool g_i is
-                    # collected against the already-quantized target layer —
-                    # consistent with `grads_true` below.
-                    refined_mse_pool_ids_i = None
-                    refined_mse_grad_pool_i = None
-                    refined_mse_mean_grad_i = None
-                    if "refined_mse" in measure_losses:
-                        (
-                            refined_mse_pool_ids_i,
-                            refined_mse_grad_pool_i,
-                            refined_mse_mean_grad_i,
-                        ) = _collect_refined_mse_state_for_loss_report(
-                            args=args,
-                            analyzer=analyzer,
-                            layer=layer,
-                            layer_idx=i,
-                            layers=layers,
-                            inps=inps,
-                            fp_inps_final=fp_inps_final,
-                            attention_mask=attention_mask,
-                            position_ids=position_ids,
-                            position_embeddings=position_embeddings,
-                            dev=dev,
-                        )
-                    cosine_results[i], layer_loss_summary = run_cosine_measurement(
+                    (
+                        refined_mse_pool_ids_i,
+                        refined_mse_grad_pool_i,
+                        refined_mse_mean_grad_i,
+                    ) = _collect_refined_mse_for_layer(payload)
+                    cosine_results[layer_idx], layer_loss_summary = run_cosine_measurement(
                         analyzer=analyzer,
                         layer=layer,
-                        layer_idx=i,
-                        layers=layers,
-                        inps=inps,
-                        fp_inps=fp_inps,  # already rolled forward to fp_inps[i+1]
-                        fp_inps_final=fp_inps_final,
-                        fisher_tensor=static_fisher_by_layer[i],
+                        layer_idx=layer_idx,
+                        layers=layers_local,
+                        inps=payload["inps"],
+                        fp_inps=payload["fp_inps"],
+                        fp_inps_final=payload["fp_inps_final"],
+                        fisher_tensor=payload["static_fisher_by_layer"][layer_idx],
                         refined_A_list=refined_A_list_i,
                         refined_diag_A_list=refined_diag_A_list_i,
-                        samples_per_A=samples_per_A,
-                        attention_mask=attention_mask,
-                        position_ids=position_ids,
-                        position_embeddings=position_embeddings,
+                        samples_per_A=payload["samples_per_A"],
+                        attention_mask=payload["attention_mask"],
+                        position_ids=payload["position_ids"],
+                        position_embeddings=payload["position_embeddings"],
                         measure_samples=args.measure_samples,
                         measure_batch_size=args.measure_batch_size,
                         kl_topk=args.kl_topk,
-                        dev=dev,
+                        dev=payload["dev"],
                         measure_losses=measure_losses,
-                        grad_clip=layer_grad_clip,
+                        grad_clip=_layer_grad_clip(layer_idx),
                         refined_mse_pool_ids=refined_mse_pool_ids_i,
                         refined_mse_grad_pool=refined_mse_grad_pool_i,
                         refined_mse_mean_grad=refined_mse_mean_grad_i,
-                        fp_weights=fp_weights,
-                        hessians=hessians,
+                        fp_module_outputs=fp_module_outputs_i,
+                        fp_weights=payload.get("fp_weights"),
+                        hessians=payload.get("hessians"),
                         reg_strategy=args.grad_reg_strategy,
                         reg_lambda=args.grad_reg_lambda,
                     )
-                layer_loss_results[i] = layer_loss_summary
-                logging.info(
-                    "Layer %d loss after quantization (batch-avg over %d samples): %s",
-                    i,
-                    args.measure_samples,
-                    _format_layer_loss_summary(layer_loss_summary),
-                )
-                def _fmt_entry(name, r):
-                    cos_bits = []
-                    if "fisher_mean" in r:
-                        cos_bits.append(f"fisher={r['fisher_mean']:.4f}")
-                    if "residual_kl_mean" in r:
-                        cos_bits.append(f"res_kl={r['residual_kl_mean']:.4f}")
-                    if "refined_residual_kl_mean" in r:
-                        cos_bits.append(f"refined_res_kl={r['refined_residual_kl_mean']:.4f}")
-                    if "refined_diag_residual_kl_mean" in r:
-                        cos_bits.append(f"refined_diag_res_kl={r['refined_diag_residual_kl_mean']:.4f}")
-                    if "refined_mse_mean" in r:
-                        cos_bits.append(f"refined_mse={r['refined_mse_mean']:.4f}")
-                    if r.get("reg_enabled"):
-                        cos_bits.append(f"reg={r['reg_cos_mean']:.4f}")
-                        for loss_key, loss_short in (
-                            ("fisher_diag_mse", "fisher+reg"),
-                            ("residual_kl", "res_kl+reg"),
-                            ("refined_residual_kl", "refined_res_kl+reg"),
-                            ("refined_diag_residual_kl", "refined_diag_res_kl+reg"),
-                            ("refined_mse", "refined_mse+reg"),
-                        ):
-                            key = f"{loss_key}_combined_cos_mean"
-                            if key in r:
-                                cos_bits.append(f"{loss_short}={r[key]:.4f}")
-                    norm_bits = [f"true={r['true_kl_grad_norm_mean']:.3e}"]
-                    if "fisher_grad_norm_mean" in r:
-                        norm_bits.append(f"fisher={r['fisher_grad_norm_mean']:.3e}")
-                    if "residual_kl_grad_norm_mean" in r:
-                        norm_bits.append(f"res_kl={r['residual_kl_grad_norm_mean']:.3e}")
-                    if "refined_residual_kl_grad_norm_mean" in r:
-                        norm_bits.append(f"refined_res_kl={r['refined_residual_kl_grad_norm_mean']:.3e}")
-                    if "refined_diag_residual_kl_grad_norm_mean" in r:
-                        norm_bits.append(f"refined_diag_res_kl={r['refined_diag_residual_kl_grad_norm_mean']:.3e}")
-                    if "refined_mse_grad_norm_mean" in r:
-                        norm_bits.append(f"refined_mse={r['refined_mse_grad_norm_mean']:.3e}")
-                    if r.get("reg_enabled"):
-                        norm_bits.append(f"reg={r['reg_grad_norm']:.3e}")
-                    return f"{name} cos[{' '.join(cos_bits)}] norm[{' '.join(norm_bits)}]"
+                layer_loss_results[layer_idx] = layer_loss_summary
+                _log_layer_summary(layer_idx, layer_loss_summary)
                 logging.info(
                     "Layer %d cosine+grad-norm (batch-avg): %s",
-                    i,
-                    ", ".join(_fmt_entry(n, r) for n, r in cosine_results[i].items()),
+                    layer_idx,
+                    ", ".join(
+                        _fmt_entry(n, r)
+                        for n, r in cosine_results[layer_idx].items()
+                    ),
                 )
             finally:
-                for k in range(i + 1, len(layers)):
-                    layers[k] = layers[k].to(orig_device)
-                # Release per-target scratch.
-                del fp_weights
-                if hessians is not None:
-                    del hessians
+                for k in range(layer_idx + 1, len(layers_local)):
+                    layers_local[k] = layers_local[k].to(payload["orig_device"])
                 memory_utils.cleanup_memory()
         else:
-            refined_A_list_i = (
-                static_refined_A_by_layer[i]
-                if static_refined_A_by_layer is not None
-                else None
-            )
-            refined_diag_A_list_i = (
-                static_refined_diag_A_by_layer[i]
-                if static_refined_diag_A_by_layer is not None
-                else None
-            )
-            refined_mse_pool_ids_i = None
-            refined_mse_grad_pool_i = None
-            refined_mse_mean_grad_i = None
             if "refined_mse" in measure_losses:
-                # refined_mse's first-order term needs an exact output-gradient
-                # pool at this post-quantized layer state, same as target layers.
-                for k in range(i + 1, len(layers)):
-                    layers[k].to(dev)
+                for k in range(layer_idx + 1, len(layers_local)):
+                    layers_local[k].to(payload["dev"])
                 try:
                     (
                         refined_mse_pool_ids_i,
                         refined_mse_grad_pool_i,
                         refined_mse_mean_grad_i,
-                    ) = _collect_refined_mse_state_for_loss_report(
-                        args=args,
-                        analyzer=analyzer,
-                        layer=layer,
-                        layer_idx=i,
-                        layers=layers,
-                        inps=inps,
-                        fp_inps_final=fp_inps_final,
-                        attention_mask=attention_mask,
-                        position_ids=position_ids,
-                        position_embeddings=position_embeddings,
-                        dev=dev,
-                    )
+                    ) = _collect_refined_mse_for_layer(payload)
                 finally:
-                    for k in range(i + 1, len(layers)):
-                        layers[k] = layers[k].to(orig_device)
+                    for k in range(layer_idx + 1, len(layers_local)):
+                        layers_local[k] = layers_local[k].to(payload["orig_device"])
             layer_loss_summary = measure_layer_losses_after_quant(
                 analyzer=analyzer,
                 layer=layer,
-                layer_idx=i,
-                inps=inps,
-                fp_inps=fp_inps,
-                fp_inps_final=fp_inps_final,
-                fisher_tensor=static_fisher_by_layer[i],
+                layer_idx=layer_idx,
+                inps=payload["inps"],
+                fp_inps=payload["fp_inps"],
+                fp_inps_final=payload["fp_inps_final"],
+                fisher_tensor=payload["static_fisher_by_layer"][layer_idx],
                 refined_A_list=refined_A_list_i,
                 refined_diag_A_list=refined_diag_A_list_i,
-                samples_per_A=samples_per_A,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                position_embeddings=position_embeddings,
+                samples_per_A=payload["samples_per_A"],
+                attention_mask=payload["attention_mask"],
+                position_ids=payload["position_ids"],
+                position_embeddings=payload["position_embeddings"],
                 measure_samples=args.measure_samples,
                 measure_batch_size=args.measure_batch_size,
                 kl_topk=args.kl_topk,
-                dev=dev,
+                dev=payload["dev"],
                 measure_losses=measure_losses,
                 refined_mse_pool_ids=refined_mse_pool_ids_i,
                 refined_mse_grad_pool=refined_mse_grad_pool_i,
                 refined_mse_mean_grad=refined_mse_mean_grad_i,
+                fp_module_outputs=fp_module_outputs_i,
             )
-            layer_loss_results[i] = layer_loss_summary
-            logging.info(
-                "Layer %d loss after quantization (batch-avg over %d samples): %s",
-                i,
-                args.measure_samples,
-                _format_layer_loss_summary(layer_loss_summary),
-            )
+            layer_loss_results[layer_idx] = layer_loss_summary
+            _log_layer_summary(layer_idx, layer_loss_summary)
             memory_utils.cleanup_memory()
+        return None
 
-        # ---------- (E) Advance inps with the now-quantized layer ----------
-        for j in range(args.nsamples):
-            inps[j] = layer(
-                inps[j].unsqueeze(0).to(dev),
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                position_embeddings=position_embeddings,
-            )[0].to(inps.device)
+    old_attrs = {}
+    for name, value in {
+        "_analysis_hook": _analysis_hook,
+        "_analysis_collect_fisher": want_fisher,
+        "_analysis_collect_refined_rkl": want_refined_full,
+        "_analysis_collect_refined_diag_rkl": want_refined_diag,
+        "_analysis_need_fp_inps_final": need_fp_final,
+    }.items():
+        old_attrs[name] = getattr(args, name, None)
+        setattr(args, name, value)
 
-        fp_inputs_cache.clear_cache()
-        layers[i] = layer.to(orig_device)
-        del layer, gptq
+    try:
+        quantizers = gptq_plus_fwrd(args, analyzer, trainloader, dev)
+    finally:
+        for name, old_value in old_attrs.items():
+            if old_value is None:
+                try:
+                    delattr(args, name)
+                except AttributeError:
+                    pass
+            else:
+                setattr(args, name, old_value)
+        fp_module_outputs_by_layer.clear()
         memory_utils.cleanup_memory()
 
-    # Restore module residency.
-    for module in analyzer.get_pre_block_modules():
-        module.to(orig_device)
-    analyzer.get_layernorm_before_head().to(orig_device)
-    analyzer.get_lm_head().to(orig_device)
-    model.config.use_cache = use_cache
-    memory_utils.cleanup_memory(verbos=True)
-    logging.info("----- GPTAQ + grad-cosine done -----")
+    logging.info("----- GPTQ+ + grad-cosine done -----")
     return quantizers, cosine_results, layer_loss_results
 
 
@@ -1570,6 +1652,7 @@ def main(args):
     analyzer = model_utils.ModelAnalyzer(args.model, args.seq_len)
     model = analyzer.model
     tokenizer = analyzer.tokenizer
+    model_pre_rotated = bool(getattr(model, "_gptqplus_checkpoint_is_rotated", False))
 
     target_layers = set(_parse_target_layers(args.target_layers, analyzer.num_layers))
     if not target_layers:
@@ -1607,7 +1690,7 @@ def main(args):
         args.grad_reg_strategy, args.grad_reg_lambda,
     )
 
-    if args.rotate:
+    if args.rotate and not model_pre_rotated:
         rotation_utils.fuse_layer_norms(analyzer)
         rotation_utils.rotate_model(args, analyzer)
         memory_utils.cleanup_memory()
@@ -1624,15 +1707,13 @@ def main(args):
                 if data.data_ptr() != p.data.data_ptr():
                     p.data = data
 
-        quant_utils.add_actquant(analyzer)
-        qlayers = quant_utils.find_qlayers(model)
-        for name in qlayers:
-            if "down_proj" in name:
-                had_K, K = hadamard_utils.get_hadK(model.config.intermediate_size)
-                qlayers[name].online_full_had = True
-                qlayers[name].had_K = had_K
-                qlayers[name].K = K
-                qlayers[name].fp32_had = False
+        rotation_utils.add_activation_quant_wrappers_for_rotation(analyzer)
+    elif args.rotate and model_pre_rotated:
+        logging.info(
+            "Model was loaded from a pre-rotated checkpoint; installing rotation "
+            "wrappers and skipping in-process rotation."
+        )
+        rotation_utils.add_activation_quant_wrappers_for_rotation(analyzer)
     else:
         quant_utils.add_actquant(analyzer)
 
@@ -1697,6 +1778,8 @@ def main(args):
             ("refined_diag_residual_kl", "refined_diag_residual_kl_mean",
              "refined_diag_residual_kl_grad_norm_mean"),
             ("refined_mse", "refined_mse_mean", "refined_mse_grad_norm_mean"),
+            ("layer_mse", "layer_mse_mean", "layer_mse_grad_norm_mean"),
+            ("module_mse", "module_mse_mean", "module_mse_grad_norm_mean"),
         ]
         _LOSS_BY_NAME = {name: (cos_key, norm_key) for name, cos_key, norm_key in _LOSS_COL_SPEC}
         if cli_order:
@@ -1806,6 +1889,12 @@ def main(args):
             if "refined_mse_mean" in r:
                 out["cos_refined_mse"] = f"{r['refined_mse_mean']:.4f}"
                 out["gnorm_refined_mse"] = f"{r['refined_mse_grad_norm_mean']:.3e}"
+            if "layer_mse_mean" in r:
+                out["cos_layer_mse"] = f"{r['layer_mse_mean']:.4f}"
+                out["gnorm_layer_mse"] = f"{r['layer_mse_grad_norm_mean']:.3e}"
+            if "module_mse_mean" in r:
+                out["cos_module_mse"] = f"{r['module_mse_mean']:.4f}"
+                out["gnorm_module_mse"] = f"{r['module_mse_grad_norm_mean']:.3e}"
             return out
         logging.info(pprint.pformat({
             i: {n: _summary_entry(r) for n, r in per_layer.items()}

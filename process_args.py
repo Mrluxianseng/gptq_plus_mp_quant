@@ -369,7 +369,7 @@ def parse_gen():
             "schedules. Scheduled non-final layers use "
             "base_lr + (target_lr - base_lr) * schedule_scale, where "
             "base_lr = target_lr * ratio. Default 0.01 makes layer 0 start at "
-            "1% of the target LR. Set 0 to recover the old zero-base ramp."
+            "1%% of the target LR. Set 0 to recover the old zero-base ramp."
         ),
     )
     parser.add_argument(
@@ -550,8 +550,7 @@ def parse_gen():
         default="1,5,10,15",
         help=(
             "Comma-separated transformer block indices at which to measure gradient cosine "
-            "(true KL vs fisher_diag_mse vs residual_kl). Use 'all' for every layer. Index 0 "
-            "is dropped with a warning because inps==fp_inps there makes the surrogate grads zero."
+            "(true KL vs selected --measure_losses). Use 'all' for every layer."
         ),
     )
     parser.add_argument(
@@ -584,7 +583,7 @@ def parse_gen():
             "Number of A matrices per layer for refined_residual_kl. Samples are split "
             "into num_A contiguous groups of size nsamples/num_A, each group fits its "
             "own A via LS. At inference time, batch picks A based on its sample id. "
-            "Requires nsamples % num_A == 0 and (nsamples/num_A) divisible by batch sizes "
+            "Requires nsamples %% num_A == 0 and (nsamples/num_A) divisible by batch sizes "
             "used during fit and measurement. Default 1 = original single-A behaviour."
         ),
     )
@@ -644,7 +643,8 @@ def parse_gen():
         help=(
             "Comma-separated subset of surrogate losses to measure against the true "
             "end-to-end KL gradient in analyze_grad_cosine. Choices: fisher_diag_mse, "
-            "residual_kl, refined_residual_kl, refined_diag_residual_kl, refined_mse. "
+            "residual_kl, refined_residual_kl, refined_diag_residual_kl, refined_mse, "
+            "layer_mse, module_mse. "
             "Only the fits / backward passes needed for the selected set are run "
             "(saves memory and time — e.g. skipping refined_residual_kl avoids the "
             "H×H A fit)."

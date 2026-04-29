@@ -5411,6 +5411,17 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
     model.config.use_cache = False
     layers = analyzer.get_layers()
     orig_device = next(model.parameters()).device
+    analysis_hook = getattr(args, "_analysis_hook", None)
+    analysis_need_fisher = bool(getattr(args, "_analysis_collect_fisher", False))
+    analysis_collect_refined_rkl = bool(
+        getattr(args, "_analysis_collect_refined_rkl", False)
+    )
+    analysis_collect_refined_diag_rkl = bool(
+        getattr(args, "_analysis_collect_refined_diag_rkl", False)
+    )
+    analysis_need_fp_inps_final = bool(
+        getattr(args, "_analysis_need_fp_inps_final", False)
+    )
 
     quant_profile_enabled = getattr(args, "enable_quant_profile", False)
     run_recorder = QuantProfileRecorder(dev) if quant_profile_enabled else None
@@ -5522,7 +5533,12 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
     # right sub-A. Zero means single-A (no per-sample routing). Also activates
     # under refined_mix, because the back half uses refined_residual_kl.
     refined_rkl_num_A = int(getattr(args, "refined_rkl_num_A", 1))
-    if refined_rkl_num_A > 1 and args.grad_refresh_loss in ("refined_residual_kl", "refined_mix"):
+    needs_refined_rkl_partition = (
+        args.grad_refresh_loss in ("refined_residual_kl", "refined_mix")
+        or analysis_collect_refined_rkl
+        or analysis_collect_refined_diag_rkl
+    )
+    if refined_rkl_num_A > 1 and needs_refined_rkl_partition:
         if args.nsamples % refined_rkl_num_A != 0:
             raise ValueError(
                 f"refined_rkl: nsamples ({args.nsamples}) must be divisible by "
@@ -5571,7 +5587,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
         # a by-product of the static saliency/fisher forward pass to avoid a
         # separate bs=1 Stage 2 precompute later. Populated on CPU in bf16;
         # moved to match fp_inps's device/dtype once `inps` is captured below.
-        need_fp_inps_final = args.grad_refresh_loss in (
+        need_fp_inps_final = analysis_need_fp_inps_final or args.grad_refresh_loss in (
             "residual_kl", "refined_residual_kl", "refined_mse", "refined_mix",
         )
         fp_inps_final_cpu = None
@@ -5612,13 +5628,28 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     dynsal_tag = f"_dynsalR{dynsal_R}_evd{dynsal_evd_tag}"
                 else:
                     dynsal_tag = ""
+                analysis_tag = ""
+                if analysis_need_fisher and args.grad_refresh_loss not in (
+                    "fisher_diag_mse", "refined_mse",
+                ):
+                    analysis_tag += "_anaFisher"
+                if analysis_collect_refined_rkl and args.grad_refresh_loss not in (
+                    "refined_residual_kl",
+                ):
+                    analysis_tag += "_anaRKL"
+                if analysis_collect_refined_diag_rkl:
+                    analysis_tag += "_anaDiagRKL"
+                if need_fp_inps_final and args.grad_refresh_loss not in (
+                    "residual_kl", "refined_residual_kl", "refined_mse", "refined_mix",
+                ):
+                    analysis_tag += "_anaFPFinal"
                 static_cache_key = (
                     f"{args.model_name}_{dataset_id}_s{args.nsamples}_"
                     f"blk{args.seq_len}_rot{rotate_flag}_g{args.num_groups}_"
                     f"fisherfull_ghtk{args.grad_hessian_topk}_"
                     f"glbsz{args.global_loss_bsz}_seed{args.seed}_"
                     f"salclip{sal_clip_tag}_rklNA{rkl_na}_fpfinal{fpfinal_tag}"
-                    f"_e2els{int(_E2E_PRECOMPUTE_LOSS_GRAD_SCALE)}{mix_tag}{dynsal_tag}"
+                    f"_e2els{int(_E2E_PRECOMPUTE_LOSS_GRAD_SCALE)}{mix_tag}{dynsal_tag}{analysis_tag}"
                 )
                 # Bind `_sink{N}` to the cache key only when the option is on,
                 # so legacy caches keep their byte-identical key (no migration).
@@ -5647,6 +5678,19 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             "Cached static saliency/fisher at %s was built before refined_A "
                             "was added. Delete the cache and rerun to regenerate." % static_cache_file
                         )
+                    if analysis_collect_refined_rkl and not static_refined_A_by_layer:
+                        raise RuntimeError(
+                            "Cached static saliency/fisher at %s does not contain refined_A "
+                            "needed by analyze_grad_cosine. Delete the cache and rerun to regenerate."
+                            % static_cache_file
+                        )
+                    static_refined_diag_A_by_layer = _loaded.get("refined_diag_A", None)
+                    if analysis_collect_refined_diag_rkl and not static_refined_diag_A_by_layer:
+                        raise RuntimeError(
+                            "Cached static saliency/fisher at %s does not contain refined_diag_A "
+                            "needed by analyze_grad_cosine. Delete the cache and rerun to regenerate."
+                            % static_cache_file
+                        )
                     # fp_inps_final is only present when the cache was built
                     # with capture_fp_final=True (cache_key has fpfinal1). The
                     # fpfinal tag in the cache key guarantees we only load
@@ -5666,7 +5710,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         )
                     del _loaded
             else:
-                want_refined = args.grad_refresh_loss in (
+                want_refined = analysis_collect_refined_rkl or args.grad_refresh_loss in (
                     "refined_residual_kl", "refined_mix",
                 )
                 # fisher is consumed by fisher_diag_mse (twofold: the refresh
@@ -5678,7 +5722,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                 # halves CPU RAM for those configurations. For refined_mix we
                 # still want fisher — but only for the front-half layers; see
                 # `fisher_layer_ids` below.
-                want_fisher = args.grad_refresh_loss in (
+                want_fisher = analysis_need_fisher or args.grad_refresh_loss in (
                     "fisher_diag_mse", "refined_mse", "refined_mix",
                 )
                 # refined_mix layer-id filters: front half uses refined_mse →
@@ -5693,6 +5737,10 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                 else:
                     fisher_layer_ids = None
                     refined_rkl_layer_ids = None
+                if analysis_need_fisher:
+                    fisher_layer_ids = None
+                if analysis_collect_refined_rkl or analysis_collect_refined_diag_rkl:
+                    refined_rkl_layer_ids = None
                 with pipeline_recorder.section("pipeline.static_end_to_end_saliency_fisher") if pipeline_recorder else _NULL_CONTEXT:
                     # 4th return (`refined_diag_A`) is only used by
                     # analyze_grad_cosine today; main quant pipeline ignores it.
@@ -5703,7 +5751,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     # wrapper {"by_layer": [...], "N_global": int}, None when
                     # `--enable_dynamic_saliency=0` (default).
                     want_dynsal = bool(int(getattr(args, "enable_dynamic_saliency", 0)))
-                    static_saliency_by_layer, static_fisher_by_layer, static_refined_A_by_layer, _, fp_inps_final_cpu, static_dynsal = \
+                    static_saliency_by_layer, static_fisher_by_layer, static_refined_A_by_layer, static_refined_diag_A_by_layer, fp_inps_final_cpu, static_dynsal = \
                         collect_static_end_to_end_saliency_and_fisher(
                             model=model,
                             analyzer=analyzer,
@@ -5719,6 +5767,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             collect_refined_rkl=want_refined,
                             refined_rkl_damp=getattr(args, "refined_rkl_damp", 0.01),
                             refined_rkl_num_A=int(getattr(args, "refined_rkl_num_A", 1)),
+                            collect_refined_diag_rkl=analysis_collect_refined_diag_rkl,
                             profile_recorder=pipeline_recorder,
                             capture_fp_final=need_fp_inps_final,
                             fisher_layer_ids=fisher_layer_ids,
@@ -5736,6 +5785,8 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             "fisher": static_fisher_by_layer,
                             "refined_A": static_refined_A_by_layer,
                         }
+                        if static_refined_diag_A_by_layer is not None:
+                            _to_save["refined_diag_A"] = static_refined_diag_A_by_layer
                         if fp_inps_final_cpu is not None:
                             _to_save["fp_inps_final"] = fp_inps_final_cpu
                         if static_dynsal is not None:
@@ -5764,6 +5815,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
             static_saliency_by_layer = [None] * len(layers)
             static_fisher_by_layer = [None] * len(layers)
             static_refined_A_by_layer = None
+            static_refined_diag_A_by_layer = None
             static_dynsal = None
             logging.info(
                 "Global loss mode is disabled. Saliency/Fisher caches will be collected layerwise with the output head, "
@@ -5901,7 +5953,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
         # the bs=1 per-layer precompute when global_loss is off or when the
         # capture didn't run (e.g. loaded an older cache).
         fp_inps_final = None
-        if args.grad_refresh_loss in ("residual_kl", "refined_residual_kl", "refined_mse", "refined_mix"):
+        if need_fp_inps_final:
             if fp_inps_final_cpu is not None:
                 with pipeline_recorder.section("pipeline.fp_final_from_static") if pipeline_recorder else _NULL_CONTEXT:
                     logging.info(
@@ -5976,6 +6028,24 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
             layer = layers[i].to(dev)
             full = analyzer.get_quantizable_modules(layer)
             layer_recorder = QuantProfileRecorder(dev, prefix=f"layers.{i}") if quant_profile_enabled else None
+            analysis_is_target = False
+            analysis_fp_weights = None
+            if analysis_hook is not None:
+                analysis_is_target = bool(analysis_hook("before_layer", {
+                    "args": args,
+                    "analyzer": analyzer,
+                    "layer": layer,
+                    "layer_idx": i,
+                    "layers": layers,
+                    "full": full,
+                    "inps": inps,
+                    "fp_inps": fp_inps,
+                    "attention_mask": attention_mask,
+                    "position_ids": position_ids,
+                    "position_embeddings": position_embeddings,
+                    "dev": dev,
+                    "orig_device": orig_device,
+                }))
             # Per-layer LR ramp. scale==1.0 when schedule="none", so this is
             # a no-op for the default config.
             grad_lr_layer_scale = compute_layer_lr_scale(
@@ -6202,6 +6272,25 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                                 layer_refined_mse_mean_grad.norm(p=2).item(),
                             )
 
+            if analysis_hook is not None:
+                analysis_hook("before_fp_reference", {
+                    "args": args,
+                    "analyzer": analyzer,
+                    "layer": layer,
+                    "layer_idx": i,
+                    "layers": layers,
+                    "full": full,
+                    "inps": inps,
+                    "fp_inps": fp_inps,
+                    "fp_inps_final": fp_inps_final,
+                    "attention_mask": attention_mask,
+                    "position_ids": position_ids,
+                    "position_embeddings": position_embeddings,
+                    "dev": dev,
+                    "orig_device": orig_device,
+                    "is_target": analysis_is_target,
+                })
+
             with layer_recorder.section("layer.fp_reference_forward") if layer_recorder else _NULL_CONTEXT:
                 with disable_fp_path_quant(layer):
                     # inps/fp_inps are rank-local shards of length n_local.
@@ -6312,6 +6401,31 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             sym=not args.w_asym,
                             mse=args.w_clip,
                         )
+
+            if analysis_hook is not None:
+                if analysis_is_target:
+                    analysis_fp_weights = {
+                        normalize_quant_module_name(raw_name): mod.weight.detach().clone().cpu()
+                        for raw_name, mod in full.items()
+                        if mod is not None and hasattr(mod, "weight")
+                    }
+                analysis_hook("after_preclip", {
+                    "args": args,
+                    "analyzer": analyzer,
+                    "layer": layer,
+                    "layer_idx": i,
+                    "layers": layers,
+                    "full": full,
+                    "inps": inps,
+                    "fp_inps": fp_inps,
+                    "fp_inps_final": fp_inps_final,
+                    "attention_mask": attention_mask,
+                    "position_ids": position_ids,
+                    "position_embeddings": position_embeddings,
+                    "dev": dev,
+                    "orig_device": orig_device,
+                    "is_target": analysis_is_target,
+                })
 
             batch_attention_mask = attention_mask.expand(args.bsz, -1, -1, -1)
             batch_position_ids = position_ids.expand(args.bsz, -1)
@@ -6559,6 +6673,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         memory_utils.cleanup_memory()
 
             layer_hessian_once = dynsal_refresh_mode == "per_layer"
+            analysis_hessians = {} if analysis_is_target else None
 
             def build_gptq_for_subset(subset_for_setup, saliency_for_setup, gradients_for_setup, reference_loss_for_setup):
                 gptq_local = {}
@@ -6646,6 +6761,11 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                 with layer_recorder.section("layer.hessian_finalize") if layer_recorder else _NULL_CONTEXT:
                     for module_name in gptq_for_accum:
                         gptq_for_accum[module_name].finalize_hessian()
+                if analysis_hessians is not None:
+                    for module_name, gptq_obj in gptq_for_accum.items():
+                        analysis_hessians[module_name] = (
+                            gptq_obj.H.detach().float().clone().cpu()
+                        )
 
             if layer_hessian_once:
                 with layer_recorder.section("layer.per_layer_stats_and_hessian") if layer_recorder else _NULL_CONTEXT:
@@ -7122,6 +7242,31 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         quantizers["model.layers.%d.%s" % (i, name)] = gptq[name].quantizer
                         gptq[name].free()
 
+            if analysis_hook is not None:
+                analysis_hook("after_layer_quantized", {
+                    "args": args,
+                    "analyzer": analyzer,
+                    "layer": layer,
+                    "layer_idx": i,
+                    "layers": layers,
+                    "full": full,
+                    "inps": inps,
+                    "fp_inps": fp_inps,
+                    "fp_inps_final": fp_inps_final,
+                    "attention_mask": attention_mask,
+                    "position_ids": position_ids,
+                    "position_embeddings": position_embeddings,
+                    "dev": dev,
+                    "orig_device": orig_device,
+                    "static_fisher_by_layer": static_fisher_by_layer,
+                    "static_refined_A_by_layer": static_refined_A_by_layer,
+                    "static_refined_diag_A_by_layer": static_refined_diag_A_by_layer,
+                    "samples_per_A": refined_rkl_samples_per_A,
+                    "fp_weights": analysis_fp_weights,
+                    "hessians": analysis_hessians,
+                    "is_target": analysis_is_target,
+                })
+
             with layer_recorder.section("layer.quantized_replay_forward") if layer_recorder else _NULL_CONTEXT:
                 for j in range(inps.shape[0]):
                     inps[j] = layer(
@@ -7177,6 +7322,8 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     static_fisher_by_layer[i] = None
                 if static_refined_A_by_layer is not None and i < len(static_refined_A_by_layer):
                     static_refined_A_by_layer[i] = None
+                if static_refined_diag_A_by_layer is not None and i < len(static_refined_diag_A_by_layer):
+                    static_refined_diag_A_by_layer[i] = None
                 if static_dynsal is not None and isinstance(static_dynsal, dict):
                     _dyn_layers = static_dynsal.get("by_layer")
                     if _dyn_layers is not None and i < len(_dyn_layers):

@@ -124,168 +124,17 @@ FSDP_PRECOMPUTE=0 \
 
 ## loss type
 
-- fisher_diag_mse：将最后一层（开启global loss）输出的kl loss在当前层的输出隐空间上二阶展开： $loss = \frac{1}{2} \Delta y ^T H \Delta y$ ，其中H使用fisher矩阵估算对角项。
-
-这里之前做过逐样本group维度l2norm为1的标准化，现在删掉了（效果更好），就是严格二阶展开式，不加任何归一化。
-
-- refined_mse：在fisher_diag_mse的基础上再加一阶项 $g \cdot \Delta y$ ，即端到端kl loss对当前layer输出的完整Taylor二阶展开式。详见 [refined_mse 详解](#refined_mse-详解)。支持和 loss_slide_window 同开（同一次反传顺带采下一层 grad pool），但要求 `--enable_gptq_plus 0`（v1 限制，理由见下）。
+- fisher_diag_mse（名字带diag但现在优化后不再只考虑对角项了，是个遗留问题）：将最后一层（开启global loss）输出的kl loss在当前层的输出隐空间上二阶展开： $loss = \frac{1}{2} \Delta y ^T H \Delta y$ ，其中H使用fisher矩阵估算。
 
 - res_kl：假设当前层的全精度模型输出为x，量化模型输出为x+Δx，假设后续层的变换可以近似为恒等变换加上一个较小的函数f，则全精度模型最终输出： $x+f(x)$ ，量化模型输出： $x+Δx+f(x+Δx)$ 约等于 $x+Δx+f(x)$ ，因此可以考虑直接比较这两个量过输出头之后的kl loss。其中 $x+f(x)$ 一开始就缓存下来了（全精度模型的激活值）。
 
 - refined_res_kl：在res_kl中，我们近似认为 $x+Δx+f(x+Δx)$ 约等于 $x+Δx+f(x)$ ，现在我们多近似一阶： $x+Δx+f(x+Δx)$ 约等于 $x+Δx+f(x)+Δx \cdot \nabla f(x)$ 。而这个 $\nabla f(x)$ 我们用一个常量Jacobi矩阵J去近似。在量化开始前预计算全模型反向传播时，对于每一layer，假设输出隐向量梯度为dx，假设最后一层输出隐向量梯度为dy，则有： $dx=(I+J)dy$ 即 $dx-dy = Jdy$ ，这个可以用最小二乘法直接拟合，从而得到每一层的J矩阵并存在cpu。除此之外定义num_A表示可以保存多少个样本的J矩阵。刚刚假设所有样本共用一个，现在改成总共有num_A个分组共用。
 
-- refined_mix：前一半 transformer layer 用 fisher_diag_mse，后一半用 refined_res_kl，最后一层沿用现有规则强制 kl。直觉是前半段层输出一阶项 $g$ 数值小、对损失的贡献有限，在 fisher_diag_mse 的纯二阶近似上再补一阶得不偿失（而且 refined_mse 每层都要做一次端到端 backward，开销贵）；后半段层 $g$ 变大、refined_res_kl 的线性 Jacobi 近似误差反而更明显，所以用 refined_res_kl。两种 loss 的预计算只各收自己需要的那一半（fisher 只收前半层、A 只拟合后半层，和 fisher_diag_mse / refined_res_kl 的 precompute 是同一次端到端 backward，只是 hook 挂的 layer 不同），相应 CPU RAM 约各省一半。前半段完全不做"每层端到端 backward 采 grad pool"那一步（fisher_diag_mse 不需要一阶项）。切换边界 layer `i = split - 1` 上 `loss_slide_window` 自动禁用（下一层 loss type 变了、pool / A 形态对不上）。详见 [refined_mix 详解](#refined_mix-详解)。要求 `--global_loss`。
-
-可以做一下实验看一下这个loss（包括fisher mse loss）的梯度对真正kl loss的梯度的近似水平好不好，可以通过cosine相关性来测一下。
-
-## refined_mse 详解
-
-### 数学定义
-
-记端到端 KL loss 为 $L = \text{KL}(\text{student}\_{\text{logits}}(y_i)\,\|\,\text{teacher}\_{\text{logits}}(y_i^{\text{fp}}))$ ，其中 $y_i$ 是 layer $i$ 的输出隐向量。把 $L$ 在 fp 输出 $y_i^{\text{fp}}$ 处做二阶 Taylor 展开：
-
-$$
-L(y_i^{\text{fp}}+\Delta y_i) \;\approx\; L(y_i^{\text{fp}}) \;+\; g_i^{T}\Delta y_i \;+\; \tfrac{1}{2}\,\Delta y_i^{T} H_i\, \Delta y_i
-$$
-
-其中 $g_i = \left.\partial L/\partial y_i\right|_{y_i=y_i^{\text{fp}}}$ ，$H_i$ 是 $L$ 在 $y_i^{\text{fp}}$ 处的 Hessian。 $L(y_i^{\text{fp}})$ 对当前层权重不依赖、求梯度为 0，舍去。 $H_i$ 用预计算的 **empirical Fisher 矩阵** `E[g g^T]`（不再按 token 保存，也不再按 `fisher_num_groups` 分组）。这里的 `g` 来自输出sample×输出token求和的 sampled NLL total loss；`E[...]` 是在中间层token维上的共享系数平均。忽略一阶项就是 Fisher 矩阵二次型；refined_mse 把一阶项加回来。
-
-一阶项 $g_i$ 取决于"从当前 layer $i$ 输出到端到端 KL 的反传"。在 fp 模型上 $g_i\equiv 0$（student 完全等于 teacher，KL=0，梯度处处为 0）——所以**必须在量化进行到 layer $i$ 的那一刻、上游 $0..i-1$ 已经量化的状态下**去采 $g_i$ ，才能拿到非零值。这一点是 refined_res_kl 在预处理一次就把 A 矩阵全收完的做法做不到的。
-
-### 实现细节（代码怎么做）
-
-整个流程完全嵌进主量化循环（[gptq_fwrd](gptq_utils/gptq_plus_utils.py)），每一层独立算一次 grad pool 然后用于该层的 refresh：
-
-### Loss 尺度约定
-
-- **输出token维**：静态 saliency / Fisher / dynsal SVD 用 sampled NLL，loss 一律对输出sample×输出token求和后 backward，不做 batch/token mean。这样 activation grad 对应的是总 NLL loss 的梯度。
-- **中间层token维**：hook 拿到的是每个中间层token的 activation grad。Saliency 保留 per-token 值，只在输出通道 group 内平均；layer-output Fisher 存的是 `sum_middle g^T g / N_middle` 这个共享系数；dynsal SVD 累积未归一化的中间token和，动态更新公式里再显式用 `N_global`。
-- **refresh loss**：`compute_refresh_loss` 仍按当前 refresh mini-batch 返回平均 loss，外层再按样本数聚合梯度；这是优化步长的尺度约定，不改变静态 NLL/Fisher/SVD 的采集定义。
-
-**Step 1 — 采样（[gptq_plus_utils.py:4738-4808](gptq_utils/gptq_plus_utils.py#L4738-L4808)）**。开始量化 layer $i$ 之前：
-- 用 `random.Random(args.seed + i)` 建独立 RNG，从 `[0, n_local)` 无放回抽 `num_samples_for_refined_mse` 个 rank-local sample id（sorted）。
-- 每 layer 独立抽、每 layer 不同样本。layer 0 直接跳过采样（grad 恒为 0），`mean_grad = zeros(H)`。
-
-**Step 2 — 端到端反传（[collect_layer_output_grad_for_refined_mse](gptq_utils/gptq_plus_utils.py#L3192)）**：
-- 把 layer $i+1..N-1$ 搬到 `dev`（主循环里下游 layer 平时在 CPU；`layernorm_before_head` / `lm_head` 常驻 dev）。
-- `quant_utils.disable_act_quant` 在 layer $i$ 和下游每一个 block 上关掉 act-quant wrapper，使得这次 forward 纯 FP。
-- `temporary_requires_grad(...)` 把上述所有模块的 param 冻结（`requires_grad=False`），只让 activation 保留 grad。
-- 按 `global_loss_bsz // world` 的 batchsize 循环：
-  - `h_in = inps[batch_ids].detach().clone().requires_grad_(True)` 启动 graph
-  - `out_i = layer(h_in, ...)[0]`（FP）
-  - 逐 block forward 到最后
-  - `logits_student = hidden2logits(h, analyzer)`
-  - `logits_teacher = hidden2logits(fp_inps_final[batch_ids], analyzer).detach()`
-  - `kl_topk > 0` 时 gather 成 top-k
-  - `kl = F.kl_div(log_softmax(...), softmax(...), reduction='none').sum(-1).sum()`，即对输出sample×输出token求总loss
-  - `grad = torch.autograd.grad(kl, out_i, retain_graph=False)[0]`（**只反传到 `out_i`，不再往前**）
-- 所有 batch 的 grad 拼成 `grad_pool` shape `(N_pool, seq, H)`，bf16 存 CPU；顺便算 `mean_grad = grad_pool.float().mean(dim=(0,1))` shape `(H,)` fp32 on dev。
-- finally 把下游 layer 搬回 CPU、把 act-quant wrapper 恢复。
-
-**Step 3 — refresh loss 计算（[compute_refresh_loss `refined_mse` 分支](gptq_utils/gptq_plus_utils.py#L3563)）**。block_gd 里每做一次 refresh，`collect_true_weight_gradient` 会按 `batch_indices` 切 mini-batch，每 batch 里：
-
-1. 建 `refined_mse_pool_lookup = {local_idx: pool_pos}`（一次，缓存整个 refresh）
-2. 每 mini-batch 对本 batch 样本查表，分两拨：
-   - 命中 pool 的样本 → `layer_output_grad_exact` 是 `grad_pool` 相应行的 slice shape `(B_pool, seq, H)`，`pool_positions` 记录这些样本在 batch 里的 row id
-   - 没命中的样本 → 用全 pool 的 `mean_grad`
-3. `compute_refresh_loss('refined_mse', ...)` 的公式：
-
-$$
-\underbrace{\tfrac{1}{2}\sum_g f_g \sum_{i\in g}\Delta y_i^2}\_{\text{fisher\_diag\_mse}} \;+\; \underbrace{\tfrac{1}{B}\Big[\sum\_{b\in\text{pool}}\tfrac{1}{T}\sum\_t g^{\text{exact}}\_{b,t}\cdot \Delta y\_{b,t} + \bar{g}\cdot\sum\_{b\notin\text{pool}}\overline{\Delta y\_b}\Big]}\_{\text{一阶项}}
-$$
-
-$\overline{\Delta y\_b} = \tfrac{1}{T}\sum\_t\Delta y\_{b,t}$ 。非 pool 样本用 `mean_grad @ delta.mean(1).t()` 一个 matmul 直接算，**不展开成 `(B, seq, H)` 大张量**。pool 样本的一阶项用 element-wise `(grad_exact * delta_pool).sum(-1).mean(-1).sum()`。
-
-**Step 4 — 资源释放（[gptq_plus_utils.py:5417](gptq_utils/gptq_plus_utils.py#L5417)）**。当前 layer 量化结束时：
-```python
-del layer_refined_mse_grad_pool
-del layer_refined_mse_mean_grad
-del layer_refined_mse_pool_ids
-# slide_window 开启时还会多 del 下一层的 pool/mean_grad
-memory_utils.cleanup_memory()
-```
-下一层开始时重新采、重新传；不跨 layer 留存。
-
-### 和 loss_slide_window 同开
-
-开启 `loss_slide_window` + `refined_mse` 时，Step 2 的端到端反传会在同一次 `torch.autograd.grad(kl, [out_i, out_{i+1}])` 里**一次性**采出 $g_{i+1}$，存成 `layer_refined_mse_grad_pool_next` / `layer_refined_mse_mean_grad_next`（同一批样本、同一 graph，pool_ids 复用，没有额外 forward）。Block_gd 里 refresh 时，`compute_refresh_loss('refined_mse', ...)` 被调两次：一次用当前层的 $g_i$ 算 `refresh_loss_current`，一次用下一层的 $g_{i+1}$、下一层的 fisher、以及 $\Delta y_{i+1} = \text{next\_layer}(\text{out\_hidden}) - \text{fp\_inps\_next}$ 算 `refresh_loss_next`，最后按 `slide_alpha * current + (1 - slide_alpha) * next` 混。slide_window 只在 `i <= final_layer_idx - 2` 激活（和其他 loss 类型一致）。至 layer 0 时两份 pool 都塞 zeros（student == teacher，两层 KL 梯度都恒零）。
-
-### Fisher 复用
-
-refined_mse 的二阶项走 fisher_diag_mse 完全一样的路径（precompute 阶段把 layer output 的 empirical Fisher 做 grad² 存 CPU bf16），代码里 5 处 `layer_refresh_loss_type == "fisher_diag_mse"` 的硬编码被改成 `in ("fisher_diag_mse", "refined_mse")`：
-- `want_fisher`（[gptq_plus_utils.py:4455](gptq_utils/gptq_plus_utils.py#L4455)）— precompute 阶段是否收 fisher
-- `need_layer_output_fisher_collection`（[gptq_plus_utils.py:3904](gptq_utils/gptq_plus_utils.py#L3904)）— 兜底 per-layer 收 fisher
-- `batch_layer_output_fisher` 切片（[gptq_plus_utils.py:4009](gptq_utils/gptq_plus_utils.py#L4009)）
-- `pre_gd_refresh_loss_type` 读 fisher（[gptq_plus_utils.py:4917](gptq_utils/gptq_plus_utils.py#L4917)）
-- `precomputed_layer_output_fisher` 传入 `collect_layer_grad_hessian_stats`（[gptq_plus_utils.py:5025](gptq_utils/gptq_plus_utils.py#L5025)）
-
-### layer 0 的退化
-
-layer 0 上游还没量化，student == teacher，KL=0，$g_i\equiv 0$。代码里直接跳过 Step 1-2，把 `pool_ids=empty`、`grad_pool=None`、`mean_grad=zeros(H)` 传下去。`compute_refresh_loss('refined_mse', ...)` 里一阶项整体化为 0，loss 与 fisher_diag_mse 数值一致（已经单元测试验证）。这样 layer 0 的行为既不多花时间收无意义的 grad、也不破坏对 fisher_diag_mse 的向下兼容。
-
-### 超参
-
-| 参数 | 默认 | 约束 | 说明 |
-|------|------|------|------|
-| `--num_samples_for_refined_mse` | 32 | `>0`, `<= nsamples // world`, `% (global_loss_bsz // world) == 0` | per-rank pool 大小 |
-| `--grad_refresh_loss refined_mse` | — | 要求 `--global_loss`，要求 `--enable_gptq_plus 0`；与 `--loss_slide_window` 兼容 | loss 选择 |
-
-### 为什么要求 `enable_gptq_plus=0`（v1 限制）
-
-开 GPTQ+（alpha≠0）时，`collect_layer_grad_hessian_stats` 里会用 `gptq_reference_loss_type` 再跑一次参考梯度反传（用于 GPTQ+ 一阶项的 reference grad）。若此时 `gptq_reference_loss_type == "refined_mse"`，该函数内部调的 `compute_refresh_loss('refined_mse', ...)` 拿不到 pool 参数会 raise。把 pool 参数穿进 `collect_layer_grad_hessian_stats` 才能解锁这一组合，目前暂不做——做纯 refresh loss 对照实验时 `ENABLE_GPTQ_PLUS=0` 是默认选项，影响不大。
-
-### 显存代价
-
-见 [memory_profile.md](memory_profile.md) 的「版本 C: refined_mse」小节。
-
-## refined_mix 详解
-
-### 想法
-
-前半段 transformer layer 的端到端梯度 $g_i$ 本身数值小、对损失的贡献有限，refined_mse 的一阶项收益不大但每层都要付"搬下游 layer 到 GPU → 端到端 backward NUM_SAMPLES_FOR_REFINED_MSE 个样本 → 搬回 CPU"的开销；因此前半段用纯二阶的 fisher_diag_mse 就够了，彻底省掉这一次 backward。后半段 layer 的 $g_i$ 变大、refined_res_kl 的线性 Jacobi 近似开始失真，这时换成 refined_res_kl 更合适（它用一次预拟合的 A 矩阵全局替代端到端反传）。refined_mix 就按深度切一刀，两段各用"当前更合适"的那一种。
-
-### 分层规则
-
-- 默认切分点 `split = N // 2`（N 是 transformer block 总数，不含 lm_head），可用 `--refined_mix_split_layer` 覆盖。
-- layer `i ∈ [0, split)`：`fisher_diag_mse`
-- layer `i ∈ [split, N-1)`：`refined_residual_kl`
-- layer `i = N-1`（final layer）：沿用 [get_effective_refresh_loss_type](gptq_utils/gptq_plus_utils.py#L58) 的现有规则，强制 `kl`
-
-### precompute 只收一半 stats
-
-`collect_static_end_to_end_saliency_and_fisher` 的那次端到端 backward 照常跑一次，但：
-
-- fisher 的 grad² 捕获 hook 只挂在 `[0, split)` 的前半段 layer 上 —— 后半段 layer 的 `fisher_data[i]` 留空，aggregate 阶段直接填 `None`。refined_res_kl 不读 fisher，所以后半没这份 stats 不影响正确性。
-- refined_res_kl 的 per-layer dy·delta 捕获 hook 只挂在 `[split, N-1)` 的后半段 layer 上（last-layer 的 dy 捕获 hook 仍然挂，它只是公共 buffer 源）。前半段 `static_refined_A[i]` 全 None，主循环里 `layer_refined_A_list=None`，fisher_diag_mse 分支不读 A，也不影响。
-- Fisher 现在按每层保存 bf16 矩阵 `H×H`，不再保存 per-token fisher，也不再使用 `fisher_num_groups`。以 Qwen3-4B `H=2560` 为例，每层约 12.5 MB；只收前半层时约减半。A 的 CPU fp32 accumulator 峰值 `2 × H² × 4B × L/2` 省一半约 1.5 GB，加上 bf16 A stack 省约 185 MB。
-- Cache key 在 mix 模式下追加 `_mixsplit{N}` 后缀，避免和非 mix run 的 cache 混用。
-
-### 前半段完全不做每层端到端 backward
-
-主循环里 refined_mse 的 grad pool 采集（[gptq_plus_utils.py:5144](gptq_utils/gptq_plus_utils.py#L5144)）是按 `layer_refresh_loss_type == "refined_mse"` 分派的——mix 模式下前半段 layer 的 `layer_refresh_loss_type` 是 `fisher_diag_mse`、后半段是 `refined_residual_kl`，两者都不触发这一大段（搬下游 layer → 端到端 FP forward + backward → collect pool → 搬回 CPU）。所以 **"mix 模式下整个训练流程完全没有每层端到端 backward"** 是 loss type 路由的副产品，不需要额外代码。
-
-### 切换边界 layer 的 slide_window 行为
-
-- 打开 `--loss_slide_window` 时，layer `i` 会同时计算自身的 loss 和 layer `i+1` 的 loss，按 `slide_alpha: 1→0` 线性混合。
-- mix 下 `i = split - 1` 那一层，当前 loss 是 fisher_diag_mse、下一层 loss 是 refined_residual_kl，两者依赖的 per-layer state 完全不同（fisher_diag_mse 要 fisher[i+1]；refined_residual_kl 要 A[i+1] + fp_inps_final），也无法跨类型线性混合。所以这一层的 slide_window 自动关闭（`next_layer_same_type` 判空）。其他 layer 的 slide_window 照常。
-
-### 学习率两段制
-
-`--refined_mix_rkl_lr_ratio r`（默认 1.0）：后半段 layer（refined_residual_kl）的 block_gd LR 和 pre_gd LR 都等于 `r × --grad_lr` / `r × --pre_grad_lr`。前半段用原始 `--grad_lr`。Final layer 仍独立使用 `--final_layer_grad_lr` / `--pre_final_layer_grad_lr`。Cosine / linear LR schedule (`--grad_lr_layer_schedule`) 在两段各自内部正常生效；调度后的 LR 先按 `--grad_lr_layer_base_ratio` 从 base lr 插值，再乘 refined_mix 的后半段 ratio。
-
-### 约束
-
-- 必须 `--global_loss`（两半都依赖 precompute 的产物）
-- `--refined_rkl_num_A > 1` 时仍需 `nsamples % num_A == 0`
-- 和 refined_mse 不同，**不需要** `--enable_gptq_plus 0`（前半走 fisher_diag_mse，后半走 refined_residual_kl，都没有 refined_mse 那条 pool-dependent 的 reference-loss 路径限制）
+- fisher mse loss效果更好，现在完全用fisher mse
 
 ## loss slide window
 
 - 原本的方法中每个layer都有一个layer wise的loss，但是一旦开始量化下一个layer那么这个loss就会突变导致优化目标瞬移。因此引入了一个slide window loss，具体来说就是在量化layer i的时候同时计算layer i+1的loss，并且在量化layer i的时候逐步调节layer i和layer i+1所占的比重从(1,0)到(0,1)，实现loss的平滑过渡。这在理论上还有一个好处就是使得layer i在量化时不仅关注于降低layer i及以前的量化误差，同时也关注于layer i的量化不要对后面的层产生太大的量化误差积累影响。
-
-目前支持的 refresh loss：`fisher_diag_mse` / `residual_kl` / `refined_residual_kl` / `refined_mse` / `refined_mix`（`refined_mse` 的做法见 [refined_mse 详解 · 和 loss_slide_window 同开](#和-loss_slide_window-同开)；`refined_mix` 在切换边界 layer 上会自动禁用 slide_window，见 [refined_mix 详解](#refined_mix-详解)）。
-
-这个一定要测一下，我感觉效果挺好的。
 
 ## 正则化和学习率调度器（次要）
 
@@ -309,16 +158,6 @@ $$
 
 - quant error gate optimized：添加一个cosine曲线的loss正则，波谷与量化格点对齐，相当于减小权重被量化产生的量化误差的期望。但其实很多误差来源于w_clip。所以感觉没啥用。
 
-有时间就测一下。
+- 正则化现在完全不用，没用
 
-# TODO
-
-按重要性：
-
-- 测fisher diag mse loss和res kl（llama2-7b/13b/70b）
-- 测loss slide window
-- 试试给res kl加二阶修正
-- 测一些极低精度/激活值量化的数据 W4A4 W2A4等
-- 测一下正则化
-- refined_mse 现在采集 grad 时是每 GPU 存一份完整模型权重、把下游 transformer block 临时搬到 dev 做端到端反传。大模型（70B+）装不下时需要像 `collect_static_end_to_end_saliency_and_fisher` 那样上 FSDP2 shard。
-- 测一下调度器
+- cosine调度器：学习率随着层数变大而变大，防止在量化前期层的时候梯度更新过大导致量化误差积累到下游。要开，有用，但是激活值量化时从第一层开始就有较大量化误差需要补偿，此时不开。
