@@ -258,6 +258,62 @@ def load_model_from_prepared_checkpoint_for_quantization(args):
     return analyzer
 
 
+def _build_empty_model_from_config(checkpoint_path: str, args):
+    from accelerate import init_empty_weights
+
+    config, process_word_embeddings = _prepare_config_for_untied_lm_head(checkpoint_path)
+    with init_empty_weights():
+        model = AutoModelForCausalLM.from_config(
+            config,
+            trust_remote_code=True,
+            torch_dtype=torch.bfloat16,
+        )
+    model.tie_word_embeddings = process_word_embeddings
+    model.seqlen = args.seq_len
+    model.eval()
+    return model
+
+
+def load_model_cpu_master_for_quantization(args):
+    """Stage-2 loader: rank0 owns the CPU model, other ranks keep a meta skeleton."""
+    checkpoint_path = get_existing_prepared_rotated_checkpoint_path(args)
+    checkpoint_is_rotated = checkpoint_path is not None
+    if checkpoint_path is None:
+        checkpoint_path, checkpoint_is_rotated = _get_fsdp_meta_checkpoint_path(args)
+
+    if dist_utils.is_main():
+        logging.info(
+            "stage2_cpu_master: rank0 loading CPU master from %s (rotated=%s); "
+            "non-rank0 processes will use meta skeletons.",
+            checkpoint_path,
+            checkpoint_is_rotated,
+        )
+        analyzer = ModelAnalyzer(
+            checkpoint_path,
+            args.seq_len,
+            tokenizer_source=checkpoint_path,
+        )
+    else:
+        logging.info(
+            "stage2_cpu_master: rank%d building meta skeleton from %s.",
+            dist_utils.get_rank(),
+            checkpoint_path,
+        )
+        model = _build_empty_model_from_config(checkpoint_path, args)
+        analyzer = ModelAnalyzer(
+            model,
+            args.seq_len,
+            tokenizer_source=checkpoint_path,
+            skip_state_dict=True,
+        )
+
+    analyzer.model._gptqplus_stage2_cpu_master = True
+    analyzer.model._gptqplus_checkpoint_is_rotated = checkpoint_is_rotated
+    if checkpoint_is_rotated:
+        analyzer.model._gptqplus_prepared_checkpoint_path = checkpoint_path
+    return analyzer
+
+
 def load_model_fsdp_meta_for_precompute(args):
     """Initialize on meta, FSDP-shard, then load checkpoint directly into shards."""
     from accelerate import init_empty_weights

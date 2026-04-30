@@ -247,6 +247,29 @@ def parse_gen():
         ),
     )
     parser.add_argument(
+        "--fisher_rademacher_k",
+        type=int,
+        default=0,
+        help=(
+            "Static global-loss saliency/Fisher precompute only: when >0, repeat each "
+            "precompute batch backward k times after multiplying every output-token "
+            "NLL by an independent Rademacher sign (+1/-1 with p=0.5), then average "
+            "the resulting g^2 / g g^T statistics. 0 keeps the legacy summed-token "
+            "backward exactly."
+        ),
+    )
+    parser.add_argument(
+        "--num_samples_for_grad",
+        type=int,
+        default=0,
+        help=(
+            "Static global-loss saliency/Fisher precompute only: when >0, each DP "
+            "rank uses only the first num_samples_for_grad // world_size samples from "
+            "its rank-local calibration shard for gradient-derived saliency/Fisher "
+            "statistics. 0 uses all calibration samples."
+        ),
+    )
+    parser.add_argument(
         "--fsdp_precompute",
         action="store_true",
         help=(
@@ -269,6 +292,16 @@ def parse_gen():
             "checkpoint load, then load directly into sharded FSDP params. This avoids each "
             "torchrun rank materializing a full CPU copy before FSDP. Requires "
             "--fsdp_precompute --exit_after_precompute."
+        ),
+    )
+    parser.add_argument(
+        "--stage2_cpu_master",
+        action="store_true",
+        help=(
+            "Stage-2 quantization memory saver: only rank0 materializes the full CPU "
+            "model; other ranks build a meta skeleton and receive the current layer "
+            "on GPU by broadcast. Intended for two-stage runs that read a static "
+            "precompute cache."
         ),
     )
     parser.add_argument(
@@ -581,12 +614,12 @@ def parse_gen():
         "--analysis_quant_method",
         type=str,
         default="rtn",
-        choices=["rtn", "gptq_plus"],
+        choices=["rtn", "gptaq", "gptq_plus"],
         help=(
             "Reference quantization path used by analyze_grad_cosine before "
             "measuring target-layer cosine. Default rtn keeps the target-layer "
             "cosine measurement method unchanged while using RTN weights; "
-            "gptq_plus restores the GPTQ+ reference path."
+            "gptaq and gptq_plus restore those reference quantization paths."
         ),
     )
     parser.add_argument(
@@ -844,6 +877,32 @@ def parse_gen():
         args.global_loss_bsz = args.bsz
     if args.global_loss_bsz <= 0:
         raise ValueError(f"`global_loss_bsz` must be positive when provided. Got {args.global_loss_bsz}.")
+    if args.fisher_rademacher_k < 0:
+        raise ValueError(
+            f"`fisher_rademacher_k` must be non-negative. Got {args.fisher_rademacher_k}."
+        )
+    if args.num_samples_for_grad < 0:
+        raise ValueError(
+            f"`num_samples_for_grad` must be non-negative. Got {args.num_samples_for_grad}."
+        )
+    if args.num_samples_for_grad > 0:
+        if args.num_samples_for_grad > args.nsamples:
+            raise ValueError(
+                f"--num_samples_for_grad ({args.num_samples_for_grad}) must be <= "
+                f"--nsamples ({args.nsamples})."
+            )
+        if args.num_samples_for_grad % _dp_world != 0:
+            raise ValueError(
+                f"DP requires num_samples_for_grad ({args.num_samples_for_grad}) "
+                f"divisible by WORLD_SIZE ({_dp_world})."
+            )
+        _grad_samples_local = args.num_samples_for_grad // _dp_world
+        _global_loss_bsz_local = args.global_loss_bsz // _dp_world
+        if _global_loss_bsz_local <= 0 or _grad_samples_local % _global_loss_bsz_local != 0:
+            raise ValueError(
+                f"--num_samples_for_grad // world ({_grad_samples_local}) must be "
+                f"divisible by global_loss_bsz // world ({_global_loss_bsz_local})."
+            )
     if getattr(args, "loss_slide_window", False):
         if args.g_update_mode != "block_gd":
             raise ValueError("--loss_slide_window requires --g_update_mode=block_gd.")
@@ -967,6 +1026,19 @@ def parse_gen():
                 "--enable_dynamic_saliency=1 requires --global_loss (per-module G^T G is "
                 "collected during the same end-to-end backward as saliency/fisher)."
             )
+        if args.fisher_rademacher_k > 0:
+            raise ValueError(
+                "--fisher_rademacher_k cannot be used together with "
+                "--enable_dynamic_saliency=1. Dynamic saliency's low-rank G "
+                "update is temporarily incompatible with signed-token gradient "
+                "averaging."
+            )
+        if 0 < args.num_samples_for_grad < args.nsamples:
+            raise ValueError(
+                "--num_samples_for_grad < --nsamples cannot be used together with "
+                "--enable_dynamic_saliency=1 because the dynamic-saliency low-rank "
+                "state must align with the full rank-local activation projection buffers."
+            )
         if args.dyn_sal_rank <= 0:
             raise ValueError(
                 f"--dyn_sal_rank must be positive when --enable_dynamic_saliency=1. "
@@ -990,6 +1062,35 @@ def parse_gen():
                 "--fsdp_meta_init requires --static_cache_path so the Stage 1 "
                 "precompute result can be saved and reused by Stage 2."
             )
+    if getattr(args, "stage2_cpu_master", False):
+        if args.fsdp_precompute:
+            raise ValueError(
+                "--stage2_cpu_master is a Stage 2 quantization mode and cannot be "
+                "combined with --fsdp_precompute."
+            )
+        if args.grad_refresh_loss == "refined_mse":
+            raise ValueError(
+                "--stage2_cpu_master does not support --grad_refresh_loss=refined_mse. "
+                "refined_mse materializes downstream layers for a per-layer backward."
+            )
+        if args.w_method != "gptq_plus":
+            raise ValueError("--stage2_cpu_master is currently implemented only for --w_method=gptq_plus.")
+        if not args.global_loss:
+            raise ValueError(
+                "--stage2_cpu_master requires --global_loss and an existing Stage 1 "
+                "static cache."
+            )
+        if args.load_qmodel_path:
+            raise ValueError("--stage2_cpu_master does not support --load_qmodel_path yet.")
+        if args.static_cache_path is None:
+            raise ValueError(
+                "--stage2_cpu_master requires --static_cache_path pointing at an "
+                "existing Stage 1 static cache."
+            )
+        if getattr(args, "act_quant_aware_gptq", False):
+            raise ValueError("--stage2_cpu_master does not support --act_quant_aware_gptq yet.")
+        if getattr(args, "k_cache_quant_aware_gptq", False):
+            raise ValueError("--stage2_cpu_master does not support --k_cache_quant_aware_gptq yet.")
     if args.fsdp_precompute and args.exit_after_precompute and not args.skip_eval:
         logging.info(
             "--fsdp_precompute --exit_after_precompute is a Stage 1 cache build; "
@@ -1049,6 +1150,10 @@ def parse_gen():
         raise ValueError(f"`grad_gate_sharpness` must be non-negative. Got {args.grad_gate_sharpness}.")
     if args.grad_gate_sine_amp < 0:
         raise ValueError(f"`grad_gate_sine_amp` must be non-negative. Got {args.grad_gate_sine_amp}.")
+    if args.measure_samples <= 0:
+        raise ValueError(f"`measure_samples` must be positive. Got {args.measure_samples}.")
+    if args.measure_batch_size <= 0:
+        raise ValueError(f"`measure_batch_size` must be positive. Got {args.measure_batch_size}.")
     if args.grad_hessian_topk == 0:
         raise ValueError("`grad_hessian_topk` must be positive or negative to disable. Use -1 to disable.")
     logging.info(args)

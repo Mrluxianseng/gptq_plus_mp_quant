@@ -32,6 +32,8 @@ def main(args):
 
     if bool(getattr(args, "fsdp_meta_init", False)):
         analyzer = model_utils.load_model_fsdp_meta_for_precompute(args)
+    elif bool(getattr(args, "stage2_cpu_master", False)):
+        analyzer = model_utils.load_model_cpu_master_for_quantization(args)
     else:
         analyzer = model_utils.load_model_from_prepared_checkpoint_for_quantization(args)
         if analyzer is None:
@@ -62,13 +64,26 @@ def main(args):
             "Skipping eval/reference-logit generation for FSDP Stage 1 precompute-only run."
         )
         args.skip_eval = True
-    if not args.skip_eval:
+    rank_runs_eval = not bool(getattr(args, "stage2_cpu_master", False)) or dist_utils.is_main()
+    if not args.skip_eval and rank_runs_eval:
         for eval_dataset in args.eval_datasets:
             test_loader = data_utils.get_loaders(eval_dataset, split="test", tokenizer=tokenizer,
                                                  seq_len=args.eval_seq_len, num_samples=args.nsamples)
             ref_logits, orig_lm_head = eval_utils.get_ref_logits(args, analyzer, eval_dataset, test_loader)
             test_loader_dict[eval_dataset] = test_loader
             ref_logits_dict[eval_dataset] = ref_logits
+    if not args.skip_eval and not rank_runs_eval and dist.is_available() and dist.is_initialized():
+        logging.info(
+            "stage2_cpu_master: rank%d skipping PPL/KL reference-logit generation; rank0 owns CPU master eval.",
+            dist_utils.get_rank(),
+        )
+    if (
+        bool(getattr(args, "stage2_cpu_master", False))
+        and not args.skip_eval
+        and dist.is_available()
+        and dist.is_initialized()
+    ):
+        dist.barrier()
 
     # Rotate the weights
     if args.rotate and not model_pre_rotated:
@@ -157,9 +172,21 @@ def main(args):
             )
 
     # Eval
-    if not args.skip_eval:
+    if not args.skip_eval and rank_runs_eval:
         eval_utils.kl_ppl_eval(args, analyzer, orig_lm_head, test_loader_dict, ref_logits_dict)
         del orig_lm_head, ref_logits_dict
+    if not args.skip_eval and not rank_runs_eval and dist.is_available() and dist.is_initialized():
+        logging.info(
+            "stage2_cpu_master: rank%d waiting for rank0 PPL/KL eval.",
+            dist_utils.get_rank(),
+        )
+    if (
+        bool(getattr(args, "stage2_cpu_master", False))
+        and not args.skip_eval
+        and dist.is_available()
+        and dist.is_initialized()
+    ):
+        dist.barrier()
 
     if args.lm_eval and not args.skip_eval:
         # Run lm_eval only on rank 0. Other ranks wait at the barrier below.

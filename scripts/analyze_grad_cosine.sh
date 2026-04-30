@@ -5,7 +5,7 @@
 
 MODEL_PATH=${1}
 DEVICE=${2}
-TARGET_LAYERS=${3:-"5,10,15,20,25,30"}
+TARGET_LAYERS=${3:-"5,10,15,20,25"}
 
 MODEL_NAME=$(basename ${MODEL_PATH})
 N_SAMPLES=256
@@ -30,7 +30,7 @@ PRE_CLIP=${PRE_CLIP:-0}
 # Skipping refined_residual_kl avoids the H×H A fit (big CPU-RAM win on 70B).
 MEASURE_LOSSES=${MEASURE_LOSSES:-"fisher_diag_mse,layer_mse,module_mse"}
 # Reference quantization path used before measuring target-layer cosine.
-# Choices: rtn (default) / gptq_plus.
+# Choices: rtn (default) / gptaq / gptq_plus.
 ANALYSIS_QUANT_METHOD=${ANALYSIS_QUANT_METHOD:-rtn}
 # Grad clip applied element-wise to every captured gradient before cosine /
 # L2-norm measurement. Mirrors the main pipeline so the diagnostic reflects
@@ -100,4 +100,5 @@ python -m torch.distributed.run \
     --grad_reg_strategy "${GRAD_REG_STRATEGY}" \
     --grad_reg_lambda "${GRAD_REG_LAMBDA}" \
     --dp_global_shuffle \
-    "${FINAL_LAYER_GRAD_CLIP_ARGS[@]}"
+    "${FINAL_LAYER_GRAD_CLIP_ARGS[@]}" \
+    --fisher_rademacher_k 0 \

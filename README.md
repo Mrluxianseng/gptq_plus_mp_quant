@@ -59,6 +59,8 @@
 - PRE_CLIP：弃用，固定为0
 - GLOBAL_LOSS：调整gptq的hessian估计以及fisher mse loss的fisher系数使用端到端的kl loss，固定为1就行
 - GLOBAL_LOSS_BSZ：预计算整个模型反传时的batchsize
+- FISHER_RADEMACHER_K：static global-loss 预计算 saliency/Fisher 时的随机符号重复次数。0 表示保持原实现；>0 时对每个 batch 重复 k 次反传，每次给每个 output token 的 NLL 乘独立 Rademacher 符号（±1 各 0.5），每次先形成 `g²` / `g g^T` 统计，再对 k 次取平均，用来修正不同输出 token 梯度流独立近似。开启时不能同时开启动态 saliency 低秩更新（`ENABLE_DYN_SAL=1`）。
+- NUM_SAMPLES_FOR_GRAD：static global-loss 预计算 saliency/Fisher 时使用的全局样本数。0 表示使用全部校准样本；>0 时每个 DP rank 使用自己 shard 的前 `NUM_SAMPLES_FOR_GRAD // world_size` 条样本，并且后续 Hessian 累积也只用同一前缀以保持 saliency 和输入样本对齐。
 - LOSS_SLIDE_WINDOW：开启后会同时计算本层和下一层的loss并线性配比
 - DP_GLOBAL_SHUFFLE：开启dp后的数据shuffle模式，固定为1就行
 - GRAD_LR_LAYER_SCHEDULE：跨layer的学习率调度器。`cosine` 时非 final layer 的有效学习率为 `base_lr + (lr - base_lr) * 0.5 * (1 - cos(pi * layer_idx / (num_layers - 1)))`
@@ -111,7 +113,7 @@ FSDP_PRECOMPUTE=0 \
   bash scripts/gptq_plus_lr_sweep.sh /path/to/Llama-2-70b-hf 4 0,1,2,3,4,5,6,7
 ```
 
-两阶段必须用相同的`N_SAMPLES / SEQ_LEN / NUM_GROUPS / GRAD_HESSIAN_TOPK / SALIENCY_CLIP_PERCENTILE / GLOBAL_LOSS_BSZ / 种子 / rotate开关 / world_size`，否则cache key对不上会重算precompute。
+两阶段必须用相同的`N_SAMPLES / SEQ_LEN / NUM_GROUPS / GRAD_HESSIAN_TOPK / SALIENCY_CLIP_PERCENTILE / GLOBAL_LOSS_BSZ / FISHER_RADEMACHER_K / NUM_SAMPLES_FOR_GRAD / 种子 / rotate开关 / world_size`，否则cache key对不上会重算precompute。
 
 # 核心的消融/创新点
 

@@ -16,19 +16,24 @@ import transformers
 from accelerate.hooks import remove_hook_from_module
 
 from gptq_utils import gptq_utils, gptaq_utils, gptq_guided_utils, gptq_plus_utils
-from utils import data_utils, model_utils
+from utils import data_utils, dist_utils, model_utils
 
 
 def quantize_weights(args, analyzer: model_utils.ModelAnalyzer):
     transformers.set_seed(args.seed)
 
     model = analyzer.model
-    if not bool(getattr(model, "_gptqplus_fsdp_prepared", False)):
+    if (
+        not bool(getattr(model, "_gptqplus_fsdp_prepared", False))
+        and not bool(getattr(model, "_gptqplus_stage2_cpu_master", False))
+    ):
         model.cpu()
     remove_hook_from_module(model, recurse=True)
 
     if args.w_bits < 16:
         save_dict = {}
+        if bool(getattr(model, "_gptqplus_stage2_cpu_master", False)) and args.load_qmodel_path:
+            raise RuntimeError("stage2_cpu_master does not support --load_qmodel_path yet.")
         if args.load_qmodel_path:  # Load Quantized Rotated Model
             logging.info("Load quantized model from ", args.load_qmodel_path)
             save_dict = torch.load(args.load_qmodel_path)
@@ -65,7 +70,10 @@ def quantize_weights(args, analyzer: model_utils.ModelAnalyzer):
                 quantizers = gptq_plus_utils.gptq_fwrd(args, analyzer, trainloader, dp_dev)
             save_dict["w_quantizers"] = quantizers
 
-        if args.save_qmodel_path:
+        if args.save_qmodel_path and (
+            not bool(getattr(model, "_gptqplus_stage2_cpu_master", False))
+            or dist_utils.is_main()
+        ):
             os.makedirs(os.path.dirname(args.save_qmodel_path), exist_ok=True)
             save_dict["model"] = model.state_dict()
             torch.save(save_dict, args.save_qmodel_path)

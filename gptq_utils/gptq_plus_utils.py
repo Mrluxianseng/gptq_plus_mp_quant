@@ -103,6 +103,136 @@ def _scale_delta_by_abs_quantile(delta, ratio, profile_recorder=None):
         return delta * scale.to(delta.dtype)
 
 
+def _refresh_act_quant_wrapper_aliases(module):
+    for child in module.modules():
+        if isinstance(child, quant_utils.ActQuantWrapper):
+            child.weight = child.module.weight
+            child.bias = child.module.bias
+
+
+def _alloc_module_empty_on_device(module, device):
+    module.to_empty(device=device)
+    _refresh_act_quant_wrapper_aliases(module)
+    return module
+
+
+def _iter_module_tensors(module):
+    seen = set()
+    for _, param in module.named_parameters(recurse=True, remove_duplicate=True):
+        if id(param) in seen:
+            continue
+        seen.add(id(param))
+        yield param
+    for _, buf in module.named_buffers(recurse=True, remove_duplicate=True):
+        if buf is None or id(buf) in seen:
+            continue
+        seen.add(id(buf))
+        yield buf
+
+
+@torch.no_grad()
+def _broadcast_module_from_rank0(module, dev, src_module=None):
+    if dist_utils.get_world_size() <= 1:
+        return module.to(dev)
+
+    rank = dist_utils.get_rank()
+    if rank == 0:
+        source = src_module if src_module is not None else module
+        target = source.to(dev)
+    else:
+        target = _alloc_module_empty_on_device(module, dev)
+
+    for tensor in _iter_module_tensors(target):
+        if tensor.device.type != "cuda":
+            raise RuntimeError(
+                f"stage2_cpu_master broadcast expected CUDA tensors, got {tensor.device}."
+            )
+        if not tensor.is_contiguous():
+            tensor.data = tensor.data.contiguous()
+        dist.broadcast(tensor.data, src=0)
+    _refresh_act_quant_wrapper_aliases(target)
+    return target
+
+
+@torch.no_grad()
+def _free_module_to_meta(module):
+    module.to_empty(device="meta")
+    _refresh_act_quant_wrapper_aliases(module)
+    return module
+
+
+class Stage2CpuMasterLayerManager:
+    def __init__(self, analyzer, dev, layers):
+        self.analyzer = analyzer
+        self.model = analyzer.model
+        self.dev = dev
+        self.layers = layers
+        self.rank = dist_utils.get_rank()
+        self.enabled = bool(getattr(self.model, "_gptqplus_stage2_cpu_master", False))
+        self.master_layers = layers if self.enabled and self.rank == 0 else None
+        self.materialized = set()
+
+    def _master_layer(self, idx):
+        if self.master_layers is None:
+            return None
+        return self.master_layers[idx]
+
+    def materialize_runtime_modules(self, modules):
+        if not self.enabled:
+            for module in modules:
+                module.to(self.dev)
+            return
+        for module in modules:
+            _broadcast_module_from_rank0(
+                module,
+                self.dev,
+                src_module=module if self.rank == 0 else None,
+            )
+
+    def release_runtime_modules(self, modules, orig_device):
+        if not self.enabled:
+            for module in modules:
+                module.to(orig_device)
+            return
+        for module in modules:
+            if self.rank == 0:
+                module.to(orig_device)
+            else:
+                _free_module_to_meta(module)
+
+    def materialize_layer(self, idx):
+        if not self.enabled:
+            layer = self.layers[idx].to(self.dev)
+            self.layers[idx] = layer
+            return layer
+        if idx in self.materialized:
+            return self.layers[idx]
+        layer = _broadcast_module_from_rank0(
+            self.layers[idx],
+            self.dev,
+            src_module=self._master_layer(idx),
+        )
+        self.layers[idx] = layer
+        self.materialized.add(idx)
+        return layer
+
+    def release_layer(self, idx, layer=None, *, update_master=False, orig_device=None):
+        if not self.enabled:
+            if layer is None:
+                layer = self.layers[idx]
+            self.layers[idx] = layer.to(orig_device)
+            return self.layers[idx]
+        if layer is None:
+            layer = self.layers[idx]
+        if self.rank == 0:
+            self.layers[idx] = layer.to(orig_device)
+            self.master_layers[idx] = self.layers[idx]
+        else:
+            self.layers[idx] = _free_module_to_meta(layer)
+        self.materialized.discard(idx)
+        return self.layers[idx]
+
+
 def normalize_quant_module_name(name: str) -> str:
     return name[:-7] if name.endswith(".module") else name
 
@@ -396,6 +526,7 @@ class GPTQPlus:
         alpha: float,
         reference_loss: float,
         hessian_saliency_scale: float = 1.0,
+        hessian_group_shard: bool = False,
     ):
         self.layer = layer
         self.dev = self.layer.weight.device
@@ -413,20 +544,86 @@ class GPTQPlus:
 
         self.saliencies = saliency.float()
         self.gradients = gradient.float()
-        # Layout: (num_groups, columns, columns). Storing the group axis first
-        # makes per-subgroup slices `self.H[g]` contiguous, so the bmm-based
-        # accumulation in `add_batch` and the per-subgroup clone in
-        # `fasterquant` get a fast contiguous read/write path.
-        #
-        # DP note: `H` / `act_square` hold an unnormalised SUM. `finalize_hessian`
-        # all-reduces across ranks and applies the single global division. This
-        # gives mathematically the same result as the old running-mean update
-        # but is invariant to sample-order / sample-shard, which is required
-        # once multiple ranks each see only part of `nsamples`.
+        # Assert row partition is valid:
+        # we do the same partition as before:
+        assert self.rows % self.num_groups == 0, (
+            f"Number of rows ({self.rows}) must be divisible "
+            f"by num_groups ({self.num_groups})"
+        )
+        self.rows_per_group = self.rows // self.num_groups
+        self.hessian_group_sharded = False
+        self.hessian_group_ids = torch.arange(self.num_groups, dtype=torch.long)
+        self.hessian_group_to_pos = torch.arange(self.num_groups, dtype=torch.long)
+        self.hessian_group_owner_mask = None
+        self.hessian_group_owner_slots = None
+        self.hessian_group_zero = None
+        if hessian_group_shard and dist_utils.get_world_size() > 1:
+            world = dist_utils.get_world_size()
+            rank = dist_utils.get_rank()
+            if self.rows % world != 0:
+                raise ValueError(
+                    "hessian_group_shard requires output rows "
+                    f"({self.rows}) to be divisible by world_size ({world})."
+                )
+            local_row_start = rank * self.rows // world
+            local_row_end = (rank + 1) * self.rows // world
+            local_rows = torch.arange(local_row_start, local_row_end, dtype=torch.long)
+            local_group_ids = torch.unique(
+                torch.div(local_rows, self.rows_per_group, rounding_mode="floor")
+            )
+            if local_group_ids.numel() <= 0:
+                raise RuntimeError("hessian_group_shard resolved an empty local group set.")
+            if int(local_group_ids.min().item()) < 0 or int(local_group_ids.max().item()) >= self.num_groups:
+                raise RuntimeError(
+                    "hessian_group_shard produced out-of-range group ids: "
+                    f"{local_group_ids.tolist()} for rows [{local_row_start}, {local_row_end})."
+                )
+            group_to_pos = torch.full((self.num_groups,), -1, dtype=torch.long)
+            group_to_pos[local_group_ids] = torch.arange(local_group_ids.numel(), dtype=torch.long)
+            group_owner_mask = torch.zeros((self.num_groups, world), dtype=torch.bool)
+            for owner_rank in range(world):
+                owner_row_start = owner_rank * self.rows // world
+                owner_row_end = (owner_rank + 1) * self.rows // world
+                owner_rows = torch.arange(owner_row_start, owner_row_end, dtype=torch.long)
+                owner_group_ids = torch.unique(
+                    torch.div(owner_rows, self.rows_per_group, rounding_mode="floor")
+                )
+                group_owner_mask[owner_group_ids, owner_rank] = True
+            self.hessian_group_sharded = True
+            self.hessian_group_ids = local_group_ids
+            self.hessian_group_to_pos = group_to_pos
+            self.hessian_group_owner_mask = group_owner_mask
+            self.hessian_group_owner_slots = [
+                group_owner_mask[g].nonzero(as_tuple=False).flatten().tolist()
+                for g in range(self.num_groups)
+            ]
+            logging.info(
+                "GPTQPlus Hessian group shard enabled for %s: rank=%d/%d groups=%s "
+                "H_shape=(%d,%d,%d) instead of (%d,%d,%d).",
+                self.layer.__class__.__name__,
+                rank,
+                world,
+                local_group_ids.tolist(),
+                int(local_group_ids.numel()),
+                self.columns,
+                self.columns,
+                self.num_groups,
+                self.columns,
+                self.columns,
+            )
+        # Layout: (num_local_hessian_groups, columns, columns). Storing the group
+        # axis first makes per-subgroup slices contiguous. In rank-parallel
+        # mode this can be a strict subset of output groups, matching the rows
+        # this rank owns; non-rank paths keep the legacy full group set.
         self.H = torch.zeros(
-            (self.num_groups, self.columns, self.columns),
+            (int(self.hessian_group_ids.numel()), self.columns, self.columns),
             device=self.dev
         )
+        if self.hessian_group_sharded:
+            self.hessian_group_zero = torch.zeros((), device=self.dev, dtype=self.H.dtype).expand(
+                self.columns,
+                self.columns,
+            )
         self.act_square = torch.zeros(
             (self.columns), device=self.dev
         )
@@ -438,13 +635,6 @@ class GPTQPlus:
         self.token_count = 0
         self._finalized = False
         self.profile_recorder = None
-
-        # Assert row partition is valid:
-        # we do the same partition as before:
-        assert self.rows % self.num_groups == 0, (
-            f"Number of rows ({self.rows}) must be divisible "
-            f"by num_groups ({self.num_groups})"
-        )
 
     def _selected_column_count(self, blocksize, max_blocks):
         if max_blocks is None:
@@ -522,6 +712,8 @@ class GPTQPlus:
 
     def _compute_gradient_terms(self, gradients_sub, Hinv_init, Hinv, enable_gradient_update):
         if enable_gradient_update and self.alpha > 0:
+            if Hinv_init is None:
+                raise ValueError("Hinv_init is required when GPTQ+ first-order updates are enabled.")
             alpha = self.alpha / (self.rows * self.columns)
             beta, GHinv_init = compute_safe_beta_from_reference_loss(
                 gradients_sub,
@@ -529,12 +721,14 @@ class GPTQPlus:
                 self.reference_loss,
                 alpha,
             )
+            beta_view = beta.unsqueeze(1)
+            Z = gradients_sub.matmul(Hinv.T) * beta_view
+            GHinv = Z.matmul(Hinv)
         else:
             beta = torch.zeros([1]).to(gradients_sub)
-            GHinv_init = gradients_sub.matmul(Hinv_init)
-        beta_view = beta.unsqueeze(1)
-        Z = gradients_sub.matmul(Hinv.T) * beta_view
-        GHinv = Z.matmul(Hinv)
+            beta_view = beta.unsqueeze(1)
+            Z = torch.zeros_like(gradients_sub)
+            GHinv = torch.zeros_like(gradients_sub)
         return beta, beta_view, Z, GHinv
 
     def _compute_hessian_inverse_batched_with_fallback(
@@ -545,6 +739,7 @@ class GPTQPlus:
         profile_recorder=None,
         profile_section=None,
         log_context="",
+        need_hinv_init=True,
     ):
         """Batched version of `_compute_hessian_inverse_with_fallback`.
 
@@ -564,7 +759,7 @@ class GPTQPlus:
         diag_idx = torch.arange(columns, device=device)
         eye = torch.eye(columns, device=device, dtype=dtype)
         H_work_all = H_subs.clone()
-        Hinv_init = torch.empty_like(H_subs)
+        Hinv_init = torch.empty_like(H_subs) if need_hinv_init else None
         Hinv = torch.empty_like(H_subs)
         damp_percent = torch.full((num_groups,), damp_percent_value, device=device, dtype=torch.float32)
         damp_used = damp_percent.clone()
@@ -600,7 +795,8 @@ class GPTQPlus:
                 if bool(ok2.any().item()):
                     ok2_local_idx = ok2.nonzero(as_tuple=False).flatten()
                     ok2_global_idx = ok_global_idx.index_select(0, ok2_local_idx)
-                    Hinv_init.index_copy_(0, ok2_global_idx, hinit.index_select(0, ok2_local_idx))
+                    if need_hinv_init:
+                        Hinv_init.index_copy_(0, ok2_global_idx, hinit.index_select(0, ok2_local_idx))
                     Hinv.index_copy_(0, ok2_global_idx, hchol.index_select(0, ok2_local_idx))
                     damp_used.index_copy_(0, ok2_global_idx, damp_percent.index_select(0, ok2_global_idx))
                     pending.index_fill_(0, ok2_global_idx, False)
@@ -632,7 +828,8 @@ class GPTQPlus:
                             damp_auto_increment,
                         )
                 if giveup_idx.numel() > 0:
-                    Hinv_init.index_copy_(0, giveup_idx, eye.expand(giveup_idx.numel(), -1, -1))
+                    if need_hinv_init:
+                        Hinv_init.index_copy_(0, giveup_idx, eye.expand(giveup_idx.numel(), -1, -1))
                     Hinv.index_copy_(0, giveup_idx, eye.expand(giveup_idx.numel(), -1, -1))
                     damp_used.index_copy_(0, giveup_idx, damp_percent.index_select(0, giveup_idx))
                     fallback.index_fill_(0, giveup_idx, True)
@@ -650,8 +847,10 @@ class GPTQPlus:
         return Hinv_init, Hinv, damp_used, fallback
 
     def _compute_gradient_terms_batched(self, gradients_sub, Hinv_init, Hinv, enable_gradient_update):
-        GHinv_init = torch.bmm(gradients_sub, Hinv_init)
         if enable_gradient_update and self.alpha > 0:
+            if Hinv_init is None:
+                raise ValueError("Hinv_init is required when GPTQ+ first-order updates are enabled.")
+            GHinv_init = torch.bmm(gradients_sub, Hinv_init)
             alpha = self.alpha / (self.rows * self.columns)
             if self.reference_loss <= 0:
                 beta = torch.zeros(
@@ -675,9 +874,42 @@ class GPTQPlus:
                 dtype=gradients_sub.dtype,
             )
         beta_view = beta.unsqueeze(-1)
-        Z = torch.bmm(gradients_sub, Hinv.transpose(1, 2)) * beta_view
-        GHinv = torch.bmm(Z, Hinv)
+        if enable_gradient_update and self.alpha > 0:
+            Z = torch.bmm(gradients_sub, Hinv.transpose(1, 2)) * beta_view
+            GHinv = torch.bmm(Z, Hinv)
+        else:
+            Z = torch.zeros_like(gradients_sub)
+            GHinv = torch.zeros_like(gradients_sub)
         return beta, beta_view, Z, GHinv
+
+    def _reduce_scatter_hessian_group_(self, global_group_id: int, block: torch.Tensor) -> torch.Tensor:
+        """SUM-reduce a single global Hessian group to the ranks that own it.
+
+        `GROUP_PARALLEL_QUANT=rank` can map one Hessian output group to multiple
+        row-owner ranks (for example 8 ranks / 4 GPTQ groups -> two ranks per
+        group). `reduce_scatter` supports this by placing the same local partial
+        block into every owner slot and stride-0 zeros elsewhere. The output is
+        written back into `block` in-place, so the peak is one CxC block plus the
+        persistent local `self.H` shard instead of a full GxCxC staging tensor.
+        """
+        if not self.hessian_group_sharded or dist_utils.get_world_size() <= 1:
+            return block
+
+        owners = self.hessian_group_owner_slots[int(global_group_id)]
+        if not owners:
+            raise RuntimeError(f"Hessian group {global_group_id} has no owner ranks.")
+        if self.hessian_group_zero is None or self.hessian_group_zero.shape != block.shape:
+            self.hessian_group_zero = torch.zeros(
+                (),
+                device=block.device,
+                dtype=block.dtype,
+            ).expand_as(block)
+        input_list = [
+            block if rank in owners else self.hessian_group_zero
+            for rank in range(dist_utils.get_world_size())
+        ]
+        dist.reduce_scatter(block, input_list, op=dist.ReduceOp.SUM)
+        return block
 
     @staticmethod
     def _make_grad_optimizer_state_batched(weight_sub, grad_optimizer):
@@ -1084,6 +1316,26 @@ class GPTQPlus:
             local_group_idx = torch.div(local_rows, R, rounding_mode="floor").to(torch.long)
             local_row_idx = torch.remainder(local_rows, R).to(torch.long)
             has_local_rows = local_rows.numel() > 0
+            use_hessian_group_shard = (
+                self.hessian_group_sharded
+                and group_parallel_mode == "rank"
+                and dist_utils.get_world_size() > 1
+            )
+            if use_hessian_group_shard:
+                hessian_group_ids = self.hessian_group_ids.to(dev)
+                hessian_group_to_pos = self.hessian_group_to_pos.to(dev)
+                local_hessian_group_idx = hessian_group_to_pos[local_group_idx]
+                if has_local_rows and bool((local_hessian_group_idx < 0).any().item()):
+                    raise RuntimeError(
+                        "Hessian group shard does not cover every local row group: "
+                        f"rank={dist_utils.get_rank()} local_groups="
+                        f"{torch.unique(local_group_idx).detach().cpu().tolist()} "
+                        f"hessian_groups={self.hessian_group_ids.tolist()}."
+                    )
+            else:
+                hessian_group_ids = torch.arange(G, device=dev, dtype=torch.long)
+                hessian_group_to_pos = torch.arange(G, device=dev, dtype=torch.long)
+                local_hessian_group_idx = local_group_idx
 
             if not self.quantizer.ready():
                 with profile_recorder.section("fasterquant_group_parallel.quantizer_find_params_initial") if profile_recorder else _NULL_CONTEXT:
@@ -1122,12 +1374,16 @@ class GPTQPlus:
                 W_sub = W.reshape(G, R, C).clone()
                 H_sub = self.H.clone()
                 gradients_sub = self.gradients.to(dev).float().reshape(G, R, C).clone()
+                gradients_hessian = gradients_sub.index_select(0, hessian_group_ids).contiguous()
 
                 diag_idx = torch.arange(C, device=dev)
                 dead = torch.diagonal(H_sub, dim1=-2, dim2=-1) == 0
                 H_diag = torch.diagonal(H_sub, dim1=-2, dim2=-1)
                 H_diag[dead] = 1
-                W_sub = W_sub.masked_fill(dead.unsqueeze(1), 0)
+                if use_hessian_group_shard:
+                    W_sub[hessian_group_ids] = W_sub[hessian_group_ids].masked_fill(dead.unsqueeze(1), 0)
+                else:
+                    W_sub = W_sub.masked_fill(dead.unsqueeze(1), 0)
 
                 perm = None
                 invperm = None
@@ -1136,10 +1392,17 @@ class GPTQPlus:
                     W_sub = W_sub[:, :, perm]
                     H_sub = H_sub[:, perm][:, :, perm]
                     gradients_sub = gradients_sub[:, :, perm]
+                    gradients_hessian = gradients_hessian[:, :, perm]
                     invperm = torch.argsort(perm)
 
                 hessian_reg = H_sub.clone() if grad_reg_strategy == "hessian" else None
-                full_precision_weight = W_sub.clone() if grad_reg_strategy in {"l2", "hessian"} else None
+                if grad_reg_strategy in {"l2", "hessian"}:
+                    full_precision_weight = (
+                        W_sub.index_select(0, hessian_group_ids).clone()
+                        if use_hessian_group_shard else W_sub.clone()
+                    )
+                else:
+                    full_precision_weight = None
                 anchor_weight = W_sub.clone()
                 Q = torch.zeros_like(W_sub)
                 W_int_sub = torch.zeros_like(W_sub)
@@ -1152,11 +1415,12 @@ class GPTQPlus:
                         percdamp=percdamp,
                         profile_recorder=profile_recorder,
                         profile_section="fasterquant_group_parallel.compute_hinv.cholesky",
+                        need_hinv_init=bool(enable_gradient_update and self.alpha > 0),
                     )
                 )
             with profile_recorder.section("fasterquant_group_parallel.init_ghinv") if profile_recorder else _NULL_CONTEXT:
                 beta, beta_view, Z, GHinv = self._compute_gradient_terms_batched(
-                    gradients_sub,
+                    gradients_hessian,
                     Hinv_init,
                     Hinv,
                     enable_gradient_update,
@@ -1167,7 +1431,7 @@ class GPTQPlus:
                 "Q": Q,
                 "W_int_sub": W_int_sub,
                 "Scale_sub": Scale_sub,
-                "gradients_sub": gradients_sub,
+                "gradients_sub": gradients_hessian,
                 "Hinv_init": Hinv_init,
                 "Hinv": Hinv,
                 "Z": Z,
@@ -1179,7 +1443,13 @@ class GPTQPlus:
                 "hessian_reg": hessian_reg,
                 "gate_scale": None,
                 "gate_zero": None,
-                "grad_optimizer_state": self._make_grad_optimizer_state_batched(W_sub, grad_optimizer) if block_gd_mode else None,
+                "grad_optimizer_state": (
+                    self._make_grad_optimizer_state_batched(
+                        W_sub.index_select(0, hessian_group_ids) if use_hessian_group_shard else W_sub,
+                        grad_optimizer,
+                    )
+                    if block_gd_mode else None
+                ),
             }
 
             base_scale = self.quantizer.scale.to(dev).reshape(G, R, -1)
@@ -1223,6 +1493,30 @@ class GPTQPlus:
                         for piece in packed.split(count, dim=1)
                     ]
 
+            def sync_weight_rows_from_col_(weight_groups, col_start=0):
+                if group_parallel_mode != "rank" or dist_utils.get_world_size() <= 1:
+                    return weight_groups
+                col_start = max(0, min(int(col_start), self.columns))
+                if col_start >= self.columns:
+                    return weight_groups
+                full_rows = weight_groups.reshape(self.rows, self.columns)
+                local_rows = full_rows[local_row_start:local_row_end]
+                if col_start <= 0:
+                    local_full_rows = local_rows.clone().contiguous()
+                    with profile_recorder.section("fasterquant_group_parallel.rank_all_gather_weight") if profile_recorder else _NULL_CONTEXT:
+                        dist.all_gather_into_tensor(full_rows, local_full_rows)
+                else:
+                    local_tail = local_rows[:, col_start:].clone().contiguous()
+                    gathered_tail = torch.empty(
+                        (self.rows, self.columns - col_start),
+                        device=full_rows.device,
+                        dtype=full_rows.dtype,
+                    )
+                    with profile_recorder.section("fasterquant_group_parallel.rank_all_gather_weight_tail") if profile_recorder else _NULL_CONTEXT:
+                        dist.all_gather_into_tensor(gathered_tail, local_tail)
+                    full_rows[:, col_start:].copy_(gathered_tail)
+                return weight_groups
+
             def natural_order(weight_groups):
                 if actorder:
                     weight_groups = weight_groups[:, :, invperm]
@@ -1253,10 +1547,18 @@ class GPTQPlus:
                         inner_update_mode = "surrogate_online" if g_update_mode == "block_backward" else "frozen" if block_gd_mode else g_update_mode
                         is_frozen_inner = inner_update_mode == "frozen"
                         is_surrogate_online = inner_update_mode == "surrogate_online"
+                        if use_hessian_group_shard:
+                            W1_hessian = W1.index_select(0, hessian_group_ids)
+                            W_ref1_hessian = W_ref1.index_select(0, hessian_group_ids)
+                            W_block_start_hessian = W_block_start.index_select(0, hessian_group_ids)
+                        else:
+                            W1_hessian = W1
+                            W_ref1_hessian = W_ref1
+                            W_block_start_hessian = W_block_start
                         GHinv1_eff = self._current_ghinv(
                             GHinv1,
-                            W1 if is_surrogate_online else W_block_start,
-                            W_ref1,
+                            W1_hessian if is_surrogate_online else W_block_start_hessian,
+                            W_ref1_hessian,
                             state["beta_view"],
                             inner_update_mode,
                         )
@@ -1273,7 +1575,7 @@ class GPTQPlus:
                             if has_local_rows:
                                 scale_local = Scale_block[local_group_idx, local_row_idx, :]
                                 W_block_start_l = W_block_start[local_group_idx, local_row_idx, :]
-                                GHinv1_eff_l = GHinv1_eff[local_group_idx, local_row_idx, :]
+                                GHinv1_eff_l = GHinv1_eff[local_hessian_group_idx, local_row_idx, :]
                                 q_int = torch.clamp(
                                     torch.round(W_block_start_l / scale_local),
                                     q_lo,
@@ -1284,7 +1586,7 @@ class GPTQPlus:
                                 W_int1[local_group_idx, local_row_idx, :] = q_int
                                 residual_block = W_block_start_l - q - GHinv1_eff_l
                                 solved = torch.linalg.solve_triangular(
-                                    Hinv1[local_group_idx].transpose(1, 2),
+                                    Hinv1[local_hessian_group_idx].transpose(1, 2),
                                     residual_block.unsqueeze(-1),
                                     upper=False,
                                 ).squeeze(-1)
@@ -1293,17 +1595,17 @@ class GPTQPlus:
                         with profile_recorder.section("fasterquant_group_parallel.block.inner_loop") if profile_recorder else _NULL_CONTEXT:
                             if has_local_rows:
                                 W1_l = W1[local_group_idx, local_row_idx, :].clone()
-                                Hinv1_l = Hinv1[local_group_idx]
-                                GHinv1_l = GHinv1[local_group_idx, local_row_idx, :].clone()
-                                Z1_l = Z1[local_group_idx, local_row_idx, :]
+                                Hinv1_l = Hinv1[local_hessian_group_idx]
+                                GHinv1_l = GHinv1[local_hessian_group_idx, local_row_idx, :].clone()
+                                Z1_l = Z1[local_hessian_group_idx, local_row_idx, :]
                                 GHinv1_eff_l = (
                                     GHinv1_l
                                     if is_frozen_inner
-                                    else GHinv1_eff[local_group_idx, local_row_idx, :].clone()
+                                    else GHinv1_eff[local_hessian_group_idx, local_row_idx, :].clone()
                                 )
                                 W_block_start_l = W_block_start[local_group_idx, local_row_idx, :]
                                 W_ref1_l = W_ref1[local_group_idx, local_row_idx, :]
-                                beta_view_l = state["beta_view"][local_group_idx, local_row_idx, :]
+                                beta_view_l = state["beta_view"][local_hessian_group_idx, local_row_idx, :]
                                 scale_l = Scale_block[local_group_idx, local_row_idx, :]
                                 Q1_l = torch.zeros_like(W1_l)
                                 W_int1_l = torch.zeros_like(W1_l)
@@ -1358,13 +1660,19 @@ class GPTQPlus:
                             if i1 > 0:
                                 current_sub_weight[:, :, :i1] = state["Q"][:, :, :i1]
                             current_sub_weight[:, :, i1:i2] = Q1
+                            if use_hessian_group_shard:
+                                sync_weight_rows_from_col_(current_sub_weight, i2)
                             refreshed_grad, refresh_meta = gradient_refresh_fn(natural_order(current_sub_weight))
                             refreshed_grad = refreshed_grad.to(dev).float().reshape(G, R, C)
                             if actorder:
                                 refreshed_grad = refreshed_grad[:, :, perm]
-                            state["gradients_sub"] = refreshed_grad
+                            refreshed_grad_hessian = (
+                                refreshed_grad.index_select(0, hessian_group_ids).contiguous()
+                                if use_hessian_group_shard else refreshed_grad
+                            )
+                            state["gradients_sub"] = refreshed_grad_hessian
                             beta, beta_view, Z, GHinv = self._compute_gradient_terms_batched(
-                                refreshed_grad,
+                                refreshed_grad_hessian,
                                 state["Hinv_init"],
                                 state["Hinv"],
                                 enable_gradient_update,
@@ -1409,22 +1717,41 @@ class GPTQPlus:
                     with profile_recorder.section("fasterquant_group_parallel.block.outer_update") if profile_recorder else _NULL_CONTEXT:
                         outer_mode = "frozen" if g_update_mode in {"frozen", "block_backward", "block_gd"} else "surrogate_block"
                         Hrest = state["Hinv"][:, i1:i2, i2:]
+                        if use_hessian_group_shard:
+                            W_sub_hessian = state["W_sub"].index_select(0, hessian_group_ids)
+                            anchor_hessian = state["anchor_weight"].index_select(0, hessian_group_ids)
+                        else:
+                            W_sub_hessian = state["W_sub"]
+                            anchor_hessian = state["anchor_weight"]
                         GHinv_rest = self._current_ghinv(
                             state["GHinv"][:, :, i2:],
-                            state["W_sub"][:, :, i2:],
-                            state["anchor_weight"][:, :, i2:],
+                            W_sub_hessian[:, :, i2:],
+                            anchor_hessian[:, :, i2:],
                             state["beta_view"],
                             outer_mode,
                         )
-                        G_Update = count * GHinv_rest - torch.einsum("grj,j,gjk->grk", Z1, D, Hrest)
-                        second_order_update = torch.bmm(Err1, Hrest)
-                        total_outer_update = second_order_update + G_Update
-                        if block_gd_mode:
-                            applied_second_order_update = second_order_scale * second_order_update
-                            state["W_sub"][:, :, i2:] -= second_order_scale * total_outer_update
+                        G_Update_h = count * GHinv_rest - torch.einsum("grj,j,gjk->grk", Z1, D, Hrest)
+                        Err1_h = Err1.index_select(0, hessian_group_ids) if use_hessian_group_shard else Err1
+                        second_order_update_h = torch.bmm(Err1_h, Hrest)
+                        if use_hessian_group_shard:
+                            total_outer_update_h = second_order_update_h + G_Update_h
+                            if block_gd_mode:
+                                applied_second_order_update = second_order_scale * second_order_update_h
+                                state["W_sub"][hessian_group_ids, :, i2:] -= (
+                                    second_order_scale * total_outer_update_h
+                                )
+                            else:
+                                applied_second_order_update = second_order_update_h
+                                state["W_sub"][hessian_group_ids, :, i2:] -= total_outer_update_h
                         else:
-                            applied_second_order_update = second_order_update
-                            state["W_sub"][:, :, i2:] -= total_outer_update
+                            second_order_update = second_order_update_h
+                            total_outer_update = second_order_update + G_Update_h
+                            if block_gd_mode:
+                                applied_second_order_update = second_order_scale * second_order_update
+                                state["W_sub"][:, :, i2:] -= second_order_scale * total_outer_update
+                            else:
+                                applied_second_order_update = second_order_update
+                                state["W_sub"][:, :, i2:] -= total_outer_update
                         state["GHinv"][:, :, i2:] -= torch.bmm(state["Z"][:, :, i1:i2], Hrest)
                         if block_gd_mode:
                             self._clear_grad_optimizer_state_batched(state["grad_optimizer_state"], i1, i2)
@@ -1435,6 +1762,8 @@ class GPTQPlus:
                         with profile_recorder.section("fasterquant_group_parallel.block.block_gd_refresh") if profile_recorder else _NULL_CONTEXT:
                             current_sub_weight = state["W_sub"].clone()
                             current_sub_weight[:, :, :i2] = state["Q"][:, :, :i2]
+                            if use_hessian_group_shard:
+                                sync_weight_rows_from_col_(current_sub_weight, i2)
                             refresh_idx = i1 // blocksize
                             effective_total = (
                                 slide_refresh_block_total
@@ -1475,7 +1804,7 @@ class GPTQPlus:
                             if refresh_full_metrics:
                                 trailing_grad = refreshed_grad[:, :, i2:]
                                 if trailing_grad.numel() > 0:
-                                    trailing_grad_2d = trailing_grad.reshape(G * R, -1).float()
+                                    trailing_grad_2d = trailing_grad.reshape(-1, trailing_grad.shape[-1]).float()
                                     trailing_grad_abs_mean = trailing_grad_2d.abs().mean().item()
                                     trailing_grad_mean_row_l2 = torch.linalg.norm(trailing_grad_2d, dim=1).mean().item()
                                     if grad_clip is not None and grad_clip > 0:
@@ -1485,7 +1814,10 @@ class GPTQPlus:
                                     else:
                                         trailing_grad_clipped_abs_mean = trailing_grad_abs_mean
                                 if applied_second_order_update.numel() > 0:
-                                    second_2d = applied_second_order_update.reshape(G * R, -1).float()
+                                    second_2d = applied_second_order_update.reshape(
+                                        -1,
+                                        applied_second_order_update.shape[-1],
+                                    ).float()
                                     second_abs = second_2d.abs()
                                     second_order_abs_mean = second_abs.mean().item()
                                     second_order_mean_row_l2 = torch.linalg.norm(second_2d, dim=1).mean().item()
@@ -1494,14 +1826,20 @@ class GPTQPlus:
 
                             optimizer_update_raw = self._compute_grad_optimizer_update_batched(
                                 state["grad_optimizer_state"],
-                                refreshed_grad,
+                                (
+                                    refreshed_grad.index_select(0, hessian_group_ids).contiguous()
+                                    if use_hessian_group_shard else refreshed_grad
+                                ),
                                 i2,
                                 grad_lr,
                                 grad_clip=grad_clip,
                             )
                             optimizer_update, gate_regularizer_update, sine_regularizer_update = self._apply_first_order_regularizer_batched(
                                 state,
-                                current_sub_weight,
+                                (
+                                    current_sub_weight.index_select(0, hessian_group_ids)
+                                    if use_hessian_group_shard else current_sub_weight
+                                ),
                                 optimizer_update_raw,
                                 i2,
                                 grad_lr,
@@ -1512,26 +1850,29 @@ class GPTQPlus:
                                 grad_gate_sine_amp,
                             )
                             if optimizer_update.numel() > 0:
-                                state["W_sub"][:, :, i2:] -= optimizer_update
+                                if use_hessian_group_shard:
+                                    state["W_sub"][hessian_group_ids, :, i2:] -= optimizer_update
+                                else:
+                                    state["W_sub"][:, :, i2:] -= optimizer_update
 
                             if refresh_full_metrics:
                                 if optimizer_update_raw.numel() > 0:
-                                    raw_2d = optimizer_update_raw.reshape(G * R, -1).float()
+                                    raw_2d = optimizer_update_raw.reshape(-1, optimizer_update_raw.shape[-1]).float()
                                     first_order_raw_abs_mean = raw_2d.abs().mean().item()
                                     first_order_raw_mean_row_l2 = torch.linalg.norm(raw_2d, dim=1).mean().item()
                                 if optimizer_update.numel() > 0:
-                                    upd_2d = optimizer_update.reshape(G * R, -1).float()
+                                    upd_2d = optimizer_update.reshape(-1, optimizer_update.shape[-1]).float()
                                     upd_abs = upd_2d.abs()
                                     first_order_abs_mean = upd_abs.mean().item()
                                     first_order_mean_row_l2 = torch.linalg.norm(upd_2d, dim=1).mean().item()
                                     first_order_abs_max = upd_abs.max().item()
                                     first_order_abs_q99 = _quantile_large(upd_abs, 0.99)
                                 if gate_regularizer_update.numel() > 0:
-                                    reg_2d = gate_regularizer_update.reshape(G * R, -1).float()
+                                    reg_2d = gate_regularizer_update.reshape(-1, gate_regularizer_update.shape[-1]).float()
                                     regularizer_abs_mean = reg_2d.abs().mean().item()
                                     regularizer_mean_row_l2 = torch.linalg.norm(reg_2d, dim=1).mean().item()
                                 if sine_regularizer_update.numel() > 0:
-                                    sine_2d = sine_regularizer_update.reshape(G * R, -1).float()
+                                    sine_2d = sine_regularizer_update.reshape(-1, sine_regularizer_update.shape[-1]).float()
                                     sine_regularizer_abs_mean = sine_2d.abs().mean().item()
                                     sine_regularizer_mean_row_l2 = torch.linalg.norm(sine_2d, dim=1).mean().item()
 
@@ -1632,17 +1973,29 @@ class GPTQPlus:
                 sal_batch = sal_batch.float()
                 n_tokens = inp.shape[0]
 
-            with profile_recorder.section("add_batch.weighted_input") if profile_recorder else _NULL_CONTEXT:
-                weighted = inp.unsqueeze(0).mul(sal_batch.transpose(0, 1).unsqueeze(-1))
+            if self.hessian_group_sharded:
+                with profile_recorder.section("add_batch.hessian_reduce_scatter") if profile_recorder else _NULL_CONTEXT:
+                    inp_T = inp.transpose(0, 1).contiguous()
+                    for group_id in range(self.num_groups):
+                        weighted = inp.mul(sal_batch[:, group_id].unsqueeze(1))
+                        block = inp_T.matmul(weighted)
+                        self._reduce_scatter_hessian_group_(group_id, block)
+                        local_pos = int(self.hessian_group_to_pos[group_id].item())
+                        if local_pos >= 0:
+                            self.H[local_pos].add_(block)
+            else:
+                with profile_recorder.section("add_batch.weighted_input") if profile_recorder else _NULL_CONTEXT:
+                    weighted = inp.unsqueeze(0).mul(sal_batch.transpose(0, 1).unsqueeze(-1))
 
-            with profile_recorder.section("add_batch.hessian_block") if profile_recorder else _NULL_CONTEXT:
-                inp_T_batched = inp.transpose(0, 1).unsqueeze(0).expand(self.num_groups, -1, -1)
-                block = torch.bmm(inp_T_batched, weighted)
+                with profile_recorder.section("add_batch.hessian_block") if profile_recorder else _NULL_CONTEXT:
+                    inp_T_batched = inp.transpose(0, 1).unsqueeze(0).expand(self.H.shape[0], -1, -1)
+                    block = torch.bmm(inp_T_batched, weighted)
 
-            with profile_recorder.section("add_batch.accumulate") if profile_recorder else _NULL_CONTEXT:
-                # Pure sum; normalisation deferred to `finalize_hessian`. Tracking
-                # `token_count` lets finalize recover seq_len = token_count / index.
-                self.H.add_(block)
+                with profile_recorder.section("add_batch.accumulate") if profile_recorder else _NULL_CONTEXT:
+                    # Pure sum; normalisation deferred to `finalize_hessian`. Tracking
+                    # `token_count` lets finalize recover seq_len = token_count / index.
+                    self.H.add_(block)
+            with profile_recorder.section("add_batch.accumulate_act_square") if profile_recorder else _NULL_CONTEXT:
                 self.act_square.add_((inp ** 2).sum(0))
                 self.token_count += n_tokens
 
@@ -1662,13 +2015,19 @@ class GPTQPlus:
             return
         from utils import dist_utils as _dist  # local import to avoid cycles
 
-        _dist.allreduce_sum_(self.H)
         _dist.allreduce_sum_(self.act_square)
         total_samples = _dist.allreduce_sum_scalar(self.index)
         total_tokens = _dist.allreduce_sum_scalar(self.token_count)
         if total_samples <= 0 or total_tokens <= 0:
             raise RuntimeError("finalize_hessian called before any add_batch ran.")
         seq_len = total_tokens / total_samples
+        if self.hessian_group_sharded:
+            # The sharded path already reduce-scatters each global group inside
+            # add_batch(), so `self.H` contains the global unnormalised sum for
+            # only this rank's owner groups. Do not rebuild a full GxCxC tensor.
+            pass
+        else:
+            _dist.allreduce_sum_(self.H)
         self.H.div_(total_samples * seq_len)
         if self.hessian_saliency_scale != 1.0:
             self.H.div_(self.hessian_saliency_scale)
@@ -1782,6 +2141,12 @@ class GPTQPlus:
                     slide_refresh_block_total=slide_refresh_block_total,
                     refresh_full_metrics=refresh_full_metrics,
                     group_parallel_mode=group_parallel_mode,
+                )
+            if self.hessian_group_sharded:
+                raise RuntimeError(
+                    f"group_parallel_mode={group_parallel_mode} requested and Hessian "
+                    f"is group-sharded, but group-parallel fasterquant would fall back: "
+                    f"{fallback_reason}. Disable group_parallel_quant or the fallback trigger."
                 )
             logging.warning(
                 "group_parallel_mode=%s requested but falling back to legacy fasterquant: %s",
@@ -3393,6 +3758,40 @@ def _deterministic_categorical_labels(logits: torch.Tensor, global_sample_indice
     return out
 
 
+def _deterministic_rademacher_signs(
+    token_shape,
+    global_sample_indices,
+    base_seed: int,
+    device,
+    dtype=torch.float32,
+) -> torch.Tensor:
+    """Generate per-(sample, token) Rademacher signs on `device`.
+
+    The seed is derived per global sample id, so a sample receives the same
+    signs regardless of DP world size or batch packing. Each row is generated
+    as one device tensor; the Python loop is only over batch rows.
+    """
+    bsz, seq_len = token_shape
+    assert len(global_sample_indices) == bsz, (
+        f"expected {bsz} global indices, got {len(global_sample_indices)}"
+    )
+    out = torch.empty((bsz, seq_len), device=device, dtype=dtype)
+    for i, global_idx in enumerate(global_sample_indices):
+        gen = torch.Generator(device=device).manual_seed(
+            int(1000003 * (base_seed * 100000 + int(global_idx)) + 97)
+        )
+        signs_i = torch.randint(
+            0,
+            2,
+            (seq_len,),
+            generator=gen,
+            device=device,
+            dtype=torch.int8,
+        )
+        out[i].copy_(signs_i.to(dtype=dtype).mul_(2).sub_(1))
+    return out
+
+
 
 def collect_static_end_to_end_saliency_and_fisher(
     *,
@@ -3423,11 +3822,51 @@ def collect_static_end_to_end_saliency_and_fisher(
     dynsal_rank=16,
     dynsal_evd_thresh=1e-6,
     sink_size=0,
+    fisher_rademacher_k=0,
+    rademacher_seed=0,
+    num_samples_for_grad=0,
 ):
+    fisher_rademacher_k = int(fisher_rademacher_k)
+    num_samples_for_grad = int(num_samples_for_grad)
+    if fisher_rademacher_k < 0:
+        raise ValueError(
+            f"fisher_rademacher_k must be non-negative, got {fisher_rademacher_k}."
+        )
+    if num_samples_for_grad < 0:
+        raise ValueError(
+            f"num_samples_for_grad must be non-negative, got {num_samples_for_grad}."
+        )
+    if fisher_rademacher_k > 0 and collect_dynsal:
+        raise ValueError(
+            "fisher_rademacher_k cannot be used with collect_dynsal=True because "
+            "dynamic saliency's low-rank gradient decomposition is temporarily "
+            "incompatible with signed-token gradient averaging."
+        )
+    use_rademacher_stats = bool(
+        fisher_rademacher_k > 0
+        and (collect_fisher or collect_saliency or collect_dynsal)
+    )
+    use_grad_sample_limit = bool(
+        num_samples_for_grad > 0
+        and (collect_fisher or collect_saliency or collect_dynsal)
+    )
     logging.info(
         "Collecting static end-to-end saliency/fisher caches from a single pre-quantization full-model backward pass. "
         "Using sampled end-to-end NLL / empirical Fisher because literal KL-to-self before quantization would be zero."
     )
+    if use_rademacher_stats:
+        logging.info(
+            "Static Fisher/saliency uses Rademacher token signs: k=%d repeated "
+            "backward passes per batch, averaging g^2 / g g^T statistics.",
+            fisher_rademacher_k,
+        )
+    if use_grad_sample_limit:
+        logging.info(
+            "Static Fisher/saliency precompute will use only the first %d samples "
+            "from each rank-local calibration shard (%d global samples total).",
+            num_samples_for_grad // max(1, dist_utils.get_world_size()),
+            num_samples_for_grad,
+        )
     if collect_refined_rkl:
         logging.info(
             "Also fitting refined_residual_kl matrix A per layer via least squares "
@@ -3623,12 +4062,17 @@ def collect_static_end_to_end_saliency_and_fisher(
         h = _zlib.crc32(_module_name.encode()) ^ (_layer_idx * 0x9E3779B1)
         return ((int(getattr(profile_recorder, "_dynsal_seed_base", 0xC0FFEE)) + h) & 0x7FFFFFFF)
     handles = []
+    stat_repeats = max(1, int(fisher_rademacher_k))
+    current_saliency_accum = {"data": None}
+    current_backward_role = {"saliency_fisher": True, "refined": True}
 
     def make_module_hook(layer_idx, module_name):
         def forward_hook(module, inp, out):
             out_tensor = out[0] if isinstance(out, (tuple, list)) else out
 
             def grad_hook(grad):
+                if not current_backward_role["saliency_fisher"]:
+                    return
                 # When --ignore_attention_sink is on, the loss above already
                 # excluded sink positions, but autograd still populates non-zero
                 # gradient at sink positions via attention back-flow. Drop the
@@ -3669,9 +4113,21 @@ def collect_static_end_to_end_saliency_and_fisher(
                     cap = torch.quantile(flat, saliency_clip_percentile)
                     sal_per_group = torch.clamp(sal_per_group, max=cap)
                 if collect_saliency:
-                    saliency_data[layer_idx][module_name].append(
-                        sal_per_group.detach().cpu()
-                    )
+                    sal_cpu = sal_per_group.detach().cpu()
+                    if use_rademacher_stats:
+                        sal_cpu.div_(float(stat_repeats))
+                        accum = current_saliency_accum["data"]
+                        if accum is None:
+                            raise RuntimeError(
+                                "Rademacher saliency accumulator is not initialised."
+                            )
+                        slot = accum[layer_idx][module_name]
+                        if slot is None:
+                            accum[layer_idx][module_name] = sal_cpu
+                        else:
+                            slot.add_(sal_cpu)
+                    else:
+                        saliency_data[layer_idx][module_name].append(sal_cpu)
                 # --- dynsal branch: streaming randomized SVD sketch ---
                 # `grad` is produced by a scalar loss that is summed over output
                 # samples/tokens. Rows below are middle-layer tokens; the sketch is
@@ -3738,6 +4194,8 @@ def collect_static_end_to_end_saliency_and_fisher(
             out_tensor = out[0] if isinstance(out, (tuple, list)) else out
 
             def grad_hook(grad):
+                if not current_backward_role["saliency_fisher"]:
+                    return
                 if sink_size > 0 and grad.dim() >= 2 and grad.shape[1] > sink_size:
                     grad = grad[:, sink_size:]
                 grad_flat = grad.detach().float().reshape(-1, grad.shape[-1])
@@ -3746,7 +4204,7 @@ def collect_static_end_to_end_saliency_and_fisher(
                 # below divides once by the global middle-token count to store
                 # the shared E_middle[g g^T] Fisher coefficient.
                 fisher_block = grad_flat.t() @ grad_flat  # stays on GPU fp32
-                fisher_block.div_(_E2E_PRECOMPUTE_QUADRATIC_SCALE)
+                fisher_block.div_(_E2E_PRECOMPUTE_QUADRATIC_SCALE * float(stat_repeats))
                 if fisher_data[layer_idx] is None:
                     fisher_data[layer_idx] = fisher_block
                 else:
@@ -3765,6 +4223,8 @@ def collect_static_end_to_end_saliency_and_fisher(
             out_tensor = out[0] if isinstance(out, (tuple, list)) else out
 
             def grad_hook(grad):
+                if not current_backward_role["refined"]:
+                    return
                 # Keep 3D fp32 on dev. The full-RKL flat view is produced on the
                 # fly by the per-layer hook (reshape is a view — no copy). Diag
                 # mode also needs the 3D structure so we cache once here.
@@ -3793,6 +4253,8 @@ def collect_static_end_to_end_saliency_and_fisher(
             out_tensor = out[0] if isinstance(out, (tuple, list)) else out
 
             def grad_hook(grad):
+                if not current_backward_role["refined"]:
+                    return
                 if "dy_3d" not in refined_dy_buffer:
                     # Last-layer hook hasn't fired yet — shouldn't happen because
                     # backward flows last→first, but guard anyway to fail loudly.
@@ -3832,8 +4294,8 @@ def collect_static_end_to_end_saliency_and_fisher(
                     # Aggregation across batches within a sub-A happens via the
                     # running sum below; solve happens at sub-A flush.
                     delta_3d = dx_3d - dy_3d
-                    inc_Cd = (dy_3d * delta_3d).sum(dim=0).div_(_E2E_PRECOMPUTE_QUADRATIC_SCALE).cpu()
-                    inc_Hd = dy_3d.pow(2).sum(dim=0).div_(_E2E_PRECOMPUTE_QUADRATIC_SCALE).cpu()
+                    inc_Cd = (dy_3d * delta_3d).sum(dim=0).div(_E2E_PRECOMPUTE_QUADRATIC_SCALE).cpu()
+                    inc_Hd = dy_3d.pow(2).sum(dim=0).div(_E2E_PRECOMPUTE_QUADRATIC_SCALE).cpu()
                     if refined_diag_C[layer_idx][a] is None:
                         refined_diag_C[layer_idx][a] = inc_Cd
                         refined_diag_H[layer_idx][a] = inc_Hd
@@ -3907,6 +4369,30 @@ def collect_static_end_to_end_saliency_and_fisher(
                 f"static saliency: global_loss_bsz ({batch_size}) must be divisible by world_size ({world})."
             )
         local_batch_size = batch_size // world
+        if use_grad_sample_limit:
+            if num_samples_for_grad > nsamples_total:
+                raise ValueError(
+                    f"num_samples_for_grad ({num_samples_for_grad}) must be <= "
+                    f"nsamples ({nsamples_total})."
+                )
+            if num_samples_for_grad % world != 0:
+                raise ValueError(
+                    f"num_samples_for_grad ({num_samples_for_grad}) must be divisible "
+                    f"by world_size ({world})."
+                )
+            local_grad_samples = num_samples_for_grad // world
+            if local_grad_samples <= 0:
+                raise ValueError(
+                    f"num_samples_for_grad ({num_samples_for_grad}) gives zero "
+                    f"rank-local samples with world_size={world}."
+                )
+            if local_grad_samples % local_batch_size != 0:
+                raise ValueError(
+                    f"num_samples_for_grad // world ({local_grad_samples}) must be "
+                    f"divisible by per-rank global_loss_bsz ({local_batch_size})."
+                )
+        else:
+            local_grad_samples = None
         # refined_rkl sub-A alignment: samples are split into `num_A` contiguous
         # groups of size `samples_per_A = nsamples/num_A`, and each global batch
         # must fit within one group so the grad hook accumulates into exactly one
@@ -3932,6 +4418,16 @@ def collect_static_end_to_end_saliency_and_fisher(
         # way) — no all-gather is needed.
         shard = dist_utils.shard_slice(nsamples_total, rank, world)
         local_batches = token_batches[shard]
+        grad_stat_local_limit = (
+            local_grad_samples if local_grad_samples is not None else len(local_batches)
+        )
+        loop_local_batches = local_batches
+        if (
+            local_grad_samples is not None
+            and not capture_fp_final
+            and not _collect_any_refined
+        ):
+            loop_local_batches = local_batches[:grad_stat_local_limit]
     with profile_recorder.section("pipeline.static_fisher.model_to_device") if profile_recorder else _NULL_CONTEXT:
         if not use_fsdp:
             # FSDP2 already placed the shards on each rank's GPU; don't try to
@@ -4067,7 +4563,7 @@ def collect_static_end_to_end_saliency_and_fisher(
         with torch.enable_grad():
             refined_prev_a = None
             for local_start in tqdm(
-                range(0, len(local_batches), local_batch_size),
+                range(0, len(loop_local_batches), local_batch_size),
                 ncols=120,
                 desc="Static E2E Saliency/Fisher",
                 position=1,
@@ -4088,7 +4584,7 @@ def collect_static_end_to_end_saliency_and_fisher(
                         refined_current_a_idx["a"] = cur_a
                         refined_prev_a = cur_a
                     with profile_recorder.section("pipeline.static_fisher.batch.prepare_inputs") if profile_recorder else _NULL_CONTEXT:
-                        input_ids = torch.cat(local_batches[local_start:local_start + local_batch_size], dim=0).to(dev)
+                        input_ids = torch.cat(loop_local_batches[local_start:local_start + local_batch_size], dim=0).to(dev)
                     with profile_recorder.section("pipeline.static_fisher.batch.forward") if profile_recorder else _NULL_CONTEXT:
                         outputs = model(input_ids=input_ids)
                         logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
@@ -4109,6 +4605,18 @@ def collect_static_end_to_end_saliency_and_fisher(
                         # both produce the same labels for the same global sample id).
                         _batch_bsz = teacher_logits.shape[0]
                         _global_indices = [global_start + _i for _i in range(_batch_bsz)]
+                        collect_grad_stats_this_batch = (
+                            local_start + _batch_bsz <= grad_stat_local_limit
+                        )
+                        if (
+                            not collect_grad_stats_this_batch
+                            and not capture_fp_final
+                            and not _collect_any_refined
+                        ):
+                            raise RuntimeError(
+                                "Static precompute reached a batch beyond num_samples_for_grad "
+                                "without any forward-only payload to collect."
+                            )
                         labels = _deterministic_categorical_labels(
                             teacher_logits,
                             _global_indices,
@@ -4120,15 +4628,97 @@ def collect_static_end_to_end_saliency_and_fisher(
                         if sink_size > 0 and sl_for_nll.shape[1] > sink_size:
                             sl_for_nll = sl_for_nll[:, sink_size:]
                             labels_for_nll = labels_for_nll[:, sink_size:]
-                        loss = F.cross_entropy(
-                            sl_for_nll.reshape(-1, sl_for_nll.size(-1)),
-                            labels_for_nll.reshape(-1),
-                            reduction="sum",
-                        )
-                        loss_for_backward = loss * _E2E_PRECOMPUTE_LOSS_GRAD_SCALE
+                        if use_rademacher_stats:
+                            per_token_nll = F.cross_entropy(
+                                sl_for_nll.reshape(-1, sl_for_nll.size(-1)),
+                                labels_for_nll.reshape(-1),
+                                reduction="none",
+                            ).view_as(labels_for_nll)
+                            loss = None
+                            loss_for_backward = None
+                        else:
+                            per_token_nll = None
+                            loss = F.cross_entropy(
+                                sl_for_nll.reshape(-1, sl_for_nll.size(-1)),
+                                labels_for_nll.reshape(-1),
+                                reduction="sum",
+                            )
+                            loss_for_backward = loss * _E2E_PRECOMPUTE_LOSS_GRAD_SCALE
                     with profile_recorder.section("pipeline.static_fisher.batch.backward") if profile_recorder else _NULL_CONTEXT:
-                        loss_for_backward.backward()
+                        if not collect_grad_stats_this_batch:
+                            try:
+                                if _collect_any_refined:
+                                    current_backward_role["saliency_fisher"] = False
+                                    current_backward_role["refined"] = True
+                                    refined_dy_buffer.clear()
+                                    model.zero_grad()
+                                    refined_loss_for_backward = (
+                                        per_token_nll.sum() * _E2E_PRECOMPUTE_LOSS_GRAD_SCALE
+                                        if per_token_nll is not None
+                                        else loss_for_backward
+                                    )
+                                    refined_loss_for_backward.backward()
+                            finally:
+                                current_backward_role["saliency_fisher"] = True
+                                current_backward_role["refined"] = True
+                        elif use_rademacher_stats:
+                            if collect_saliency:
+                                current_saliency_accum["data"] = [
+                                    {name: None for name in md.keys()}
+                                    for md in module_dicts
+                                ]
+                            try:
+                                current_backward_role["saliency_fisher"] = True
+                                current_backward_role["refined"] = False
+                                for rep_idx in range(stat_repeats):
+                                    refined_dy_buffer.clear()
+                                    model.zero_grad()
+                                    signs = _deterministic_rademacher_signs(
+                                        per_token_nll.shape,
+                                        _global_indices,
+                                        base_seed=int(rademacher_seed) + rep_idx,
+                                        device=per_token_nll.device,
+                                        dtype=per_token_nll.dtype,
+                                    )
+                                    signed_loss = (per_token_nll * signs).sum()
+                                    signed_loss_for_backward = signed_loss * _E2E_PRECOMPUTE_LOSS_GRAD_SCALE
+                                    signed_loss_for_backward.backward(
+                                        retain_graph=(
+                                            rep_idx + 1 < stat_repeats
+                                            or _collect_any_refined
+                                        )
+                                    )
+                                    del signs, signed_loss, signed_loss_for_backward
+                                if collect_saliency:
+                                    accum = current_saliency_accum["data"]
+                                    for _layer_idx, module_dict in enumerate(module_dicts):
+                                        for _module_name in module_dict.keys():
+                                            sal_chunk = accum[_layer_idx][_module_name]
+                                            if sal_chunk is None:
+                                                raise RuntimeError(
+                                                    f"Rademacher saliency was not collected for "
+                                                    f"layer={_layer_idx} module={_module_name}."
+                                            )
+                                            saliency_data[_layer_idx][_module_name].append(sal_chunk)
+                                if _collect_any_refined:
+                                    current_backward_role["saliency_fisher"] = False
+                                    current_backward_role["refined"] = True
+                                    refined_dy_buffer.clear()
+                                    model.zero_grad()
+                                    loss_for_backward = per_token_nll.sum() * _E2E_PRECOMPUTE_LOSS_GRAD_SCALE
+                                    loss_for_backward.backward()
+                            finally:
+                                current_backward_role["saliency_fisher"] = True
+                                current_backward_role["refined"] = True
+                                current_saliency_accum["data"] = None
+                        else:
+                            current_backward_role["saliency_fisher"] = True
+                            current_backward_role["refined"] = True
+                            model.zero_grad()
+                            loss_for_backward.backward()
                     del outputs, logits, teacher_logits, student_logits, labels, loss, loss_for_backward, input_ids
+                    if per_token_nll is not None:
+                        del per_token_nll
             # Flush the last sub-A's accumulators. The streaming flush inside
             # the loop only fires on transitions, so the final one needs to be
             # drained explicitly.
@@ -4484,16 +5074,7 @@ def collect_static_end_to_end_saliency_and_fisher(
                     else:
                         token_batches = [batch[0] for batch in dataloader]
                         eff_seq_len = max(1, token_batches[0].shape[1] - max(0, sink_size))
-                        local_tokens = sum(
-                            int(batch.shape[0] * eff_seq_len)
-                            for batch in token_batches[
-                                dist_utils.shard_slice(
-                                    len(token_batches),
-                                    dist_utils.get_rank(),
-                                    dist_utils.get_world_size(),
-                                )
-                            ]
-                        )
+                        local_tokens = int(grad_stat_local_limit * eff_seq_len)
                     total_tokens = dist_utils.allreduce_sum_scalar(local_tokens)
                     static_fisher.append((fisher_sum / float(total_tokens)).to(torch.bfloat16).cpu())
                     # Release the per-layer GPU fp32 Fisher immediately. For
@@ -6362,7 +6943,31 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
     use_cache = model.config.use_cache
     model.config.use_cache = False
     layers = analyzer.get_layers()
-    orig_device = next(model.parameters()).device
+    if bool(getattr(model, "_gptqplus_stage2_cpu_master", False)) and not dist_utils.is_main():
+        orig_device = torch.device("meta")
+    else:
+        orig_device = next(model.parameters()).device
+    stage2_cpu_master = bool(getattr(model, "_gptqplus_stage2_cpu_master", False))
+    global_loss_enabled = bool(getattr(args, "global_loss", False))
+    if stage2_cpu_master:
+        if args.grad_refresh_loss == "refined_mse":
+            raise RuntimeError(
+                "stage2_cpu_master does not support refined_mse because it materializes "
+                "all downstream layers for a per-layer backward."
+            )
+        if args.load_qmodel_path:
+            raise RuntimeError("stage2_cpu_master does not support load_qmodel_path yet.")
+        if not global_loss_enabled:
+            raise RuntimeError(
+                "stage2_cpu_master requires --global_loss with an existing static cache. "
+                "The non-global path would collect per-layer end-to-end stats from the "
+                "partially materialized model."
+            )
+        logging.info(
+            "Stage 2 CPU-master quantization enabled: rank0 owns the CPU model; "
+            "layers are broadcast to rank-local GPUs on demand."
+        )
+    layer_manager = Stage2CpuMasterLayerManager(analyzer, dev, layers)
     analysis_hook = getattr(args, "_analysis_hook", None)
     analysis_need_fisher = bool(getattr(args, "_analysis_collect_fisher", False))
     analysis_collect_refined_rkl = bool(
@@ -6424,7 +7029,15 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
     # numerical change.
     skip_ref_backward = args.alpha == 0
     effective_pre_gd_steps = args.pre_gd_steps if preclip_enabled else 0
-    global_loss_enabled = bool(getattr(args, "global_loss", False))
+    if (
+        (int(getattr(args, "fisher_rademacher_k", 0)) > 0
+         or int(getattr(args, "num_samples_for_grad", 0)) > 0)
+        and not global_loss_enabled
+    ):
+        raise ValueError(
+            "--fisher_rademacher_k / --num_samples_for_grad only apply to the "
+            "static end-to-end precompute path, so they require --global_loss."
+        )
     act_quant_aware_gptq = bool(getattr(args, "act_quant_aware_gptq", False))
     k_cache_quant_aware_gptq = bool(getattr(args, "k_cache_quant_aware_gptq", False))
     if act_quant_aware_gptq and args.grad_refresh_loss == "refined_mse":
@@ -6580,6 +7193,13 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     dynsal_tag = f"_dynsalR{dynsal_R}_evd{dynsal_evd_tag}"
                 else:
                     dynsal_tag = ""
+                fisher_rademacher_k = int(getattr(args, "fisher_rademacher_k", 0))
+                num_samples_for_grad = int(getattr(args, "num_samples_for_grad", 0))
+                grad_stat_tag = (
+                    f"_radk{fisher_rademacher_k}_ngrad{num_samples_for_grad}"
+                    if fisher_rademacher_k > 0 or num_samples_for_grad > 0
+                    else ""
+                )
                 analysis_tag = ""
                 if analysis_need_fisher and args.grad_refresh_loss not in (
                     "fisher_diag_mse", "refined_mse",
@@ -6601,7 +7221,8 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     f"fisherfull_ghtk{args.grad_hessian_topk}_"
                     f"glbsz{args.global_loss_bsz}_seed{args.seed}_"
                     f"salclip{sal_clip_tag}_rklNA{rkl_na}_fpfinal{fpfinal_tag}"
-                    f"_e2els{int(_E2E_PRECOMPUTE_LOSS_GRAD_SCALE)}{mix_tag}{dynsal_tag}{analysis_tag}"
+                    f"_e2els{int(_E2E_PRECOMPUTE_LOSS_GRAD_SCALE)}"
+                    f"{grad_stat_tag}{mix_tag}{dynsal_tag}{analysis_tag}"
                 )
                 # Bind `_sink{N}` to the cache key only when the option is on,
                 # so legacy caches keep their byte-identical key (no migration).
@@ -6613,6 +7234,15 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                 os.path.join(static_cache_dir, f"{static_cache_key}.pt")
                 if static_cache_key is not None else None
             )
+            if stage2_cpu_master and (
+                static_cache_file is None or not os.path.exists(static_cache_file)
+            ):
+                raise RuntimeError(
+                    "stage2_cpu_master requires an existing static precompute cache "
+                    "for global_loss Stage 2. Run Stage 1 first with matching "
+                    "--static_cache_path / cache-key parameters. Missing cache: "
+                    f"{static_cache_file}"
+                )
 
             if static_cache_file is not None and os.path.exists(static_cache_file):
                 with pipeline_recorder.section("pipeline.static_cache.load") if pipeline_recorder else _NULL_CONTEXT:
@@ -6728,6 +7358,9 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             dynsal_rank=int(getattr(args, "dyn_sal_rank", 16)),
                             dynsal_evd_thresh=float(getattr(args, "dyn_sal_evd_thresh", 1e-6)),
                             sink_size=sink_size,
+                            fisher_rademacher_k=int(getattr(args, "fisher_rademacher_k", 0)),
+                            rademacher_seed=int(getattr(args, "seed", 0)) + 1701,
+                            num_samples_for_grad=int(getattr(args, "num_samples_for_grad", 0)),
                         )
                 if static_cache_file is not None:
                     with pipeline_recorder.section("pipeline.static_cache.save") if pipeline_recorder else _NULL_CONTEXT:
@@ -6782,9 +7415,8 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
             ]
         )
         with pipeline_recorder.section("pipeline.move_to_device") if pipeline_recorder else _NULL_CONTEXT:
-            for module in per_layer_runtime_modules:
-                module.to(dev)
-            layers[0] = layers[0].to(dev)
+            layer_manager.materialize_runtime_modules(per_layer_runtime_modules)
+            layers[0] = layer_manager.materialize_layer(0)
 
         dtype = next(iter(model.parameters())).dtype
         # DP: shard calibration samples contiguously by rank. Each rank only
@@ -6830,7 +7462,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     pass
         layers[0] = layers[0].module
 
-        layers[0] = layers[0].to(orig_device)
+        layer_manager.release_layer(0, layers[0], update_master=False, orig_device=orig_device)
         memory_utils.cleanup_memory(False)
 
         attention_mask = cache["attention_mask"]
@@ -6842,6 +7474,12 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
         fp_inps = inps.clone()
 
         if act_quant_aware_gptq:
+            if stage2_cpu_master:
+                raise RuntimeError(
+                    "stage2_cpu_master does not support --act_quant_aware_gptq yet; "
+                    "configuring all meta-resident layers would materialize or mutate "
+                    "non-broadcast layers."
+                )
             with pipeline_recorder.section("pipeline.configure_act_quant_for_gptq") if pipeline_recorder else _NULL_CONTEXT:
                 input_q_count, v_q_count = configure_activation_quantizers_for_gptq(args, model)
                 logging.info(
@@ -6852,6 +7490,11 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                 )
 
         if k_cache_quant_aware_gptq:
+            if stage2_cpu_master:
+                raise RuntimeError(
+                    "stage2_cpu_master does not support --k_cache_quant_aware_gptq yet; "
+                    "QK wrappers are installed across all layers before the streaming loop."
+                )
             with pipeline_recorder.section("pipeline.configure_k_cache_quant_for_gptq") if pipeline_recorder else _NULL_CONTEXT:
                 k_q_count = configure_k_cache_quantizers_for_gptq(args, analyzer)
                 logging.info(
@@ -6930,7 +7573,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     # buffer (which is still at the layer-0 input stage).
                     scratch = inps.detach().clone().to(dev)
                     for idx in range(len(layers)):
-                        lay = layers[idx].to(dev)
+                        lay = layer_manager.materialize_layer(idx)
                         with disable_fp_path_quant(lay):
                             # Per-sample forward matches the per-layer fp_reference_forward
                             # pattern; batching here would change numerics (cuBLAS kernel
@@ -6945,7 +7588,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         # Return each layer to its original (CPU) residency so the
                         # main quant loop's `layers[i].to(dev)` starts from the same
                         # state as if this precompute never happened.
-                        layers[idx] = lay.to(orig_device)
+                        layer_manager.release_layer(idx, lay, update_master=False, orig_device=orig_device)
                     # Match the storage convention of `fp_inps` so downstream index
                     # expressions behave identically (`fp_inps_final[batch]` / CPU-
                     # to-GPU handoff inside collect_true_weight_gradient).
@@ -6977,7 +7620,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
         refined_mse_d2h_event = None
         pbar = tqdm(layer_indices, ncols=120, desc="Quantizing Layers", position=0)
         for i in pbar:
-            layer = layers[i].to(dev)
+            layer = layer_manager.materialize_layer(i)
             full = analyzer.get_quantizable_modules(layer)
             layer_recorder = QuantProfileRecorder(dev, prefix=f"layers.{i}") if quant_profile_enabled else None
             analysis_is_target = False
@@ -7156,7 +7799,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         # dev (see `per_layer_runtime_modules` setup at fn entry).
                         with layer_recorder.section("layer.refined_mse_grad_pool.downstream_to_dev") if layer_recorder else _NULL_CONTEXT:
                             for k in range(i + 1, len(layers)):
-                                layers[k].to(dev)
+                                layer_manager.materialize_layer(k)
                         try:
                             with layer_recorder.section("layer.refined_mse_grad_pool.collect") if layer_recorder else _NULL_CONTEXT:
                                 (
@@ -7202,7 +7845,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                                     refined_mse_d2h_stream = torch.cuda.Stream(device=dev)
                                 with torch.cuda.stream(refined_mse_d2h_stream):
                                     for k in range(i + 1, len(layers)):
-                                        layers[k] = layers[k].to(orig_device, non_blocking=True)
+                                        layer_manager.release_layer(k, layers[k], update_master=False, orig_device=orig_device)
                                 refined_mse_d2h_event = torch.cuda.Event()
                                 refined_mse_d2h_event.record(refined_mse_d2h_stream)
                         layer_refined_mse_pool_ids = torch.tensor(
@@ -7310,7 +7953,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
             slide_next_refined_A_list = None
             if slide_active_layer:
                 with layer_recorder.section("layer.slide_window.next_fp_reference") if layer_recorder else _NULL_CONTEXT:
-                    slide_next_layer = layers[i + 1].to(dev)
+                    slide_next_layer = layer_manager.materialize_layer(i + 1)
                     # fisher_diag_mse and refined_mse both need the next-layer
                     # fisher (they share the fisher-diag second-order term);
                     # refined_residual_kl needs the next-layer A. residual_kl
@@ -7653,6 +8296,10 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                                 _E2E_PRECOMPUTE_QUADRATIC_SCALE
                                 if global_loss_enabled else 1.0
                             ),
+                            hessian_group_shard=(
+                                getattr(args, "group_parallel_quant", "none") == "rank"
+                                and dist_utils.get_world_size() > 1
+                            ),
                         )
                         gptq_local[module_name].quantizer = quant_utils.WeightQuantizer()
                         gptq_local[module_name].quantizer.configure(
@@ -7664,6 +8311,22 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                 return gptq_local
 
             def accumulate_hessian_for_gptq(gptq_for_accum, subset_for_accum):
+                hessian_sample_count = int(getattr(args, "num_samples_for_grad", 0) or 0)
+                if global_loss_enabled and hessian_sample_count > 0:
+                    if hessian_sample_count % dp_world != 0:
+                        raise ValueError(
+                            f"num_samples_for_grad ({hessian_sample_count}) must be "
+                            f"divisible by world_size ({dp_world})."
+                        )
+                    hessian_local_samples = hessian_sample_count // dp_world
+                    if hessian_local_samples <= 0 or hessian_local_samples > inps.shape[0]:
+                        raise ValueError(
+                            f"num_samples_for_grad // world ({hessian_local_samples}) "
+                            f"must be in [1, {inps.shape[0]}]."
+                        )
+                else:
+                    hessian_local_samples = inps.shape[0]
+
                 def add_batch(name):
                     def tmp(_, inp, out):
                         gptq_for_accum[name].add_batch(inp[0].data, out.data)
@@ -7683,15 +8346,15 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     # batch sizes (it reshapes to [bsz*seq, dim] internally), so
                     # the math is bit-exact regardless of bsz.
                     hessian_accum_bsz = args.hessian_accum_bsz if args.hessian_accum_bsz is not None else args.bsz
-                    hessian_accum_bsz = max(1, min(hessian_accum_bsz, inps.shape[0]))
+                    hessian_accum_bsz = max(1, min(hessian_accum_bsz, hessian_local_samples))
                     for j in tqdm(
-                        range(0, inps.shape[0], hessian_accum_bsz),
+                        range(0, hessian_local_samples, hessian_accum_bsz),
                         ncols=120,
                         desc=f"Layer {i} Hessian accumulation",
                         position=1,
                         leave=False,
                     ):
-                        batch_bsz = min(hessian_accum_bsz, inps.shape[0] - j)
+                        batch_bsz = min(hessian_accum_bsz, hessian_local_samples - j)
                         _ = layer(
                             inps[j : j + batch_bsz].to(dev),
                             attention_mask=attention_mask.expand(batch_bsz, -1, -1, -1),
@@ -8232,11 +8895,12 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
             with layer_recorder.section("layer.cleanup") if layer_recorder else _NULL_CONTEXT:
                 if slide_active_layer and slide_next_layer is not None:
                     del slide_fp_inps_next
+                    layer_manager.release_layer(i + 1, slide_next_layer, update_master=False, orig_device=orig_device)
                     slide_next_layer = None
                     slide_fp_inps_next = None
                     slide_next_layer_output_fisher = None
                     slide_next_refined_A_list = None
-                layers[i] = layer.to(orig_device)
+                layer_manager.release_layer(i, layer, update_master=True, orig_device=orig_device)
                 del layer
                 del gptq
                 del saliency_dict, gradients_dict
@@ -8296,8 +8960,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
             refined_mse_d2h_event = None
 
         with pipeline_recorder.section("pipeline.restore_modules") if pipeline_recorder else _NULL_CONTEXT:
-            for module in per_layer_runtime_modules:
-                module.to(orig_device)
+            layer_manager.release_runtime_modules(per_layer_runtime_modules, orig_device)
             model.config.use_cache = use_cache
         memory_utils.cleanup_memory(verbos=True)
 

@@ -30,22 +30,26 @@ DEVICE=${3}
 shift 3
 
 # Sweep configuration. Override from the shell when needed.
-GRAD_LRS_STR=${GRAD_LRS:-"0.0000001 0.000001 0.000005"}
+GRAD_LRS_STR=${GRAD_LRS:-"0.0000005"}
 DATASET=${DATASET:-wikitext2} # wikitext2 / neuralmagic / ultrachat_2k / numinamath
 N_SAMPLES=${N_SAMPLES:-256}
 SEQ_LEN=${SEQ_LEN:-2048}
-BSZ=${BSZ:-32}
+BSZ=${BSZ:-64}
 FINAL_LAYER_STATS_BSZ=${FINAL_LAYER_STATS_BSZ:-8}
 HESSIAN_ACCUM_BSZ=${HESSIAN_ACCUM_BSZ:-32}
 ENABLE_GPTQ_PLUS=${ENABLE_GPTQ_PLUS:-0}
-BACKWARD_SAMPLES=${BACKWARD_SAMPLES:-8}
-BACKWARD_BSZ=${BACKWARD_BSZ:-8}
+BACKWARD_SAMPLES=${BACKWARD_SAMPLES:-32}
+BACKWARD_BSZ=${BACKWARD_BSZ:-32}
 FINAL_LAYER_BACKWARD_BSZ=${FINAL_LAYER_BACKWARD_BSZ:-8}
 FINAL_LAYER_FULL_BACKWARD=${FINAL_LAYER_FULL_BACKWARD:-0}
-BLOCKSIZE=${BLOCKSIZE:-512}
+BLOCKSIZE=${BLOCKSIZE:-128}
 W_GROUPSIZE=${W_GROUPSIZE:--1}
 ACT_ORDER=${ACT_ORDER:-1}
 BLOCK_ATOMIC_QUANT=${BLOCK_ATOMIC_QUANT:-0}
+# none: legacy subgroup loop. tensor: local [group, row, col] tensor path.
+# rank: split block-internal quantization across DP ranks, then sync per block;
+#       block-outer updates and block_gd still run locally on full group tensors.
+GROUP_PARALLEL_QUANT=${GROUP_PARALLEL_QUANT:-rank}
 # Activation / KV quantization knobs. A/V/K quantization is applied to the
 # final quantized model when the bit-width is <16. The quant-aware flags also
 # enable the corresponding fake-quant paths inside GPTQ+ student forwards.
@@ -98,7 +102,7 @@ DYN_SAL_EVD_THRESH=${DYN_SAL_EVD_THRESH:-1e-6}
 # up+gate / down entry). `per_layer` = 1 refresh per layer (at layer entry,
 # weights still FP; captures only upstream drift, halves the current-state
 # forwards per layer).
-DYN_SAL_REFRESH_MODE=${DYN_SAL_REFRESH_MODE:-per_layer} # per_layer or per_boundary
+DYN_SAL_REFRESH_MODE=${DYN_SAL_REFRESH_MODE:-per_boundary} # per_layer or per_boundary
 FINAL_LAYER_GRAD_LR=${FINAL_LAYER_GRAD_LR:-0.000001}
 PRE_GD_STEPS=${PRE_GD_STEPS:-10}
 PRE_GRAD_LR=${PRE_GRAD_LR:-0.00003}
@@ -119,7 +123,9 @@ SECOND_ORDER_SCALE=${SECOND_ORDER_SCALE:-1.0}
 PRE_CLIP=${PRE_CLIP:-0}
 GLOBAL_LOSS=${GLOBAL_LOSS:-1}
 GLOBAL_LOSS_BSZ=${GLOBAL_LOSS_BSZ:-8}
-LOSS_SLIDE_WINDOW=${LOSS_SLIDE_WINDOW:-0}
+FISHER_RADEMACHER_K=${FISHER_RADEMACHER_K:-0}
+NUM_SAMPLES_FOR_GRAD=${NUM_SAMPLES_FOR_GRAD:-0}
+LOSS_SLIDE_WINDOW=${LOSS_SLIDE_WINDOW:-1}
 DP_GLOBAL_SHUFFLE=${DP_GLOBAL_SHUFFLE:-1}
 # Drop first ATTENTION_SINK_SIZE tokens from every loss (NLL/KL/MSE) when
 # IGNORE_ATTENTION_SINK=1. Sink tokens still flow through forward / KV; only
@@ -135,7 +141,7 @@ GRAD_LR_LAYER_BASE_RATIO=${GRAD_LR_LAYER_BASE_RATIO:-0.01}
 ALPHA=${ALPHA:-0.0}
 KL_TOPK=${KL_TOPK:-20}
 LM_EVAL_BATCH_SIZE=${LM_EVAL_BATCH_SIZE:-32}
-ENABLE_QA_EVAL=${ENABLE_QA_EVAL:-0}
+ENABLE_QA_EVAL=${ENABLE_QA_EVAL:-1}
 BASE_EXP=${BASE_EXP:-gptq_plus_lr_sweep}
 OUTPUT_ROOT=${OUTPUT_ROOT:-./outputs}
 # FSDP2 precompute: shard params + grads across ranks during
@@ -146,7 +152,8 @@ OUTPUT_ROOT=${OUTPUT_ROOT:-./outputs}
 FSDP_PRECOMPUTE=${FSDP_PRECOMPUTE:-0}
 FSDP_CPU_OFFLOAD=${FSDP_CPU_OFFLOAD:-0}
 FSDP_META_INIT=${FSDP_META_INIT:-${FSDP_PRECOMPUTE}}
-STATIC_CACHE_PATH=${STATIC_CACHE_PATH:-cache/qwen32}
+STAGE2_CPU_MASTER=${STAGE2_CPU_MASTER:-1}
+STATIC_CACHE_PATH=${STATIC_CACHE_PATH:-cache/llama3.1-70B-cache}
 EXIT_AFTER_PRECOMPUTE=${EXIT_AFTER_PRECOMPUTE:-0}
 
 IFS=' ' read -r -a GRAD_LRS <<< "${GRAD_LRS_STR}"
@@ -168,7 +175,7 @@ export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-0}
 # RDZV port decouples from DEVICE so the commas don't end up in the endpoint.
 IFS=',' read -r -a _DEVICE_LIST <<< "${DEVICE}"
 N_GPUS=${N_GPUS:-${#_DEVICE_LIST[@]}}
-RDZV_PORT=${RDZV_PORT:-29500}
+RDZV_PORT=${RDZV_PORT:-29400}
 
 sanitize_float() {
     local value="${1}"
@@ -187,6 +194,17 @@ BLOCK_ATOMIC_TAG=""
 if [[ "${BLOCK_ATOMIC_QUANT}" == "1" ]]; then
     BLOCK_ATOMIC_ARGS=(--block_atomic_quant)
     BLOCK_ATOMIC_TAG="_batomic"
+fi
+
+GROUP_PARALLEL_ARGS=()
+GROUP_PARALLEL_TAG=""
+if [[ "${GROUP_PARALLEL_QUANT}" != "none" ]]; then
+    if [[ "${GROUP_PARALLEL_QUANT}" != "tensor" && "${GROUP_PARALLEL_QUANT}" != "rank" ]]; then
+        echo "GROUP_PARALLEL_QUANT must be one of: none, tensor, rank. Got: ${GROUP_PARALLEL_QUANT}" >&2
+        exit 1
+    fi
+    GROUP_PARALLEL_ARGS=(--group_parallel_quant "${GROUP_PARALLEL_QUANT}")
+    GROUP_PARALLEL_TAG="_gpar${GROUP_PARALLEL_QUANT}"
 fi
 
 FINAL_LAYER_FULL_BACKWARD_ARGS=()
@@ -223,10 +241,21 @@ fi
 GLOBAL_LOSS_ARGS=()
 GLOBAL_LOSS_TAG=""
 if [[ "${GLOBAL_LOSS}" == "1" ]]; then
-    GLOBAL_LOSS_ARGS=(--global_loss --global_loss_bsz "${GLOBAL_LOSS_BSZ}")
+    GLOBAL_LOSS_ARGS=(
+        --global_loss
+        --global_loss_bsz "${GLOBAL_LOSS_BSZ}"
+        --fisher_rademacher_k "${FISHER_RADEMACHER_K}"
+        --num_samples_for_grad "${NUM_SAMPLES_FOR_GRAD}"
+    )
     GLOBAL_LOSS_TAG="_globalloss"
     if [[ "${GLOBAL_LOSS_BSZ}" != "${BSZ}" ]]; then
         GLOBAL_LOSS_TAG="${GLOBAL_LOSS_TAG}_bsz$(sanitize_float "${GLOBAL_LOSS_BSZ}")"
+    fi
+    if [[ "${FISHER_RADEMACHER_K}" != "0" ]]; then
+        GLOBAL_LOSS_TAG="${GLOBAL_LOSS_TAG}_radk${FISHER_RADEMACHER_K}"
+    fi
+    if [[ "${NUM_SAMPLES_FOR_GRAD}" != "0" ]]; then
+        GLOBAL_LOSS_TAG="${GLOBAL_LOSS_TAG}_ngrad${NUM_SAMPLES_FOR_GRAD}"
     fi
 fi
 
@@ -343,6 +372,9 @@ fi
 if [[ -n "${STATIC_CACHE_PATH}" ]]; then
     FSDP_ARGS+=(--static_cache_path "${STATIC_CACHE_PATH}")
 fi
+if [[ "${STAGE2_CPU_MASTER}" == "1" && "${FSDP_PRECOMPUTE}" != "1" ]]; then
+    FSDP_ARGS+=(--stage2_cpu_master)
+fi
 
 MIX_ARGS=()
 if [[ "${GRAD_REFRESH_LOSS}" == "refined_mix" ]]; then
@@ -382,6 +414,7 @@ if [[ "${FSDP_PRECOMPUTE}" == "1" && "${EXIT_AFTER_PRECOMPUTE}" != "1" ]]; then
     echo "  Passes that affect the cache key must match Stage 2:"
     echo "    model, nsamples=${N_SAMPLES}, seq_len=${SEQ_LEN},"
     echo "    grad_hessian_topk=${GRAD_HESSIAN_TOPK}, global_loss_bsz=${GLOBAL_LOSS_BSZ},"
+    echo "    fisher_rademacher_k=${FISHER_RADEMACHER_K}, num_samples_for_grad=${NUM_SAMPLES_FOR_GRAD},"
     echo "    world_size=${N_GPUS}, rotate=1"
     echo "============================================================"
     python -m torch.distributed.run \
@@ -419,6 +452,9 @@ if [[ "${FSDP_PRECOMPUTE}" == "1" && "${EXIT_AFTER_PRECOMPUTE}" != "1" ]]; then
     # just point at the cache so each quantisation pass reads precomputed
     # saliency/fisher from disk.
     FSDP_ARGS=(--static_cache_path "${STATIC_CACHE_PATH}")
+    if [[ "${STAGE2_CPU_MASTER}" == "1" ]]; then
+        FSDP_ARGS+=(--stage2_cpu_master)
+    fi
     echo "[sweep] Stage 2/2: sweeping quantisation LRs (FSDP off, reading cache)"
 fi
 
@@ -487,7 +523,7 @@ for grad_lr in "${GRAD_LRS[@]}"; do
             pre_gd_suffix="${pre_gd_suffix}_flopt${PRE_FINAL_LAYER_GRAD_OPTIMIZER}"
         fi
     fi
-    exp_name="${BASE_EXP}_block_gd_${GRAD_OPTIMIZER}${refresh_suffix}${refined_rkl_suffix}${refined_mse_suffix}${refined_mix_suffix}${reg_suffix}${grad_hessian_suffix}${dyn_sal_suffix}${W_QUANT_TAG}${ACT_KV_QUANT_TAG}_lr${grad_lr_tag}_fllr${final_layer_grad_lr_tag}_s${second_order_tag}${pre_gd_suffix}${PRE_CLIP_TAG}${BLOCK_ATOMIC_TAG}${FINAL_LAYER_FULL_BACKWARD_TAG}${GLOBAL_LOSS_TAG}${LOSS_SLIDE_WINDOW_TAG}${ATTENTION_SINK_TAG}${DP_GLOBAL_SHUFFLE_TAG}${GRAD_LR_LAYER_SCHEDULE_TAG}"
+    exp_name="${BASE_EXP}_block_gd_${GRAD_OPTIMIZER}${refresh_suffix}${refined_rkl_suffix}${refined_mse_suffix}${refined_mix_suffix}${reg_suffix}${grad_hessian_suffix}${dyn_sal_suffix}${W_QUANT_TAG}${ACT_KV_QUANT_TAG}_lr${grad_lr_tag}_fllr${final_layer_grad_lr_tag}_s${second_order_tag}${pre_gd_suffix}${PRE_CLIP_TAG}${BLOCK_ATOMIC_TAG}${GROUP_PARALLEL_TAG}${FINAL_LAYER_FULL_BACKWARD_TAG}${GLOBAL_LOSS_TAG}${LOSS_SLIDE_WINDOW_TAG}${ATTENTION_SINK_TAG}${DP_GLOBAL_SHUFFLE_TAG}${GRAD_LR_LAYER_SCHEDULE_TAG}"
 
     echo "============================================================"
     echo "Running GPTQ+ LR sweep"
@@ -495,6 +531,7 @@ for grad_lr in "${GRAD_LRS[@]}"; do
     echo "  groups : ${NUM_GROUPS}"
     echo "  mode   : block_gd"
     echo "  atomic : ${BLOCK_ATOMIC_QUANT}"
+    echo "  gpar   : ${GROUP_PARALLEL_QUANT}"
     echo "  flfb   : ${FINAL_LAYER_FULL_BACKWARD}"
     echo "  opt    : ${GRAD_OPTIMIZER}"
     echo "  flopt  : ${FINAL_LAYER_GRAD_OPTIMIZER}"
@@ -524,6 +561,8 @@ for grad_lr in "${GRAD_LRS[@]}"; do
     echo "  preclip: ${PRE_CLIP}"
     echo "  global : ${GLOBAL_LOSS}"
     echo "  gl_bsz : ${GLOBAL_LOSS_BSZ}"
+    echo "  rad_k  : ${FISHER_RADEMACHER_K}"
+    echo "  ng_grad: ${NUM_SAMPLES_FOR_GRAD}"
     echo "  slidew : ${LOSS_SLIDE_WINDOW}"
     echo "  gshuf  : ${DP_GLOBAL_SHUFFLE}"
     echo "  lrsch  : ${GRAD_LR_LAYER_SCHEDULE} base_ratio=${GRAD_LR_LAYER_BASE_RATIO}"
@@ -541,6 +580,7 @@ for grad_lr in "${GRAD_LRS[@]}"; do
     echo "  bw_smp : ${BACKWARD_SAMPLES}"
     echo "  bw_bsz : ${BACKWARD_BSZ}"
     echo "  fl_bwb : ${FINAL_LAYER_BACKWARD_BSZ}"
+    echo "  s2_cpu : ${STAGE2_CPU_MASTER}"
     echo "  exp    : ${exp_name}"
     echo "============================================================"
 
@@ -588,6 +628,7 @@ for grad_lr in "${GRAD_LRS[@]}"; do
         "${PRE_FINAL_LAYER_GRAD_OPTIMIZER_ARGS[@]}" \
         "${PRE_CLIP_ARGS[@]}" \
         "${BLOCK_ATOMIC_ARGS[@]}" \
+        "${GROUP_PARALLEL_ARGS[@]}" \
         "${FINAL_LAYER_FULL_BACKWARD_ARGS[@]}" \
         --proj_lr_scale "${PROJ_LR_SCALE}" --down_proj_lr_scale "${DOWN_PROJ_LR_SCALE}" \
         --grad_reg_strategy "${GRAD_REG_STRATEGY}" --grad_reg_lambda "${GRAD_REG_LAMBDA}" \

@@ -51,7 +51,12 @@ from gptq_utils.gptq_plus_utils import (
     hidden2logits,
     temporary_requires_grad,
 )
-from gptq_utils.quant_aware_utils import disable_fp_path_quant
+from gptq_utils.gptaq_utils import GPTAQ, FPInputsCache
+from gptq_utils.quant_aware_utils import (
+    configure_activation_quantizers_for_gptq,
+    configure_k_cache_quantizers_for_gptq,
+    disable_fp_path_quant,
+)
 
 torch.backends.cuda.matmul.allow_tf32 = False
 
@@ -1853,6 +1858,8 @@ def _load_or_collect_static_analysis_stats(
             f"glbsz{args.global_loss_bsz}",
             f"seed{args.seed}",
             f"salclip{getattr(args, 'saliency_clip_percentile', 0.99)}",
+            f"radk{int(getattr(args, 'fisher_rademacher_k', 0))}",
+            f"ngrad{int(getattr(args, 'num_samples_for_grad', 0))}",
             f"rklNA{rkl_na}",
             f"fisher{int(want_fisher)}",
             f"rkl{int(want_refined_full)}",
@@ -1929,6 +1936,9 @@ def _load_or_collect_static_analysis_stats(
                 if bool(getattr(args, "ignore_attention_sink", False))
                 else 0
             ),
+            fisher_rademacher_k=int(getattr(args, "fisher_rademacher_k", 0)),
+            rademacher_seed=int(getattr(args, "seed", 0)) + 1701,
+            num_samples_for_grad=int(getattr(args, "num_samples_for_grad", 0)),
         )
         if bool(getattr(args, "exit_after_precompute", False)):
             logging.info(
@@ -2220,6 +2230,327 @@ def _rtn_fwrd_with_analysis(
     return quantizers
 
 
+@torch.no_grad()
+def _gptaq_fwrd_with_analysis(
+    args,
+    analyzer,
+    trainloader,
+    dev,
+    analysis_hook,
+    *,
+    want_fisher,
+    want_refined_full,
+    want_refined_diag,
+    need_fp_final,
+):
+    logging.info("-----GPTAQ + grad-cosine analysis quantization-----")
+    model = analyzer.model
+    use_cache = model.config.use_cache
+    model.config.use_cache = False
+    layers = analyzer.get_layers()
+    orig_device = next(model.parameters()).device
+
+    if not getattr(args, "global_loss", False):
+        logging.info(
+            "analyze_grad_cosine GPTAQ reference needs static end-to-end stats for "
+            "the selected losses; forcing --global_loss for this diagnostic run."
+        )
+        args.global_loss = True
+
+    (
+        static_fisher_by_layer,
+        static_refined_A_by_layer,
+        static_refined_diag_A_by_layer,
+        fp_inps_final_cpu,
+    ) = _load_or_collect_static_analysis_stats(
+        args=args,
+        analyzer=analyzer,
+        trainloader=trainloader,
+        dev=dev,
+        layers=layers,
+        want_fisher=want_fisher,
+        want_refined_full=want_refined_full,
+        want_refined_diag=want_refined_diag,
+        need_fp_final=need_fp_final,
+    )
+
+    per_layer_runtime_modules = list(analyzer.get_pre_block_modules())
+    per_layer_runtime_modules.extend(
+        [analyzer.get_layernorm_before_head(), analyzer.get_lm_head()]
+    )
+    for module in per_layer_runtime_modules:
+        module.to(dev)
+    layers[0] = layers[0].to(dev)
+
+    dtype = next(iter(model.parameters())).dtype
+    dp_world = dist_utils.get_world_size()
+    dp_rank = dist_utils.get_rank()
+    if args.nsamples % dp_world != 0:
+        raise ValueError(
+            f"nsamples ({args.nsamples}) must be divisible by world_size ({dp_world}) for DP."
+        )
+    n_local = args.nsamples // dp_world
+    dp_shard = slice(dp_rank * n_local, (dp_rank + 1) * n_local)
+    inps = torch.zeros(
+        (n_local, model.seqlen, model.config.hidden_size),
+        dtype=dtype,
+        device=dev,
+    )
+    cache = {"global_i": 0, "attention_mask": None}
+
+    class Catcher(nn.Module):
+        def __init__(self, module):
+            super().__init__()
+            self.module = module
+            if hasattr(module, "attention_type"):
+                self.attention_type = module.attention_type
+
+        def forward(self, inp, **kwargs):
+            global_i = cache["global_i"]
+            if dp_shard.start <= global_i < dp_shard.stop:
+                inps[global_i - dp_shard.start] = inp
+            cache["global_i"] += 1
+            cache["attention_mask"] = kwargs["attention_mask"]
+            cache["position_ids"] = kwargs["position_ids"]
+            cache["position_embeddings"] = kwargs["position_embeddings"]
+            raise ValueError
+
+    layers[0] = Catcher(layers[0])
+    for batch in trainloader:
+        try:
+            model(batch[0].to(dev))
+        except ValueError:
+            pass
+    layers[0] = layers[0].module
+    layers[0] = layers[0].to(orig_device)
+    memory_utils.cleanup_memory(False)
+
+    attention_mask = cache["attention_mask"]
+    position_ids = cache["position_ids"]
+    position_embeddings = cache["position_embeddings"]
+
+    quantizers = {}
+    sequential = analyzer.get_sequential_quantizable_module_names()
+    fp_inputs_cache = FPInputsCache(sequential)
+    fp_inps = inps.clone()
+    fp_inps_final = (
+        None
+        if fp_inps_final_cpu is None
+        else fp_inps_final_cpu.to(device=fp_inps.device, dtype=fp_inps.dtype)
+    )
+    fp_inps_final_cpu = None
+
+    if bool(getattr(args, "act_quant_aware_gptq", False)):
+        input_q_count, v_q_count = configure_activation_quantizers_for_gptq(args, model)
+        logging.info(
+            "act_quant_aware_gptq enabled for GPTAQ analysis: student paths use "
+            "A/V fake quantization after FP teacher caches are captured "
+            "(input_wrappers=%d v_out_wrappers=%d, a_bits=%d, v_bits=%d).",
+            input_q_count,
+            v_q_count,
+            args.a_bits,
+            args.v_bits,
+        )
+
+    if bool(getattr(args, "k_cache_quant_aware_gptq", False)):
+        k_q_count = configure_k_cache_quantizers_for_gptq(args, analyzer)
+        logging.info(
+            "k_cache_quant_aware_gptq enabled for GPTAQ analysis: student paths use "
+            "online K fake quantization after RoPE/QK rotation "
+            "(qk_wrappers=%d, k_bits=%d).",
+            k_q_count,
+            args.k_bits,
+        )
+
+    if args.offload_inps:
+        inps = inps.cpu()
+        fp_inps = fp_inps.cpu()
+        if fp_inps_final is not None:
+            fp_inps_final = fp_inps_final.cpu()
+
+    refined_rkl_num_A = int(getattr(args, "refined_rkl_num_A", 1))
+    samples_per_A = (
+        args.nsamples // refined_rkl_num_A
+        if refined_rkl_num_A > 1 else 0
+    )
+
+    pbar = tqdm(range(len(layers)), ncols=120, desc="GPTAQ Quantizing Layers", position=0)
+    for i in pbar:
+        layer = layers[i].to(dev)
+        full = analyzer.get_quantizable_modules(layer)
+        analysis_is_target = bool(analysis_hook("before_layer", {
+            "args": args,
+            "analyzer": analyzer,
+            "layer": layer,
+            "layer_idx": i,
+            "layers": layers,
+            "full": full,
+            "inps": inps,
+            "fp_inps": fp_inps,
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
+            "position_embeddings": position_embeddings,
+            "dev": dev,
+            "orig_device": orig_device,
+        }))
+
+        analysis_hook("before_fp_reference", {
+            "args": args,
+            "analyzer": analyzer,
+            "layer": layer,
+            "layer_idx": i,
+            "layers": layers,
+            "full": full,
+            "inps": inps,
+            "fp_inps": fp_inps,
+            "fp_inps_final": fp_inps_final,
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
+            "position_embeddings": position_embeddings,
+            "dev": dev,
+            "orig_device": orig_device,
+            "is_target": analysis_is_target,
+        })
+
+        with disable_fp_path_quant(layer):
+            fp_inputs_cache.add_hook(full)
+            for j in range(fp_inps.shape[0]):
+                fp_inps[j] = _layer_out(layer(
+                    fp_inps[j].unsqueeze(0).to(dev),
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    position_embeddings=position_embeddings,
+                )).to(fp_inps.device)
+            fp_inputs_cache.clear_hook()
+
+        analysis_fp_weights = None
+        if analysis_is_target:
+            analysis_fp_weights = {
+                raw_name[:-7] if raw_name.endswith(".module") else raw_name:
+                mod.weight.detach().clone().cpu()
+                for raw_name, mod in full.items()
+                if mod is not None and hasattr(mod, "weight")
+            }
+        analysis_hessians = _collect_layer_hessians_for_reg(
+            args,
+            analyzer,
+            layer,
+            inps,
+            attention_mask,
+            position_ids,
+            position_embeddings,
+            dev,
+        ) if analysis_is_target else None
+
+        for names in sequential:
+            subset = {n: full.get(n, full.get(n + ".module", None)) for n in names}
+            subset = {n: m for n, m in subset.items() if m is not None and "lm_head" not in n}
+            if not subset:
+                continue
+
+            gptq = {}
+            for name, module in subset.items():
+                gptq[name] = GPTAQ(module)
+                gptq[name].quantizer = quant_utils.WeightQuantizer()
+                gptq[name].quantizer.configure(
+                    args.w_bits,
+                    perchannel=True,
+                    sym=not args.w_asym,
+                    mse=args.w_clip,
+                )
+                gptq[name].fp_inp = fp_inputs_cache.fp_cache[name]
+
+            def add_batch(name):
+                def tmp(_, inp, out):
+                    gptq[name].add_batch(inp[0].data, out.data)
+                return tmp
+
+            first_module_name = list(subset.keys())[0]
+            handle = subset[first_module_name].register_forward_hook(
+                add_batch(first_module_name)
+            )
+            for j in range(inps.shape[0]):
+                _ = _layer_out(layer(
+                    inps[j].unsqueeze(0).to(dev),
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    position_embeddings=position_embeddings,
+                ))
+            handle.remove()
+
+            if dp_world > 1:
+                dist_utils.allreduce_sum_(gptq[first_module_name].H)
+                dist_utils.allreduce_sum_(gptq[first_module_name].dXXT)
+                gptq[first_module_name].H.div_(float(dp_world))
+                gptq[first_module_name].dXXT.div_(float(dp_world))
+
+            for name in subset:
+                if name != first_module_name:
+                    gptq[name].H = gptq[first_module_name].H
+                    gptq[name].dXXT = gptq[first_module_name].dXXT
+
+            for name in subset:
+                pbar.set_postfix(module=f"layers.{i}." + name)
+                gptq[name].fasterquant(
+                    blocksize=args.blocksize,
+                    percdamp=args.percdamp,
+                    groupsize=args.w_groupsize,
+                    actorder=args.act_order,
+                    static_groups=args.act_order,
+                )
+                if getattr(args, "enable_debug", False):
+                    dist_utils.assert_bit_exact(
+                        subset[name].weight.data,
+                        tag=f"gptaq_analysis.layer{i}.{name}.weight_after_fasterquant",
+                    )
+                quantizers["model.layers.%d.%s" % (i, name)] = gptq[name].quantizer
+                gptq[name].free()
+
+        analysis_hook("after_layer_quantized", {
+            "args": args,
+            "analyzer": analyzer,
+            "layer": layer,
+            "layer_idx": i,
+            "layers": layers,
+            "full": full,
+            "inps": inps,
+            "fp_inps": fp_inps,
+            "fp_inps_final": fp_inps_final,
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
+            "position_embeddings": position_embeddings,
+            "dev": dev,
+            "orig_device": orig_device,
+            "static_fisher_by_layer": static_fisher_by_layer,
+            "static_refined_A_by_layer": static_refined_A_by_layer,
+            "static_refined_diag_A_by_layer": static_refined_diag_A_by_layer,
+            "samples_per_A": samples_per_A,
+            "fp_weights": analysis_fp_weights,
+            "hessians": analysis_hessians,
+            "is_target": analysis_is_target,
+        })
+
+        for j in range(inps.shape[0]):
+            inps[j] = _layer_out(layer(
+                inps[j].unsqueeze(0).to(dev),
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                position_embeddings=position_embeddings,
+            )).to(inps.device)
+
+        fp_inputs_cache.clear_cache()
+        layers[i] = layer.to(orig_device)
+        del layer, full, gptq, analysis_fp_weights, analysis_hessians
+        memory_utils.cleanup_memory()
+
+    for module in per_layer_runtime_modules:
+        module.to(orig_device)
+    model.config.use_cache = use_cache
+    memory_utils.cleanup_memory(verbos=True)
+    logging.info("-----GPTAQ + grad-cosine analysis done-----")
+    return quantizers
+
+
 # ---------------------------------------------------------------------------
 # main pipeline — selectable reference quantization with measurement
 # ---------------------------------------------------------------------------
@@ -2231,9 +2562,9 @@ def quantize_and_measure(args, analyzer, trainloader, dev, target_layers, measur
         "----- %s + grad-cosine analysis -----",
         analysis_quant_method.upper(),
     )
-    if analysis_quant_method not in {"rtn", "gptq_plus"}:
+    if analysis_quant_method not in {"rtn", "gptaq", "gptq_plus"}:
         raise ValueError(
-            "--analysis_quant_method currently supports {'rtn', 'gptq_plus'} "
+            "--analysis_quant_method currently supports {'rtn', 'gptaq', 'gptq_plus'} "
             f"for target-layer cosine measurement, got {analysis_quant_method!r}."
         )
     layers = analyzer.get_layers()
@@ -2315,6 +2646,30 @@ def quantize_and_measure(args, analyzer, trainloader, dev, target_layers, measur
 
     if analysis_quant_method == "rtn":
         quantizers = _rtn_fwrd_with_analysis(
+            args,
+            analyzer,
+            trainloader,
+            dev,
+            analysis_hook,
+            want_fisher=want_fisher,
+            want_refined_full=want_refined_full,
+            want_refined_diag=want_refined_diag,
+            need_fp_final=need_fp_final,
+        )
+        clear_analysis_state()
+        memory_utils.cleanup_memory()
+        logging.info("----- %s + grad-cosine done -----", analysis_quant_method.upper())
+        return quantizers, cosine_results, layer_loss_results
+
+    if analysis_quant_method == "gptaq":
+        if getattr(args, "w_method", None) != "gptaq":
+            logging.info(
+                "analysis_quant_method=gptaq requires GPTAQ reference path; "
+                "overriding w_method=%s -> gptaq.",
+                getattr(args, "w_method", None),
+            )
+            args.w_method = "gptaq"
+        quantizers = _gptaq_fwrd_with_analysis(
             args,
             analyzer,
             trainloader,
