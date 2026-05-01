@@ -700,8 +700,8 @@ def parse_gen():
         help=(
             "Comma-separated subset of surrogate losses to measure against the true "
             "end-to-end KL gradient in analyze_grad_cosine. Choices: fisher_diag_mse, "
-            "residual_kl, refined_residual_kl, refined_diag_residual_kl, refined_mse, "
-            "layer_mse, module_mse. "
+            "legacy_fisher_diag_mse, residual_kl, refined_residual_kl, "
+            "refined_diag_residual_kl, refined_mse, layer_mse, module_mse. "
             "Only the fits / backward passes needed for the selected set are run "
             "(saves memory and time — e.g. skipping refined_residual_kl avoids the "
             "H×H A fit)."

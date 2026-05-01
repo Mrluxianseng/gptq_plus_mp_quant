@@ -5435,7 +5435,9 @@ def compute_refresh_loss(
                 return kl_loss.sum(dim=-1).mean()
 
     delta = _drop_sink(out_hidden - fp_hidden)
-    if refresh_loss_type in ("fisher_diag_mse", "refined_mse") and a_loss_ratio < 1.0:
+    if refresh_loss_type in (
+        "fisher_diag_mse", "legacy_fisher_diag_mse", "refined_mse",
+    ) and a_loss_ratio < 1.0:
         delta = _scale_delta_by_abs_quantile(delta, a_loss_ratio, profile_recorder)
     if refresh_loss_type == "hidden_mse":
         with profile_recorder.section("compute_refresh_loss.hidden_mse") if profile_recorder else _NULL_CONTEXT:
@@ -5562,7 +5564,7 @@ def compute_refresh_loss(
     if layer_output_fisher is None:
         raise ValueError(
             f"`layer_output_fisher` must be provided for refresh_loss_type='{refresh_loss_type}' "
-            "(fisher_diag_mse / refined_mse)."
+            "(fisher_diag_mse / legacy_fisher_diag_mse / refined_mse)."
         )
     with profile_recorder.section("compute_refresh_loss.fisher_diag_mse.total") if profile_recorder else _NULL_CONTEXT:
         with profile_recorder.section("compute_refresh_loss.fisher_diag_mse.quadratic") if profile_recorder else _NULL_CONTEXT:
@@ -5577,7 +5579,15 @@ def compute_refresh_loss(
                 )
             fisher = layer_output_fisher.to(device=delta.device, dtype=torch.float32)
             delta_flat = delta.float().reshape(-1, hidden_size)
-            fisher_loss_per_token = 0.5 * (delta_flat.matmul(fisher) * delta_flat).sum(dim=-1)
+            if refresh_loss_type == "legacy_fisher_diag_mse":
+                fisher_diag = torch.diag(fisher)
+                fisher_loss_per_token = 0.5 * (
+                    delta_flat.square() * fisher_diag
+                ).sum(dim=-1)
+            else:
+                fisher_loss_per_token = 0.5 * (
+                    delta_flat.matmul(fisher) * delta_flat
+                ).sum(dim=-1)
             fisher_loss = fisher_loss_per_token.mean()
 
         if refresh_loss_type != "refined_mse":

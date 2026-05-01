@@ -67,6 +67,7 @@ torch.backends.cuda.matmul.allow_tf32 = False
 
 _VALID_MEASURE_LOSSES = {
     "fisher_diag_mse",
+    "legacy_fisher_diag_mse",
     "residual_kl",
     "refined_residual_kl",
     "refined_diag_residual_kl",
@@ -77,6 +78,7 @@ _VALID_MEASURE_LOSSES = {
 
 _LOSS_REPORT_ORDER = (
     "fisher_diag_mse",
+    "legacy_fisher_diag_mse",
     "residual_kl",
     "refined_residual_kl",
     "refined_diag_residual_kl",
@@ -239,6 +241,14 @@ _ENTRY_SERIES_TO_STATS = {
     "per_batch_reg_cos": ("reg_cos_mean", "reg_cos_std"),
     "per_batch_fisher": ("fisher_mean", "fisher_std"),
     "per_batch_fisher_grad_norm": ("fisher_grad_norm_mean", None),
+    "per_batch_legacy_fisher_diag_mse": (
+        "legacy_fisher_diag_mse_mean",
+        "legacy_fisher_diag_mse_std",
+    ),
+    "per_batch_legacy_fisher_diag_mse_grad_norm": (
+        "legacy_fisher_diag_mse_grad_norm_mean",
+        None,
+    ),
     "per_batch_residual_kl": ("residual_kl_mean", "residual_kl_std"),
     "per_batch_residual_kl_grad_norm": ("residual_kl_grad_norm_mean", None),
     "per_batch_refined_residual_kl": (
@@ -495,6 +505,7 @@ def run_cosine_measurement(
     # Require batch to sit entirely within one sub-A so the routing is
     # unambiguous.
     want_fisher = "fisher_diag_mse" in measure_losses
+    want_legacy_fisher_diag = "legacy_fisher_diag_mse" in measure_losses
     want_residual = "residual_kl" in measure_losses
     want_refined_full = "refined_residual_kl" in measure_losses
     want_refined_diag = "refined_diag_residual_kl" in measure_losses
@@ -505,7 +516,7 @@ def run_cosine_measurement(
     # same batch-level fisher slice. Use a broader "needs fisher slice" gate
     # for the per-batch indexing below without touching `want_fisher` (which
     # still drives the dedicated fisher-surrogate measurement branch).
-    need_fisher_slice = want_fisher or want_refined_mse
+    need_fisher_slice = want_fisher or want_legacy_fisher_diag or want_refined_mse
     has_refined = (
         want_refined_full
         and refined_A_list is not None
@@ -536,8 +547,9 @@ def run_cosine_measurement(
         )
     if need_fisher_slice and fisher_tensor is None:
         raise RuntimeError(
-            "measure_losses requested fisher_diag_mse or refined_mse but fisher was "
-            "not collected (check collect_fisher flag)."
+            "measure_losses requested a Fisher-backed loss "
+            "(fisher_diag_mse / legacy_fisher_diag_mse / refined_mse) but "
+            "fisher was not collected (check collect_fisher flag)."
         )
 
     # Canonicalise linear names ("q_proj" not "q_proj.module" after ActQuantWrapper).
@@ -619,6 +631,7 @@ def run_cosine_measurement(
             reg_grad_norm[canon] = rg.flatten().norm(p=2).item()
 
     per_batch_fisher_cos = {n: [] for n in name_to_weight}
+    per_batch_legacy_fisher_diag_cos = {n: [] for n in name_to_weight}
     per_batch_residual_cos = {n: [] for n in name_to_weight}
     per_batch_refined_cos = {n: [] for n in name_to_weight}
     per_batch_refined_diag_cos = {n: [] for n in name_to_weight}
@@ -627,6 +640,7 @@ def run_cosine_measurement(
     per_batch_module_mse_cos = {n: [] for n in name_to_weight}
     per_batch_true_norm = {n: [] for n in name_to_weight}
     per_batch_fisher_norm = {n: [] for n in name_to_weight}
+    per_batch_legacy_fisher_diag_norm = {n: [] for n in name_to_weight}
     per_batch_residual_norm = {n: [] for n in name_to_weight}
     per_batch_refined_norm = {n: [] for n in name_to_weight}
     per_batch_refined_diag_norm = {n: [] for n in name_to_weight}
@@ -641,13 +655,15 @@ def run_cosine_measurement(
     # series per (module, loss) pair.
     per_batch_combined_cos = {
         loss: {n: [] for n in name_to_weight}
-        for loss in ("fisher_diag_mse", "residual_kl",
+        for loss in ("fisher_diag_mse", "legacy_fisher_diag_mse",
+                     "residual_kl",
                      "refined_residual_kl", "refined_diag_residual_kl",
                      "refined_mse", "layer_mse", "module_mse")
     }
     per_batch_combined_norm = {
         loss: {n: [] for n in name_to_weight}
-        for loss in ("fisher_diag_mse", "residual_kl",
+        for loss in ("fisher_diag_mse", "legacy_fisher_diag_mse",
+                     "residual_kl",
                      "refined_residual_kl", "refined_diag_residual_kl",
                      "refined_mse", "layer_mse", "module_mse")
     }
@@ -655,6 +671,7 @@ def run_cosine_measurement(
     # One series per loss type; only filled for losses we actually evaluated.
     # Used to print "loss after each layer" alongside the cosine/grad-norm view.
     per_batch_fisher_loss = []
+    per_batch_legacy_fisher_diag_loss = []
     per_batch_residual_loss = []
     per_batch_refined_loss = []
     per_batch_refined_diag_loss = []
@@ -735,7 +752,30 @@ def run_cosine_measurement(
                 grads_fisher = _capture_grads(name_to_weight, grad_clip=grad_clip)
                 del out_hidden, fisher_loss
 
-            # ---------- (3) residual_kl ----------
+            # ---------- (3) legacy_fisher_diag_mse ----------
+            grads_legacy_fisher_diag = None
+            if want_legacy_fisher_diag:
+                _zero_grads(target_params)
+                out_hidden = _call_layer(inp_batch)
+                legacy_fisher_diag_loss = compute_refresh_loss(
+                    refresh_loss_type="legacy_fisher_diag_mse",
+                    out_hidden=out_hidden,
+                    fp_hidden=fp_hidden_cached,
+                    analyzer=analyzer,
+                    kl_topk=kl_topk,
+                    layer_output_fisher=fisher_batch,
+                    fp_final_hidden=None,
+                )
+                legacy_fisher_diag_loss.backward()
+                per_batch_legacy_fisher_diag_loss.append(
+                    legacy_fisher_diag_loss.item()
+                )
+                grads_legacy_fisher_diag = _capture_grads(
+                    name_to_weight, grad_clip=grad_clip
+                )
+                del out_hidden, legacy_fisher_diag_loss
+
+            # ---------- (4) residual_kl ----------
             grads_residual = None
             if want_residual:
                 _zero_grads(target_params)
@@ -754,7 +794,7 @@ def run_cosine_measurement(
                 grads_residual = _capture_grads(name_to_weight, grad_clip=grad_clip)
                 del out_hidden, residual_loss
 
-            # ---------- (4) refined_residual_kl ----------
+            # ---------- (5) refined_residual_kl ----------
             grads_refined = None
             if has_refined:
                 # Pick the sub-A that owns this batch's samples. We enforce
@@ -791,7 +831,7 @@ def run_cosine_measurement(
                 grads_refined = _capture_grads(name_to_weight, grad_clip=grad_clip)
                 del out_hidden, refined_loss, refined_A_dev
 
-            # ---------- (5) refined_diag_residual_kl ----------
+            # ---------- (6) refined_diag_residual_kl ----------
             grads_refined_diag = None
             if has_refined_diag:
                 global_start = int(sample_offset) + start
@@ -826,7 +866,7 @@ def run_cosine_measurement(
                 grads_refined_diag = _capture_grads(name_to_weight, grad_clip=grad_clip)
                 del out_hidden, refined_diag_loss, refined_diag_dev
 
-            # ---------- (6) refined_mse ----------
+            # ---------- (7) refined_mse ----------
             grads_refined_mse = None
             if has_refined_mse and fisher_tensor is not None:
                 # Which measurement samples land in the pre-collected pool?
@@ -870,7 +910,7 @@ def run_cosine_measurement(
                 if layer_output_grad_exact is not None:
                     del layer_output_grad_exact
 
-            # ---------- (7) layer_mse ----------
+            # ---------- (8) layer_mse ----------
             grads_layer_mse = None
             if want_layer_mse:
                 _zero_grads(target_params)
@@ -889,7 +929,7 @@ def run_cosine_measurement(
                 grads_layer_mse = _capture_grads(name_to_weight, grad_clip=grad_clip)
                 del out_hidden, layer_mse_loss
 
-            # ---------- (8) module_mse ----------
+            # ---------- (9) module_mse ----------
             grads_module_mse = None
             if want_module_mse:
                 if fp_module_outputs is None:
@@ -940,6 +980,10 @@ def run_cosine_measurement(
 
             # ---------- cosine + grad L2 per linear ----------
             cos_f = _cosine_per_linear(grads_true, grads_fisher) if grads_fisher is not None else None
+            cos_lfd = (
+                _cosine_per_linear(grads_true, grads_legacy_fisher_diag)
+                if grads_legacy_fisher_diag is not None else None
+            )
             cos_r = _cosine_per_linear(grads_true, grads_residual) if grads_residual is not None else None
             cos_rf = _cosine_per_linear(grads_true, grads_refined) if grads_refined is not None else None
             cos_rfd = _cosine_per_linear(grads_true, grads_refined_diag) if grads_refined_diag is not None else None
@@ -955,6 +999,7 @@ def run_cosine_measurement(
             # (loss_name, grads_surrogate) pairs for the combined metric loop.
             _combined_pairs = [
                 ("fisher_diag_mse", grads_fisher),
+                ("legacy_fisher_diag_mse", grads_legacy_fisher_diag),
                 ("residual_kl", grads_residual),
                 ("refined_residual_kl", grads_refined),
                 ("refined_diag_residual_kl", grads_refined_diag),
@@ -965,6 +1010,8 @@ def run_cosine_measurement(
             for n in name_to_weight:
                 if cos_f is not None:
                     per_batch_fisher_cos[n].append(cos_f[n])
+                if cos_lfd is not None:
+                    per_batch_legacy_fisher_diag_cos[n].append(cos_lfd[n])
                 if cos_r is not None:
                     per_batch_residual_cos[n].append(cos_r[n])
                 if cos_rf is not None:
@@ -983,6 +1030,10 @@ def run_cosine_measurement(
                 per_batch_true_norm[n].append(grads_true[n].flatten().norm(p=2).item())
                 if grads_fisher is not None:
                     per_batch_fisher_norm[n].append(grads_fisher[n].flatten().norm(p=2).item())
+                if grads_legacy_fisher_diag is not None:
+                    per_batch_legacy_fisher_diag_norm[n].append(
+                        grads_legacy_fisher_diag[n].flatten().norm(p=2).item()
+                    )
                 if grads_residual is not None:
                     per_batch_residual_norm[n].append(grads_residual[n].flatten().norm(p=2).item())
                 if grads_refined is not None:
@@ -1019,6 +1070,8 @@ def run_cosine_measurement(
             del grads_true
             if grads_fisher is not None:
                 del grads_fisher
+            if grads_legacy_fisher_diag is not None:
+                del grads_legacy_fisher_diag
             if grads_residual is not None:
                 del grads_residual
             if grads_refined is not None:
@@ -1037,6 +1090,7 @@ def run_cosine_measurement(
 
     loss_summary = _summarize_loss_series({
         "fisher_diag_mse": per_batch_fisher_loss,
+        "legacy_fisher_diag_mse": per_batch_legacy_fisher_diag_loss,
         "residual_kl": per_batch_residual_loss,
         "refined_residual_kl": per_batch_refined_loss,
         "refined_diag_residual_kl": per_batch_refined_diag_loss,
@@ -1079,6 +1133,16 @@ def run_cosine_measurement(
             entry["per_batch_fisher"] = fs.tolist()
             entry["fisher_grad_norm_mean"] = fn.mean().item()
             entry["per_batch_fisher_grad_norm"] = fn.tolist()
+        if want_legacy_fisher_diag and per_batch_legacy_fisher_diag_cos[n]:
+            lfd = torch.tensor(per_batch_legacy_fisher_diag_cos[n])
+            lfdn = torch.tensor(per_batch_legacy_fisher_diag_norm[n])
+            entry["legacy_fisher_diag_mse_mean"] = lfd.mean().item()
+            entry["legacy_fisher_diag_mse_std"] = (
+                lfd.std(unbiased=False).item() if len(lfd) > 1 else 0.0
+            )
+            entry["per_batch_legacy_fisher_diag_mse"] = lfd.tolist()
+            entry["legacy_fisher_diag_mse_grad_norm_mean"] = lfdn.mean().item()
+            entry["per_batch_legacy_fisher_diag_mse_grad_norm"] = lfdn.tolist()
         if want_residual and per_batch_residual_cos[n]:
             rs = torch.tensor(per_batch_residual_cos[n])
             rn = torch.tensor(per_batch_residual_norm[n])
@@ -1130,7 +1194,7 @@ def run_cosine_measurement(
         # Combined (surrogate + reg_grad) metrics, one set per loss that ran.
         if reg_enabled:
             for loss_name in (
-                "fisher_diag_mse", "residual_kl",
+                "fisher_diag_mse", "legacy_fisher_diag_mse", "residual_kl",
                 "refined_residual_kl", "refined_diag_residual_kl",
                 "refined_mse", "layer_mse", "module_mse",
             ):
@@ -1262,8 +1326,9 @@ def measure_layer_losses_after_quant(
         )
 
     want_fisher = "fisher_diag_mse" in measure_losses
+    want_legacy_fisher_diag = "legacy_fisher_diag_mse" in measure_losses
     want_refined_mse = "refined_mse" in measure_losses
-    need_fisher = want_fisher or want_refined_mse
+    need_fisher = want_fisher or want_legacy_fisher_diag or want_refined_mse
     want_layer_mse = "layer_mse" in measure_losses
     want_module_mse = "module_mse" in measure_losses
     want_residual = "residual_kl" in measure_losses
@@ -1287,8 +1352,9 @@ def measure_layer_losses_after_quant(
         }
     if need_fisher and fisher_tensor is None:
         raise RuntimeError(
-            "measure_losses requested fisher_diag_mse or refined_mse but fisher was not collected "
-            "(check collect_fisher flag)."
+            "measure_losses requested a Fisher-backed loss "
+            "(fisher_diag_mse / legacy_fisher_diag_mse / refined_mse) but "
+            "fisher was not collected (check collect_fisher flag)."
         )
     if want_refined_mse and not has_refined_mse:
         raise RuntimeError(
@@ -1343,6 +1409,17 @@ def measure_layer_losses_after_quant(
                 fp_final_hidden=None,
             )
             per_loss_values["fisher_diag_mse"].append(loss.item())
+        if want_legacy_fisher_diag:
+            loss = compute_refresh_loss(
+                refresh_loss_type="legacy_fisher_diag_mse",
+                out_hidden=out_hidden,
+                fp_hidden=fp_hidden_cached,
+                analyzer=analyzer,
+                kl_topk=kl_topk,
+                layer_output_fisher=fisher_batch,
+                fp_final_hidden=None,
+            )
+            per_loss_values["legacy_fisher_diag_mse"].append(loss.item())
         if want_residual:
             loss = compute_refresh_loss(
                 refresh_loss_type="residual_kl",
@@ -1549,6 +1626,7 @@ def _build_cosine_analysis_hook(
     def _fmt_entry(name, r):
         loss_specs = [
             ("fisher_mean", "fisher"),
+            ("legacy_fisher_diag_mse_mean", "legacy_fisher_diag"),
             ("residual_kl_mean", "res_kl"),
             ("refined_residual_kl_mean", "refined_res_kl"),
             ("refined_diag_residual_kl_mean", "refined_diag_res_kl"),
@@ -1558,6 +1636,7 @@ def _build_cosine_analysis_hook(
         ]
         norm_specs = [
             ("fisher_grad_norm_mean", "fisher"),
+            ("legacy_fisher_diag_mse_grad_norm_mean", "legacy_fisher_diag"),
             ("residual_kl_grad_norm_mean", "res_kl"),
             ("refined_residual_kl_grad_norm_mean", "refined_res_kl"),
             ("refined_diag_residual_kl_grad_norm_mean", "refined_diag_res_kl"),
@@ -1570,6 +1649,7 @@ def _build_cosine_analysis_hook(
             cos_bits.append(f"reg={r['reg_cos_mean']:.4f}")
             for loss_key, loss_short in (
                 ("fisher_diag_mse", "fisher+reg"),
+                ("legacy_fisher_diag_mse", "legacy_fisher_diag+reg"),
                 ("residual_kl", "res_kl+reg"),
                 ("refined_residual_kl", "refined_res_kl+reg"),
                 ("refined_diag_residual_kl", "refined_diag_res_kl+reg"),
@@ -2605,7 +2685,11 @@ def quantize_and_measure(args, analyzer, trainloader, dev, target_layers, measur
     )
     sample_offset = rank_sample_start
 
-    want_fisher = "fisher_diag_mse" in measure_losses or "refined_mse" in measure_losses
+    want_fisher = bool(
+        measure_losses.intersection(
+            {"fisher_diag_mse", "legacy_fisher_diag_mse", "refined_mse"}
+        )
+    )
     want_refined_full = "refined_residual_kl" in measure_losses
     want_refined_diag = "refined_diag_residual_kl" in measure_losses
     want_module_mse = "module_mse" in measure_losses
@@ -2871,6 +2955,8 @@ def main(args):
                     seen.add(name)
         _LOSS_COL_SPEC = [
             ("fisher_diag_mse", "fisher_mean", "fisher_grad_norm_mean"),
+            ("legacy_fisher_diag_mse", "legacy_fisher_diag_mse_mean",
+             "legacy_fisher_diag_mse_grad_norm_mean"),
             ("residual_kl", "residual_kl_mean", "residual_kl_grad_norm_mean"),
             ("refined_residual_kl", "refined_residual_kl_mean",
              "refined_residual_kl_grad_norm_mean"),
@@ -2978,6 +3064,13 @@ def main(args):
             if "fisher_mean" in r:
                 out["cos_fisher"] = f"{r['fisher_mean']:.4f}"
                 out["gnorm_fisher"] = f"{r['fisher_grad_norm_mean']:.3e}"
+            if "legacy_fisher_diag_mse_mean" in r:
+                out["cos_legacy_fisher_diag"] = (
+                    f"{r['legacy_fisher_diag_mse_mean']:.4f}"
+                )
+                out["gnorm_legacy_fisher_diag"] = (
+                    f"{r['legacy_fisher_diag_mse_grad_norm_mean']:.3e}"
+                )
             if "residual_kl_mean" in r:
                 out["cos_res_kl"] = f"{r['residual_kl_mean']:.4f}"
                 out["gnorm_res_kl"] = f"{r['residual_kl_grad_norm_mean']:.3e}"

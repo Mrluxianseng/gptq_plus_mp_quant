@@ -25,10 +25,11 @@ ENABLE_GPTQ_PLUS=${ENABLE_GPTQ_PLUS:-0}
 ALPHA=${ALPHA:-0.0}
 PRE_CLIP=${PRE_CLIP:-0}
 # Subset of surrogate losses to measure against the true end-to-end KL gradient.
-# Choices: fisher_diag_mse, residual_kl, refined_residual_kl,
-# refined_diag_residual_kl, refined_mse, layer_mse, module_mse.
+# Choices: fisher_diag_mse, legacy_fisher_diag_mse, residual_kl,
+# refined_residual_kl, refined_diag_residual_kl, refined_mse,
+# layer_mse, module_mse.
 # Skipping refined_residual_kl avoids the H×H A fit (big CPU-RAM win on 70B).
-MEASURE_LOSSES=${MEASURE_LOSSES:-"fisher_diag_mse,layer_mse,module_mse"}
+MEASURE_LOSSES=${MEASURE_LOSSES:-"fisher_diag_mse,legacy_fisher_diag_mse,layer_mse,module_mse"}
 # Reference quantization path used before measuring target-layer cosine.
 # Choices: rtn (default) / gptaq / gptq_plus.
 ANALYSIS_QUANT_METHOD=${ANALYSIS_QUANT_METHOD:-rtn}
