@@ -154,9 +154,16 @@ def parse_gen():
         "--grad_refresh_loss",
         type=str,
         default="fisher_diag_mse",
-        choices=["kl", "hidden_mse", "fisher_diag_mse", "residual_kl", "refined_residual_kl", "refined_mse", "refined_mix"],
+        choices=[
+            "kl", "hidden_mse", "layer_mse", "fisher_diag_mse",
+            "legacy_fisher_diag_mse", "residual_kl", "refined_residual_kl",
+            "refined_mse", "refined_mix",
+        ],
         help=(
             "Loss used to compute the true refresh gradient in block_backward/block_gd. "
+            "'layer_mse' is accepted as an alias of 'hidden_mse'. "
+            "'legacy_fisher_diag_mse' follows the fisher_diag_mse pipeline but keeps "
+            "only the diagonal of the cached Fisher matrix in the quadratic loss. "
             "'residual_kl' assumes the current-layer output delta flows through the "
             "remaining residual stream unchanged and only measures its effect after the "
             "final norm + lm_head (cheap approximation of end-to-end KL). "
@@ -197,10 +204,12 @@ def parse_gen():
         "--loss_slide_window",
         action="store_true",
         help=(
-            "In block_gd, linearly blend the current-layer fisher_diag_mse loss with the "
-            "next-layer fisher_diag_mse (weights α=1→0 across per-block refreshes). "
-            "Requires --grad_refresh_loss=fisher_diag_mse and --global_loss. Skipped for the "
-            "last layer and the second-to-last layer."
+            "In block_gd, linearly blend the current-layer loss with the next-layer "
+            "loss (weights α=1→0 across per-block refreshes). Supported for "
+            "fisher_diag_mse / legacy_fisher_diag_mse / residual_kl / "
+            "refined_residual_kl / refined_mse / refined_mix when their required "
+            "global stats are available. Skipped for the last layer and the "
+            "second-to-last layer."
         ),
     )
     parser.add_argument(
@@ -208,7 +217,8 @@ def parse_gen():
         action="store_true",
         help=(
             "Skip the first --attention_sink_size tokens of every calibration sequence when "
-            "computing any loss (NLL / KL / hidden_mse / fisher_diag_mse / refined_mse / "
+            "computing any loss (NLL / KL / hidden_mse / layer_mse / "
+            "fisher_diag_mse / legacy_fisher_diag_mse / refined_mse / "
             "residual_kl / refined_residual_kl / refined_diag_residual_kl). Sink tokens still "
             "participate in forward/KV (so downstream tokens see them as context), but their "
             "loss contribution and the gradients flowing back through them are zero. "
@@ -763,6 +773,8 @@ def parse_gen():
     )
 
     args = parser.parse_args()
+    if args.grad_refresh_loss == "layer_mse":
+        args.grad_refresh_loss = "hidden_mse"
 
     # set paths & others
     args.model_name = args.model.split("/")[-1]
@@ -906,14 +918,18 @@ def parse_gen():
     if getattr(args, "loss_slide_window", False):
         if args.g_update_mode != "block_gd":
             raise ValueError("--loss_slide_window requires --g_update_mode=block_gd.")
-        if args.grad_refresh_loss not in ("fisher_diag_mse", "residual_kl", "refined_residual_kl", "refined_mse", "refined_mix"):
+        if args.grad_refresh_loss not in (
+            "fisher_diag_mse", "legacy_fisher_diag_mse", "residual_kl",
+            "refined_residual_kl", "refined_mse", "refined_mix",
+        ):
             raise ValueError(
                 "--loss_slide_window requires --grad_refresh_loss in "
-                "{fisher_diag_mse, residual_kl, refined_residual_kl, refined_mse, refined_mix}."
+                "{fisher_diag_mse, legacy_fisher_diag_mse, residual_kl, "
+                "refined_residual_kl, refined_mse, refined_mix}."
             )
-        if args.grad_refresh_loss == "fisher_diag_mse" and not args.global_loss:
+        if args.grad_refresh_loss in ("fisher_diag_mse", "legacy_fisher_diag_mse") and not args.global_loss:
             raise ValueError(
-                "--loss_slide_window + fisher_diag_mse requires --global_loss "
+                f"--loss_slide_window + {args.grad_refresh_loss} requires --global_loss "
                 "(so next-layer fisher is cached)."
             )
         if args.grad_refresh_loss == "refined_mse" and not args.global_loss:

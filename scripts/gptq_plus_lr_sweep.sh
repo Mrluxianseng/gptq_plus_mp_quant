@@ -30,7 +30,7 @@ DEVICE=${3}
 shift 3
 
 # Sweep configuration. Override from the shell when needed.
-GRAD_LRS_STR=${GRAD_LRS:-"0.0000005"}
+GRAD_LRS_STR=${GRAD_LRS:-"0.000003"}
 DATASET=${DATASET:-wikitext2} # wikitext2 / neuralmagic / ultrachat_2k / numinamath
 N_SAMPLES=${N_SAMPLES:-256}
 SEQ_LEN=${SEQ_LEN:-2048}
@@ -75,7 +75,7 @@ GRAD_CLIP=${GRAD_CLIP:-5e-5}
 # final layer's grads flow through lm_head + final norm and often blow up
 # relative to earlier blocks. Empty / "none" → reuse GRAD_CLIP for every layer.
 FINAL_LAYER_GRAD_CLIP=${FINAL_LAYER_GRAD_CLIP:-5e-4}
-# --grad_refresh_loss {kl,hidden_mse,fisher_diag_mse,residual_kl,refined_residual_kl,refined_mse,refined_mix}
+# --grad_refresh_loss {kl,hidden_mse,layer_mse,fisher_diag_mse,legacy_fisher_diag_mse,residual_kl,refined_residual_kl,refined_mse,refined_mix}
 GRAD_REFRESH_LOSS=${GRAD_REFRESH_LOSS:-fisher_diag_mse}
 # refined_residual_kl knobs (only used when GRAD_REFRESH_LOSS=refined_residual_kl)
 REFINED_RKL_NUM_A=${REFINED_RKL_NUM_A:-1}
@@ -140,7 +140,7 @@ GRAD_LR_LAYER_SCHEDULE=${GRAD_LR_LAYER_SCHEDULE:-cosine}
 GRAD_LR_LAYER_BASE_RATIO=${GRAD_LR_LAYER_BASE_RATIO:-0.01}
 ALPHA=${ALPHA:-0.0}
 KL_TOPK=${KL_TOPK:-20}
-LM_EVAL_BATCH_SIZE=${LM_EVAL_BATCH_SIZE:-32}
+LM_EVAL_BATCH_SIZE=${LM_EVAL_BATCH_SIZE:-2}
 ENABLE_QA_EVAL=${ENABLE_QA_EVAL:-1}
 BASE_EXP=${BASE_EXP:-gptq_plus_lr_sweep}
 OUTPUT_ROOT=${OUTPUT_ROOT:-./outputs}

@@ -189,13 +189,18 @@ def main(args):
         dist.barrier()
 
     if args.lm_eval and not args.skip_eval:
-        # Run lm_eval only on rank 0. Other ranks wait at the barrier below.
-        # Running on every rank caused them to (a) contend for the same GPUs
-        # via accelerate.dispatch_model and (b) duplicate the full task suite,
-        # which made ceval-valid in particular hang with 0% SM utilisation.
-        if dist_utils.is_main():
+        # Run lm_eval only on the original rank 0 process. accelerate.dispatch_model
+        # still does the model-parallel device placement inside that process; the
+        # torchrun ranks must not sit in a later NCCL barrier while rank 0 spends
+        # hours evaluating loglikelihood requests.
+        run_lm_eval = dist_utils.is_main()
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
+            dist.destroy_process_group()
+        if run_lm_eval:
             dist_utils.distribute_model(model)
             eval_utils.qa_eval(model, tokenizer, args.lm_eval_batch_size)
+        return
 
     if dist.is_available() and dist.is_initialized():
         dist.barrier()

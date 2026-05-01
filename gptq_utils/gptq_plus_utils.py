@@ -237,12 +237,29 @@ def normalize_quant_module_name(name: str) -> str:
     return name[:-7] if name.endswith(".module") else name
 
 
+def canonical_refresh_loss_type(loss_type: str) -> str:
+    return "hidden_mse" if loss_type == "layer_mse" else loss_type
+
+
+def is_hidden_mse_loss(loss_type: str) -> bool:
+    return loss_type in ("hidden_mse", "layer_mse")
+
+
+def is_fisher_mse_loss(loss_type: str) -> bool:
+    return loss_type in ("fisher_diag_mse", "legacy_fisher_diag_mse")
+
+
+def is_fisher_backed_loss(loss_type: str) -> bool:
+    return is_fisher_mse_loss(loss_type) or loss_type == "refined_mse"
+
+
 def get_effective_refresh_loss_type(
     layer_idx: int,
     final_layer_idx: int,
     default_refresh_loss_type: str,
     refined_mix_split_layer=None,
 ) -> str:
+    default_refresh_loss_type = canonical_refresh_loss_type(default_refresh_loss_type)
     if layer_idx == final_layer_idx:
         return "kl"
     if default_refresh_loss_type == "refined_mix":
@@ -258,7 +275,7 @@ def get_effective_refresh_loss_type(
 
 
 def get_effective_gptq_reference_loss_type(global_loss_enabled: bool, layer_refresh_loss_type: str) -> str:
-    return layer_refresh_loss_type if global_loss_enabled else "kl"
+    return canonical_refresh_loss_type(layer_refresh_loss_type) if global_loss_enabled else "kl"
 
 
 def compute_safe_beta_from_reference_loss(
@@ -5404,6 +5421,7 @@ def compute_refresh_loss(
     sink_size=0,
     a_loss_ratio=1.0,
 ):
+    refresh_loss_type = canonical_refresh_loss_type(refresh_loss_type)
     # `sink_size > 0` (driven by --ignore_attention_sink) drops the first
     # `sink_size` seq positions from every loss tensor before reduction. The
     # underlying activations still flow through forward / KV unchanged; only
@@ -5435,11 +5453,9 @@ def compute_refresh_loss(
                 return kl_loss.sum(dim=-1).mean()
 
     delta = _drop_sink(out_hidden - fp_hidden)
-    if refresh_loss_type in (
-        "fisher_diag_mse", "legacy_fisher_diag_mse", "refined_mse",
-    ) and a_loss_ratio < 1.0:
+    if is_fisher_backed_loss(refresh_loss_type) and a_loss_ratio < 1.0:
         delta = _scale_delta_by_abs_quantile(delta, a_loss_ratio, profile_recorder)
-    if refresh_loss_type == "hidden_mse":
+    if is_hidden_mse_loss(refresh_loss_type):
         with profile_recorder.section("compute_refresh_loss.hidden_mse") if profile_recorder else _NULL_CONTEXT:
             return 0.5 * delta.square().sum(dim=-1).mean()
 
@@ -6102,6 +6118,7 @@ def collect_true_weight_gradient(
     those. Empty-shard runs still return a valid zero tensor + count=0 so the
     caller's allreduce does the right thing.
     """
+    refresh_loss_type = canonical_refresh_loss_type(refresh_loss_type)
     module = full.get(module_name, full.get(module_name + ".module", None))
     if module is None:
         raise ValueError(f"Unable to find module `{module_name}` in the provided layer.")
@@ -6179,7 +6196,7 @@ def collect_true_weight_gradient(
     loss_sum_next = 0.0
 
     # Slide-window mixes in a "next-layer" version of the same loss.
-    #   fisher_diag_mse      path: needs the next-layer fisher tensor.
+    #   fisher MSE variants path: needs the next-layer fisher tensor.
     #   residual_kl          path: reuses fp_inps_final (same final-head target for
     #                              both current- and next-layer deltas).
     #   refined_residual_kl  path: reuses fp_inps_final AND needs the next-layer A
@@ -6193,7 +6210,7 @@ def collect_true_weight_gradient(
         and next_layer is not None
         and fp_inps_next is not None
         and (
-            (refresh_loss_type == "fisher_diag_mse" and next_layer_output_fisher is not None)
+            (is_fisher_mse_loss(refresh_loss_type) and next_layer_output_fisher is not None)
             or (refresh_loss_type == "residual_kl" and fp_inps_final is not None)
             or (
                 refresh_loss_type == "refined_residual_kl"
@@ -6233,7 +6250,7 @@ def collect_true_weight_gradient(
                 # we split the batch into `refresh_mb`-sized micro-batches; the
                 # accumulation into `partial_grad_sum` is linear so the final
                 # gradient is identical to using the full `bsz`. Losses that
-                # don't hit the LM head (fisher_diag_mse, hidden_mse) ignore the
+                # don't hit the LM head (fisher MSE variants, hidden_mse) ignore the
                 # cap — memory isn't their bottleneck.
                 _lm_head_loss = refresh_loss_type in (
                     "kl", "residual_kl", "refined_residual_kl", "refined_diag_residual_kl",
@@ -6399,8 +6416,8 @@ def collect_true_weight_gradient(
                                 )
                                 next_out_hidden = next_out[0] if isinstance(next_out, (tuple, list)) else next_out
                                 fp_hidden_next = fp_inps_next[batch_indices].to(dev)
-                                # fisher_diag_mse / refined_mse: next-layer
-                                # loss needs the next-layer fisher diagonal.
+                                # fisher MSE variants / refined_mse: next-layer
+                                # loss needs the next-layer fisher tensor.
                                 # residual_kl: doesn't — reuses fp_inps_final.
                                 fisher_batch_next = (
                                     None if next_layer_output_fisher is None
@@ -6500,14 +6517,16 @@ def collect_layer_grad_hessian_stats(
     sink_size=0,
     a_loss_ratio=1.0,
 ):
+    layer_refresh_loss_type = canonical_refresh_loss_type(layer_refresh_loss_type)
+    gptq_reference_loss_type = canonical_refresh_loss_type(gptq_reference_loss_type)
     need_saliency_collection = precomputed_saliency_dict is None
     # When the caller sets skip_gradient_backward, we're running pure GPTQ with
     # enable_gptq_plus=0: no gradient reference loss, no fisher collection on
-    # this path (fisher only feeds fisher_diag_mse / refined_mse refresh,
+    # this path (fisher only feeds fisher MSE / refined_mse refresh,
     # which is also off).
     need_layer_output_fisher_collection = (
         not skip_gradient_backward
-        and layer_refresh_loss_type in ("fisher_diag_mse", "refined_mse")
+        and is_fisher_backed_loss(layer_refresh_loss_type)
         and precomputed_layer_output_fisher is None
     )
     need_gradient_backward = not skip_gradient_backward
@@ -6664,7 +6683,7 @@ def collect_layer_grad_hessian_stats(
                         saliency_cache.disable_hooks()
 
                 batch_layer_output_fisher = None
-                if layer_refresh_loss_type in ("fisher_diag_mse", "refined_mse") and precomputed_layer_output_fisher is not None:
+                if is_fisher_backed_loss(layer_refresh_loss_type) and precomputed_layer_output_fisher is not None:
                     with layer_recorder.section("layer.grad_hessian.fisher_slice") if layer_recorder else _NULL_CONTEXT:
                         batch_layer_output_fisher = precomputed_layer_output_fisher.to(dev).float()
                 if need_gradient_backward:
@@ -6934,6 +6953,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
     From GPTQ repo
     """
     logging.info("-----GPTQPlus Quantization-----")
+    args.grad_refresh_loss = canonical_refresh_loss_type(args.grad_refresh_loss)
 
     # Guard: `--fsdp_precompute` leaves the model with DTensor-wrapped params
     # after precompute (in-process unwrap was too fragile). The supported
@@ -7211,9 +7231,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     else ""
                 )
                 analysis_tag = ""
-                if analysis_need_fisher and args.grad_refresh_loss not in (
-                    "fisher_diag_mse", "refined_mse",
-                ):
+                if analysis_need_fisher and not is_fisher_backed_loss(args.grad_refresh_loss):
                     analysis_tag += "_anaFisher"
                 if analysis_collect_refined_rkl and args.grad_refresh_loss not in (
                     "refined_residual_kl",
@@ -7225,6 +7243,8 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     "residual_kl", "refined_residual_kl", "refined_mse", "refined_mix",
                 ):
                     analysis_tag += "_anaFPFinal"
+                if is_fisher_backed_loss(args.grad_refresh_loss):
+                    analysis_tag += "_mainFisher"
                 static_cache_key = (
                     f"{args.model_name}_{dataset_id}_s{args.nsamples}_"
                     f"blk{args.seq_len}_rot{rotate_flag}_g{args.num_groups}_"
@@ -7260,6 +7280,15 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     _loaded = torch.load(static_cache_file, map_location="cpu", weights_only=True)
                     static_saliency_by_layer = _loaded["saliency"]
                     static_fisher_by_layer = _loaded["fisher"]
+                    if (
+                        (analysis_need_fisher or is_fisher_backed_loss(args.grad_refresh_loss))
+                        and not any(f is not None for f in static_fisher_by_layer)
+                    ):
+                        raise RuntimeError(
+                            "Cached static saliency/fisher at %s does not contain "
+                            "layer-output Fisher needed by %s. Delete the cache and rerun "
+                            "to regenerate." % (static_cache_file, args.grad_refresh_loss)
+                        )
                     # `refined_A` was added later; tolerate older caches that don't
                     # have it. If refined_residual_kl is requested but the cache is
                     # stale, the reloaded list will be empty/missing and we'd fail
@@ -7305,7 +7334,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                 want_refined = analysis_collect_refined_rkl or args.grad_refresh_loss in (
                     "refined_residual_kl", "refined_mix",
                 )
-                # fisher is consumed by fisher_diag_mse (twofold: the refresh
+                # fisher is consumed by fisher MSE variants (twofold: the refresh
                 # loss itself, and the slide-window blend reads the next
                 # layer's fisher) AND by refined_mse (as its second-order term
                 # — the first-order g·Δy is stacked on top). Everything else
@@ -7314,8 +7343,10 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                 # halves CPU RAM for those configurations. For refined_mix we
                 # still want fisher — but only for the front-half layers; see
                 # `fisher_layer_ids` below.
-                want_fisher = analysis_need_fisher or args.grad_refresh_loss in (
-                    "fisher_diag_mse", "refined_mse", "refined_mix",
+                want_fisher = (
+                    analysis_need_fisher
+                    or is_fisher_backed_loss(args.grad_refresh_loss)
+                    or args.grad_refresh_loss == "refined_mix"
                 )
                 # refined_mix layer-id filters: front half uses refined_mse →
                 # needs fisher; back half (except final) uses refined_residual_kl
@@ -7390,7 +7421,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         del _to_save
             logging.info(
                 "Collected frozen end-to-end saliency/Fisher caches before quantization with global_loss_bsz=%d. "
-                "These cached coefficients will be reused for Hessian estimation and fisher_diag_mse throughout quantization.",
+                "These cached coefficients will be reused for Hessian estimation and Fisher-backed MSE losses throughout quantization.",
                 args.global_loss_bsz,
             )
             # Exit right after persisting the cache — the FSDP-wrapped model
@@ -7910,8 +7941,8 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
             # --- Loss-slide-window setup: precompute reference output of the
             # next FP transformer block, so the per-block refresh can blend the
             # current-layer loss with the next-layer loss. Supported under:
-            #   * fisher_diag_mse — needs `static_fisher_by_layer[i+1]` (so
-            #     global_loss must be on).
+            #   * fisher MSE variants — need `static_fisher_by_layer[i+1]`
+            #     (so global_loss must be on).
             #   * residual_kl    — reuses the already-precomputed fp_inps_final
             #     (no next-layer fisher needed).
             #   * refined_residual_kl — reuses fp_inps_final and additionally
@@ -7928,7 +7959,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                 and next_layer_same_type
             ):
                 if (
-                    layer_refresh_loss_type == "fisher_diag_mse"
+                    is_fisher_mse_loss(layer_refresh_loss_type)
                     and global_loss_enabled
                     and static_fisher_by_layer[i + 1] is not None
                 ):
@@ -7964,11 +7995,12 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
             if slide_active_layer:
                 with layer_recorder.section("layer.slide_window.next_fp_reference") if layer_recorder else _NULL_CONTEXT:
                     slide_next_layer = layer_manager.materialize_layer(i + 1)
-                    # fisher_diag_mse and refined_mse both need the next-layer
-                    # fisher (they share the fisher-diag second-order term);
+                    # fisher MSE variants and refined_mse both need the
+                    # next-layer fisher; legacy_fisher_diag_mse differs only in
+                    # how compute_refresh_loss consumes that matrix.
                     # refined_residual_kl needs the next-layer A. residual_kl
                     # needs neither — loss routes through fp_inps_final only.
-                    if layer_refresh_loss_type in ("fisher_diag_mse", "refined_mse"):
+                    if is_fisher_backed_loss(layer_refresh_loss_type):
                         slide_next_layer_output_fisher = static_fisher_by_layer[i + 1]
                     elif layer_refresh_loss_type == "refined_residual_kl":
                         # Load the next layer's full A list onto dev for
@@ -8043,7 +8075,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
             subset = {n: full.get(n, full.get(n + ".module", None)) for n in names}
             layer_output_fisher_by_module = {}
             pre_gd_refresh_loss_type = layer_refresh_loss_type
-            if effective_pre_gd_steps > 0 and pre_gd_refresh_loss_type in ("fisher_diag_mse", "refined_mse"):
+            if effective_pre_gd_steps > 0 and is_fisher_backed_loss(pre_gd_refresh_loss_type):
                 layer_output_fisher = static_fisher_by_layer[i]
                 if layer_output_fisher is None:
                     with layer_recorder.section("layer.pre_quant_fisher_collect") if layer_recorder else _NULL_CONTEXT:
@@ -8426,7 +8458,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         precomputed_saliency_dict=precomputed_saliency_for_layer,
                         precomputed_layer_output_fisher=(
                             static_fisher_by_layer[i]
-                            if layer_refresh_loss_type in ("fisher_diag_mse", "refined_mse")
+                            if is_fisher_backed_loss(layer_refresh_loss_type)
                             else None
                         ),
                         fp_inps_final=fp_inps_final,
@@ -8561,7 +8593,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         precomputed_saliency_dict=precomputed_saliency_for_group,
                         precomputed_layer_output_fisher=(
                             static_fisher_by_layer[i]
-                            if layer_refresh_loss_type in ("fisher_diag_mse", "refined_mse")
+                            if is_fisher_backed_loss(layer_refresh_loss_type)
                             else None
                         ),
                         fp_inps_final=fp_inps_final,

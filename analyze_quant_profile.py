@@ -44,7 +44,13 @@ def build_parser():
     parser.add_argument("--grad_optimizer", type=str, default="adam", choices=["sgd", "adam"], help="Optimizer for block_gd updates")
     parser.add_argument("--final_layer_grad_optimizer", type=str, default="sgd", choices=["sgd", "adam"], help="Optional final-layer optimizer override")
     parser.add_argument("--grad_clip", type=float, default=1.0, help="Elementwise clip threshold for SGD gradients")
-    parser.add_argument("--grad_refresh_loss", type=str, default="fisher_diag_mse", choices=["kl", "hidden_mse", "fisher_diag_mse"], help="Refresh loss type")
+    parser.add_argument(
+        "--grad_refresh_loss",
+        type=str,
+        default="fisher_diag_mse",
+        choices=["kl", "hidden_mse", "layer_mse", "fisher_diag_mse", "legacy_fisher_diag_mse"],
+        help="Refresh loss type; layer_mse is an alias for hidden_mse.",
+    )
     parser.add_argument(
         "--global_loss",
         dest="global_loss",
@@ -128,6 +134,8 @@ def build_parser():
 def main():
     parser = build_parser()
     args = parser.parse_args()
+    if args.grad_refresh_loss == "layer_mse":
+        args.grad_refresh_loss = "hidden_mse"
 
     model_name = args.model.split("/")[-1]
     args.model_name = model_name
