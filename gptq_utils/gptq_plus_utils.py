@@ -103,6 +103,11 @@ def _scale_delta_by_abs_quantile(delta, ratio, profile_recorder=None):
         return delta * scale.to(delta.dtype)
 
 
+def _reduce_refresh_loss_for_aggregation(refresh_loss_type, loss_tensor, batch_size):
+    """Convert a local refresh loss scalar to the sum convention used by callers."""
+    return float(loss_tensor.item()) * float(batch_size)
+
+
 def _refresh_act_quant_wrapper_aliases(module):
     for child in module.modules():
         if isinstance(child, quant_utils.ActQuantWrapper):
@@ -237,6 +242,97 @@ def normalize_quant_module_name(name: str) -> str:
     return name[:-7] if name.endswith(".module") else name
 
 
+def resolve_quant_module(full, module_name: str):
+    """Return the actual quantized Linear module and its path in `full`.
+
+    After activation wrappers are installed, analyzer.get_quantizable_modules()
+    sees the wrapped Linear as e.g. `mlp.down_proj.module`, while the quantization
+    schedule and reporting use the canonical name `mlp.down_proj`. Keeping the
+    resolution in one place avoids accidentally mixing the wrapper with the
+    Linear that GPTQ+ updates.
+    """
+    candidates = [module_name]
+    if module_name.endswith(".module"):
+        candidates.append(normalize_quant_module_name(module_name))
+    else:
+        candidates.append(module_name + ".module")
+
+    canonical_name = normalize_quant_module_name(module_name)
+    for name in full.keys():
+        if normalize_quant_module_name(name) == canonical_name:
+            candidates.append(name)
+
+    seen = set()
+    for name in candidates:
+        if name in seen:
+            continue
+        seen.add(name)
+        module = full.get(name)
+        if module is not None:
+            if isinstance(module, quant_utils.ActQuantWrapper):
+                return f"{name}.module", module.module
+            return name, module
+
+    raise ValueError(
+        f"Unable to find module `{module_name}` in the provided layer. "
+        f"Available modules: {sorted(full.keys())}"
+    )
+
+
+def _get_submodule_or_none(root: nn.Module, path: str):
+    if not path:
+        return root
+    try:
+        return root.get_submodule(path)
+    except AttributeError:
+        cur = root
+        for part in path.split("."):
+            if not hasattr(cur, part):
+                return None
+            cur = getattr(cur, part)
+        return cur
+    except Exception:
+        return None
+
+
+def functional_weight_name_for_quant_module(
+    layer: nn.Module,
+    module_name: str,
+    resolved_module_name: str,
+    module: nn.Module,
+) -> str:
+    """Parameter key for functional_call that targets the updated Linear.
+
+    With rotation enabled, FFN down_proj is an ActQuantWrapper:
+
+        wrapper.forward: online Hadamard -> wrapper.module(...)
+
+    The online Hadamard is part of the input transform, but the weight being
+    optimized/quantized is the inner Linear's weight. Use the inner parameter
+    path explicitly (`*.module.weight`) instead of relying on the wrapper-level
+    `*.weight` alias.
+    """
+    canonical_name = normalize_quant_module_name(module_name)
+    wrapper = _get_submodule_or_none(layer, canonical_name)
+    if (
+        isinstance(wrapper, quant_utils.ActQuantWrapper)
+        and getattr(wrapper, "module", None) is module
+    ):
+        return f"{canonical_name}.module.weight"
+    return f"{resolved_module_name}.weight"
+
+
+def build_quant_subset(full, names):
+    subset = {}
+    for name in names:
+        try:
+            _, module = resolve_quant_module(full, name)
+        except ValueError:
+            continue
+        subset[name] = module
+    return subset
+
+
 def canonical_refresh_loss_type(loss_type: str) -> str:
     return "hidden_mse" if loss_type == "layer_mse" else loss_type
 
@@ -251,6 +347,52 @@ def is_fisher_mse_loss(loss_type: str) -> bool:
 
 def is_fisher_backed_loss(loss_type: str) -> bool:
     return is_fisher_mse_loss(loss_type) or loss_type == "refined_mse"
+
+
+def is_legacy_fisher_diag_loss(loss_type: str) -> bool:
+    return canonical_refresh_loss_type(loss_type) == "legacy_fisher_diag_mse"
+
+
+def is_full_fisher_backed_loss(loss_type: str) -> bool:
+    loss_type = canonical_refresh_loss_type(loss_type)
+    return loss_type in ("fisher_diag_mse", "refined_mse")
+
+
+def select_layer_output_fisher_for_loss(
+    loss_type: str,
+    static_fisher_by_layer,
+    static_legacy_fisher_diag_by_layer,
+    layer_idx: int,
+):
+    loss_type = canonical_refresh_loss_type(loss_type)
+    if loss_type == "legacy_fisher_diag_mse":
+        if static_legacy_fisher_diag_by_layer is None:
+            return None
+        return static_legacy_fisher_diag_by_layer[layer_idx]
+    if is_full_fisher_backed_loss(loss_type):
+        if static_fisher_by_layer is None:
+            return None
+        return static_fisher_by_layer[layer_idx]
+    return None
+
+
+def slice_layer_output_fisher_for_batch(
+    layer_output_fisher,
+    batch_indices,
+    dev,
+    refresh_loss_type: str,
+):
+    if layer_output_fisher is None:
+        return None
+    refresh_loss_type = canonical_refresh_loss_type(refresh_loss_type)
+    if refresh_loss_type == "legacy_fisher_diag_mse":
+        if layer_output_fisher.dim() != 3:
+            raise ValueError(
+                "legacy_fisher_diag_mse expects per-token Fisher diagonal with "
+                f"shape (N_local, T, H), got {tuple(layer_output_fisher.shape)}."
+            )
+        return layer_output_fisher[batch_indices].to(dev).float()
+    return layer_output_fisher.to(dev).float()
 
 
 def get_effective_refresh_loss_type(
@@ -3616,8 +3758,9 @@ class SaliencyCache:
 
     def add_hook(self, full, enable=True):
         for name in self.names:
+            _, module = resolve_quant_module(full, name)
             self.handles.append(
-                full.get(name, full.get(name + ".module", None)).register_forward_hook(
+                module.register_forward_hook(
                     functools.partial(self.cache_saliency, name=name)
                 )
             )
@@ -3703,8 +3846,9 @@ class GradientCache:
 
     def add_hook(self, full, enable=True):
         for name in self.names:
+            _, module = resolve_quant_module(full, name)
             self.handles.append(
-                full.get(name, full.get(name + ".module", None)).weight.register_hook(
+                module.weight.register_hook(
                     functools.partial(self.cache_gradient, name=name)
                 )
             )
@@ -3820,6 +3964,7 @@ def collect_static_end_to_end_saliency_and_fisher(
     grad_hessian_topk,
     batch_size,
     collect_fisher=True,
+    collect_legacy_fisher_diag=False,
     collect_refined_rkl=False,
     refined_rkl_damp=0.01,
     refined_rkl_num_A=1,
@@ -3867,6 +4012,18 @@ def collect_static_end_to_end_saliency_and_fisher(
         num_samples_for_grad > 0
         and (collect_fisher or collect_saliency or collect_dynsal)
     )
+    if collect_legacy_fisher_diag and fisher_rademacher_k > 0:
+        raise ValueError(
+            "legacy_fisher_diag_mse stores per-sample/per-token g^2 from the "
+            "sum-reduced NLL backward, so it cannot be combined with "
+            "fisher_rademacher_k > 0."
+        )
+    if collect_legacy_fisher_diag and num_samples_for_grad > 0:
+        raise ValueError(
+            "legacy_fisher_diag_mse requires a per-token Fisher diagonal for "
+            "every rank-local calibration sample. --num_samples_for_grad would "
+            "collect only a prefix and break sample alignment."
+        )
     logging.info(
         "Collecting static end-to-end saliency/fisher caches from a single pre-quantization full-model backward pass. "
         "Using sampled end-to-end NLL / empirical Fisher because literal KL-to-self before quantization would be zero."
@@ -3967,6 +4124,9 @@ def collect_static_end_to_end_saliency_and_fisher(
         if collect_saliency else None
     )
     fisher_data = [None for _ in layers]
+    legacy_fisher_diag_data = (
+        [[] for _ in layers] if collect_legacy_fisher_diag else None
+    )
     # Any refined-rkl variant reuses the same num_A / samples_per_A partitioning
     # and the shared dy capture at the last transformer block's output.
     _collect_any_refined = collect_refined_rkl or collect_refined_diag_rkl
@@ -4201,7 +4361,13 @@ def collect_static_end_to_end_saliency_and_fisher(
         )
 
     def make_layer_hook(layer_idx):
-        """Per-layer end-to-end Fisher (H, H) at the transformer block output.
+        """Per-layer end-to-end Fisher stats at the transformer block output.
+
+        `collect_fisher=True` stores the full token-averaged (H, H) empirical
+        Fisher used by fisher_diag_mse/refined_mse. `collect_legacy_fisher_diag`
+        stores each rank-local token's diagonal g^2 separately as
+        (N_local, T_eff, H), without summing across tokens.
+
         Same in-GPU-accumulator strategy as dynsal: keep the running sum on
         the device, transfer to CPU exactly once during aggregation. Before
         this change the hook did `(grad.t() @ grad).cpu()` + CPU fp32 add on
@@ -4215,18 +4381,27 @@ def collect_static_end_to_end_saliency_and_fisher(
                     return
                 if sink_size > 0 and grad.dim() >= 2 and grad.shape[1] > sink_size:
                     grad = grad[:, sink_size:]
-                grad_flat = grad.detach().float().reshape(-1, grad.shape[-1])
-                # `grad` comes from an output-token SUM loss. Accumulate the
-                # unnormalised sum over middle-layer tokens here; aggregation
-                # below divides once by the global middle-token count to store
-                # the shared E_middle[g g^T] Fisher coefficient.
-                fisher_block = grad_flat.t() @ grad_flat  # stays on GPU fp32
-                fisher_block.div_(_E2E_PRECOMPUTE_QUADRATIC_SCALE * float(stat_repeats))
-                if fisher_data[layer_idx] is None:
-                    fisher_data[layer_idx] = fisher_block
-                else:
-                    fisher_data[layer_idx].add_(fisher_block)
-                    del fisher_block
+                grad_fp32 = grad.detach().float()
+                if collect_legacy_fisher_diag:
+                    legacy_fisher_diag_data[layer_idx].append(
+                        grad_fp32.pow(2)
+                        .div(_E2E_PRECOMPUTE_QUADRATIC_SCALE)
+                        .to(torch.bfloat16)
+                        .cpu()
+                    )
+                if collect_fisher:
+                    grad_flat = grad_fp32.reshape(-1, grad_fp32.shape[-1])
+                    # `grad` comes from an output-token SUM loss. Accumulate the
+                    # unnormalised sum over middle-layer tokens here; aggregation
+                    # below divides once by the global middle-token count to store
+                    # the shared E_middle[g g^T] Fisher coefficient.
+                    fisher_block = grad_flat.t() @ grad_flat  # stays on GPU fp32
+                    fisher_block.div_(_E2E_PRECOMPUTE_QUADRATIC_SCALE * float(stat_repeats))
+                    if fisher_data[layer_idx] is None:
+                        fisher_data[layer_idx] = fisher_block
+                    else:
+                        fisher_data[layer_idx].add_(fisher_block)
+                        del fisher_block
 
             out_tensor.register_hook(grad_hook)
 
@@ -4342,7 +4517,10 @@ def collect_static_end_to_end_saliency_and_fisher(
             )
 
     for layer_idx, (layer, module_dict) in enumerate(zip(layers, module_dicts)):
-        if collect_fisher and (fisher_layer_ids is None or layer_idx in fisher_layer_ids):
+        if (
+            (collect_fisher or collect_legacy_fisher_diag)
+            and (fisher_layer_ids is None or layer_idx in fisher_layer_ids)
+        ):
             handles.append(layer.register_forward_hook(make_layer_hook(layer_idx)))
         if collect_saliency:
             for module_name, module in module_dict.items():
@@ -5049,6 +5227,7 @@ def collect_static_end_to_end_saliency_and_fisher(
     with profile_recorder.section("pipeline.static_fisher.aggregate") if profile_recorder else _NULL_CONTEXT:
         static_saliency = []
         static_fisher = []
+        static_legacy_fisher_diag = []
         for layer_idx, module_dict in enumerate(module_dicts):
             layer_saliency = {}
             if collect_saliency:
@@ -5104,6 +5283,23 @@ def collect_static_end_to_end_saliency_and_fisher(
                     static_fisher.append(None)
             else:
                 static_fisher.append(None)
+            if collect_legacy_fisher_diag:
+                want_legacy_this_layer = (
+                    fisher_layer_ids is None or layer_idx in fisher_layer_ids
+                )
+                if want_legacy_this_layer:
+                    chunks = legacy_fisher_diag_data[layer_idx]
+                    if not chunks:
+                        raise ValueError(
+                            f"Failed to collect static per-token legacy Fisher diag "
+                            f"for layer={layer_idx}."
+                        )
+                    static_legacy_fisher_diag.append(torch.cat(chunks, dim=0).cpu())
+                    legacy_fisher_diag_data[layer_idx] = None
+                else:
+                    static_legacy_fisher_diag.append(None)
+            else:
+                static_legacy_fisher_diag.append(None)
 
     # refined_residual_kl A matrices have already been streamed into
     # `static_refined_A[l][a]` by `_flush_refined_rkl_sub_a` as each sub-A's
@@ -5150,7 +5346,15 @@ def collect_static_end_to_end_saliency_and_fisher(
         fp_inps_final = torch.cat(fp_final_cache, dim=0)
         fp_final_cache.clear()
 
-    return static_saliency, static_fisher, static_refined_A, static_refined_diag_A, fp_inps_final, static_dynsal
+    return (
+        static_saliency,
+        static_fisher,
+        static_legacy_fisher_diag,
+        static_refined_A,
+        static_refined_diag_A,
+        fp_inps_final,
+        static_dynsal,
+    )
 
 
 def _pick_refined_A_for_batch(
@@ -5584,27 +5788,39 @@ def compute_refresh_loss(
         )
     with profile_recorder.section("compute_refresh_loss.fisher_diag_mse.total") if profile_recorder else _NULL_CONTEXT:
         with profile_recorder.section("compute_refresh_loss.fisher_diag_mse.quadratic") if profile_recorder else _NULL_CONTEXT:
-            if layer_output_fisher.dim() != 2 or layer_output_fisher.shape[0] != layer_output_fisher.shape[1]:
-                raise ValueError(
-                    f"Expected layer-output Fisher matrix with shape (H, H), got {tuple(layer_output_fisher.shape)}."
-                )
             hidden_size = delta.shape[-1]
-            if layer_output_fisher.shape[0] != hidden_size:
-                raise ValueError(
-                    f"Fisher matrix hidden dim ({layer_output_fisher.shape[0]}) does not match delta hidden dim ({hidden_size})."
-                )
-            fisher = layer_output_fisher.to(device=delta.device, dtype=torch.float32)
-            delta_flat = delta.float().reshape(-1, hidden_size)
             if refresh_loss_type == "legacy_fisher_diag_mse":
-                fisher_diag = torch.diag(fisher)
+                if layer_output_fisher.dim() != 3:
+                    raise ValueError(
+                        "legacy_fisher_diag_mse expects per-token Fisher diagonal "
+                        f"with shape (B, T, H), got {tuple(layer_output_fisher.shape)}."
+                    )
+                if tuple(layer_output_fisher.shape) != tuple(delta.shape):
+                    raise ValueError(
+                        "legacy_fisher_diag_mse Fisher diag shape must match "
+                        f"delta shape after sink slicing: fisher={tuple(layer_output_fisher.shape)} "
+                        f"delta={tuple(delta.shape)}."
+                    )
+                fisher_diag = layer_output_fisher.to(device=delta.device, dtype=torch.float32)
                 fisher_loss_per_token = 0.5 * (
-                    delta_flat.square() * fisher_diag
+                    delta.float().square() * fisher_diag
                 ).sum(dim=-1)
+                fisher_loss = fisher_loss_per_token.mean()
             else:
+                if layer_output_fisher.dim() != 2 or layer_output_fisher.shape[0] != layer_output_fisher.shape[1]:
+                    raise ValueError(
+                        f"Expected layer-output Fisher matrix with shape (H, H), got {tuple(layer_output_fisher.shape)}."
+                    )
+                if layer_output_fisher.shape[0] != hidden_size:
+                    raise ValueError(
+                        f"Fisher matrix hidden dim ({layer_output_fisher.shape[0]}) does not match delta hidden dim ({hidden_size})."
+                    )
+                fisher = layer_output_fisher.to(device=delta.device, dtype=torch.float32)
+                delta_flat = delta.float().reshape(-1, hidden_size)
                 fisher_loss_per_token = 0.5 * (
                     delta_flat.matmul(fisher) * delta_flat
                 ).sum(dim=-1)
-            fisher_loss = fisher_loss_per_token.mean()
+                fisher_loss = fisher_loss_per_token.mean()
 
         if refresh_loss_type != "refined_mse":
             return fisher_loss
@@ -5967,8 +6183,17 @@ def collect_layer_output_fisher_only(
     layer_idx,
     layer_recorder=None,
     sink_size=0,
+    legacy_diag=False,
 ):
+    if legacy_diag:
+        raise ValueError(
+            "legacy_fisher_diag_mse per-token diagonals must come from "
+            "collect_static_end_to_end_saliency_and_fisher's sum-reduced NLL "
+            "backward, not the layerwise KL Fisher fallback."
+        )
     fisher_sum = None
+    if legacy_diag:
+        fisher_chunks = []
     with torch.enable_grad():
         for j in tqdm(
             range(0, inps.shape[0], bsz),
@@ -6033,12 +6258,21 @@ def collect_layer_output_fisher_only(
                     def layer_output_grad_hook(grad):
                         nonlocal fisher_sum
                         g = grad if sink_size <= 0 else grad[:, sink_size:]
-                        grad_flat = g.detach().float().reshape(-1, g.shape[-1])
-                        fisher_block = grad_flat.t() @ grad_flat
-                        if fisher_sum is None:
-                            fisher_sum = fisher_block
+                        grad_fp32 = g.detach().float()
+                        if legacy_diag:
+                            fisher_chunks.append(
+                                grad_fp32.pow(2)
+                                .div(_E2E_PRECOMPUTE_QUADRATIC_SCALE)
+                                .to(torch.bfloat16)
+                                .cpu()
+                            )
                         else:
-                            fisher_sum.add_(fisher_block)
+                            grad_flat = grad_fp32.reshape(-1, grad_fp32.shape[-1])
+                            fisher_block = grad_flat.t() @ grad_flat
+                            if fisher_sum is None:
+                                fisher_sum = fisher_block
+                            else:
+                                fisher_sum.add_(fisher_block)
 
                     out_hidden.register_hook(layer_output_grad_hook)
                     model.zero_grad()
@@ -6047,6 +6281,10 @@ def collect_layer_output_fisher_only(
                 # Per-batch cleanup_memory() was here. Removed for the same
                 # reason as above — autograd state is released automatically.
 
+    if legacy_diag:
+        if not fisher_chunks:
+            return None
+        return torch.cat(fisher_chunks, dim=0).cpu()
     if fisher_sum is None:
         return None
     dist_utils.allreduce_sum_(fisher_sum)
@@ -6119,9 +6357,10 @@ def collect_true_weight_gradient(
     caller's allreduce does the right thing.
     """
     refresh_loss_type = canonical_refresh_loss_type(refresh_loss_type)
-    module = full.get(module_name, full.get(module_name + ".module", None))
-    if module is None:
-        raise ValueError(f"Unable to find module `{module_name}` in the provided layer.")
+    resolved_module_name, module = resolve_quant_module(full, module_name)
+    functional_weight_name = functional_weight_name_for_quant_module(
+        layer, module_name, resolved_module_name, module
+    )
     if sample_indices is None:
         raw_indices = list(range(inps.shape[0]))
     else:
@@ -6273,7 +6512,7 @@ def collect_true_weight_gradient(
                         with layer_recorder.section("layer.true_weight_grad.batch.forward") if layer_recorder else _NULL_CONTEXT:
                             out = functional_call(
                                 layer,
-                                {f"{module_name}.weight": override_weight},
+                                {functional_weight_name: override_weight},
                                 (inps[batch_indices].to(dev),),
                                 {
                                     "attention_mask": batch_attention_mask,
@@ -6286,9 +6525,11 @@ def collect_true_weight_gradient(
                         with layer_recorder.section("layer.true_weight_grad.batch.fp_hidden") if layer_recorder else _NULL_CONTEXT:
                             fp_hidden = fp_inps[batch_indices].to(dev)
                         with layer_recorder.section("layer.true_weight_grad.batch.fisher_slice") if layer_recorder else _NULL_CONTEXT:
-                            fisher_batch = (
-                                None if layer_output_fisher is None
-                                else layer_output_fisher.to(dev).float()
+                            fisher_batch = slice_layer_output_fisher_for_batch(
+                                layer_output_fisher,
+                                batch_indices,
+                                dev,
+                                refresh_loss_type,
                             )
                             fp_final_batch = (
                                 None if fp_inps_final is None
@@ -6419,9 +6660,11 @@ def collect_true_weight_gradient(
                                 # fisher MSE variants / refined_mse: next-layer
                                 # loss needs the next-layer fisher tensor.
                                 # residual_kl: doesn't — reuses fp_inps_final.
-                                fisher_batch_next = (
-                                    None if next_layer_output_fisher is None
-                                    else next_layer_output_fisher.to(dev).float()
+                                fisher_batch_next = slice_layer_output_fisher_for_batch(
+                                    next_layer_output_fisher,
+                                    batch_indices,
+                                    dev,
+                                    refresh_loss_type,
                                 )
                             with layer_recorder.section("layer.true_weight_grad.batch.refresh_loss_next") if layer_recorder else _NULL_CONTEXT:
                                 refresh_loss_next = compute_refresh_loss(
@@ -6454,21 +6697,29 @@ def collect_true_weight_gradient(
                                     slide_alpha * refresh_loss_current
                                     + (1.0 - slide_alpha) * refresh_loss_next
                                 )
-                                loss_sum_current += refresh_loss_current.item() * batch_size
-                                loss_sum_next += refresh_loss_next.item() * batch_size
+                                loss_sum_current += _reduce_refresh_loss_for_aggregation(
+                                    refresh_loss_type, refresh_loss_current, batch_size
+                                )
+                                loss_sum_next += _reduce_refresh_loss_for_aggregation(
+                                    refresh_loss_type, refresh_loss_next, batch_size
+                                )
                         else:
                             refresh_loss = refresh_loss_current
 
                         with layer_recorder.section("layer.true_weight_grad.batch.backward") if layer_recorder else _NULL_CONTEXT:
-                            batch_grad_mean = torch.autograd.grad(
+                            batch_grad = torch.autograd.grad(
                                 refresh_loss, override_weight, retain_graph=False
                             )[0].float()
                         with layer_recorder.section("layer.true_weight_grad.batch.accumulate") if layer_recorder else _NULL_CONTEXT:
                             # `autograd.grad` returns ∂(mean_loss)/∂W. Multiply by batch
                             # size to recover a sum-over-samples gradient so per-rank
-                            # partials aggregate with a plain allreduce_sum.
-                            partial_grad_sum.add_(batch_grad_mean, alpha=float(batch_size))
-                            loss_sum += refresh_loss.item() * batch_size
+                            # partials aggregate with a plain allreduce_sum. All refresh
+                            # losses, including legacy_fisher_diag_mse, use batch/token
+                            # mean convention here.
+                            partial_grad_sum.add_(batch_grad, alpha=float(batch_size))
+                            loss_sum += _reduce_refresh_loss_for_aggregation(
+                                refresh_loss_type, refresh_loss, batch_size
+                            )
                             partial_count += batch_size
                         # Per-batch `cleanup_memory()` used to run here; removing
                         # it trades a small increase in peak transient memory for
@@ -6548,7 +6799,7 @@ def collect_layer_grad_hessian_stats(
         with layer_recorder.section("layer.grad_hessian.fast_path") if layer_recorder else _NULL_CONTEXT:
             gradients_dict = {}
             for name in names:
-                module = full.get(name, full.get(name + ".module", None))
+                _, module = resolve_quant_module(full, name)
                 gradients_dict[name] = torch.zeros_like(module.weight.data, dtype=torch.float32)
             return (
                 precomputed_saliency_dict,
@@ -6577,6 +6828,7 @@ def collect_layer_grad_hessian_stats(
             layer_idx=layer_idx,
             layer_recorder=layer_recorder,
             sink_size=sink_size,
+            legacy_diag=(layer_refresh_loss_type == "legacy_fisher_diag_mse"),
         )
         need_layer_output_fisher_collection = False
 
@@ -6685,7 +6937,12 @@ def collect_layer_grad_hessian_stats(
                 batch_layer_output_fisher = None
                 if is_fisher_backed_loss(layer_refresh_loss_type) and precomputed_layer_output_fisher is not None:
                     with layer_recorder.section("layer.grad_hessian.fisher_slice") if layer_recorder else _NULL_CONTEXT:
-                        batch_layer_output_fisher = precomputed_layer_output_fisher.to(dev).float()
+                        batch_layer_output_fisher = slice_layer_output_fisher_for_batch(
+                            precomputed_layer_output_fisher,
+                            list(range(j, j + batch_size)),
+                            dev,
+                            layer_refresh_loss_type,
+                        )
                 if need_gradient_backward:
                     with layer_recorder.section("layer.grad_hessian.gradient_loss_build") if layer_recorder else _NULL_CONTEXT:
                         if gptq_reference_loss_type == "kl":
@@ -6772,7 +7029,7 @@ def collect_layer_grad_hessian_stats(
         gradients_cache.finalize()
     else:
         for name in gradients_cache.names:
-            module = full.get(name, full.get(name + ".module", None))
+            _, module = resolve_quant_module(full, name)
             gradients_cache.gradients_cache[name] = torch.zeros_like(
                 module.weight.data, dtype=torch.float32
             )
@@ -6832,9 +7089,7 @@ def run_pre_quant_gd(
     with layer_recorder.section("layer.pre_quant_gd.setup") if layer_recorder else _NULL_CONTEXT:
         modules = []
         for module_name in module_names:
-            module = full.get(module_name, full.get(module_name + ".module", None))
-            if module is None:
-                raise ValueError(f"Unable to find module `{module_name}` in the provided layer.")
+            _, module = resolve_quant_module(full, module_name)
             modules.append((module_name, module))
 
         optimizer_states = {}
@@ -7000,6 +7255,9 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
     layer_manager = Stage2CpuMasterLayerManager(analyzer, dev, layers)
     analysis_hook = getattr(args, "_analysis_hook", None)
     analysis_need_fisher = bool(getattr(args, "_analysis_collect_fisher", False))
+    analysis_need_legacy_fisher_diag = bool(
+        getattr(args, "_analysis_collect_legacy_fisher_diag", False)
+    )
     analysis_collect_refined_rkl = bool(
         getattr(args, "_analysis_collect_refined_rkl", False)
     )
@@ -7068,6 +7326,28 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
             "--fisher_rademacher_k / --num_samples_for_grad only apply to the "
             "static end-to-end precompute path, so they require --global_loss."
         )
+    if (
+        args.grad_refresh_loss == "legacy_fisher_diag_mse"
+        or analysis_need_legacy_fisher_diag
+    ):
+        if not global_loss_enabled:
+            raise ValueError(
+                "legacy_fisher_diag_mse requires --global_loss because its "
+                "per-token Fisher diagonal is collected during static "
+                "end-to-end NLL precompute."
+            )
+        if int(getattr(args, "fisher_rademacher_k", 0)) > 0:
+            raise ValueError(
+                "legacy_fisher_diag_mse stores per-token g^2 from a "
+                "sum-reduced NLL backward, so it cannot be used with "
+                "--fisher_rademacher_k > 0."
+            )
+        if int(getattr(args, "num_samples_for_grad", 0)) > 0:
+            raise ValueError(
+                "legacy_fisher_diag_mse needs per-token Fisher diagonals for "
+                "all calibration samples, so it cannot be used with "
+                "--num_samples_for_grad > 0."
+            )
     act_quant_aware_gptq = bool(getattr(args, "act_quant_aware_gptq", False))
     k_cache_quant_aware_gptq = bool(getattr(args, "k_cache_quant_aware_gptq", False))
     if act_quant_aware_gptq and args.grad_refresh_loss == "refined_mse":
@@ -7231,8 +7511,13 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     else ""
                 )
                 analysis_tag = ""
-                if analysis_need_fisher and not is_fisher_backed_loss(args.grad_refresh_loss):
+                if analysis_need_fisher and not is_full_fisher_backed_loss(args.grad_refresh_loss):
                     analysis_tag += "_anaFisher"
+                if (
+                    analysis_need_legacy_fisher_diag
+                    and args.grad_refresh_loss != "legacy_fisher_diag_mse"
+                ):
+                    analysis_tag += "_anaLegacyFisherDiag"
                 if analysis_collect_refined_rkl and args.grad_refresh_loss not in (
                     "refined_residual_kl",
                 ):
@@ -7243,8 +7528,10 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     "residual_kl", "refined_residual_kl", "refined_mse", "refined_mix",
                 ):
                     analysis_tag += "_anaFPFinal"
-                if is_fisher_backed_loss(args.grad_refresh_loss):
+                if is_full_fisher_backed_loss(args.grad_refresh_loss):
                     analysis_tag += "_mainFisher"
+                if args.grad_refresh_loss == "legacy_fisher_diag_mse":
+                    analysis_tag += "_mainLegacyFisherDiag"
                 static_cache_key = (
                     f"{args.model_name}_{dataset_id}_s{args.nsamples}_"
                     f"blk{args.seq_len}_rot{rotate_flag}_g{args.num_groups}_"
@@ -7264,6 +7551,23 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                 os.path.join(static_cache_dir, f"{static_cache_key}.pt")
                 if static_cache_key is not None else None
             )
+            if (
+                static_cache_file is not None
+                and not os.path.exists(static_cache_file)
+                and is_full_fisher_backed_loss(args.grad_refresh_loss)
+                and not analysis_need_legacy_fisher_diag
+                and "_mainFisher" in static_cache_key
+            ):
+                legacy_cache_key = static_cache_key.replace("_mainFisher", "")
+                legacy_cache_file = os.path.join(static_cache_dir, f"{legacy_cache_key}.pt")
+                if os.path.exists(legacy_cache_file):
+                    logging.info(
+                        "Static cache %s is missing; falling back to legacy cache key %s. "
+                        "The loaded payload will still be checked for Fisher tensors.",
+                        static_cache_file,
+                        legacy_cache_file,
+                    )
+                    static_cache_file = legacy_cache_file
             if stage2_cpu_master and (
                 static_cache_file is None or not os.path.exists(static_cache_file)
             ):
@@ -7279,15 +7583,30 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     logging.info("Loading static saliency/fisher cache from %s", static_cache_file)
                     _loaded = torch.load(static_cache_file, map_location="cpu", weights_only=True)
                     static_saliency_by_layer = _loaded["saliency"]
-                    static_fisher_by_layer = _loaded["fisher"]
+                    static_fisher_by_layer = _loaded.get("fisher", None)
+                    if static_fisher_by_layer is None:
+                        static_fisher_by_layer = [None] * len(layers)
+                    static_legacy_fisher_diag_by_layer = _loaded.get("legacy_fisher_diag", None)
+                    if static_legacy_fisher_diag_by_layer is None:
+                        static_legacy_fisher_diag_by_layer = [None] * len(layers)
                     if (
-                        (analysis_need_fisher or is_fisher_backed_loss(args.grad_refresh_loss))
+                        (analysis_need_fisher or is_full_fisher_backed_loss(args.grad_refresh_loss))
                         and not any(f is not None for f in static_fisher_by_layer)
                     ):
                         raise RuntimeError(
                             "Cached static saliency/fisher at %s does not contain "
                             "layer-output Fisher needed by %s. Delete the cache and rerun "
                             "to regenerate." % (static_cache_file, args.grad_refresh_loss)
+                        )
+                    if (
+                        (analysis_need_legacy_fisher_diag or args.grad_refresh_loss == "legacy_fisher_diag_mse")
+                        and not any(f is not None for f in static_legacy_fisher_diag_by_layer)
+                    ):
+                        raise RuntimeError(
+                            "Cached static saliency/fisher at %s does not contain "
+                            "per-token legacy Fisher diagonals needed by %s. Delete "
+                            "the cache and rerun to regenerate."
+                            % (static_cache_file, args.grad_refresh_loss)
                         )
                     # `refined_A` was added later; tolerate older caches that don't
                     # have it. If refined_residual_kl is requested but the cache is
@@ -7345,8 +7664,12 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                 # `fisher_layer_ids` below.
                 want_fisher = (
                     analysis_need_fisher
-                    or is_fisher_backed_loss(args.grad_refresh_loss)
+                    or is_full_fisher_backed_loss(args.grad_refresh_loss)
                     or args.grad_refresh_loss == "refined_mix"
+                )
+                want_legacy_fisher_diag = (
+                    analysis_need_legacy_fisher_diag
+                    or args.grad_refresh_loss == "legacy_fisher_diag_mse"
                 )
                 # refined_mix layer-id filters: front half uses refined_mse →
                 # needs fisher; back half (except final) uses refined_residual_kl
@@ -7360,7 +7683,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                 else:
                     fisher_layer_ids = None
                     refined_rkl_layer_ids = None
-                if analysis_need_fisher:
+                if analysis_need_fisher or analysis_need_legacy_fisher_diag:
                     fisher_layer_ids = None
                 if analysis_collect_refined_rkl or analysis_collect_refined_diag_rkl:
                     refined_rkl_layer_ids = None
@@ -7374,7 +7697,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     # wrapper {"by_layer": [...], "N_global": int}, None when
                     # `--enable_dynamic_saliency=0` (default).
                     want_dynsal = bool(int(getattr(args, "enable_dynamic_saliency", 0)))
-                    static_saliency_by_layer, static_fisher_by_layer, static_refined_A_by_layer, static_refined_diag_A_by_layer, fp_inps_final_cpu, static_dynsal = \
+                    static_saliency_by_layer, static_fisher_by_layer, static_legacy_fisher_diag_by_layer, static_refined_A_by_layer, static_refined_diag_A_by_layer, fp_inps_final_cpu, static_dynsal = \
                         collect_static_end_to_end_saliency_and_fisher(
                             model=model,
                             analyzer=analyzer,
@@ -7387,6 +7710,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             fsdp_cpu_offload=bool(getattr(args, "fsdp_cpu_offload", False)),
                             saliency_clip_percentile=getattr(args, "saliency_clip_percentile", 0.99),
                             collect_fisher=want_fisher,
+                            collect_legacy_fisher_diag=want_legacy_fisher_diag,
                             collect_refined_rkl=want_refined,
                             refined_rkl_damp=getattr(args, "refined_rkl_damp", 0.01),
                             refined_rkl_num_A=int(getattr(args, "refined_rkl_num_A", 1)),
@@ -7409,6 +7733,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         _to_save = {
                             "saliency": static_saliency_by_layer,
                             "fisher": static_fisher_by_layer,
+                            "legacy_fisher_diag": static_legacy_fisher_diag_by_layer,
                             "refined_A": static_refined_A_by_layer,
                         }
                         if static_refined_diag_A_by_layer is not None:
@@ -7440,6 +7765,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
         else:
             static_saliency_by_layer = [None] * len(layers)
             static_fisher_by_layer = [None] * len(layers)
+            static_legacy_fisher_diag_by_layer = [None] * len(layers)
             static_refined_A_by_layer = None
             static_refined_diag_A_by_layer = None
             static_dynsal = None
@@ -7961,7 +8287,12 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                 if (
                     is_fisher_mse_loss(layer_refresh_loss_type)
                     and global_loss_enabled
-                    and static_fisher_by_layer[i + 1] is not None
+                    and select_layer_output_fisher_for_loss(
+                        layer_refresh_loss_type,
+                        static_fisher_by_layer,
+                        static_legacy_fisher_diag_by_layer,
+                        i + 1,
+                    ) is not None
                 ):
                     slide_active_layer = True
                 elif (
@@ -8001,7 +8332,12 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     # refined_residual_kl needs the next-layer A. residual_kl
                     # needs neither — loss routes through fp_inps_final only.
                     if is_fisher_backed_loss(layer_refresh_loss_type):
-                        slide_next_layer_output_fisher = static_fisher_by_layer[i + 1]
+                        slide_next_layer_output_fisher = select_layer_output_fisher_for_loss(
+                            layer_refresh_loss_type,
+                            static_fisher_by_layer,
+                            static_legacy_fisher_diag_by_layer,
+                            i + 1,
+                        )
                     elif layer_refresh_loss_type == "refined_residual_kl":
                         # Load the next layer's full A list onto dev for
                         # per-batch sub-A dispatch in the slide branch.
@@ -8072,12 +8408,23 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
             )
 
             layer_output_fisher = None
-            subset = {n: full.get(n, full.get(n + ".module", None)) for n in names}
+            subset = build_quant_subset(full, names)
             layer_output_fisher_by_module = {}
             pre_gd_refresh_loss_type = layer_refresh_loss_type
             if effective_pre_gd_steps > 0 and is_fisher_backed_loss(pre_gd_refresh_loss_type):
-                layer_output_fisher = static_fisher_by_layer[i]
+                layer_output_fisher = select_layer_output_fisher_for_loss(
+                    pre_gd_refresh_loss_type,
+                    static_fisher_by_layer,
+                    static_legacy_fisher_diag_by_layer,
+                    i,
+                )
                 if layer_output_fisher is None:
+                    if pre_gd_refresh_loss_type == "legacy_fisher_diag_mse":
+                        raise RuntimeError(
+                            "legacy_fisher_diag_mse pre-GD requires the static "
+                            "per-token Fisher diagonal cache. Delete stale caches "
+                            "and rerun with --global_loss."
+                        )
                     with layer_recorder.section("layer.pre_quant_fisher_collect") if layer_recorder else _NULL_CONTEXT:
                         layer_output_fisher = collect_layer_output_fisher_only(
                             model=model,
@@ -8095,6 +8442,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             layer_idx=i,
                             layer_recorder=layer_recorder,
                             sink_size=sink_size,
+                            legacy_diag=False,
                         )
                 for name in subset:
                     if subset[name] is not None:
@@ -8426,10 +8774,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
 
             if layer_hessian_once:
                 with layer_recorder.section("layer.per_layer_stats_and_hessian") if layer_recorder else _NULL_CONTEXT:
-                    layerwide_subset = {
-                        n: full.get(n, full.get(n + ".module", None)) for n in names
-                    }
-                    layerwide_subset = {n: m for n, m in layerwide_subset.items() if m is not None}
+                    layerwide_subset = build_quant_subset(full, names)
                     precomputed_saliency_for_layer = static_saliency_by_layer[i]
                     if dynsal_enabled:
                         precomputed_saliency_for_layer = {
@@ -8456,10 +8801,11 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         layer_refresh_loss_type=layer_refresh_loss_type,
                         gptq_reference_loss_type=gptq_reference_loss_type,
                         precomputed_saliency_dict=precomputed_saliency_for_layer,
-                        precomputed_layer_output_fisher=(
-                            static_fisher_by_layer[i]
-                            if is_fisher_backed_loss(layer_refresh_loss_type)
-                            else None
+                        precomputed_layer_output_fisher=select_layer_output_fisher_for_loss(
+                            layer_refresh_loss_type,
+                            static_fisher_by_layer,
+                            static_legacy_fisher_diag_by_layer,
+                            i,
                         ),
                         fp_inps_final=fp_inps_final,
                         refined_A_list=layer_refined_A_list,
@@ -8480,8 +8826,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     accumulate_hessian_for_gptq(gptq, layerwide_subset)
 
             for group_names in sequential:
-                subset = {n: full.get(n, full.get(n + ".module", None)) for n in group_names}
-                subset = {n: m for n, m in subset.items() if m is not None}
+                subset = build_quant_subset(full, group_names)
                 if not subset:
                     continue
 
@@ -8591,10 +8936,11 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         layer_refresh_loss_type=layer_refresh_loss_type,
                         gptq_reference_loss_type=gptq_reference_loss_type,
                         precomputed_saliency_dict=precomputed_saliency_for_group,
-                        precomputed_layer_output_fisher=(
-                            static_fisher_by_layer[i]
-                            if is_fisher_backed_loss(layer_refresh_loss_type)
-                            else None
+                        precomputed_layer_output_fisher=select_layer_output_fisher_for_loss(
+                            layer_refresh_loss_type,
+                            static_fisher_by_layer,
+                            static_legacy_fisher_diag_by_layer,
+                            i,
                         ),
                         fp_inps_final=fp_inps_final,
                         refined_A_list=layer_refined_A_list,
@@ -8917,6 +9263,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     "dev": dev,
                     "orig_device": orig_device,
                     "static_fisher_by_layer": static_fisher_by_layer,
+                    "static_legacy_fisher_diag_by_layer": static_legacy_fisher_diag_by_layer,
                     "static_refined_A_by_layer": static_refined_A_by_layer,
                     "static_refined_diag_A_by_layer": static_refined_diag_A_by_layer,
                     "samples_per_A": refined_rkl_samples_per_A,
@@ -8979,6 +9326,11 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     static_saliency_by_layer[i] = None
                 if static_fisher_by_layer is not None and i < len(static_fisher_by_layer):
                     static_fisher_by_layer[i] = None
+                if (
+                    static_legacy_fisher_diag_by_layer is not None
+                    and i < len(static_legacy_fisher_diag_by_layer)
+                ):
+                    static_legacy_fisher_diag_by_layer[i] = None
                 if static_refined_A_by_layer is not None and i < len(static_refined_A_by_layer):
                     static_refined_A_by_layer[i] = None
                 if static_refined_diag_A_by_layer is not None and i < len(static_refined_diag_A_by_layer):

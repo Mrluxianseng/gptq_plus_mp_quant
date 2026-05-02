@@ -162,8 +162,8 @@ def parse_gen():
         help=(
             "Loss used to compute the true refresh gradient in block_backward/block_gd. "
             "'layer_mse' is accepted as an alias of 'hidden_mse'. "
-            "'legacy_fisher_diag_mse' follows the fisher_diag_mse pipeline but keeps "
-            "only the diagonal of the cached Fisher matrix in the quadratic loss. "
+            "'legacy_fisher_diag_mse' uses per-sample/per-token Fisher diagonal "
+            "g^2 from the static sum-NLL backward. "
             "'residual_kl' assumes the current-layer output delta flows through the "
             "remaining residual stream unchanged and only measures its effect after the "
             "final norm + lm_head (cheap approximation of end-to-end KL). "
@@ -208,7 +208,8 @@ def parse_gen():
             "loss (weights α=1→0 across per-block refreshes). Supported for "
             "fisher_diag_mse / legacy_fisher_diag_mse / residual_kl / "
             "refined_residual_kl / refined_mse / refined_mix when their required "
-            "global stats are available. Skipped for the last layer and the "
+            "global stats are available. legacy_fisher_diag_mse also requires "
+            "per-token Fisher diagonals for the next layer. Skipped for the last layer and the "
             "second-to-last layer."
         ),
     )
@@ -712,6 +713,7 @@ def parse_gen():
             "end-to-end KL gradient in analyze_grad_cosine. Choices: fisher_diag_mse, "
             "legacy_fisher_diag_mse, residual_kl, refined_residual_kl, "
             "refined_diag_residual_kl, refined_mse, layer_mse, module_mse. "
+            "legacy_fisher_diag_mse uses per-sample/per-token g^2, not diag(full Fisher). "
             "Only the fits / backward passes needed for the selected set are run "
             "(saves memory and time — e.g. skipping refined_residual_kl avoids the "
             "H×H A fit)."
@@ -962,6 +964,25 @@ def parse_gen():
             raise ValueError(
                 "--grad_refresh_loss=refined_residual_kl requires --global_loss "
                 "(the per-layer A matrix is fit during the global-loss precompute)."
+            )
+    if args.grad_refresh_loss == "legacy_fisher_diag_mse":
+        if not args.global_loss:
+            raise ValueError(
+                "--grad_refresh_loss=legacy_fisher_diag_mse requires --global_loss "
+                "(the per-token Fisher diagonal is collected during static "
+                "end-to-end NLL precompute)."
+            )
+        if args.fisher_rademacher_k > 0:
+            raise ValueError(
+                "--grad_refresh_loss=legacy_fisher_diag_mse cannot be used with "
+                "--fisher_rademacher_k > 0 because the legacy diagonal stores "
+                "per-token g^2 from the sum-reduced NLL backward."
+            )
+        if args.num_samples_for_grad > 0:
+            raise ValueError(
+                "--grad_refresh_loss=legacy_fisher_diag_mse cannot be used with "
+                "--num_samples_for_grad > 0 because the per-token Fisher diagonal "
+                "must align with every calibration sample."
             )
     if getattr(args, "refined_rkl_num_A", 1) < 1:
         raise ValueError(

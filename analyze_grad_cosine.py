@@ -49,6 +49,7 @@ from gptq_utils.gptq_plus_utils import (
     collect_static_end_to_end_saliency_and_fisher,
     compute_refresh_loss,
     hidden2logits,
+    slice_layer_output_fisher_for_batch,
     temporary_requires_grad,
 )
 from gptq_utils.gptaq_utils import GPTAQ, FPInputsCache
@@ -226,6 +227,10 @@ def _summarize_loss_series(per_loss_values):
             "per_batch": t.tolist(),
         }
     return summary
+
+
+def _analysis_loss_value(loss_name, loss_tensor, batch_size):
+    return loss_tensor.item()
 
 
 def _tensor_stats(values):
@@ -468,6 +473,7 @@ def run_cosine_measurement(
     fp_inps,
     fp_inps_final,
     fisher_tensor,
+    legacy_fisher_diag_tensor,
     refined_A_list,
     refined_diag_A_list,
     samples_per_A,
@@ -516,7 +522,7 @@ def run_cosine_measurement(
     # same batch-level fisher slice. Use a broader "needs fisher slice" gate
     # for the per-batch indexing below without touching `want_fisher` (which
     # still drives the dedicated fisher-surrogate measurement branch).
-    need_fisher_slice = want_fisher or want_legacy_fisher_diag or want_refined_mse
+    need_fisher_slice = want_fisher or want_refined_mse
     has_refined = (
         want_refined_full
         and refined_A_list is not None
@@ -548,8 +554,13 @@ def run_cosine_measurement(
     if need_fisher_slice and fisher_tensor is None:
         raise RuntimeError(
             "measure_losses requested a Fisher-backed loss "
-            "(fisher_diag_mse / legacy_fisher_diag_mse / refined_mse) but "
+            "(fisher_diag_mse / refined_mse) but "
             "fisher was not collected (check collect_fisher flag)."
+        )
+    if want_legacy_fisher_diag and legacy_fisher_diag_tensor is None:
+        raise RuntimeError(
+            "measure_losses requested legacy_fisher_diag_mse but per-token "
+            "legacy Fisher diagonal was not collected."
         )
 
     # Canonicalise linear names ("q_proj" not "q_proj.module" after ActQuantWrapper).
@@ -711,7 +722,25 @@ def run_cosine_measurement(
                     "measurement, but GPTQ+ did not provide it."
                 )
             fp_final_batch = fp_inps_final[start:end].to(dev)
-            fisher_batch = fisher_tensor.to(dev).float() if need_fisher_slice and fisher_tensor is not None else None
+            batch_indices = list(range(start, end))
+            fisher_batch = (
+                slice_layer_output_fisher_for_batch(
+                    fisher_tensor,
+                    batch_indices,
+                    dev,
+                    "fisher_diag_mse",
+                )
+                if need_fisher_slice and fisher_tensor is not None else None
+            )
+            legacy_fisher_diag_batch = (
+                slice_layer_output_fisher_for_batch(
+                    legacy_fisher_diag_tensor,
+                    batch_indices,
+                    dev,
+                    "legacy_fisher_diag_mse",
+                )
+                if want_legacy_fisher_diag else None
+            )
 
             # ---------- (1) true KL ----------
             _zero_grads(target_params)
@@ -763,12 +792,16 @@ def run_cosine_measurement(
                     fp_hidden=fp_hidden_cached,
                     analyzer=analyzer,
                     kl_topk=kl_topk,
-                    layer_output_fisher=fisher_batch,
+                    layer_output_fisher=legacy_fisher_diag_batch,
                     fp_final_hidden=None,
                 )
                 legacy_fisher_diag_loss.backward()
                 per_batch_legacy_fisher_diag_loss.append(
-                    legacy_fisher_diag_loss.item()
+                    _analysis_loss_value(
+                        "legacy_fisher_diag_mse",
+                        legacy_fisher_diag_loss,
+                        measure_batch_size,
+                    )
                 )
                 grads_legacy_fisher_diag = _capture_grads(
                     name_to_weight, grad_clip=grad_clip
@@ -1298,6 +1331,7 @@ def measure_layer_losses_after_quant(
     fp_inps,
     fp_inps_final,
     fisher_tensor,
+    legacy_fisher_diag_tensor,
     refined_A_list,
     refined_diag_A_list,
     samples_per_A,
@@ -1328,7 +1362,7 @@ def measure_layer_losses_after_quant(
     want_fisher = "fisher_diag_mse" in measure_losses
     want_legacy_fisher_diag = "legacy_fisher_diag_mse" in measure_losses
     want_refined_mse = "refined_mse" in measure_losses
-    need_fisher = want_fisher or want_legacy_fisher_diag or want_refined_mse
+    need_fisher = want_fisher or want_refined_mse
     want_layer_mse = "layer_mse" in measure_losses
     want_module_mse = "module_mse" in measure_losses
     want_residual = "residual_kl" in measure_losses
@@ -1353,8 +1387,13 @@ def measure_layer_losses_after_quant(
     if need_fisher and fisher_tensor is None:
         raise RuntimeError(
             "measure_losses requested a Fisher-backed loss "
-            "(fisher_diag_mse / legacy_fisher_diag_mse / refined_mse) but "
+            "(fisher_diag_mse / refined_mse) but "
             "fisher was not collected (check collect_fisher flag)."
+        )
+    if want_legacy_fisher_diag and legacy_fisher_diag_tensor is None:
+        raise RuntimeError(
+            "measure_losses requested legacy_fisher_diag_mse but per-token "
+            "legacy Fisher diagonal was not collected."
         )
     if want_refined_mse and not has_refined_mse:
         raise RuntimeError(
@@ -1372,11 +1411,11 @@ def measure_layer_losses_after_quant(
         attention_mask, position_ids, position_embeddings, measure_batch_size,
     )
     n_batches = measure_samples // measure_batch_size
-    fisher_batch = fisher_tensor.to(dev).float() if need_fisher else None
 
     for b in tqdm(range(n_batches), ncols=100, desc=f"loss@layer{layer_idx}", leave=False):
         start = b * measure_batch_size
         end = start + measure_batch_size
+        batch_indices = list(range(start, end))
         inp_batch = inps[start:end].to(dev)
         fp_hidden_cached = fp_inps[start:end].to(dev)
         fp_final_batch = (
@@ -1390,6 +1429,24 @@ def measure_layer_losses_after_quant(
                 "measure_layer_losses_after_quant requires fp_inps_final for "
                 "residual/refined residual losses, but GPTQ+ did not provide it."
             )
+        fisher_batch = (
+            slice_layer_output_fisher_for_batch(
+                fisher_tensor,
+                batch_indices,
+                dev,
+                "fisher_diag_mse",
+            )
+            if need_fisher else None
+        )
+        legacy_fisher_diag_batch = (
+            slice_layer_output_fisher_for_batch(
+                legacy_fisher_diag_tensor,
+                batch_indices,
+                dev,
+                "legacy_fisher_diag_mse",
+            )
+            if want_legacy_fisher_diag else None
+        )
 
         out_hidden = _layer_out(layer(
             inp_batch,
@@ -1416,10 +1473,16 @@ def measure_layer_losses_after_quant(
                 fp_hidden=fp_hidden_cached,
                 analyzer=analyzer,
                 kl_topk=kl_topk,
-                layer_output_fisher=fisher_batch,
+                layer_output_fisher=legacy_fisher_diag_batch,
                 fp_final_hidden=None,
             )
-            per_loss_values["legacy_fisher_diag_mse"].append(loss.item())
+            per_loss_values["legacy_fisher_diag_mse"].append(
+                _analysis_loss_value(
+                    "legacy_fisher_diag_mse",
+                    loss,
+                    measure_batch_size,
+                )
+            )
         if want_residual:
             loss = compute_refresh_loss(
                 refresh_loss_type="residual_kl",
@@ -1728,6 +1791,9 @@ def _build_cosine_analysis_hook(
                         fp_inps=payload["fp_inps"],
                         fp_inps_final=payload["fp_inps_final"],
                         fisher_tensor=payload["static_fisher_by_layer"][layer_idx],
+                        legacy_fisher_diag_tensor=(
+                            payload.get("static_legacy_fisher_diag_by_layer", [None] * len(layers_local))[layer_idx]
+                        ),
                         refined_A_list=refined_A_list_i,
                         refined_diag_A_list=refined_diag_A_list_i,
                         samples_per_A=payload.get("samples_per_A", samples_per_A),
@@ -1785,6 +1851,9 @@ def _build_cosine_analysis_hook(
                 fp_inps=payload["fp_inps"],
                 fp_inps_final=payload["fp_inps_final"],
                 fisher_tensor=payload["static_fisher_by_layer"][layer_idx],
+                legacy_fisher_diag_tensor=(
+                    payload.get("static_legacy_fisher_diag_by_layer", [None] * len(layers_local))[layer_idx]
+                ),
                 refined_A_list=refined_A_list_i,
                 refined_diag_A_list=refined_diag_A_list_i,
                 samples_per_A=payload.get("samples_per_A", samples_per_A),
@@ -1902,6 +1971,7 @@ def _load_or_collect_static_analysis_stats(
     dev,
     layers,
     want_fisher,
+    want_legacy_fisher_diag,
     want_refined_full,
     want_refined_diag,
     need_fp_final,
@@ -1942,6 +2012,7 @@ def _load_or_collect_static_analysis_stats(
             f"ngrad{int(getattr(args, 'num_samples_for_grad', 0))}",
             f"rklNA{rkl_na}",
             f"fisher{int(want_fisher)}",
+            f"legacydiag{int(want_legacy_fisher_diag)}",
             f"rkl{int(want_refined_full)}",
             f"diagrkl{int(want_refined_diag)}",
             f"fpfinal{int(need_fp_final)}",
@@ -1955,13 +2026,24 @@ def _load_or_collect_static_analysis_stats(
         if os.path.exists(static_cache_file):
             logging.info("Loading analyze static fisher/fp-final cache from %s", static_cache_file)
             loaded = torch.load(static_cache_file, map_location="cpu", weights_only=True)
-            static_fisher_by_layer = loaded["fisher"]
+            static_fisher_by_layer = loaded.get("fisher", [None] * len(layers))
+            static_legacy_fisher_diag_by_layer = loaded.get(
+                "legacy_fisher_diag", [None] * len(layers)
+            )
             static_refined_A_by_layer = loaded.get("refined_A", None)
             static_refined_diag_A_by_layer = loaded.get("refined_diag_A", None)
             fp_inps_final_cpu = loaded.get("fp_inps_final", None)
             if want_fisher and not static_fisher_by_layer:
                 raise RuntimeError(
                     f"Cached analyze stats at {static_cache_file} do not contain fisher."
+                )
+            if (
+                want_legacy_fisher_diag
+                and not any(f is not None for f in static_legacy_fisher_diag_by_layer)
+            ):
+                raise RuntimeError(
+                    f"Cached analyze stats at {static_cache_file} do not contain "
+                    "per-token legacy Fisher diagonal."
                 )
             if want_refined_full and not static_refined_A_by_layer:
                 raise RuntimeError(
@@ -1978,16 +2060,18 @@ def _load_or_collect_static_analysis_stats(
             del loaded
             return (
                 static_fisher_by_layer,
+                static_legacy_fisher_diag_by_layer,
                 static_refined_A_by_layer,
                 static_refined_diag_A_by_layer,
                 fp_inps_final_cpu,
             )
 
-    if want_fisher or want_refined_full or want_refined_diag or need_fp_final:
+    if want_fisher or want_legacy_fisher_diag or want_refined_full or want_refined_diag or need_fp_final:
         logging.info("Collecting analyze static fisher/fp-final caches for reference quantization.")
         (
             _static_saliency_unused,
             static_fisher_by_layer,
+            static_legacy_fisher_diag_by_layer,
             static_refined_A_by_layer,
             static_refined_diag_A_by_layer,
             fp_inps_final_cpu,
@@ -2001,6 +2085,7 @@ def _load_or_collect_static_analysis_stats(
             grad_hessian_topk=args.grad_hessian_topk,
             batch_size=args.global_loss_bsz,
             collect_fisher=want_fisher,
+            collect_legacy_fisher_diag=want_legacy_fisher_diag,
             collect_refined_rkl=want_refined_full,
             refined_rkl_damp=getattr(args, "refined_rkl_damp", 0.01),
             refined_rkl_num_A=int(getattr(args, "refined_rkl_num_A", 1)),
@@ -2030,13 +2115,17 @@ def _load_or_collect_static_analysis_stats(
             raise SystemExit(0)
     else:
         static_fisher_by_layer = [None] * len(layers)
+        static_legacy_fisher_diag_by_layer = [None] * len(layers)
         static_refined_A_by_layer = None
         static_refined_diag_A_by_layer = None
         fp_inps_final_cpu = None
 
     if static_cache_file is not None:
         logging.info("Saving analyze static fisher/fp-final cache to %s", static_cache_file)
-        payload = {"fisher": static_fisher_by_layer}
+        payload = {
+            "fisher": static_fisher_by_layer,
+            "legacy_fisher_diag": static_legacy_fisher_diag_by_layer,
+        }
         if static_refined_A_by_layer is not None:
             payload["refined_A"] = static_refined_A_by_layer
         if static_refined_diag_A_by_layer is not None:
@@ -2048,6 +2137,7 @@ def _load_or_collect_static_analysis_stats(
 
     return (
         static_fisher_by_layer,
+        static_legacy_fisher_diag_by_layer,
         static_refined_A_by_layer,
         static_refined_diag_A_by_layer,
         fp_inps_final_cpu,
@@ -2063,6 +2153,7 @@ def _rtn_fwrd_with_analysis(
     analysis_hook,
     *,
     want_fisher,
+    want_legacy_fisher_diag,
     want_refined_full,
     want_refined_diag,
     need_fp_final,
@@ -2095,6 +2186,7 @@ def _rtn_fwrd_with_analysis(
 
     (
         static_fisher_by_layer,
+        static_legacy_fisher_diag_by_layer,
         static_refined_A_by_layer,
         static_refined_diag_A_by_layer,
         fp_inps_final_cpu,
@@ -2105,6 +2197,7 @@ def _rtn_fwrd_with_analysis(
         dev=dev,
         layers=layers,
         want_fisher=want_fisher,
+        want_legacy_fisher_diag=want_legacy_fisher_diag,
         want_refined_full=want_refined_full,
         want_refined_diag=want_refined_diag,
         need_fp_final=need_fp_final,
@@ -2282,6 +2375,7 @@ def _rtn_fwrd_with_analysis(
             "dev": dev,
             "orig_device": orig_device,
             "static_fisher_by_layer": static_fisher_by_layer,
+            "static_legacy_fisher_diag_by_layer": static_legacy_fisher_diag_by_layer,
             "static_refined_A_by_layer": static_refined_A_by_layer,
             "static_refined_diag_A_by_layer": static_refined_diag_A_by_layer,
             "samples_per_A": samples_per_A,
@@ -2319,6 +2413,7 @@ def _gptaq_fwrd_with_analysis(
     analysis_hook,
     *,
     want_fisher,
+    want_legacy_fisher_diag,
     want_refined_full,
     want_refined_diag,
     need_fp_final,
@@ -2339,6 +2434,7 @@ def _gptaq_fwrd_with_analysis(
 
     (
         static_fisher_by_layer,
+        static_legacy_fisher_diag_by_layer,
         static_refined_A_by_layer,
         static_refined_diag_A_by_layer,
         fp_inps_final_cpu,
@@ -2349,6 +2445,7 @@ def _gptaq_fwrd_with_analysis(
         dev=dev,
         layers=layers,
         want_fisher=want_fisher,
+        want_legacy_fisher_diag=want_legacy_fisher_diag,
         want_refined_full=want_refined_full,
         want_refined_diag=want_refined_diag,
         need_fp_final=need_fp_final,
@@ -2602,6 +2699,7 @@ def _gptaq_fwrd_with_analysis(
             "dev": dev,
             "orig_device": orig_device,
             "static_fisher_by_layer": static_fisher_by_layer,
+            "static_legacy_fisher_diag_by_layer": static_legacy_fisher_diag_by_layer,
             "static_refined_A_by_layer": static_refined_A_by_layer,
             "static_refined_diag_A_by_layer": static_refined_diag_A_by_layer,
             "samples_per_A": samples_per_A,
@@ -2686,10 +2784,9 @@ def quantize_and_measure(args, analyzer, trainloader, dev, target_layers, measur
     sample_offset = rank_sample_start
 
     want_fisher = bool(
-        measure_losses.intersection(
-            {"fisher_diag_mse", "legacy_fisher_diag_mse", "refined_mse"}
-        )
+        measure_losses.intersection({"fisher_diag_mse", "refined_mse"})
     )
+    want_legacy_fisher_diag = "legacy_fisher_diag_mse" in measure_losses
     want_refined_full = "refined_residual_kl" in measure_losses
     want_refined_diag = "refined_diag_residual_kl" in measure_losses
     want_module_mse = "module_mse" in measure_losses
@@ -2699,12 +2796,30 @@ def quantize_and_measure(args, analyzer, trainloader, dev, target_layers, measur
             {"residual_kl", "refined_residual_kl", "refined_diag_residual_kl", "refined_mse"}
         )
     )
-    if (want_fisher or want_refined_full or want_refined_diag) and not args.global_loss:
+    if (
+        want_fisher
+        or want_legacy_fisher_diag
+        or want_refined_full
+        or want_refined_diag
+    ) and not args.global_loss:
         logging.info(
             "analyze_grad_cosine requires global static stats for selected losses; "
             "forcing --global_loss for this diagnostic run."
         )
         args.global_loss = True
+    if want_legacy_fisher_diag:
+        if int(getattr(args, "fisher_rademacher_k", 0)) > 0:
+            raise ValueError(
+                "legacy_fisher_diag_mse grad-cosine uses per-token g^2 from a "
+                "sum-reduced NLL backward and cannot be used with "
+                "--fisher_rademacher_k > 0."
+            )
+        if int(getattr(args, "num_samples_for_grad", 0)) > 0:
+            raise ValueError(
+                "legacy_fisher_diag_mse grad-cosine needs per-token Fisher "
+                "diagonals for all calibration samples and cannot be used with "
+                "--num_samples_for_grad > 0."
+            )
     if want_module_mse and measure_samples_local % args.measure_batch_size != 0:
         raise ValueError(
             f"local measure_samples ({measure_samples_local}) must be divisible by "
@@ -2736,6 +2851,7 @@ def quantize_and_measure(args, analyzer, trainloader, dev, target_layers, measur
             dev,
             analysis_hook,
             want_fisher=want_fisher,
+            want_legacy_fisher_diag=want_legacy_fisher_diag,
             want_refined_full=want_refined_full,
             want_refined_diag=want_refined_diag,
             need_fp_final=need_fp_final,
@@ -2760,6 +2876,7 @@ def quantize_and_measure(args, analyzer, trainloader, dev, target_layers, measur
             dev,
             analysis_hook,
             want_fisher=want_fisher,
+            want_legacy_fisher_diag=want_legacy_fisher_diag,
             want_refined_full=want_refined_full,
             want_refined_diag=want_refined_diag,
             need_fp_final=need_fp_final,
@@ -2781,6 +2898,7 @@ def quantize_and_measure(args, analyzer, trainloader, dev, target_layers, measur
     for name, value in {
         "_analysis_hook": analysis_hook,
         "_analysis_collect_fisher": want_fisher,
+        "_analysis_collect_legacy_fisher_diag": want_legacy_fisher_diag,
         "_analysis_collect_refined_rkl": want_refined_full,
         "_analysis_collect_refined_diag_rkl": want_refined_diag,
         "_analysis_need_fp_inps_final": need_fp_final,

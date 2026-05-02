@@ -61,6 +61,7 @@
 - GLOBAL_LOSS_BSZ：预计算整个模型反传时的batchsize
 - FISHER_RADEMACHER_K：static global-loss 预计算 saliency/Fisher 时的随机符号重复次数。0 表示保持原实现；>0 时对每个 batch 重复 k 次反传，每次给每个 output token 的 NLL 乘独立 Rademacher 符号（±1 各 0.5），每次先形成 `g²` / `g g^T` 统计，再对 k 次取平均，用来修正不同输出 token 梯度流独立近似。开启时不能同时开启动态 saliency 低秩更新（`ENABLE_DYN_SAL=1`）。
 - NUM_SAMPLES_FOR_GRAD：static global-loss 预计算 saliency/Fisher 时使用的全局样本数。0 表示使用全部校准样本；>0 时每个 DP rank 使用自己 shard 的前 `NUM_SAMPLES_FOR_GRAD // world_size` 条样本，并且后续 Hessian 累积也只用同一前缀以保持 saliency 和输入样本对齐。
+- `GRAD_REFRESH_LOSS=legacy_fisher_diag_mse` 会保存每个 rank-local sample/token 的 Fisher 对角项 `g^2`，不再从完整 Fisher 矩阵取对角线。这个 loss 需要 `GLOBAL_LOSS=1`，并且不能和 `FISHER_RADEMACHER_K>0` 或 `NUM_SAMPLES_FOR_GRAD>0` 同时使用。
 - LOSS_SLIDE_WINDOW：开启后会同时计算本层和下一层的loss并线性配比
 - DP_GLOBAL_SHUFFLE：开启dp后的数据shuffle模式，固定为1就行
 - GRAD_LR_LAYER_SCHEDULE：跨layer的学习率调度器。`cosine` 时非 final layer 的有效学习率为 `base_lr + (lr - base_lr) * 0.5 * (1 - cos(pi * layer_idx / (num_layers - 1)))`
@@ -128,6 +129,8 @@ FSDP_PRECOMPUTE=0 \
 ## loss type
 
 - fisher_diag_mse（名字带diag但现在优化后不再只考虑对角项了，是个遗留问题）：将最后一层（开启global loss）输出的kl loss在当前层的输出隐空间上二阶展开： $loss = \frac{1}{2} \Delta y ^T H \Delta y$ ，其中H使用fisher矩阵估算。
+
+- legacy_fisher_diag_mse：使用同一次 sum-reduced NLL backward 得到的逐 sample/token 梯度 `g_t`，保存逐 token 对角 Fisher `g_t^2`，局部二阶项按 $\mathrm{mean}_{sample,token}\frac{1}{2}\Delta y_t^T \mathrm{diag}(g_t^2)\Delta y_t$ 计算，reduction 尺度和 fisher_diag_mse 对齐。
 
 - res_kl：假设当前层的全精度模型输出为x，量化模型输出为x+Δx，假设后续层的变换可以近似为恒等变换加上一个较小的函数f，则全精度模型最终输出： $x+f(x)$ ，量化模型输出： $x+Δx+f(x+Δx)$ 约等于 $x+Δx+f(x)$ ，因此可以考虑直接比较这两个量过输出头之后的kl loss。其中 $x+f(x)$ 一开始就缓存下来了（全精度模型的激活值）。
 
