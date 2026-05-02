@@ -61,9 +61,9 @@ def parse_gen():
         type=float,
         default=1.0,
         help=(
-            "Fisher-MSE delta-y clipping quantile. 1.0 leaves delta_y unchanged; "
+            "Activation-delta loss clipping quantile. 1.0 leaves delta_y unchanged; "
             "values <1 scale elements with |delta_y| above that quantile down to "
-            "the quantile magnitude before computing the Fisher/refined MSE loss."
+            "the quantile magnitude before computing Fisher/refined/hidden MSE losses."
         ),
     )
     parser.add_argument("--k_clip_ratio", type=float, default=1.0, help="K cache clipping ratio")

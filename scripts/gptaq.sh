@@ -13,14 +13,10 @@ export CUDA_VISIBLE_DEVICES=${DEVICE}
 
 # Execute the distributed run
 python -m torch.distributed.run \
-    --nnodes=1 --nproc_per_node=1 --rdzv_endpoint=localhost:2940${DEVICE} ./ptq.py \
+    --nnodes=1 --nproc_per_node=1 --rdzv_endpoint=localhost:29400 ./ptq.py \
     --model ${MODEL_PATH} \
     --exp gptaq \
     --dataset wikitext2 --nsamples ${N_SAMPLES} --seq_len ${SEQ_LEN} \
     --w_method gptaq --w_bits 4 --w_clip --act_order \
     --lm_eval --lm_eval_batch_size 32 \
     --rotate \
-    --a_clip_ratio 0.9 --k_clip_ratio 0.9 --k_clip_ratio 0.9 \
-    --w_groupsize 128 \
-    --a_bits 4 --k_bits 4 --v_bits 4 \
-    --act_quant_aware_gptq --k_cache_quant_aware_gptq \

@@ -5,13 +5,13 @@
 
 MODEL_PATH=${1}
 DEVICE=${2}
-TARGET_LAYERS=${3:-"5,10,15,20,25"}
+TARGET_LAYERS=${3:-"0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26"}
 
 MODEL_NAME=$(basename ${MODEL_PATH})
 N_SAMPLES=256
 SEQ_LEN=2048
 MEASURE_SAMPLES=256
-MEASURE_BSZ=4
+MEASURE_BSZ=8
 BSZ=${BSZ:-32}
 GLOBAL_LOSS_BSZ=${GLOBAL_LOSS_BSZ:-16}
 BACKWARD_SAMPLES=${BACKWARD_SAMPLES:-32}
@@ -103,3 +103,4 @@ python -m torch.distributed.run \
     --dp_global_shuffle \
     "${FINAL_LAYER_GRAD_CLIP_ARGS[@]}" \
     --fisher_rademacher_k 0 \
+    --a_loss_ratio 0.95 \

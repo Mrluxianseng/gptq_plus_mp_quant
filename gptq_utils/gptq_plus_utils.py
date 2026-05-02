@@ -92,7 +92,7 @@ def _activation_clip_threshold(tensor, q):
 def _scale_delta_by_abs_quantile(delta, ratio, profile_recorder=None):
     if ratio >= 1.0:
         return delta
-    with profile_recorder.section("compute_refresh_loss.fisher_diag_mse.a_loss_delta_scale") if profile_recorder else _NULL_CONTEXT:
+    with profile_recorder.section("compute_refresh_loss.a_loss_delta_scale") if profile_recorder else _NULL_CONTEXT:
         abs_delta = delta.detach().float().abs()
         threshold = _activation_clip_threshold(abs_delta, float(ratio))
         if threshold is None:
@@ -5657,7 +5657,10 @@ def compute_refresh_loss(
                 return kl_loss.sum(dim=-1).mean()
 
     delta = _drop_sink(out_hidden - fp_hidden)
-    if is_fisher_backed_loss(refresh_loss_type) and a_loss_ratio < 1.0:
+    if (
+        is_fisher_backed_loss(refresh_loss_type)
+        or is_hidden_mse_loss(refresh_loss_type)
+    ) and a_loss_ratio < 1.0:
         delta = _scale_delta_by_abs_quantile(delta, a_loss_ratio, profile_recorder)
     if is_hidden_mse_loss(refresh_loss_type):
         with profile_recorder.section("compute_refresh_loss.hidden_mse") if profile_recorder else _NULL_CONTEXT:
@@ -9340,6 +9343,8 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     if _dyn_layers is not None and i < len(_dyn_layers):
                         _dyn_layers[i] = None
                 memory_utils.cleanup_memory(trim_cpu=True)
+            if analysis_hook is not None:
+                dist_utils.barrier()
 
             if quant_stop_layer is not None and i >= quant_stop_layer:
                 logging.info("Stopping quantization after transformer layer %d due to --quant_stop_layer.", i)

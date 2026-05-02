@@ -51,6 +51,7 @@ from gptq_utils.gptq_plus_utils import (
     hidden2logits,
     slice_layer_output_fisher_for_batch,
     temporary_requires_grad,
+    _scale_delta_by_abs_quantile,
 )
 from gptq_utils.gptaq_utils import GPTAQ, FPInputsCache
 from gptq_utils.quant_aware_utils import (
@@ -486,6 +487,7 @@ def run_cosine_measurement(
     kl_topk,
     dev,
     measure_losses,
+    a_loss_ratio=1.0,
     grad_clip=None,
     refined_mse_pool_ids=None,
     refined_mse_grad_pool=None,
@@ -775,6 +777,7 @@ def run_cosine_measurement(
                     kl_topk=kl_topk,
                     layer_output_fisher=fisher_batch,
                     fp_final_hidden=None,
+                    a_loss_ratio=a_loss_ratio,
                 )
                 fisher_loss.backward()
                 per_batch_fisher_loss.append(fisher_loss.item())
@@ -794,6 +797,7 @@ def run_cosine_measurement(
                     kl_topk=kl_topk,
                     layer_output_fisher=legacy_fisher_diag_batch,
                     fp_final_hidden=None,
+                    a_loss_ratio=a_loss_ratio,
                 )
                 legacy_fisher_diag_loss.backward()
                 per_batch_legacy_fisher_diag_loss.append(
@@ -935,6 +939,7 @@ def run_cosine_measurement(
                     layer_output_grad_exact=layer_output_grad_exact,
                     layer_output_grad_mean=refined_mse_mean_grad,
                     pool_positions=pool_positions,
+                    a_loss_ratio=a_loss_ratio,
                 )
                 refined_mse_loss.backward()
                 per_batch_refined_mse_loss.append(refined_mse_loss.item())
@@ -956,6 +961,7 @@ def run_cosine_measurement(
                     kl_topk=kl_topk,
                     layer_output_fisher=None,
                     fp_final_hidden=None,
+                    a_loss_ratio=a_loss_ratio,
                 )
                 layer_mse_loss.backward()
                 per_batch_layer_mse_loss.append(layer_mse_loss.item())
@@ -996,9 +1002,13 @@ def run_cosine_measurement(
                     fp_module_out = fp_module_outputs[module_name][b].to(
                         dev, dtype=captured[0].dtype
                     )
-                    module_mse_loss = 0.5 * (
-                        captured[0] - fp_module_out
-                    ).square().sum(dim=-1).mean()
+                    module_delta = captured[0] - fp_module_out
+                    if a_loss_ratio < 1.0:
+                        module_delta = _scale_delta_by_abs_quantile(
+                            module_delta,
+                            a_loss_ratio,
+                        )
+                    module_mse_loss = 0.5 * module_delta.square().sum(dim=-1).mean()
                     module_mse_loss.backward()
                     module_loss_sum += module_mse_loss.item()
                     grads_module_mse[module_name] = _capture_one_grad(
@@ -1006,7 +1016,7 @@ def run_cosine_measurement(
                         module_name,
                         grad_clip=grad_clip,
                     )
-                    del captured, fp_module_out, module_mse_loss
+                    del captured, fp_module_out, module_delta, module_mse_loss
                 per_batch_module_mse_loss.append(
                     module_loss_sum / max(len(name_to_module), 1)
                 )
@@ -1344,6 +1354,7 @@ def measure_layer_losses_after_quant(
     kl_topk,
     dev,
     measure_losses,
+    a_loss_ratio=1.0,
     refined_mse_pool_ids=None,
     refined_mse_grad_pool=None,
     refined_mse_mean_grad=None,
@@ -1464,6 +1475,7 @@ def measure_layer_losses_after_quant(
                 kl_topk=kl_topk,
                 layer_output_fisher=fisher_batch,
                 fp_final_hidden=None,
+                a_loss_ratio=a_loss_ratio,
             )
             per_loss_values["fisher_diag_mse"].append(loss.item())
         if want_legacy_fisher_diag:
@@ -1475,6 +1487,7 @@ def measure_layer_losses_after_quant(
                 kl_topk=kl_topk,
                 layer_output_fisher=legacy_fisher_diag_batch,
                 fp_final_hidden=None,
+                a_loss_ratio=a_loss_ratio,
             )
             per_loss_values["legacy_fisher_diag_mse"].append(
                 _analysis_loss_value(
@@ -1558,6 +1571,7 @@ def measure_layer_losses_after_quant(
                 layer_output_grad_exact=layer_output_grad_exact,
                 layer_output_grad_mean=refined_mse_mean_grad,
                 pool_positions=pool_positions,
+                a_loss_ratio=a_loss_ratio,
             )
             per_loss_values["refined_mse"].append(loss.item())
             if layer_output_grad_exact is not None:
@@ -1571,6 +1585,7 @@ def measure_layer_losses_after_quant(
                 kl_topk=kl_topk,
                 layer_output_fisher=None,
                 fp_final_hidden=None,
+                a_loss_ratio=a_loss_ratio,
             )
             per_loss_values["layer_mse"].append(loss.item())
         if want_module_mse:
@@ -1614,8 +1629,14 @@ def measure_layer_losses_after_quant(
                         f"module_mse: missing FP output for module {name!r}."
                     )
                 out_fp = fp_module_outputs[name][b].to(dev, dtype=out_q.dtype)
+                module_delta = out_q - out_fp
+                if a_loss_ratio < 1.0:
+                    module_delta = _scale_delta_by_abs_quantile(
+                        module_delta,
+                        a_loss_ratio,
+                    )
                 module_losses.append(
-                    0.5 * (out_q - out_fp).square().sum(dim=-1).mean().item()
+                    0.5 * module_delta.square().sum(dim=-1).mean().item()
                 )
             per_loss_values["module_mse"].append(
                 sum(module_losses) / max(len(module_losses), 1)
@@ -1806,6 +1827,7 @@ def _build_cosine_analysis_hook(
                         kl_topk=args.kl_topk,
                         dev=payload["dev"],
                         measure_losses=measure_losses,
+                        a_loss_ratio=args.a_loss_ratio,
                         grad_clip=_layer_grad_clip(layer_idx),
                         refined_mse_pool_ids=refined_mse_pool_ids_i,
                         refined_mse_grad_pool=refined_mse_grad_pool_i,
@@ -1866,6 +1888,7 @@ def _build_cosine_analysis_hook(
                 kl_topk=args.kl_topk,
                 dev=payload["dev"],
                 measure_losses=measure_losses,
+                a_loss_ratio=args.a_loss_ratio,
                 refined_mse_pool_ids=refined_mse_pool_ids_i,
                 refined_mse_grad_pool=refined_mse_grad_pool_i,
                 refined_mse_mean_grad=refined_mse_mean_grad_i,
@@ -2395,6 +2418,7 @@ def _rtn_fwrd_with_analysis(
         layers[i] = layer.to(orig_device)
         del layer, full, analysis_fp_weights, analysis_hessians
         memory_utils.cleanup_memory()
+        dist_utils.barrier()
 
     for module in per_layer_runtime_modules:
         module.to(orig_device)
@@ -2720,6 +2744,7 @@ def _gptaq_fwrd_with_analysis(
         layers[i] = layer.to(orig_device)
         del layer, full, gptq, analysis_fp_weights, analysis_hessians
         memory_utils.cleanup_memory()
+        dist_utils.barrier()
 
     for module in per_layer_runtime_modules:
         module.to(orig_device)
@@ -3103,6 +3128,7 @@ def main(args):
             f"# model={args.model}  exp={args.exp}",
             f"# analysis_quant_method={args.analysis_quant_method}",
             f"# reg_strategy={args.grad_reg_strategy}  reg_lambda={args.grad_reg_lambda}",
+            f"# a_loss_ratio={args.a_loss_ratio}",
             f"# measure_losses={args.measure_losses}  target_layers={args.target_layers}",
             f"# measure_samples={args.measure_samples}  measure_batch_size={args.measure_batch_size}",
             f"# columns: cos_* are global batch-mean cosine(true_KL_grad, ·); "
@@ -3117,6 +3143,9 @@ def main(args):
             "norm_true", "norm_loss", "norm_reg", "norm_with_reg",
         ]
         rows = []
+        layer_loss_cos_values = {}
+        layer_loss_cos_with_reg_values = {}
+        layer_loss_norm_values = {}
         for layer_idx in sorted(cosine_results.keys()):
             per_layer = cosine_results[layer_idx]
             for module_name in per_layer:
@@ -3139,6 +3168,10 @@ def main(args):
                     # (keeps the table tight instead of filling with NaN).
                     if cos_key not in r:
                         continue
+                    layer_loss_cos_values.setdefault((layer_idx, loss_name), []).append(cos_no_reg)
+                    layer_loss_norm_values.setdefault((layer_idx, loss_name), []).append(norm_loss)
+                    if reg_enabled and isinstance(cos_with, (int, float)) and cos_with == cos_with:
+                        layer_loss_cos_with_reg_values.setdefault((layer_idx, loss_name), []).append(cos_with)
                     rows.append([
                         str(layer_idx), module_name, loss_name,
                         _fmt_cos(cos_no_reg), _fmt_cos(reg_cos), _fmt_cos(cos_with),
@@ -3152,6 +3185,78 @@ def main(args):
             for row in rows:
                 f.write("\t".join(row) + "\n")
         logging.info("Wrote cosine table to %s (%d rows)", out_tsv, len(rows))
+
+        layer_cos_rows = []
+        layer_cos_summary = {}
+        for layer_idx in sorted(cosine_results.keys()):
+            for loss_name in ordered_losses:
+                values = [
+                    float(v) for v in layer_loss_cos_values.get((layer_idx, loss_name), [])
+                    if isinstance(v, (int, float)) and v == v
+                ]
+                if not values:
+                    continue
+                norm_values = [
+                    float(v) for v in layer_loss_norm_values.get((layer_idx, loss_name), [])
+                    if isinstance(v, (int, float)) and v == v
+                ]
+                with_reg_values = layer_loss_cos_with_reg_values.get((layer_idx, loss_name), [])
+                cos_mean = sum(values) / len(values)
+                norm_mean = (
+                    sum(norm_values) / len(norm_values)
+                    if norm_values else float("nan")
+                )
+                cos_with_reg_mean = (
+                    sum(with_reg_values) / len(with_reg_values)
+                    if with_reg_values else float("nan")
+                )
+                layer_cos_rows.append([
+                    str(layer_idx),
+                    loss_name,
+                    f"{cos_mean:.8g}",
+                    _fmt_cos(cos_with_reg_mean),
+                    f"{norm_mean:.8g}" if norm_mean == norm_mean else "nan",
+                    str(len(values)),
+                ])
+                layer_cos_summary.setdefault(layer_idx, {})[loss_name] = {
+                    "cos_mean": cos_mean,
+                    "cos_with_reg_mean": cos_with_reg_mean,
+                    "norm_loss_mean": norm_mean,
+                    "n_modules": len(values),
+                }
+
+        out_layer_cos_tsv = os.path.join(out_dir, "layer_module_cosine_mean_table.txt")
+        with open(out_layer_cos_tsv, "w") as f:
+            f.write("# analyze_grad_cosine per-layer module-average cosine\n")
+            f.write(f"# analysis_quant_method={args.analysis_quant_method}\n")
+            f.write(f"# a_loss_ratio={args.a_loss_ratio}\n")
+            f.write(f"# measure_samples={args.measure_samples}  measure_batch_size={args.measure_batch_size}\n")
+            f.write(
+                "\t".join([
+                    "layer", "loss", "cos_module_mean", "cos_with_reg_module_mean",
+                    "norm_loss_module_mean", "n_modules",
+                ]) + "\n"
+            )
+            for row in layer_cos_rows:
+                f.write("\t".join(row) + "\n")
+        logging.info(
+            "Wrote per-layer module-mean cosine table to %s (%d rows)",
+            out_layer_cos_tsv,
+            len(layer_cos_rows),
+        )
+        with open(out_tsv, "a") as f:
+            f.write("\n")
+            f.write("# per-layer module-mean cosine across measured modules\n")
+            f.write(
+                "# columns: layer loss cos_module_mean "
+                "cos_with_reg_module_mean norm_loss_module_mean n_modules\n"
+            )
+            for row in layer_cos_rows:
+                f.write("\t".join(row) + "\n")
+        logging.info(
+            "Appended per-layer module-mean cosine summary to %s",
+            out_tsv,
+        )
 
         out_loss_tsv = os.path.join(out_dir, "layer_loss_table.txt")
         loss_rows = []
@@ -3170,6 +3275,7 @@ def main(args):
         with open(out_loss_tsv, "w") as f:
             f.write("# analyze_grad_cosine per-layer post-quantization losses\n")
             f.write(f"# analysis_quant_method={args.analysis_quant_method}\n")
+            f.write(f"# a_loss_ratio={args.a_loss_ratio}\n")
             f.write(f"# measure_samples={args.measure_samples}  measure_batch_size={args.measure_batch_size}\n")
             f.write("\t".join(["layer", "loss", "mean", "std", "n_batches"]) + "\n")
             for row in loss_rows:
@@ -3211,6 +3317,23 @@ def main(args):
         logging.info(pprint.pformat({
             i: {n: _summary_entry(r) for n, r in per_layer.items()}
             for i, per_layer in cosine_results.items()
+        }))
+        logging.info("==== per-layer module-mean cosine (global merged batch-avg) ====")
+        logging.info(pprint.pformat({
+            i: {
+                loss_name: {
+                    "cos": f"{stats['cos_mean']:.4f}",
+                    "cos_with_reg": (
+                        "nan"
+                        if stats["cos_with_reg_mean"] != stats["cos_with_reg_mean"]
+                        else f"{stats['cos_with_reg_mean']:.4f}"
+                    ),
+                    "gnorm": f"{stats['norm_loss_mean']:.3e}",
+                    "n_modules": stats["n_modules"],
+                }
+                for loss_name, stats in per_layer.items()
+            }
+            for i, per_layer in layer_cos_summary.items()
         }))
 
     if dist.is_available() and dist.is_initialized():
