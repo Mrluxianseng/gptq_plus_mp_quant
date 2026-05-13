@@ -1,0 +1,239 @@
+"""Configuration for RealQ.
+
+A single dataclass replaces process_args.py's ~99 argparse fields. Anything
+that the old codebase had hard-coded "always X" or that RealQ deliberately
+skips (FSDP, A/V/K quant, alpha, pre-GD, regularisation, ...) is gone.
+
+The dataclass exposes attribute names that match what `utils.eval_utils` /
+`utils.rotation_utils` / `utils.data_utils` already read from `args.X`, so we
+can pass `Config` instances straight into those helpers without an adapter.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+from dataclasses import dataclass, field, fields
+from typing import Optional
+
+
+@dataclass
+class Config:
+    # ----- model / data ----------------------------------------------------
+    model: str = ""
+    dataset: str = "wikitext2"
+    eval_datasets: list[str] = field(default_factory=lambda: ["wikitext2"])
+    seed: int = 0
+    nsamples: int = 128
+    seq_len: int = 2048
+    eval_seq_len: int = 2048
+
+    # ----- weight quantisation --------------------------------------------
+    w_bits: int = 4
+    w_groupsize: int = -1     # -1 = per-row
+    w_asym: bool = False
+    w_clip: bool = True       # MSE-based clip search in find_params
+
+    # ----- RealQ algorithm -------------------------------------------------
+    num_groups: int = 4       # Hessian groups per linear (output-row sharing)
+    percdamp: float = 0.01
+    blocksize: int = 128
+    act_order: bool = True
+    # When ``rank``, output-row sharding inside ``RealQLayer.quantize``: each
+    # DP rank owns ``out_features / world_size`` consecutive rows for
+    # find_params + per-row inner block update. Rank shards are gathered at
+    # the END of quantize so module.weight ends up replicated on every rank.
+    # ``none`` keeps the legacy redundant-replica path (each rank runs the
+    # full quantize). Old code's tensor-mode is not ported (RealQ already
+    # vectorises across NUM_GROUPS in the per-group fallback).
+    group_parallel_quant: str = "none"  # one of: none, rank
+
+    # ----- static end-to-end precompute -----------------------------------
+    global_loss_bsz: int = 4
+    saliency_clip_percentile: float = 0.99
+    grad_hessian_topk: int = -1   # -1 = full vocab
+    static_cache_path: Optional[str] = None
+    exit_after_precompute: bool = False
+
+    # ----- block_gd refresh (Adam + cosine + grad_clip) -------------------
+    grad_lr: float = 1e-4
+    grad_clip: float = 1.0
+    # Per-layer lr schedule. "cosine" ramps from `grad_lr * grad_lr_layer_base_ratio`
+    # at layer 0 to `grad_lr` at the deepest layer via 0.5*(1-cos(π·x)). "none"
+    # disables the ramp entirely so every layer uses `grad_lr` (base_ratio is
+    # ignored). Mirrors legacy `--grad_lr_layer_schedule` (process_args.py:393).
+    grad_lr_layer_schedule: str = "cosine"
+    grad_lr_layer_base_ratio: float = 0.01
+    backward_samples: int = 32
+    backward_bsz: int = 4
+    # Per-element |delta| clip applied to the refresh-loss delta
+    # (= q_out - fp_out) before the fisher quadratic. ``a_loss_ratio`` is
+    # the kept-fraction quantile: ratio < 1 caps the top (1 - ratio)
+    # fraction of |delta| at its quantile threshold to stop a few outlier
+    # tokens from dominating the gradient. Old GPTQ+ ``--a_loss_ratio``
+    # (process_args.py:60); see ``_scale_delta_by_abs_quantile`` and
+    # the ``_activation_clip_threshold`` torch.quantile/topk fallback.
+    # Default 1.0 = disabled (delta passes through).
+    a_loss_ratio: float = 1.0
+
+    # ----- batch / memory -------------------------------------------------
+    bsz: int = 4
+    hessian_accum_bsz: int = 128
+
+    # ----- FSDP single-stage (Stage 3) ------------------------------------
+    # When True, wrap the model with FSDP2 for the precompute backward pass,
+    # save the post-rotate weights to a temp checkpoint, then drop FSDP and
+    # reload from the checkpoint on CPU master so per-layer quant streams
+    # one block at a time to GPU. Default cpu_master ⇒ master copy on CPU
+    # for the quant phase. Set to False for single-GPU / small-model runs.
+    fsdp: bool = False
+    fsdp_cpu_offload: bool = False         # forwarded to CPUOffloadPolicy
+    fsdp_max_shard_size: str = "5GB"       # for save_pretrained sharding
+    fsdp_prepared_dir: Optional[str] = None  # cached checkpoint between phases
+    # TEMPORARY (Commit 1 of cpu_master refactor): opt-in flag for the new
+    # rank0-CPU-master path. When True the pipeline goes through Phase A/B/D
+    # (rank0-only rotate cache + meta init + sharded broadcast load + asymmetric
+    # rebuild). When False the legacy fsdp=True path runs unchanged. This
+    # field is removed in Commit 2 once A/B numerical equivalence is verified;
+    # at that point cfg.fsdp=True unconditionally implies cpu_master.
+    cpu_master: bool = False
+
+    # ----- AKV quantisation (Stage 2) -------------------------------------
+    # A applies to the linear's INPUT (pre-matmul activation).
+    # V applies to v_proj's OUTPUT (the value cached for attention).
+    # K applies to the K projection AFTER RoPE rotation.
+    # All default to fp16 (no quant). Set bits<16 to enable.
+    a_bits: int = 16
+    a_groupsize: int = -1
+    a_asym: bool = False
+    a_clip_ratio: float = 1.0
+    v_bits: int = 16
+    v_groupsize: int = -1
+    v_asym: bool = False
+    v_clip_ratio: float = 1.0
+    k_bits: int = 16
+    k_groupsize: int = -1
+    k_asym: bool = False
+    k_clip_ratio: float = 1.0
+    # When True the A/K quantisers fire DURING the weight-Hessian forward
+    # so GPTQ sees the quantised activation (the "aware" path). When False
+    # A/K quant is only applied AFTER weight quant for runtime use.
+    act_quant_aware_gptq: bool = False
+    k_cache_quant_aware_gptq: bool = False
+
+    # ----- loss_slide_window (Stage 2) ------------------------------------
+    loss_slide_window: bool = False  # raised by layer_loop; see REFACTOR_NOTES
+
+    # ----- final layer override (Stage 2) ---------------------------------
+    final_layer_grad_lr: Optional[float] = None
+    kl_topk: int = 20
+
+    # ----- rotate (QuaRot) -------------------------------------------------
+    rotate: bool = True
+    optimized_rotation_path: Optional[str] = None
+
+    # ----- eval -----------------------------------------------------------
+    skip_eval: bool = False
+    lm_eval: bool = False                # run QA tasks via lm-eval-harness
+    lm_eval_batch_size: int = 8
+
+    # ----- caching --------------------------------------------------------
+    tokens_cache_path: str = "./cache/tokens"
+    cache_dir: str = "./cache"
+
+    # ----- debug ----------------------------------------------------------
+    quant_stop_layer: Optional[int] = None
+
+    # ----- output ---------------------------------------------------------
+    save_qmodel_path: Optional[str] = None
+    output_dir: str = "./output"
+    exp: str = "realq"
+
+    # ----- derived (auto-filled by __post_init__) -------------------------
+    model_name: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.model_name:
+            # Mirror the old process_args convention: model_name = basename
+            # of the model path, used as a cache-key fragment by eval_utils.
+            self.model_name = os.path.basename(self.model.rstrip("/")) or "model"
+        if not (0.0 < self.a_loss_ratio <= 1.0):
+            raise ValueError(
+                f"`a_loss_ratio` must be in (0, 1]. Got {self.a_loss_ratio}."
+            )
+        if self.grad_lr_layer_schedule not in ("none", "cosine"):
+            raise ValueError(
+                "`grad_lr_layer_schedule` must be 'none' or 'cosine'. "
+                f"Got {self.grad_lr_layer_schedule!r}."
+            )
+        if self.cpu_master and not self.fsdp:
+            raise ValueError("`cpu_master=True` requires `fsdp=True`.")
+        if self.cpu_master and (
+            self.act_quant_aware_gptq or self.k_cache_quant_aware_gptq
+        ):
+            raise ValueError(
+                "`cpu_master=True` does not support aware AKV "
+                f"(act_quant_aware_gptq={self.act_quant_aware_gptq}, "
+                f"k_cache_quant_aware_gptq={self.k_cache_quant_aware_gptq}). "
+                "See realq/TODO_CPU_MASTER.md."
+            )
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+_BOOL_TRUE = {"1", "true", "yes", "y", "t"}
+_BOOL_FALSE = {"0", "false", "no", "n", "f"}
+
+
+def _str2bool(v: str) -> bool:
+    s = v.lower()
+    if s in _BOOL_TRUE:
+        return True
+    if s in _BOOL_FALSE:
+        return False
+    raise argparse.ArgumentTypeError(f"expected bool, got {v!r}")
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="RealQ post-training quantisation")
+    defaults = Config()
+    for f in fields(Config):
+        if f.name == "model_name":
+            continue  # derived
+        default = getattr(defaults, f.name)
+        flag = f"--{f.name}"
+        if f.type is bool or isinstance(default, bool):
+            p.add_argument(flag, type=_str2bool, default=default)
+        elif f.name == "eval_datasets":
+            p.add_argument(flag, type=str, nargs="+", default=default)
+        elif default is None:
+            # Optional[str] / Optional[int]: leave default None, accept str
+            # — the dataclass field type carries the runtime intent.
+            p.add_argument(flag, type=str, default=None)
+        elif isinstance(default, int) and not isinstance(default, bool):
+            p.add_argument(flag, type=int, default=default)
+        elif isinstance(default, float):
+            p.add_argument(flag, type=float, default=default)
+        else:
+            p.add_argument(flag, type=str, default=default)
+    return p
+
+
+def parse_cli(argv: list[str] | None = None) -> Config:
+    """Parse argv into a Config. Optional fields stay None when omitted."""
+    ns = _build_parser().parse_args(argv)
+    raw = vars(ns)
+
+    # Re-cast Optional[int] CLI strings back to int.
+    for f in fields(Config):
+        if f.name == "model_name":
+            continue
+        v = raw.get(f.name)
+        if v is None:
+            continue
+        # quant_stop_layer is Optional[int]; CLI gave us a str.
+        if f.name == "quant_stop_layer" and isinstance(v, str):
+            raw[f.name] = int(v)
+    return Config(**raw)
