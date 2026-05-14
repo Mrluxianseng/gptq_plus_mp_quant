@@ -39,6 +39,7 @@ from realq.precompute import cache as cache_mod
 from realq.precompute import hooks as hooks_mod
 from realq.precompute.labels import deterministic_categorical_labels
 from realq.utils import memory as mem_utils
+from realq.utils import nvtx
 from utils import data_utils, dist_utils
 
 if TYPE_CHECKING:
@@ -159,74 +160,77 @@ def run(cfg: "Config", analyzer: "ModelAnalyzer") -> StaticStats:
 
     # 1. Cache lookup.
     if cfg.static_cache_path:
-        key = cache_mod.build_cache_key(cfg, world)
-        cached = cache_mod.try_load(cfg.static_cache_path, key, world, rank)
-        if cached is not None:
-            logging.info(
-                "[realq.precompute] cache hit (rank %d): %s",
-                rank, cache_mod.cache_path(cfg.static_cache_path, key, world, rank),
-            )
-            return StaticStats(saliency=cached["saliency"], fisher=cached["fisher"])
+        with nvtx.nvtx_range("precompute.cache_lookup"):
+            key = cache_mod.build_cache_key(cfg, world)
+            cached = cache_mod.try_load(cfg.static_cache_path, key, world, rank)
+            if cached is not None:
+                logging.info(
+                    "[realq.precompute] cache hit (rank %d): %s",
+                    rank, cache_mod.cache_path(cfg.static_cache_path, key, world, rank),
+                )
+                return StaticStats(saliency=cached["saliency"], fisher=cached["fisher"])
 
     # 2. Calibration data, sharded per rank.
-    tokens_save_path = None
-    if cfg.tokens_cache_path:
-        # data_utils.get_tokens expects a file path; build one keyed by the
-        # arguments that change tokenisation output.
-        import os as _os
-        tokens_save_path = _os.path.join(
-            cfg.tokens_cache_path,
-            f"{cfg.model_name}_{cfg.dataset}_train_n{cfg.nsamples}_sl{cfg.seq_len}_seed{cfg.seed}.pt",
+    with nvtx.nvtx_range("precompute.load_data"):
+        tokens_save_path = None
+        if cfg.tokens_cache_path:
+            # data_utils.get_tokens expects a file path; build one keyed by the
+            # arguments that change tokenisation output.
+            import os as _os
+            tokens_save_path = _os.path.join(
+                cfg.tokens_cache_path,
+                f"{cfg.model_name}_{cfg.dataset}_train_n{cfg.nsamples}_sl{cfg.seq_len}_seed{cfg.seed}.pt",
+            )
+        trainloader = data_utils.get_tokens(
+            cfg.dataset, "train", analyzer.tokenizer,
+            cfg.seq_len, cfg.nsamples,
+            tokens_save_path, cfg.seed,
         )
-    trainloader = data_utils.get_tokens(
-        cfg.dataset, "train", analyzer.tokenizer,
-        cfg.seq_len, cfg.nsamples,
-        tokens_save_path, cfg.seed,
-    )
-    # get_tokens returns 1D LongTensors of length seq_len.
-    rank_samples = _shard_local_calibration(trainloader, rank, world)
-    n_local = len(rank_samples)
-    if n_local == 0:
-        raise RuntimeError(
-            f"[realq.precompute] rank {rank} got 0 calibration samples — bump nsamples."
-        )
+        # get_tokens returns 1D LongTensors of length seq_len.
+        rank_samples = _shard_local_calibration(trainloader, rank, world)
+        n_local = len(rank_samples)
+        if n_local == 0:
+            raise RuntimeError(
+                f"[realq.precompute] rank {rank} got 0 calibration samples — bump nsamples."
+            )
 
-    if cfg.global_loss_bsz % world != 0:
-        raise ValueError(
-            f"global_loss_bsz ({cfg.global_loss_bsz}) must be divisible by "
-            f"world_size ({world})."
-        )
-    local_bsz = max(1, cfg.global_loss_bsz // world)
+        if cfg.global_loss_bsz % world != 0:
+            raise ValueError(
+                f"global_loss_bsz ({cfg.global_loss_bsz}) must be divisible by "
+                f"world_size ({world})."
+            )
+        local_bsz = max(1, cfg.global_loss_bsz // world)
 
     # 3. Move model to GPU and switch to grad-enabled mode.
-    dev = torch.device(f"cuda:{torch.cuda.current_device()}")
-    model = analyzer.model
-    use_cache = model.config.use_cache
-    model.config.use_cache = False
-    model.to(dev)
-    # model.eval(): match old gptq_plus_utils.py:4631 line-for-line. Even
-    # though Qwen3 has no dropout / BatchNorm so train vs eval should be a
-    # no-op, the precompute saliency on Qwen3-0.6B comes out off by ~0.3-
-    # 0.5% per batch under model.train() vs model.eval() (cuBLAS picks a
-    # different attention kernel under model.training=True), and that off-
-    # by-0.5% saliency cascades into a ~5e-2 max-diff in the quantised
-    # weight after Hessian-weighted block update. Forcing eval mode (which
-    # is what old code does) restores bit-exactness with the legacy
-    # reference at lr=0 on 1-GPU AND 2-GPU configurations.
-    model.eval()
-    prev_requires_grad = _freeze_model_params(model)
+    with nvtx.nvtx_range("precompute.model_setup"):
+        dev = torch.device(f"cuda:{torch.cuda.current_device()}")
+        model = analyzer.model
+        use_cache = model.config.use_cache
+        model.config.use_cache = False
+        model.to(dev)
+        # model.eval(): match old gptq_plus_utils.py:4631 line-for-line. Even
+        # though Qwen3 has no dropout / BatchNorm so train vs eval should be a
+        # no-op, the precompute saliency on Qwen3-0.6B comes out off by ~0.3-
+        # 0.5% per batch under model.train() vs model.eval() (cuBLAS picks a
+        # different attention kernel under model.training=True), and that off-
+        # by-0.5% saliency cascades into a ~5e-2 max-diff in the quantised
+        # weight after Hessian-weighted block update. Forcing eval mode (which
+        # is what old code does) restores bit-exactness with the legacy
+        # reference at lr=0 on 1-GPU AND 2-GPU configurations.
+        model.eval()
+        prev_requires_grad = _freeze_model_params(model)
 
-    # 4. Resolve modules per layer + attach hooks.
-    layers = analyzer.get_layers()
-    layer_modules = [_find_layer_modules(layer) for layer in layers]
-    sal_mgr = hooks_mod.SaliencyHookManager(
-        num_groups=cfg.num_groups,
-        clip_percentile=cfg.saliency_clip_percentile,
-    )
-    fisher_mgr = hooks_mod.FisherHookManager()
-    sal_mgr.attach(layer_modules)
-    fisher_mgr.attach(layers)
-    kick_off_handle = _register_kick_off_hook(layers[0])
+        # 4. Resolve modules per layer + attach hooks.
+        layers = analyzer.get_layers()
+        layer_modules = [_find_layer_modules(layer) for layer in layers]
+        sal_mgr = hooks_mod.SaliencyHookManager(
+            num_groups=cfg.num_groups,
+            clip_percentile=cfg.saliency_clip_percentile,
+        )
+        fisher_mgr = hooks_mod.FisherHookManager()
+        sal_mgr.attach(layer_modules)
+        fisher_mgr.attach(layers)
+        kick_off_handle = _register_kick_off_hook(layers[0])
 
     # 5. Forward + backward loop over the per-rank shard.
     iterator = range(0, n_local, local_bsz)
@@ -234,50 +238,57 @@ def run(cfg: "Config", analyzer: "ModelAnalyzer") -> StaticStats:
     if show_progress:
         iterator = tqdm(iterator, desc="Static precompute", ncols=100)
     try:
-        for local_start in iterator:
-            local_end = min(local_start + local_bsz, n_local)
-            batch_samples = rank_samples[local_start:local_end]
-            input_ids = torch.stack([s.view(-1) for s in batch_samples], dim=0).to(dev)
-            B, T = input_ids.shape
+        with nvtx.nvtx_range("precompute.fwd_bwd_loop"):
+            batch_counter = 0
+            for local_start in iterator:
+                with nvtx.nvtx_range(f"precompute.batch_{batch_counter}"):
+                    local_end = min(local_start + local_bsz, n_local)
+                    batch_samples = rank_samples[local_start:local_end]
+                    input_ids = torch.stack([s.view(-1) for s in batch_samples], dim=0).to(dev)
+                    B, T = input_ids.shape
 
-            # Per-sample global ids. Sharding is contiguous, so global id is
-            # just the local id offset by the rank's shard start.
-            shard = dist_utils.shard_slice(cfg.nsamples, rank=rank, world=world)
-            global_indices = [shard.start + local_start + i for i in range(B)]
+                    # Per-sample global ids. Sharding is contiguous, so global id is
+                    # just the local id offset by the rank's shard start.
+                    shard = dist_utils.shard_slice(cfg.nsamples, rank=rank, world=world)
+                    global_indices = [shard.start + local_start + i for i in range(B)]
 
-            model.zero_grad(set_to_none=True)
-            outputs = model(input_ids=input_ids)
-            logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
+                    model.zero_grad(set_to_none=True)
+                    with nvtx.nvtx_range("precompute.forward"):
+                        outputs = model(input_ids=input_ids)
+                        logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
 
-            if cfg.grad_hessian_topk > 0:
-                # Reduce the vocab axis for the Fisher backward; the topk
-                # picks per-position teacher tokens, student goes through
-                # the same indices. NOTE: must include the sampled label
-                # in the topk subset, but using teacher's top-k and then
-                # sampling from teacher inside that subset is consistent.
-                teacher_logits, indices = logits.detach().topk(
-                    cfg.grad_hessian_topk, dim=-1, sorted=False
-                )
-                student_logits = logits.gather(-1, indices)
-                labels = deterministic_categorical_labels(
-                    teacher_logits, global_indices, base_seed=0,
-                )
-            else:
-                student_logits = logits
-                labels = deterministic_categorical_labels(
-                    logits.detach(), global_indices, base_seed=0,
-                )
+                    with nvtx.nvtx_range("precompute.loss_compute"):
+                        if cfg.grad_hessian_topk > 0:
+                            # Reduce the vocab axis for the Fisher backward; the topk
+                            # picks per-position teacher tokens, student goes through
+                            # the same indices. NOTE: must include the sampled label
+                            # in the topk subset, but using teacher's top-k and then
+                            # sampling from teacher inside that subset is consistent.
+                            teacher_logits, indices = logits.detach().topk(
+                                cfg.grad_hessian_topk, dim=-1, sorted=False
+                            )
+                            student_logits = logits.gather(-1, indices)
+                            labels = deterministic_categorical_labels(
+                                teacher_logits, global_indices, base_seed=0,
+                            )
+                        else:
+                            student_logits = logits
+                            labels = deterministic_categorical_labels(
+                                logits.detach(), global_indices, base_seed=0,
+                            )
 
-            loss = F.cross_entropy(
-                student_logits.reshape(-1, student_logits.size(-1)),
-                labels.reshape(-1),
-                reduction="sum",
-            )
-            (loss * hooks_mod.LOSS_GRAD_SCALE).backward()
-            fisher_mgr.add_token_count(B * T)
-            # Free the autograd graph + per-step grad memory before next iter.
-            model.zero_grad(set_to_none=True)
-            del outputs, logits, student_logits, labels, loss
+                        loss = F.cross_entropy(
+                            student_logits.reshape(-1, student_logits.size(-1)),
+                            labels.reshape(-1),
+                            reduction="sum",
+                        )
+                    with nvtx.nvtx_range("precompute.backward"):
+                        (loss * hooks_mod.LOSS_GRAD_SCALE).backward()
+                    fisher_mgr.add_token_count(B * T)
+                    # Free the autograd graph + per-step grad memory before next iter.
+                    model.zero_grad(set_to_none=True)
+                    del outputs, logits, student_logits, labels, loss
+                    batch_counter += 1
     finally:
         sal_mgr.remove()
         fisher_mgr.remove()
@@ -285,33 +296,38 @@ def run(cfg: "Config", analyzer: "ModelAnalyzer") -> StaticStats:
         _restore_requires_grad(prev_requires_grad)
 
     # 6. Finalize.
-    saliency = sal_mgr.finalize()
-    fisher_sums, local_tokens = fisher_mgr.finalize()
-    total_tokens = float(dist_utils.allreduce_sum_scalar(local_tokens))
-    fisher_out: list[torch.Tensor] = []
-    for layer_idx, fisher_sum in enumerate(fisher_sums):
-        if fisher_sum is None:
-            raise RuntimeError(
-                f"[realq.precompute] layer {layer_idx} produced no Fisher accumulator."
-            )
-        parallel_reduce.allreduce_sum_(fisher_sum)
-        fisher_out.append((fisher_sum / total_tokens).to(torch.bfloat16).cpu())
-    del fisher_sums
+    with nvtx.nvtx_range("precompute.finalize_saliency"):
+        saliency = sal_mgr.finalize()
+    with nvtx.nvtx_range("precompute.fisher_allreduce"):
+        fisher_sums, local_tokens = fisher_mgr.finalize()
+        total_tokens = float(dist_utils.allreduce_sum_scalar(local_tokens))
+        fisher_out: list[torch.Tensor] = []
+        for layer_idx, fisher_sum in enumerate(fisher_sums):
+            if fisher_sum is None:
+                raise RuntimeError(
+                    f"[realq.precompute] layer {layer_idx} produced no Fisher accumulator."
+                )
+            with nvtx.nvtx_range(f"precompute.fisher_allreduce.layer_{layer_idx}"):
+                parallel_reduce.allreduce_sum_(fisher_sum)
+                fisher_out.append((fisher_sum / total_tokens).to(torch.bfloat16).cpu())
+        del fisher_sums
 
     # 7. Restore model state, free memory.
-    model.config.use_cache = use_cache
-    model.eval()
-    model.cpu()
-    mem_utils.cleanup_memory()
+    with nvtx.nvtx_range("precompute.teardown"):
+        model.config.use_cache = use_cache
+        model.eval()
+        model.cpu()
+        mem_utils.cleanup_memory()
 
     static = StaticStats(saliency=saliency, fisher=fisher_out)
 
     # 8. Cache write.
     if cfg.static_cache_path:
-        path = cache_mod.save(
-            cfg.static_cache_path, key, world, rank,
-            {"saliency": static.saliency, "fisher": static.fisher},
-        )
-        logging.info("[realq.precompute] wrote rank-%d cache → %s", rank, path)
+        with nvtx.nvtx_range("precompute.cache_write"):
+            path = cache_mod.save(
+                cfg.static_cache_path, key, world, rank,
+                {"saliency": static.saliency, "fisher": static.fisher},
+            )
+            logging.info("[realq.precompute] wrote rank-%d cache → %s", rank, path)
 
     return static

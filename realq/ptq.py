@@ -19,12 +19,14 @@ from realq import config as cfg_mod
 from realq import pipeline
 from realq.parallel import env as parallel_env
 from realq.utils import log as log_utils
+from realq.utils import nvtx as nvtx_utils
 
 torch.backends.cuda.matmul.allow_tf32 = False
 
 
 def main() -> None:
     cfg = cfg_mod.parse_cli()
+    nvtx_utils.set_enabled(cfg.nsys_profile)
     log_utils.init(cfg.output_dir, cfg.exp)
     parallel_env.init()
     pipeline.run(cfg)

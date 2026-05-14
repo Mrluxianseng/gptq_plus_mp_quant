@@ -148,6 +148,11 @@ class Config:
 
     # ----- debug ----------------------------------------------------------
     quant_stop_layer: Optional[int] = None
+    # When True, emit NVTX ranges for every major pipeline phase so that
+    # `nsys profile -t cuda,nvtx ...` traces can be inspected. Off by
+    # default — when off, the wrapper is a nullcontext (no behavior change,
+    # no synchronization, no allocation).
+    nsys_profile: bool = False
 
     # ----- output ---------------------------------------------------------
     save_qmodel_path: Optional[str] = None

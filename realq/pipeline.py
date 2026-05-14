@@ -23,6 +23,7 @@ import torch.distributed as dist
 from realq import akv, fsdp as realq_fsdp, precompute, runner
 from realq.parallel import env as parallel_env
 from realq.utils import memory as mem_utils
+from realq.utils import nvtx
 from utils import data_utils, eval_utils, model_utils, quant_utils, rotation_utils
 
 if TYPE_CHECKING:
@@ -78,30 +79,36 @@ def run(cfg: "Config") -> None:
     """End-to-end RealQ pipeline."""
     if cfg.cpu_master:
         return _run_cpu_master(cfg)
-    analyzer = model_utils.ModelAnalyzer(cfg.model, cfg.seq_len)
+    with nvtx.nvtx_range("ptq.load_model"):
+        analyzer = model_utils.ModelAnalyzer(cfg.model, cfg.seq_len)
 
     # 1. Reference logits (must be captured BEFORE rotate — KL eval compares
     # quantised lm_head against the unrotated lm_head).
     test_loaders = ref_logits = orig_lm_head = None
     if not cfg.skip_eval:
-        test_loaders, ref_logits, orig_lm_head = _setup_eval(cfg, analyzer)
+        with nvtx.nvtx_range("ptq.ref_logits"):
+            test_loaders, ref_logits, orig_lm_head = _setup_eval(cfg, analyzer)
 
     # 2. Rotate (optional)
-    _maybe_rotate(cfg, analyzer)
+    with nvtx.nvtx_range("ptq.rotate"):
+        _maybe_rotate(cfg, analyzer)
 
     # 2b. Aware AKV setup: install + configure the activation/K-cache wrappers
     # BEFORE weight GPTQ runs so the per-linear Hessian forward sees the
     # quantised input. Unaware paths defer this to step 6.
-    akv.setup_aware_pre_quant(analyzer, cfg)
+    with nvtx.nvtx_range("ptq.akv_setup_pre_quant"):
+        akv.setup_aware_pre_quant(analyzer, cfg)
 
     # 2c. FSDP single-stage wrap: shard the (rotated, possibly aware-AKV-
     # configured) model across all visible GPUs so the precompute backward
     # fits memory budgets that don't admit a full replica per rank.
     if cfg.fsdp:
-        realq_fsdp.fsdp_wrap_for_precompute(analyzer, cfg)
+        with nvtx.nvtx_range("ptq.fsdp_wrap"):
+            realq_fsdp.fsdp_wrap_for_precompute(analyzer, cfg)
 
     # 3. Static precompute (saliency + Fisher).
-    static = precompute.run(cfg, analyzer)
+    with nvtx.nvtx_range("ptq.precompute"):
+        static = precompute.run(cfg, analyzer)
     logging.info(
         "[realq] precompute done: %d layers, saliency[0] modules=%s, fisher[0].shape=%s",
         len(static.fisher),
@@ -117,22 +124,23 @@ def run(cfg: "Config") -> None:
     # rank-local and produces an unwrapped, CPU-resident model that the
     # per-layer streaming quant phase consumes one block at a time.
     if cfg.fsdp:
-        ckpt_dir = realq_fsdp.save_post_precompute_checkpoint(analyzer, cfg)
-        analyzer = realq_fsdp.reload_on_cpu(analyzer, ckpt_dir)
-        # Reinstall ActQuantWrapper sites on the freshly-loaded model — the
-        # checkpoint stored only the inner Linear weights without wrappers.
-        # Re-applying the rotation wrappers (which install had_K on down_proj
-        # so the next stage's activation gets the inverse Hadamard) is
-        # necessary when ``cfg.rotate=True``: the saved weights are already
-        # rotated, but the runtime activation rotators are NOT in state and
-        # must be re-attached. ``add_activation_quant_wrappers_for_rotation``
-        # is an idempotent install (same model flag guard as before), so it
-        # only sets the had_K buffers; weight values stay as-is.
-        if cfg.rotate:
-            rotation_utils.add_activation_quant_wrappers_for_rotation(analyzer)
-        else:
-            akv.install_actquant_wrappers(analyzer)
-        akv.setup_aware_pre_quant(analyzer, cfg)
+        with nvtx.nvtx_range("ptq.fsdp_unwrap"):
+            ckpt_dir = realq_fsdp.save_post_precompute_checkpoint(analyzer, cfg)
+            analyzer = realq_fsdp.reload_on_cpu(analyzer, ckpt_dir)
+            # Reinstall ActQuantWrapper sites on the freshly-loaded model — the
+            # checkpoint stored only the inner Linear weights without wrappers.
+            # Re-applying the rotation wrappers (which install had_K on down_proj
+            # so the next stage's activation gets the inverse Hadamard) is
+            # necessary when ``cfg.rotate=True``: the saved weights are already
+            # rotated, but the runtime activation rotators are NOT in state and
+            # must be re-attached. ``add_activation_quant_wrappers_for_rotation``
+            # is an idempotent install (same model flag guard as before), so it
+            # only sets the had_K buffers; weight values stay as-is.
+            if cfg.rotate:
+                rotation_utils.add_activation_quant_wrappers_for_rotation(analyzer)
+            else:
+                akv.install_actquant_wrappers(analyzer)
+            akv.setup_aware_pre_quant(analyzer, cfg)
 
     # 4. Quantise.
     # Reuse the same calibration tokens that drove precompute (same key, so
@@ -143,33 +151,39 @@ def run(cfg: "Config") -> None:
             cfg.tokens_cache_path,
             f"{cfg.model_name}_{cfg.dataset}_train_n{cfg.nsamples}_sl{cfg.seq_len}_seed{cfg.seed}.pt",
         )
-    trainloader = data_utils.get_tokens(
-        cfg.dataset, "train", analyzer.tokenizer,
-        cfg.seq_len, cfg.nsamples, tokens_save_path, cfg.seed,
-    )
-    runner.quantize_all_layers(cfg, analyzer, static, trainloader)
+    with nvtx.nvtx_range("ptq.load_calibration_tokens"):
+        trainloader = data_utils.get_tokens(
+            cfg.dataset, "train", analyzer.tokenizer,
+            cfg.seq_len, cfg.nsamples, tokens_save_path, cfg.seed,
+        )
+    with nvtx.nvtx_range("ptq.quant_loop"):
+        runner.quantize_all_layers(cfg, analyzer, static, trainloader)
 
     if cfg.save_qmodel_path and parallel_env.is_main():
-        os.makedirs(os.path.dirname(cfg.save_qmodel_path) or ".", exist_ok=True)
-        torch.save({"model": analyzer.model.state_dict()}, cfg.save_qmodel_path)
-        logging.info("[realq] quantised state_dict saved → %s", cfg.save_qmodel_path)
+        with nvtx.nvtx_range("ptq.save_qmodel"):
+            os.makedirs(os.path.dirname(cfg.save_qmodel_path) or ".", exist_ok=True)
+            torch.save({"model": analyzer.model.state_dict()}, cfg.save_qmodel_path)
+            logging.info("[realq] quantised state_dict saved → %s", cfg.save_qmodel_path)
 
     # 5. Unaware AKV setup: configure the wrappers AFTER weight GPTQ when
     # ``act_quant_aware_gptq=False`` / ``k_cache_quant_aware_gptq=False``.
     # The wrappers were already installed by the rotate path or by
     # ``setup_aware_pre_quant``; this only pushes the quant params.
-    akv.setup_unaware_post_quant(analyzer, cfg)
+    with nvtx.nvtx_range("ptq.akv_setup_post_quant"):
+        akv.setup_unaware_post_quant(analyzer, cfg)
 
     # 6. Eval (PPL/KL)
     if not cfg.skip_eval:
-        analyzer.model.cpu()
-        eval_utils.kl_ppl_eval(cfg, analyzer, orig_lm_head, test_loaders, ref_logits)
+        with nvtx.nvtx_range("ptq.eval_kl_ppl"):
+            analyzer.model.cpu()
+            eval_utils.kl_ppl_eval(cfg, analyzer, orig_lm_head, test_loaders, ref_logits)
 
     # 7. Optional lm_eval QA tasks (Stage 2 — runs on rank 0 only).
     if getattr(cfg, "lm_eval", False) and parallel_env.is_main():
         # ``qa_eval`` dispatches the model across all visible GPUs via
         # accelerate; rank 0 alone is enough for the eval driver.
-        eval_utils.qa_eval(analyzer.model, analyzer.tokenizer, cfg.lm_eval_batch_size)
+        with nvtx.nvtx_range("ptq.eval_lm_eval"):
+            eval_utils.qa_eval(analyzer.model, analyzer.tokenizer, cfg.lm_eval_batch_size)
 
     if parallel_env.is_dist_available_and_initialized():
         parallel_env.barrier()

@@ -18,6 +18,7 @@ import torch.nn.functional as F
 from torch.func import functional_call
 
 from realq.refresh.block_gd import _functional_weight_name
+from realq.utils import nvtx
 from utils import dist_utils
 
 if TYPE_CHECKING:
@@ -90,87 +91,102 @@ def make_kl_refresh_fn(
         # cross-rank packed allreduce REGARDLESS of whether its local
         # shard came up empty (so NCCL stays in sync and Adam step
         # counter advances uniformly across ranks).
-        ctx.adam_step += 1
-        selected_global = ctx.next_indices()
-        rank = dist_utils.get_rank()
-        n_local = inps.shape[0]
-        rank_start = rank * n_local
-        rank_end = rank_start + n_local
-        selected = [gi - rank_start for gi in selected_global if rank_start <= gi < rank_end]
-        override_dtype = module.weight.data.dtype
-        # Pre-allocate so the empty-local-shard path still allreduces a
-        # valid zeros tensor. Matches old GPTQ+ ``partial_grad_sum =
-        # torch.zeros_like(override_weight, dtype=fp32)`` at
-        # gptq_plus_utils.py:6434, hoisted ABOVE the
-        # ``if len(selected_indices) > 0`` guard.
-        partial_grad_sum = torch.zeros_like(stitched_weight_fp32)
-        partial_count = 0
-        for start in range(0, len(selected), ctx.backward_bsz):
-            batch_idx = selected[start : start + ctx.backward_bsz]
-            batch_size = len(batch_idx)
-            sample_idx = torch.tensor(batch_idx, dtype=torch.long, device=inps.device)
-            x = inps.index_select(0, sample_idx)
-            fp_target_hidden = fp_out_for_this_layer.index_select(0, sample_idx).to(x.device)
-            kw = {}
-            if am is not None:
-                kw["attention_mask"] = am.expand(batch_size, *am.shape[1:]) if am.shape[0] != batch_size else am
-            if pi is not None:
-                kw["position_ids"] = pi.expand(batch_size, -1) if pi.shape[0] != batch_size else pi
-            if pe is not None:
-                kw["position_embeddings"] = (
-                    pe[0].expand(batch_size, *pe[0].shape[1:]) if pe[0].shape[0] != batch_size else pe[0],
-                    pe[1].expand(batch_size, *pe[1].shape[1:]) if pe[1].shape[0] != batch_size else pe[1],
-                )
+        with nvtx.nvtx_range("kl_refresh.setup"):
+            ctx.adam_step += 1
+            selected_global = ctx.next_indices()
+            rank = dist_utils.get_rank()
+            n_local = inps.shape[0]
+            rank_start = rank * n_local
+            rank_end = rank_start + n_local
+            selected = [gi - rank_start for gi in selected_global if rank_start <= gi < rank_end]
+            # Pre-allocate so the empty-local-shard path still allreduces a
+            # valid zeros tensor. Matches old GPTQ+ ``partial_grad_sum =
+            # torch.zeros_like(override_weight, dtype=fp32)`` at
+            # gptq_plus_utils.py:6434, hoisted ABOVE the
+            # ``if len(selected_indices) > 0`` guard.
+            partial_grad_sum = torch.zeros_like(stitched_weight_fp32)
+            partial_count = 0
+            # Cast stitched fp32 weight to module dtype ONCE per refresh and
+            # reuse the bf16 leaf across all backward batches. ``autograd.grad``
+            # doesn't touch ``.grad``, so reusing one leaf across multiple
+            # backwards is safe. Mirrors block_gd.refresh's hoist; matches old
+            # GPTQ+ ``collect_true_weight_gradient`` line 6420-6433.
+            override_dtype = module.weight.data.dtype
             override_weight = stitched_weight_fp32.to(override_dtype).requires_grad_(True)
-            with torch.enable_grad():
-                out = functional_call(
-                    layer,
-                    {weight_name: override_weight},
-                    (x,),
-                    kw,
-                    strict=False,
-                )
-                q_hidden = out[0] if isinstance(out, tuple) else out
-                loss = kl_topk_loss(q_hidden, fp_target_hidden, analyzer, kl_topk)
-                (batch_grad,) = torch.autograd.grad(loss, override_weight, retain_graph=False)
-            batch_grad_fp32 = batch_grad.detach().float()
-            partial_grad_sum.add_(batch_grad_fp32, alpha=float(batch_size))
-            partial_count += batch_size
+        iter_idx = 0
+        for start in range(0, len(selected), ctx.backward_bsz):
+            with nvtx.nvtx_range(f"kl_refresh.iter_{iter_idx}"):
+                batch_idx = selected[start : start + ctx.backward_bsz]
+                batch_size = len(batch_idx)
+                sample_idx = torch.tensor(batch_idx, dtype=torch.long, device=inps.device)
+                x = inps.index_select(0, sample_idx)
+                fp_target_hidden = fp_out_for_this_layer.index_select(0, sample_idx).to(x.device)
+                kw = {}
+                if am is not None:
+                    kw["attention_mask"] = am.expand(batch_size, *am.shape[1:]) if am.shape[0] != batch_size else am
+                if pi is not None:
+                    kw["position_ids"] = pi.expand(batch_size, -1) if pi.shape[0] != batch_size else pi
+                if pe is not None:
+                    kw["position_embeddings"] = (
+                        pe[0].expand(batch_size, *pe[0].shape[1:]) if pe[0].shape[0] != batch_size else pe[0],
+                        pe[1].expand(batch_size, *pe[1].shape[1:]) if pe[1].shape[0] != batch_size else pe[1],
+                    )
+                with torch.enable_grad():
+                    with nvtx.nvtx_range("kl_refresh.forward"):
+                        out = functional_call(
+                            layer,
+                            {weight_name: override_weight},
+                            (x,),
+                            kw,
+                            strict=False,
+                        )
+                        q_hidden = out[0] if isinstance(out, tuple) else out
+                    with nvtx.nvtx_range("kl_refresh.loss"):
+                        loss = kl_topk_loss(q_hidden, fp_target_hidden, analyzer, kl_topk)
+                    with nvtx.nvtx_range("kl_refresh.backward"):
+                        (batch_grad,) = torch.autograd.grad(loss, override_weight, retain_graph=False)
+                with nvtx.nvtx_range("kl_refresh.accumulate"):
+                    batch_grad_fp32 = batch_grad.detach().float()
+                    partial_grad_sum.add_(batch_grad_fp32, alpha=float(batch_size))
+                    partial_count += batch_size
+                iter_idx += 1
         # All-reduce ALWAYS (even with partial_count == 0) so NCCL stays
         # synchronised across ranks under global-shuffle load imbalance.
-        if dist_utils.get_world_size() > 1:
-            global_count_t = torch.tensor(
-                [float(partial_count)],
-                dtype=partial_grad_sum.dtype,
-                device=partial_grad_sum.device,
-            )
-            grad_flat = partial_grad_sum.reshape(-1)
-            packed = torch.cat([grad_flat, global_count_t])
-            dist_utils.allreduce_sum_(packed)
-            partial_grad_sum.copy_(packed[:grad_flat.numel()].view_as(partial_grad_sum))
-            global_count = int(packed[-1].item())
-        else:
-            global_count = partial_count
-        accum_grad = partial_grad_sum / float(global_count)
-        # act_order: re-key natural-order grad → permuted column order so the
-        # Adam state slice matches old GPTQ+ subgroup state. See block_gd.py
-        # for the full rationale.
-        if perm is not None:
-            accum_grad = accum_grad[:, perm]
-        grad_slice = accum_grad[:, trailing_col_start:]
-        if ctx.grad_clip > 0:
-            grad_slice = grad_slice.clamp(min=-ctx.grad_clip, max=ctx.grad_clip)
-        ea = ctx.exp_avg[:, trailing_col_start:]
-        ev = ctx.exp_avg_sq[:, trailing_col_start:]
-        ea.mul_(ctx.beta1).add_(grad_slice, alpha=1.0 - ctx.beta1)
-        ev.mul_(ctx.beta2).addcmul_(grad_slice, grad_slice, value=1.0 - ctx.beta2)
-        bc1 = 1.0 - ctx.beta1 ** ctx.adam_step
-        bc2 = 1.0 - ctx.beta2 ** ctx.adam_step
-        # Match old order: sqrt(ev) / sqrt(bc2) + eps  (NOT sqrt(ev / bc2)).
-        denom = ev.sqrt() / math.sqrt(bc2)
-        denom.add_(ctx.eps)
-        step_size = ctx.layer_lr / bc1
-        update = step_size * (ea / denom)
-        return update
+        with nvtx.nvtx_range("kl_refresh.grad_allreduce"):
+            if dist_utils.get_world_size() > 1:
+                global_count_t = torch.tensor(
+                    [float(partial_count)],
+                    dtype=partial_grad_sum.dtype,
+                    device=partial_grad_sum.device,
+                )
+                grad_flat = partial_grad_sum.reshape(-1)
+                packed = torch.cat([grad_flat, global_count_t])
+                dist_utils.allreduce_sum_(packed)
+                partial_grad_sum.copy_(packed[:grad_flat.numel()].view_as(partial_grad_sum))
+                global_count = int(packed[-1].item())
+            else:
+                global_count = partial_count
+            accum_grad = partial_grad_sum / float(global_count)
+        with nvtx.nvtx_range("kl_refresh.adam_step"):
+            # act_order: re-key natural-order grad → permuted column order so the
+            # Adam state slice matches old GPTQ+ subgroup state. See block_gd.py
+            # for the full rationale.
+            if perm is not None:
+                accum_grad = accum_grad[:, perm]
+            grad_slice = accum_grad[:, trailing_col_start:]
+            if ctx.grad_clip > 0:
+                grad_slice = grad_slice.clamp(min=-ctx.grad_clip, max=ctx.grad_clip)
+            ea = ctx.exp_avg[:, trailing_col_start:]
+            ev = ctx.exp_avg_sq[:, trailing_col_start:]
+            ea.mul_(ctx.beta1).add_(grad_slice, alpha=1.0 - ctx.beta1)
+            ev.mul_(ctx.beta2).addcmul_(grad_slice, grad_slice, value=1.0 - ctx.beta2)
+            bc1 = 1.0 - ctx.beta1 ** ctx.adam_step
+            bc2 = 1.0 - ctx.beta2 ** ctx.adam_step
+            # Match old order: sqrt(ev) / sqrt(bc2) + eps  (NOT sqrt(ev / bc2)).
+            denom = ev.sqrt() / math.sqrt(bc2)
+            denom.add_(ctx.eps)
+            step_size = ctx.layer_lr / bc1
+            update = step_size * (ea / denom)
+            return update
 
     return refresh

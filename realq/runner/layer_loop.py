@@ -36,6 +36,7 @@ from realq.refresh.block_gd import (
 from realq.refresh.kl_loss import make_kl_refresh_fn
 from realq.runner import module_groups, streams
 from realq.utils import memory as mem_utils
+from realq.utils import nvtx
 from utils import dist_utils, quant_utils
 
 if TYPE_CHECKING:
@@ -87,24 +88,29 @@ def _accumulate_hessian_for_group(
         am = state.attention_mask
         pi = state.position_ids
         pe = state.position_embeddings
-        for j in range(0, n, hessian_accum_bsz):
-            b = min(hessian_accum_bsz, n - j)
-            kw = {}
-            if am is not None:
-                kw["attention_mask"] = am.expand(b, *am.shape[1:]) if am.shape[0] != b else am
-            if pi is not None:
-                kw["position_ids"] = pi.expand(b, -1) if pi.shape[0] != b else pi
-            if pe is not None:
-                kw["position_embeddings"] = (
-                    pe[0].expand(b, *pe[0].shape[1:]) if pe[0].shape[0] != b else pe[0],
-                    pe[1].expand(b, *pe[1].shape[1:]) if pe[1].shape[0] != b else pe[1],
-                )
-            _ = layer(state.inps[j : j + b], **kw)
+        with nvtx.nvtx_range("hessian.forward_loop"):
+            chunk_idx = 0
+            for j in range(0, n, hessian_accum_bsz):
+                with nvtx.nvtx_range(f"hessian.chunk_{chunk_idx}"):
+                    b = min(hessian_accum_bsz, n - j)
+                    kw = {}
+                    if am is not None:
+                        kw["attention_mask"] = am.expand(b, *am.shape[1:]) if am.shape[0] != b else am
+                    if pi is not None:
+                        kw["position_ids"] = pi.expand(b, -1) if pi.shape[0] != b else pi
+                    if pe is not None:
+                        kw["position_embeddings"] = (
+                            pe[0].expand(b, *pe[0].shape[1:]) if pe[0].shape[0] != b else pe[0],
+                            pe[1].expand(b, *pe[1].shape[1:]) if pe[1].shape[0] != b else pe[1],
+                        )
+                    _ = layer(state.inps[j : j + b], **kw)
+                    chunk_idx += 1
     finally:
         for h in handles:
             h.remove()
-    for r in realqs.values():
-        r.finalize_hessian()
+    with nvtx.nvtx_range("hessian.finalize"):
+        for r in realqs.values():
+            r.finalize_hessian()
 
 
 @torch.no_grad()
@@ -135,253 +141,275 @@ def quantize_one_layer(
     has meta-tensor weights so plain ``.to(dev)`` would crash. None or
     ``layer_manager.enabled=False`` ⇒ identical to plain ``.to`` calls.
     """
-    use_manager = layer_manager is not None and layer_manager.enabled
-    if use_manager:
-        layer = layer_manager.materialize_layer(layer_idx)
-    else:
-        layer.to(dev)
-    saliency_for_layer = static.saliency[layer_idx]
+    with nvtx.nvtx_range(f"layer_{layer_idx}"):
+        use_manager = layer_manager is not None and layer_manager.enabled
+        with nvtx.nvtx_range("layer.materialize"):
+            if use_manager:
+                layer = layer_manager.materialize_layer(layer_idx)
+            else:
+                layer.to(dev)
+        saliency_for_layer = static.saliency[layer_idx]
 
-    # Pre-compute the FP-reference forward of THIS layer BEFORE any of its
-    # weights get mutated. ``fp_outs`` becomes ``state.fp_inps`` for the
-    # next layer; refresh closures slice it per backward batch as the
-    # fisher_mse target. ``bsz=1`` matches old GPTQ+
-    # ``layer.fp_reference_forward`` (gptq_plus_utils.py:8262-8268) which
-    # runs ``fp_inps[j] = layer(fp_inps[j].unsqueeze(0))`` per sample.
-    # cuBLAS attention picks a different bf16 kernel for batch>1 vs batch=1
-    # so ``fp_outs`` ULP-drifts from old's whenever bsz>1; the drift then
-    # propagates into every refresh's ``fp_target``.
-    fp_outs = streams.replay_layer(layer, state, bsz=1, inps=state.fp_inps)
+        # Pre-compute the FP-reference forward of THIS layer BEFORE any of its
+        # weights get mutated. ``fp_outs`` becomes ``state.fp_inps`` for the
+        # next layer; refresh closures slice it per backward batch as the
+        # fisher_mse target. ``bsz=1`` matches old GPTQ+
+        # ``layer.fp_reference_forward`` (gptq_plus_utils.py:8262-8268) which
+        # runs ``fp_inps[j] = layer(fp_inps[j].unsqueeze(0))`` per sample.
+        # cuBLAS attention picks a different bf16 kernel for batch>1 vs batch=1
+        # so ``fp_outs`` ULP-drifts from old's whenever bsz>1; the drift then
+        # propagates into every refresh's ``fp_target``.
+        with nvtx.nvtx_range("layer.fp_replay"):
+            fp_outs = streams.replay_layer(layer, state, bsz=1, inps=state.fp_inps)
 
-    # loss_slide_window: pre-stage next_layer to GPU and forward
-    # ``fp_outs`` (the FP forward output of THIS layer) through it once to
-    # cache the FP next-layer reference. Old GPTQ+ ``slide_fp_inps_next``
-    # (lines 8291-8300, 8353-8361) updates ``fp_inps`` in place to
-    # ``layer_FP(fp_inps)`` at the start of each layer's iteration, then
-    # computes ``slide_next_layer(fp_inps)`` — i.e. the next-layer FP
-    # baseline already includes the current layer's FP forward. ``fp_outs``
-    # in our code is the same quantity, so feeding it to next_layer here
-    # mirrors old exactly. Earlier RealQ versions fed ``state.fp_inps``
-    # directly (skipping the current layer's FP forward), producing a
-    # next-layer baseline 10×+ smaller than old's and the slide-arm loss
-    # 4-5 orders of magnitude too large.
-    next_fp_outs = None
-    if cfg.loss_slide_window and next_layer is not None and next_fp_inps is not None:
-        if use_manager:
-            next_layer = layer_manager.materialize_layer(layer_idx + 1)
-        else:
-            next_layer.to(dev)
-        # bsz=1: match old GPTQ+ ``slide_fp_inps_next`` per-sample loop
-        # (gptq_plus_utils.py:8355-8361). cuBLAS attention picks a different
-        # bf16 kernel for batch>1 vs batch=1; using ``hessian_accum_bsz``
-        # here lets next-layer FP target drift ULP-wise from old's, which
-        # propagates through every slide-arm refresh gradient.
-        next_fp_outs = streams.replay_layer(
-            next_layer, state, bsz=1, inps=fp_outs,
-        )
-
-    # Layer-wise lr (cosine schedule) — same for every module in this layer.
-    # The last transformer layer can opt in to a separate base lr via
-    # ``cfg.final_layer_grad_lr``; loss formula still falls back to
-    # fisher_mse for sub-task simplicity (KL-vs-ref_logits override is
-    # documented as a follow-up in REFACTOR_NOTES.md).
-    is_final_layer = (layer_idx == num_layers - 1)
-    base_lr = cfg.grad_lr
-    if is_final_layer and cfg.final_layer_grad_lr is not None:
-        base_lr = float(cfg.final_layer_grad_lr)
-    layer_lr = layer_lr_for_schedule(
-        base_lr, layer_idx, num_layers,
-        cfg.grad_lr_layer_base_ratio, cfg.grad_lr_layer_schedule,
-    )
-    block_gd_enabled = base_lr > 0
-    # Final layer drops the fisher_mse loss for the more accurate
-    # KL-vs-real-time-FP-logits loss (matches old GPTQ+ ``--grad_refresh_loss=kl``
-    # semantics for the final layer when ``final_layer_grad_lr`` is set).
-    # Requires lm_head + final norm on the same device as ``layer``.
-    use_kl_refresh = is_final_layer and block_gd_enabled and analyzer is not None
-    if use_kl_refresh:
-        if use_manager:
-            layer_manager.materialize_runtime_modules(
-                [analyzer.get_layernorm_before_head(), analyzer.get_lm_head()]
-            )
-        else:
-            analyzer.get_layernorm_before_head().to(dev)
-            analyzer.get_lm_head().to(dev)
-
-    # Slide α schedule: at the FIRST refresh in the layer α=1, at the LAST
-    # α=0. Total refreshes in the layer = sum over modules of
-    # (cols/blocksize - 1).
-    slide_total_refreshes = 0
-    if cfg.loss_slide_window and next_layer is not None:
-        for grp in module_groups.GROUP_ORDER:
-            mods = module_groups.get_group_modules(layer, grp)
-            for _, mod in mods.items():
-                cols = mod.weight.shape[1]
-                n_blocks = (cols + cfg.blocksize - 1) // cfg.blocksize
-                slide_total_refreshes += max(n_blocks - 1, 0)
-    slide_cursor = {"n": 0}  # advances by 1 per refresh CALL across all modules
-
-    if block_gd_enabled:
-        # functional_call inside the refresh closure carries the override
-        # weight's requires_grad; module params themselves stay False so
-        # autograd doesn't waste time computing their grads. (Any param
-        # left requires_grad=True would still produce the right gradient
-        # for module.weight, but at the cost of wasted backward work.)
-        for p in layer.parameters():
-            p.requires_grad_(False)
-        if next_layer is not None and cfg.loss_slide_window:
-            for p in next_layer.parameters():
-                p.requires_grad_(False)
-        if use_kl_refresh:
-            for p in analyzer.get_layernorm_before_head().parameters():
-                p.requires_grad_(False)
-            for p in analyzer.get_lm_head().parameters():
-                p.requires_grad_(False)
-
-    # Pre-stage the per-layer Fisher to GPU ONCE (reused across all modules in
-    # this layer's refresh closures). Calling ``.to(dev)`` lazily inside each
-    # ``make_grad_refresh_fn`` invocation perturbs the GPU memory pool (each
-    # call mints a fresh 2 MB tensor right before ``realq.quantize`` runs the
-    # next module's inner block + outer compensation), and the resulting
-    # cuBLAS workspace shifts produce ULP-level diffs in the bmm-driven outer
-    # compensation that diverge from the legacy reference (~1e-2 max-diff
-    # propagated through later refreshes). Hoisting the alloc here keeps the
-    # GPU memory layout deterministic across all per-module quantize calls.
-    fisher_dev = static.fisher[layer_idx].to(dev) if block_gd_enabled else None
-
-    for grp in module_groups.GROUP_ORDER:
-        modules = module_groups.get_group_modules(layer, grp)
-        # Build one RealQLayer per module in this group, sharing the layer's
-        # static saliency entry for that module.
-        realqs = {}
-        for name, mod in modules.items():
-            r = RealQLayer(
-                linear=mod,
-                saliency=saliency_for_layer[name],
-                quantizer=_make_quantizer(cfg),
-                num_groups=cfg.num_groups,
-                dev=dev,
-                group_parallel_quant=cfg.group_parallel_quant,
-            )
-            realqs[name] = r
-        _accumulate_hessian_for_group(
-            layer, modules, realqs, state, cfg.hessian_accum_bsz,
-        )
-        # Quantise each module in the group; subsequent groups will see the
-        # mutated weights when they re-forward the layer.
-        for name, realq in realqs.items():
-            grad_refresh_fn = None
-            if block_gd_enabled:
-                # Single shared sample scheduler across all layers + modules.
-                # Old code creates one ``BackwardSampleScheduler`` for the
-                # whole model (line 7882) and every refresh draws the next
-                # chunk from the same cursor. Replicating per-(layer,module)
-                # made every module replay [0..bsz), which gave the wrong
-                # gradient signal.
-                if sample_scheduler is None:
-                    raise RuntimeError(
-                        "block_gd is enabled but no shared sample scheduler "
-                        "was passed in. Quantize via quantize_all_layers, "
-                        "which constructs the scheduler once."
-                    )
-                ctx = RefreshContext(
-                    module=realq.linear,
-                    layer_lr=layer_lr,
-                    grad_clip=cfg.grad_clip,
-                    backward_bsz=cfg.backward_bsz,
-                    scheduler=sample_scheduler,
+        # loss_slide_window: pre-stage next_layer to GPU and forward
+        # ``fp_outs`` (the FP forward output of THIS layer) through it once to
+        # cache the FP next-layer reference. Old GPTQ+ ``slide_fp_inps_next``
+        # (lines 8291-8300, 8353-8361) updates ``fp_inps`` in place to
+        # ``layer_FP(fp_inps)`` at the start of each layer's iteration, then
+        # computes ``slide_next_layer(fp_inps)`` — i.e. the next-layer FP
+        # baseline already includes the current layer's FP forward. ``fp_outs``
+        # in our code is the same quantity, so feeding it to next_layer here
+        # mirrors old exactly. Earlier RealQ versions fed ``state.fp_inps``
+        # directly (skipping the current layer's FP forward), producing a
+        # next-layer baseline 10×+ smaller than old's and the slide-arm loss
+        # 4-5 orders of magnitude too large.
+        next_fp_outs = None
+        if cfg.loss_slide_window and next_layer is not None and next_fp_inps is not None:
+            with nvtx.nvtx_range("layer.next_fp_replay"):
+                if use_manager:
+                    next_layer = layer_manager.materialize_layer(layer_idx + 1)
+                else:
+                    next_layer.to(dev)
+                # bsz=1: match old GPTQ+ ``slide_fp_inps_next`` per-sample loop
+                # (gptq_plus_utils.py:8355-8361). cuBLAS attention picks a different
+                # bf16 kernel for batch>1 vs batch=1; using ``hessian_accum_bsz``
+                # here lets next-layer FP target drift ULP-wise from old's, which
+                # propagates through every slide-arm refresh gradient.
+                next_fp_outs = streams.replay_layer(
+                    next_layer, state, bsz=1, inps=fp_outs,
                 )
-                # slide_alpha closure: returns CURRENT α and advances the
-                # layer-shared cumulative refresh cursor. Must be called
-                # exactly once per refresh; tying the cursor advance to the
-                # alpha read keeps the count honest.
-                def _alpha_advance(_cursor=slide_cursor, _total=slide_total_refreshes):
-                    n = _cursor["n"]
-                    alpha = 1.0 - n / max(_total - 1, 1) if _total > 1 else 1.0
-                    _cursor["n"] = n + 1
-                    return alpha
 
-                if use_kl_refresh:
-                    grad_refresh_fn = make_kl_refresh_fn(
-                        layer=layer,
-                        module=realq.linear,
-                        layer_state=state,
-                        fp_out_for_this_layer=fp_outs,
-                        analyzer=analyzer,
-                        kl_topk=cfg.kl_topk,
-                        ctx=ctx,
+        # Layer-wise lr (cosine schedule) — same for every module in this layer.
+        # The last transformer layer can opt in to a separate base lr via
+        # ``cfg.final_layer_grad_lr``; loss formula still falls back to
+        # fisher_mse for sub-task simplicity (KL-vs-ref_logits override is
+        # documented as a follow-up in REFACTOR_NOTES.md).
+        is_final_layer = (layer_idx == num_layers - 1)
+        base_lr = cfg.grad_lr
+        if is_final_layer and cfg.final_layer_grad_lr is not None:
+            base_lr = float(cfg.final_layer_grad_lr)
+        layer_lr = layer_lr_for_schedule(
+            base_lr, layer_idx, num_layers,
+            cfg.grad_lr_layer_base_ratio, cfg.grad_lr_layer_schedule,
+        )
+        block_gd_enabled = base_lr > 0
+        # Final layer drops the fisher_mse loss for the more accurate
+        # KL-vs-real-time-FP-logits loss (matches old GPTQ+ ``--grad_refresh_loss=kl``
+        # semantics for the final layer when ``final_layer_grad_lr`` is set).
+        # Requires lm_head + final norm on the same device as ``layer``.
+        use_kl_refresh = is_final_layer and block_gd_enabled and analyzer is not None
+        if use_kl_refresh:
+            with nvtx.nvtx_range("layer.materialize_lm_head"):
+                if use_manager:
+                    layer_manager.materialize_runtime_modules(
+                        [analyzer.get_layernorm_before_head(), analyzer.get_lm_head()]
                     )
                 else:
-                    grad_refresh_fn = make_grad_refresh_fn(
-                        layer=layer,
-                        module=realq.linear,
-                        layer_state=state,
-                        fp_out_for_this_layer=fp_outs,
-                        fisher=fisher_dev,
-                        ctx=ctx,
-                        next_layer=next_layer if cfg.loss_slide_window else None,
-                        next_fp_out=next_fp_outs if cfg.loss_slide_window else None,
-                        next_fisher=(
-                            static.fisher[layer_idx + 1].to(dev)
-                            if cfg.loss_slide_window and next_layer is not None
-                            else None
-                        ),
-                        slide_alpha_fn=(
-                            _alpha_advance
-                            if cfg.loss_slide_window and next_layer is not None
-                            else None
-                        ),
-                        a_loss_ratio=cfg.a_loss_ratio,
+                    analyzer.get_layernorm_before_head().to(dev)
+                    analyzer.get_lm_head().to(dev)
+
+        # Slide α schedule: at the FIRST refresh in the layer α=1, at the LAST
+        # α=0. Total refreshes in the layer = sum over modules of
+        # (cols/blocksize - 1).
+        slide_total_refreshes = 0
+        if cfg.loss_slide_window and next_layer is not None:
+            for grp in module_groups.GROUP_ORDER:
+                mods = module_groups.get_group_modules(layer, grp)
+                for _, mod in mods.items():
+                    cols = mod.weight.shape[1]
+                    n_blocks = (cols + cfg.blocksize - 1) // cfg.blocksize
+                    slide_total_refreshes += max(n_blocks - 1, 0)
+        slide_cursor = {"n": 0}  # advances by 1 per refresh CALL across all modules
+
+        if block_gd_enabled:
+            # functional_call inside the refresh closure carries the override
+            # weight's requires_grad; module params themselves stay False so
+            # autograd doesn't waste time computing their grads. (Any param
+            # left requires_grad=True would still produce the right gradient
+            # for module.weight, but at the cost of wasted backward work.)
+            for p in layer.parameters():
+                p.requires_grad_(False)
+            if next_layer is not None and cfg.loss_slide_window:
+                for p in next_layer.parameters():
+                    p.requires_grad_(False)
+            if use_kl_refresh:
+                for p in analyzer.get_layernorm_before_head().parameters():
+                    p.requires_grad_(False)
+                for p in analyzer.get_lm_head().parameters():
+                    p.requires_grad_(False)
+
+        # Pre-stage the per-layer Fisher to GPU ONCE (reused across all modules in
+        # this layer's refresh closures). Calling ``.to(dev)`` lazily inside each
+        # ``make_grad_refresh_fn`` invocation perturbs the GPU memory pool (each
+        # call mints a fresh 2 MB tensor right before ``realq.quantize`` runs the
+        # next module's inner block + outer compensation), and the resulting
+        # cuBLAS workspace shifts produce ULP-level diffs in the bmm-driven outer
+        # compensation that diverge from the legacy reference (~1e-2 max-diff
+        # propagated through later refreshes). Hoisting the alloc here keeps the
+        # GPU memory layout deterministic across all per-module quantize calls.
+        with nvtx.nvtx_range("layer.fisher_to_gpu"):
+            fisher_dev = static.fisher[layer_idx].to(dev) if block_gd_enabled else None
+            # next-layer fisher for slide_window. Hoisted to layer entry so
+            # the H2D copy happens ONCE per layer instead of once per module
+            # (block_gd reused 6 modules × per-module ``static.fisher[...].to(dev)``
+            # before this hoist, perturbing cuBLAS workspace allocations and
+            # wasting ~12 MB H2D bandwidth per layer for Qwen3-0.6B).
+            next_fisher_dev = None
+            if (
+                block_gd_enabled
+                and cfg.loss_slide_window
+                and next_layer is not None
+            ):
+                next_fisher_dev = static.fisher[layer_idx + 1].to(dev)
+
+        for grp in module_groups.GROUP_ORDER:
+            with nvtx.nvtx_range(f"group_{grp}"):
+                modules = module_groups.get_group_modules(layer, grp)
+                # Build one RealQLayer per module in this group, sharing the layer's
+                # static saliency entry for that module.
+                with nvtx.nvtx_range("group.build_realqs"):
+                    realqs = {}
+                    for name, mod in modules.items():
+                        r = RealQLayer(
+                            linear=mod,
+                            saliency=saliency_for_layer[name],
+                            quantizer=_make_quantizer(cfg),
+                            num_groups=cfg.num_groups,
+                            dev=dev,
+                            group_parallel_quant=cfg.group_parallel_quant,
+                        )
+                        realqs[name] = r
+                with nvtx.nvtx_range("group.hessian_accum"):
+                    _accumulate_hessian_for_group(
+                        layer, modules, realqs, state, cfg.hessian_accum_bsz,
                     )
-            realq.quantize(
-                blocksize=cfg.blocksize,
-                percdamp=cfg.percdamp,
-                act_order=cfg.act_order,
-                w_clip=cfg.w_clip,
-                grad_refresh_fn=grad_refresh_fn,
-                group_parallel_quant=cfg.group_parallel_quant,
-            )
-            realq.free()
-        del realqs
+                # Quantise each module in the group; subsequent groups will see the
+                # mutated weights when they re-forward the layer.
+                for name, realq in realqs.items():
+                    with nvtx.nvtx_range(f"module_{name}"):
+                        grad_refresh_fn = None
+                        if block_gd_enabled:
+                            with nvtx.nvtx_range("module.build_refresh_fn"):
+                                # Single shared sample scheduler across all layers + modules.
+                                # Old code creates one ``BackwardSampleScheduler`` for the
+                                # whole model (line 7882) and every refresh draws the next
+                                # chunk from the same cursor. Replicating per-(layer,module)
+                                # made every module replay [0..bsz), which gave the wrong
+                                # gradient signal.
+                                if sample_scheduler is None:
+                                    raise RuntimeError(
+                                        "block_gd is enabled but no shared sample scheduler "
+                                        "was passed in. Quantize via quantize_all_layers, "
+                                        "which constructs the scheduler once."
+                                    )
+                                ctx = RefreshContext(
+                                    module=realq.linear,
+                                    layer_lr=layer_lr,
+                                    grad_clip=cfg.grad_clip,
+                                    backward_bsz=cfg.backward_bsz,
+                                    scheduler=sample_scheduler,
+                                )
+                                # slide_alpha closure: returns CURRENT α and advances the
+                                # layer-shared cumulative refresh cursor. Must be called
+                                # exactly once per refresh; tying the cursor advance to the
+                                # alpha read keeps the count honest.
+                                def _alpha_advance(_cursor=slide_cursor, _total=slide_total_refreshes):
+                                    n = _cursor["n"]
+                                    alpha = 1.0 - n / max(_total - 1, 1) if _total > 1 else 1.0
+                                    _cursor["n"] = n + 1
+                                    return alpha
 
-    if block_gd_enabled:
-        for p in layer.parameters():
-            p.requires_grad_(False)
-            p.grad = None
+                                if use_kl_refresh:
+                                    grad_refresh_fn = make_kl_refresh_fn(
+                                        layer=layer,
+                                        module=realq.linear,
+                                        layer_state=state,
+                                        fp_out_for_this_layer=fp_outs,
+                                        analyzer=analyzer,
+                                        kl_topk=cfg.kl_topk,
+                                        ctx=ctx,
+                                    )
+                                else:
+                                    grad_refresh_fn = make_grad_refresh_fn(
+                                        layer=layer,
+                                        module=realq.linear,
+                                        layer_state=state,
+                                        fp_out_for_this_layer=fp_outs,
+                                        fisher=fisher_dev,
+                                        ctx=ctx,
+                                        next_layer=next_layer if cfg.loss_slide_window else None,
+                                        next_fp_out=next_fp_outs if cfg.loss_slide_window else None,
+                                        next_fisher=next_fisher_dev,
+                                        slide_alpha_fn=(
+                                            _alpha_advance
+                                            if cfg.loss_slide_window and next_layer is not None
+                                            else None
+                                        ),
+                                        a_loss_ratio=cfg.a_loss_ratio,
+                                    )
+                        with nvtx.nvtx_range("module.quantize"):
+                            realq.quantize(
+                                blocksize=cfg.blocksize,
+                                percdamp=cfg.percdamp,
+                                act_order=cfg.act_order,
+                                w_clip=cfg.w_clip,
+                                grad_refresh_fn=grad_refresh_fn,
+                                group_parallel_quant=cfg.group_parallel_quant,
+                            )
+                        realq.free()
+                del realqs
 
-    # Final forward → produces input for next layer (all weights quantised).
-    new_inps = streams.replay_layer(layer, state, bsz=cfg.hessian_accum_bsz)
-    if use_manager:
-        layer_manager.release_layer(layer_idx, layer, orig_device=torch.device("cpu"))
-    else:
-        layer.cpu()
-    if next_layer is not None and cfg.loss_slide_window:
-        # Free the next-layer GPU copy; it'll be re-streamed when its turn
-        # comes (and quantised at that point — the FP forward we did up
-        # there was on un-mutated weights).
-        if use_manager:
-            layer_manager.release_layer(
-                layer_idx + 1, next_layer, orig_device=torch.device("cpu"),
-            )
-        else:
-            next_layer.cpu()
-    if use_kl_refresh:
-        if use_manager:
-            layer_manager.release_runtime_modules(
-                [analyzer.get_layernorm_before_head(), analyzer.get_lm_head()],
-                torch.device("cpu"),
-            )
-        else:
-            analyzer.get_layernorm_before_head().cpu()
-            analyzer.get_lm_head().cpu()
-    mem_utils.cleanup_memory()
-    return streams.LayerInputs(
-        inps=new_inps,
-        fp_inps=fp_outs,
-        attention_mask=state.attention_mask,
-        position_ids=state.position_ids,
-        position_embeddings=state.position_embeddings,
-    )
+        if block_gd_enabled:
+            for p in layer.parameters():
+                p.requires_grad_(False)
+                p.grad = None
+
+        # Final forward → produces input for next layer (all weights quantised).
+        with nvtx.nvtx_range("layer.final_replay"):
+            new_inps = streams.replay_layer(layer, state, bsz=cfg.hessian_accum_bsz)
+        with nvtx.nvtx_range("layer.teardown"):
+            if use_manager:
+                layer_manager.release_layer(layer_idx, layer, orig_device=torch.device("cpu"))
+            else:
+                layer.cpu()
+            if next_layer is not None and cfg.loss_slide_window:
+                # Free the next-layer GPU copy; it'll be re-streamed when its turn
+                # comes (and quantised at that point — the FP forward we did up
+                # there was on un-mutated weights).
+                if use_manager:
+                    layer_manager.release_layer(
+                        layer_idx + 1, next_layer, orig_device=torch.device("cpu"),
+                    )
+                else:
+                    next_layer.cpu()
+            if use_kl_refresh:
+                if use_manager:
+                    layer_manager.release_runtime_modules(
+                        [analyzer.get_layernorm_before_head(), analyzer.get_lm_head()],
+                        torch.device("cpu"),
+                    )
+                else:
+                    analyzer.get_layernorm_before_head().cpu()
+                    analyzer.get_lm_head().cpu()
+            mem_utils.cleanup_memory()
+        return streams.LayerInputs(
+            inps=new_inps,
+            fp_inps=fp_outs,
+            attention_mask=state.attention_mask,
+            position_ids=state.position_ids,
+            position_embeddings=state.position_embeddings,
+        )
 
 
 def quantize_all_layers(

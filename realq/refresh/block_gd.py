@@ -30,6 +30,7 @@ import torch.nn as nn
 from torch.func import functional_call
 
 from realq.refresh.fisher_loss import fisher_mse_loss
+from realq.utils import nvtx
 from utils import dist_utils
 
 if TYPE_CHECKING:
@@ -254,147 +255,160 @@ def make_grad_refresh_fn(
         # stays in sync — required because ``allreduce`` makes ``accum_grad``
         # identical on all ranks, and we want the resulting Adam update to
         # be identical too.
-        ctx.adam_step += 1
-        selected_global = ctx.next_indices()
-        # GLOBAL → LOCAL filter. ``inps`` is this rank's contiguous shard
-        # of size ``n_local`` starting at ``rank * n_local`` in the global
-        # ``[0, nsamples)`` index space (matches dp_shard slicing at
-        # gptq_plus_utils.py:7802 and realq layer-0 capture upstream).
-        rank = dist_utils.get_rank()
-        n_local = inps.shape[0]
-        rank_start = rank * n_local
-        rank_end = rank_start + n_local
-        selected = [gi - rank_start for gi in selected_global if rank_start <= gi < rank_end]
-        # slide_alpha is computed ONCE per refresh CALL (matching old GPTQ+
-        # which passes a single ``slide_alpha`` from fasterquant into
-        # ``gradient_refresh_fn``). Per mini-batch ``slide_alpha_fn()``
-        # would advance the cursor multiple times per refresh and produce
-        # the wrong α schedule across modules. Computed BEFORE the empty-
-        # local-shard short-circuit so the α schedule advances at the same
-        # cadence on every rank — ``slide_alpha_fn()`` carries cumulative
-        # state and must tick once per refresh CALL on each rank.
-        slide_alpha: float | None = None
-        if next_layer is not None and slide_alpha_fn is not None:
-            slide_alpha = float(slide_alpha_fn())
-        # Pre-allocate the gradient sum so the empty-local-shard case can
-        # still participate in the cross-rank allreduce with a valid zeros
-        # tensor (matches old ``partial_grad_sum = torch.zeros_like(
-        # override_weight, dtype=fp32)`` at gptq_plus_utils.py:6434, which
-        # is constructed BEFORE the ``if len(selected_indices) > 0`` guard).
-        partial_grad_sum = torch.zeros_like(stitched_weight_fp32)
-        partial_count = 0
-        # Cast the stitched fp32 weight to module dtype ONCE per refresh
-        # and pass it to functional_call. Old GPTQ+ does the same downcast
-        # inside ``collect_true_weight_gradient`` line 6422-6432 (`.to(target_dev,
-        # dtype=target_dtype)`). Forward then runs in module dtype (bf16);
-        # backward gives a bf16 grad which we cast to fp32 before
-        # accumulating into ``partial_grad_sum``. Matches old
-        # ``batch_grad = autograd.grad(...)[0].float()`` at line 6715.
-        override_dtype = module.weight.data.dtype
-        for start in range(0, len(selected), ctx.backward_bsz):
-            batch_idx = selected[start : start + ctx.backward_bsz]
-            batch_size = len(batch_idx)
-            sample_idx = torch.tensor(batch_idx, dtype=torch.long, device=inps.device)
-            x = inps.index_select(0, sample_idx)
-            fp_target = fp_out_for_this_layer.index_select(0, sample_idx).to(x.device)
-            kw = {}
-            if am is not None:
-                kw["attention_mask"] = am.expand(batch_size, *am.shape[1:]) if am.shape[0] != batch_size else am
-            if pi is not None:
-                kw["position_ids"] = pi.expand(batch_size, -1) if pi.shape[0] != batch_size else pi
-            if pe is not None:
-                kw["position_embeddings"] = (
-                    pe[0].expand(batch_size, *pe[0].shape[1:]) if pe[0].shape[0] != batch_size else pe[0],
-                    pe[1].expand(batch_size, *pe[1].shape[1:]) if pe[1].shape[0] != batch_size else pe[1],
-                )
+        with nvtx.nvtx_range("refresh.setup"):
+            ctx.adam_step += 1
+            selected_global = ctx.next_indices()
+            # GLOBAL → LOCAL filter. ``inps`` is this rank's contiguous shard
+            # of size ``n_local`` starting at ``rank * n_local`` in the global
+            # ``[0, nsamples)`` index space (matches dp_shard slicing at
+            # gptq_plus_utils.py:7802 and realq layer-0 capture upstream).
+            rank = dist_utils.get_rank()
+            n_local = inps.shape[0]
+            rank_start = rank * n_local
+            rank_end = rank_start + n_local
+            selected = [gi - rank_start for gi in selected_global if rank_start <= gi < rank_end]
+            # slide_alpha is computed ONCE per refresh CALL (matching old GPTQ+
+            # which passes a single ``slide_alpha`` from fasterquant into
+            # ``gradient_refresh_fn``). Per mini-batch ``slide_alpha_fn()``
+            # would advance the cursor multiple times per refresh and produce
+            # the wrong α schedule across modules. Computed BEFORE the empty-
+            # local-shard short-circuit so the α schedule advances at the same
+            # cadence on every rank — ``slide_alpha_fn()`` carries cumulative
+            # state and must tick once per refresh CALL on each rank.
+            slide_alpha: float | None = None
+            if next_layer is not None and slide_alpha_fn is not None:
+                slide_alpha = float(slide_alpha_fn())
+            # Pre-allocate the gradient sum so the empty-local-shard case can
+            # still participate in the cross-rank allreduce with a valid zeros
+            # tensor (matches old ``partial_grad_sum = torch.zeros_like(
+            # override_weight, dtype=fp32)`` at gptq_plus_utils.py:6434, which
+            # is constructed BEFORE the ``if len(selected_indices) > 0`` guard).
+            partial_grad_sum = torch.zeros_like(stitched_weight_fp32)
+            partial_count = 0
+            # Cast the stitched fp32 weight to module dtype ONCE per refresh
+            # and pass it to functional_call for every backward batch. Old
+            # GPTQ+ does the same downcast inside ``collect_true_weight_gradient``
+            # line 6422-6432 (`.to(target_dev, dtype=target_dtype)`) and reuses
+            # the resulting bf16 leaf tensor across all per-batch backwards.
+            # Hoisting the cast saves a fresh (rows, columns) bf16 alloc + cast
+            # per backward batch (4-8 batches per refresh × 6 modules ×
+            # n_layers refreshes adds up). ``autograd.grad`` doesn't touch
+            # ``.grad``, so reusing one leaf across multiple backwards is safe.
+            override_dtype = module.weight.data.dtype
             override_weight = stitched_weight_fp32.to(override_dtype).requires_grad_(True)
-            with torch.enable_grad():
-                out = functional_call(
-                    layer,
-                    {weight_name: override_weight},
-                    (x,),
-                    kw,
-                    strict=False,
-                )
-                q_out = out[0] if isinstance(out, tuple) else out
-                loss_curr = fisher_mse_loss(q_out, fp_target, fisher, a_loss_ratio=a_loss_ratio)
-                loss_next = None
-                # Old GPTQ+ ``collect_true_weight_gradient`` only triggers the
-                # next-layer arm when ``slide_alpha < 1.0`` (line 6450).
-                # At α=1.0 it skips the blend entirely:
-                #     refresh_loss = refresh_loss_current
-                # Doing the explicit ``1.0*curr + 0.0*next`` blend would
-                # introduce fp32 rounding diffs and break bit-exactness.
-                if slide_alpha is not None and slide_alpha < 1.0:
-                    next_q_out_pkg = next_layer(q_out, **kw)
-                    next_q_out = next_q_out_pkg[0] if isinstance(next_q_out_pkg, tuple) else next_q_out_pkg
-                    fp_target_next = next_fp_out.index_select(0, sample_idx).to(next_q_out.device)
-                    loss_next = fisher_mse_loss(
-                        next_q_out, fp_target_next, next_fisher, a_loss_ratio=a_loss_ratio,
+        iter_idx = 0
+        for start in range(0, len(selected), ctx.backward_bsz):
+            with nvtx.nvtx_range(f"refresh.iter_{iter_idx}"):
+                batch_idx = selected[start : start + ctx.backward_bsz]
+                batch_size = len(batch_idx)
+                sample_idx = torch.tensor(batch_idx, dtype=torch.long, device=inps.device)
+                x = inps.index_select(0, sample_idx)
+                fp_target = fp_out_for_this_layer.index_select(0, sample_idx).to(x.device)
+                kw = {}
+                if am is not None:
+                    kw["attention_mask"] = am.expand(batch_size, *am.shape[1:]) if am.shape[0] != batch_size else am
+                if pi is not None:
+                    kw["position_ids"] = pi.expand(batch_size, -1) if pi.shape[0] != batch_size else pi
+                if pe is not None:
+                    kw["position_embeddings"] = (
+                        pe[0].expand(batch_size, *pe[0].shape[1:]) if pe[0].shape[0] != batch_size else pe[0],
+                        pe[1].expand(batch_size, *pe[1].shape[1:]) if pe[1].shape[0] != batch_size else pe[1],
                     )
-                    loss = slide_alpha * loss_curr + (1.0 - slide_alpha) * loss_next
-                else:
-                    loss = loss_curr
-                (batch_grad,) = torch.autograd.grad(loss, override_weight, retain_graph=False)
-            batch_grad_fp32 = batch_grad.detach().float()
-            partial_grad_sum.add_(batch_grad_fp32, alpha=float(batch_size))
-            partial_count += batch_size
+                with torch.enable_grad():
+                    with nvtx.nvtx_range("refresh.forward"):
+                        out = functional_call(
+                            layer,
+                            {weight_name: override_weight},
+                            (x,),
+                            kw,
+                            strict=False,
+                        )
+                        q_out = out[0] if isinstance(out, tuple) else out
+                    with nvtx.nvtx_range("refresh.loss"):
+                        loss_curr = fisher_mse_loss(q_out, fp_target, fisher, a_loss_ratio=a_loss_ratio)
+                        loss_next = None
+                        # Old GPTQ+ ``collect_true_weight_gradient`` only triggers the
+                        # next-layer arm when ``slide_alpha < 1.0`` (line 6450).
+                        # At α=1.0 it skips the blend entirely:
+                        #     refresh_loss = refresh_loss_current
+                        # Doing the explicit ``1.0*curr + 0.0*next`` blend would
+                        # introduce fp32 rounding diffs and break bit-exactness.
+                        if slide_alpha is not None and slide_alpha < 1.0:
+                            with nvtx.nvtx_range("refresh.next_layer_forward"):
+                                next_q_out_pkg = next_layer(q_out, **kw)
+                                next_q_out = next_q_out_pkg[0] if isinstance(next_q_out_pkg, tuple) else next_q_out_pkg
+                            fp_target_next = next_fp_out.index_select(0, sample_idx).to(next_q_out.device)
+                            loss_next = fisher_mse_loss(
+                                next_q_out, fp_target_next, next_fisher, a_loss_ratio=a_loss_ratio,
+                            )
+                            loss = slide_alpha * loss_curr + (1.0 - slide_alpha) * loss_next
+                        else:
+                            loss = loss_curr
+                    with nvtx.nvtx_range("refresh.backward"):
+                        (batch_grad,) = torch.autograd.grad(loss, override_weight, retain_graph=False)
+                with nvtx.nvtx_range("refresh.accumulate"):
+                    batch_grad_fp32 = batch_grad.detach().float()
+                    partial_grad_sum.add_(batch_grad_fp32, alpha=float(batch_size))
+                    partial_count += batch_size
+                iter_idx += 1
         # All-reduce per-rank partial sum + count, then divide. ALWAYS
         # runs on every rank (even with partial_count == 0) so NCCL stays
         # in lock-step. Matches old GPTQ+ ``make_gradient_refresh_fn``
         # (lines 9026-9057) — packed all-reduce of (grad_flat, count) so
         # summation order is identical across runs.
-        if dist_utils.get_world_size() > 1:
-            global_count_t = torch.tensor(
-                [float(partial_count)],
-                dtype=partial_grad_sum.dtype,
-                device=partial_grad_sum.device,
-            )
-            grad_flat = partial_grad_sum.reshape(-1)
-            packed = torch.cat([grad_flat, global_count_t])
-            dist_utils.allreduce_sum_(packed)
-            partial_grad_sum.copy_(packed[:grad_flat.numel()].view_as(partial_grad_sum))
-            global_count = int(packed[-1].item())
-        else:
-            global_count = partial_count
-        accum_grad = partial_grad_sum / float(global_count)
-        # act_order: re-key the natural-order grad into PERMUTED column order
-        # so the Adam state slice [:, trailing_col_start:] sees only the
-        # not-yet-quantised columns. Old GPTQ+ does the equivalent at
-        # gptq_plus_utils.py:3038-3050 (``refreshed_grad_sub[:, state["perm"]]``
-        # then sliced from i2 inside ``_compute_grad_optimizer_update``).
-        # Without this re-keying, Adam state evolves for every natural-order
-        # column on every refresh — including columns that map to ALREADY-
-        # quantised permuted positions [0..i2) — and the resulting trailing
-        # update diverges from the legacy reference by ~1-7e-2 per quant
-        # bin after a few refreshes. ``ctx.exp_avg`` and ``ctx.exp_avg_sq``
-        # are interpreted in the SAME (permuted) coordinate frame as the
-        # incoming grad: at init they are zeros so the frame choice doesn't
-        # matter; after the first refresh, every access uses permuted
-        # indexing, mirroring old GPTQPlus subgroup state which was created
-        # AFTER ``W_sub = W_sub[:, perm]``.
-        if perm is not None:
-            accum_grad = accum_grad[:, perm]
-        # Slice trailing columns and grad-clip (per-element clamp; matches
-        # old ``_compute_grad_optimizer_update_batched`` line 1105-1106).
-        grad_slice = accum_grad[:, trailing_col_start:]
-        if ctx.grad_clip > 0:
-            grad_slice = grad_slice.clamp(min=-ctx.grad_clip, max=ctx.grad_clip)
-        # Adam moments on the trailing slice. Match old order:
-        #   denom = sqrt(ev) / sqrt(bc2) + eps  (NOT sqrt(ev / bc2))
-        ea = ctx.exp_avg[:, trailing_col_start:]
-        ev = ctx.exp_avg_sq[:, trailing_col_start:]
-        ea.mul_(ctx.beta1).add_(grad_slice, alpha=1.0 - ctx.beta1)
-        ev.mul_(ctx.beta2).addcmul_(grad_slice, grad_slice, value=1.0 - ctx.beta2)
-        bc1 = 1.0 - ctx.beta1 ** ctx.adam_step
-        bc2 = 1.0 - ctx.beta2 ** ctx.adam_step
-        denom = ev.sqrt() / math.sqrt(bc2)
-        denom.add_(ctx.eps)
-        step_size = ctx.layer_lr / bc1
-        update = step_size * (ea / denom)
-        # Return fp32 update — caller subtracts from its fp32 working W
-        # master so the precision of the per-step delta survives even when
-        # lr is below module-dtype ULP.
-        return update
+        with nvtx.nvtx_range("refresh.grad_allreduce"):
+            if dist_utils.get_world_size() > 1:
+                global_count_t = torch.tensor(
+                    [float(partial_count)],
+                    dtype=partial_grad_sum.dtype,
+                    device=partial_grad_sum.device,
+                )
+                grad_flat = partial_grad_sum.reshape(-1)
+                packed = torch.cat([grad_flat, global_count_t])
+                dist_utils.allreduce_sum_(packed)
+                partial_grad_sum.copy_(packed[:grad_flat.numel()].view_as(partial_grad_sum))
+                global_count = int(packed[-1].item())
+            else:
+                global_count = partial_count
+            accum_grad = partial_grad_sum / float(global_count)
+        with nvtx.nvtx_range("refresh.adam_step"):
+            # act_order: re-key the natural-order grad into PERMUTED column order
+            # so the Adam state slice [:, trailing_col_start:] sees only the
+            # not-yet-quantised columns. Old GPTQ+ does the equivalent at
+            # gptq_plus_utils.py:3038-3050 (``refreshed_grad_sub[:, state["perm"]]``
+            # then sliced from i2 inside ``_compute_grad_optimizer_update``).
+            # Without this re-keying, Adam state evolves for every natural-order
+            # column on every refresh — including columns that map to ALREADY-
+            # quantised permuted positions [0..i2) — and the resulting trailing
+            # update diverges from the legacy reference by ~1-7e-2 per quant
+            # bin after a few refreshes. ``ctx.exp_avg`` and ``ctx.exp_avg_sq``
+            # are interpreted in the SAME (permuted) coordinate frame as the
+            # incoming grad: at init they are zeros so the frame choice doesn't
+            # matter; after the first refresh, every access uses permuted
+            # indexing, mirroring old GPTQPlus subgroup state which was created
+            # AFTER ``W_sub = W_sub[:, perm]``.
+            if perm is not None:
+                accum_grad = accum_grad[:, perm]
+            # Slice trailing columns and grad-clip (per-element clamp; matches
+            # old ``_compute_grad_optimizer_update_batched`` line 1105-1106).
+            grad_slice = accum_grad[:, trailing_col_start:]
+            if ctx.grad_clip > 0:
+                grad_slice = grad_slice.clamp(min=-ctx.grad_clip, max=ctx.grad_clip)
+            # Adam moments on the trailing slice. Match old order:
+            #   denom = sqrt(ev) / sqrt(bc2) + eps  (NOT sqrt(ev / bc2))
+            ea = ctx.exp_avg[:, trailing_col_start:]
+            ev = ctx.exp_avg_sq[:, trailing_col_start:]
+            ea.mul_(ctx.beta1).add_(grad_slice, alpha=1.0 - ctx.beta1)
+            ev.mul_(ctx.beta2).addcmul_(grad_slice, grad_slice, value=1.0 - ctx.beta2)
+            bc1 = 1.0 - ctx.beta1 ** ctx.adam_step
+            bc2 = 1.0 - ctx.beta2 ** ctx.adam_step
+            denom = ev.sqrt() / math.sqrt(bc2)
+            denom.add_(ctx.eps)
+            step_size = ctx.layer_lr / bc1
+            update = step_size * (ea / denom)
+            # Return fp32 update — caller subtracts from its fp32 working W
+            # master so the precision of the per-step delta survives even when
+            # lr is below module-dtype ULP.
+            return update
 
     return refresh

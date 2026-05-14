@@ -18,6 +18,8 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 
+from realq.utils import nvtx
+
 if TYPE_CHECKING:
     from realq.parallel.cpu_master import CpuMasterLayerManager
     from utils.model_utils import ModelAnalyzer
@@ -153,18 +155,21 @@ def replay_layer(
     am = state.attention_mask
     pi = state.position_ids
     pe = state.position_embeddings
+    chunk_idx = 0
     for j in range(0, n, bsz):
-        b = min(bsz, n - j)
-        kw = {}
-        if am is not None:
-            kw["attention_mask"] = am.expand(b, *am.shape[1:]) if am.shape[0] != b else am
-        if pi is not None:
-            kw["position_ids"] = pi.expand(b, -1) if pi.shape[0] != b else pi
-        if pe is not None:
-            kw["position_embeddings"] = (
-                pe[0].expand(b, *pe[0].shape[1:]) if pe[0].shape[0] != b else pe[0],
-                pe[1].expand(b, *pe[1].shape[1:]) if pe[1].shape[0] != b else pe[1],
-            )
-        out = layer(inps[j : j + b], **kw)
-        outs[j : j + b] = out[0] if isinstance(out, tuple) else out
+        with nvtx.nvtx_range(f"replay.chunk_{chunk_idx}"):
+            b = min(bsz, n - j)
+            kw = {}
+            if am is not None:
+                kw["attention_mask"] = am.expand(b, *am.shape[1:]) if am.shape[0] != b else am
+            if pi is not None:
+                kw["position_ids"] = pi.expand(b, -1) if pi.shape[0] != b else pi
+            if pe is not None:
+                kw["position_embeddings"] = (
+                    pe[0].expand(b, *pe[0].shape[1:]) if pe[0].shape[0] != b else pe[0],
+                    pe[1].expand(b, *pe[1].shape[1:]) if pe[1].shape[0] != b else pe[1],
+                )
+            out = layer(inps[j : j + b], **kw)
+            outs[j : j + b] = out[0] if isinstance(out, tuple) else out
+            chunk_idx += 1
     return outs
