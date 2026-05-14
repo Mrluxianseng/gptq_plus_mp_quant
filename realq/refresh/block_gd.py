@@ -228,7 +228,11 @@ def make_grad_refresh_fn(
     pe = layer_state.position_embeddings
     weight_name = _functional_weight_name(layer, module)
 
-    def refresh(stitched_weight_fp32: torch.Tensor, trailing_col_start: int) -> torch.Tensor | None:
+    def refresh(
+        stitched_weight_fp32: torch.Tensor,
+        trailing_col_start: int,
+        perm: torch.Tensor | None = None,
+    ) -> torch.Tensor | None:
         # Match old GPTQ+ ``collect_true_weight_gradient`` (lines 6500-6726)
         # under ``--dp_global_shuffle=True``:
         #   selected_global = scheduler.next_indices()  # backward_samples global ids
@@ -353,15 +357,24 @@ def make_grad_refresh_fn(
             global_count = int(packed[-1].item())
         else:
             global_count = partial_count
-        if global_count <= 0:
-            # Matches old guard at gptq_plus_utils.py:9052-9056. Cannot
-            # happen when ``nsamples % backward_samples == 0`` and
-            # scheduler is wired correctly — defensive only.
-            raise RuntimeError(
-                f"refresh produced zero samples across all ranks; "
-                f"selected_global={selected_global[:8]}..."
-            )
         accum_grad = partial_grad_sum / float(global_count)
+        # act_order: re-key the natural-order grad into PERMUTED column order
+        # so the Adam state slice [:, trailing_col_start:] sees only the
+        # not-yet-quantised columns. Old GPTQ+ does the equivalent at
+        # gptq_plus_utils.py:3038-3050 (``refreshed_grad_sub[:, state["perm"]]``
+        # then sliced from i2 inside ``_compute_grad_optimizer_update``).
+        # Without this re-keying, Adam state evolves for every natural-order
+        # column on every refresh — including columns that map to ALREADY-
+        # quantised permuted positions [0..i2) — and the resulting trailing
+        # update diverges from the legacy reference by ~1-7e-2 per quant
+        # bin after a few refreshes. ``ctx.exp_avg`` and ``ctx.exp_avg_sq``
+        # are interpreted in the SAME (permuted) coordinate frame as the
+        # incoming grad: at init they are zeros so the frame choice doesn't
+        # matter; after the first refresh, every access uses permuted
+        # indexing, mirroring old GPTQPlus subgroup state which was created
+        # AFTER ``W_sub = W_sub[:, perm]``.
+        if perm is not None:
+            accum_grad = accum_grad[:, perm]
         # Slice trailing columns and grad-clip (per-element clamp; matches
         # old ``_compute_grad_optimizer_update_batched`` line 1105-1106).
         grad_slice = accum_grad[:, trailing_col_start:]

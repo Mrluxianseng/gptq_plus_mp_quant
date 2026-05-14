@@ -30,7 +30,7 @@ from realq.quant.realq_layer import RealQLayer
 from realq.refresh.block_gd import (
     RefreshContext,
     _SharedSampleScheduler,
-    layer_lr_for_cosine,
+    layer_lr_for_schedule,
     make_grad_refresh_fn,
 )
 from realq.refresh.kl_loss import make_kl_refresh_fn
@@ -119,17 +119,17 @@ def quantize_one_layer(
     sample_scheduler: "_SharedSampleScheduler | None" = None,
     next_layer: "nn.Module | None" = None,
     next_fp_inps: "torch.Tensor | None" = None,
-    next_fisher: "torch.Tensor | None" = None,
     analyzer: "ModelAnalyzer | None" = None,
     layer_manager: "CpuMasterLayerManager | None" = None,
 ) -> streams.LayerInputs:
     """Quantise one transformer layer, return updated input state for the
     next layer (= output of this layer with all-quantised weights).
 
-    ``next_layer`` / ``next_fp_inps`` / ``next_fisher`` enable the
-    loss_slide_window blend: per-block α linearly interpolates the refresh
-    loss between current-layer fisher_mse and next-layer fisher_mse. Pass
-    None for the LAST layer (or when loss_slide_window=False).
+    ``next_layer`` / ``next_fp_inps`` enable the loss_slide_window blend:
+    per-block α linearly interpolates the refresh loss between current-layer
+    fisher_mse and next-layer fisher_mse. Pass None for the LAST layer (or
+    when loss_slide_window=False). Next-layer fisher is fetched directly
+    from ``static.fisher[layer_idx + 1]`` inside.
 
     ``layer_manager`` is consulted for the cpu_master path: rank>0's model
     has meta-tensor weights so plain ``.to(dev)`` would crash. None or
@@ -145,8 +145,13 @@ def quantize_one_layer(
     # Pre-compute the FP-reference forward of THIS layer BEFORE any of its
     # weights get mutated. ``fp_outs`` becomes ``state.fp_inps`` for the
     # next layer; refresh closures slice it per backward batch as the
-    # fisher_mse target.
-    fp_outs = streams.replay_layer(layer, state, bsz=cfg.hessian_accum_bsz, inps=state.fp_inps)
+    # fisher_mse target. ``bsz=1`` matches old GPTQ+
+    # ``layer.fp_reference_forward`` (gptq_plus_utils.py:8262-8268) which
+    # runs ``fp_inps[j] = layer(fp_inps[j].unsqueeze(0))`` per sample.
+    # cuBLAS attention picks a different bf16 kernel for batch>1 vs batch=1
+    # so ``fp_outs`` ULP-drifts from old's whenever bsz>1; the drift then
+    # propagates into every refresh's ``fp_target``.
+    fp_outs = streams.replay_layer(layer, state, bsz=1, inps=state.fp_inps)
 
     # loss_slide_window: pre-stage next_layer to GPU and forward
     # ``fp_outs`` (the FP forward output of THIS layer) through it once to
@@ -166,8 +171,13 @@ def quantize_one_layer(
             next_layer = layer_manager.materialize_layer(layer_idx + 1)
         else:
             next_layer.to(dev)
+        # bsz=1: match old GPTQ+ ``slide_fp_inps_next`` per-sample loop
+        # (gptq_plus_utils.py:8355-8361). cuBLAS attention picks a different
+        # bf16 kernel for batch>1 vs batch=1; using ``hessian_accum_bsz``
+        # here lets next-layer FP target drift ULP-wise from old's, which
+        # propagates through every slide-arm refresh gradient.
         next_fp_outs = streams.replay_layer(
-            next_layer, state, bsz=cfg.hessian_accum_bsz, inps=fp_outs,
+            next_layer, state, bsz=1, inps=fp_outs,
         )
 
     # Layer-wise lr (cosine schedule) — same for every module in this layer.
@@ -179,8 +189,9 @@ def quantize_one_layer(
     base_lr = cfg.grad_lr
     if is_final_layer and cfg.final_layer_grad_lr is not None:
         base_lr = float(cfg.final_layer_grad_lr)
-    layer_lr = layer_lr_for_cosine(
-        base_lr, layer_idx, num_layers, cfg.grad_lr_layer_base_ratio,
+    layer_lr = layer_lr_for_schedule(
+        base_lr, layer_idx, num_layers,
+        cfg.grad_lr_layer_base_ratio, cfg.grad_lr_layer_schedule,
     )
     block_gd_enabled = base_lr > 0
     # Final layer drops the fisher_mse loss for the more accurate
@@ -227,6 +238,17 @@ def quantize_one_layer(
             for p in analyzer.get_lm_head().parameters():
                 p.requires_grad_(False)
 
+    # Pre-stage the per-layer Fisher to GPU ONCE (reused across all modules in
+    # this layer's refresh closures). Calling ``.to(dev)`` lazily inside each
+    # ``make_grad_refresh_fn`` invocation perturbs the GPU memory pool (each
+    # call mints a fresh 2 MB tensor right before ``realq.quantize`` runs the
+    # next module's inner block + outer compensation), and the resulting
+    # cuBLAS workspace shifts produce ULP-level diffs in the bmm-driven outer
+    # compensation that diverge from the legacy reference (~1e-2 max-diff
+    # propagated through later refreshes). Hoisting the alloc here keeps the
+    # GPU memory layout deterministic across all per-module quantize calls.
+    fisher_dev = static.fisher[layer_idx].to(dev) if block_gd_enabled else None
+
     for grp in module_groups.GROUP_ORDER:
         modules = module_groups.get_group_modules(layer, grp)
         # Build one RealQLayer per module in this group, sharing the layer's
@@ -241,7 +263,6 @@ def quantize_one_layer(
                 dev=dev,
                 group_parallel_quant=cfg.group_parallel_quant,
             )
-            r._dbg_name = f"L{layer_idx}_{name.replace('.', '_')}"
             realqs[name] = r
         _accumulate_hessian_for_group(
             layer, modules, realqs, state, cfg.hessian_accum_bsz,
@@ -296,7 +317,7 @@ def quantize_one_layer(
                         module=realq.linear,
                         layer_state=state,
                         fp_out_for_this_layer=fp_outs,
-                        fisher=static.fisher[layer_idx].to(dev),
+                        fisher=fisher_dev,
                         ctx=ctx,
                         next_layer=next_layer if cfg.loss_slide_window else None,
                         next_fp_out=next_fp_outs if cfg.loss_slide_window else None,
@@ -427,21 +448,17 @@ def quantize_all_layers(
         # on ``i <= final_layer_idx - 2``: i.e. the last TWO layers
         # (final-1 and final) DON'T slide. Match exactly.
         next_layer = None
-        next_fisher = None
         if (
             cfg.loss_slide_window
             and layer_idx <= len(layers) - 3
             and layer_idx + 1 < n_layers + 1  # tolerate final-stop runs
         ):
             next_layer = layers[layer_idx + 1]
-            if static.fisher[layer_idx + 1] is not None:
-                next_fisher = static.fisher[layer_idx + 1]
         state = quantize_one_layer(
             cfg, layer_idx, layers[layer_idx], static, state, dev,
             num_layers=len(layers), sample_scheduler=sample_scheduler,
             next_layer=next_layer,
             next_fp_inps=state.fp_inps if next_layer is not None else None,
-            next_fisher=next_fisher,
             analyzer=analyzer,
             layer_manager=layer_manager,
         )

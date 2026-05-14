@@ -228,24 +228,6 @@ def _build_untied_checkpoint_on_rank0(cfg: "Config", untied_dir: str) -> None:
     mem_utils.cleanup_memory()
 
 
-def _get_prepared_checkpoint_path(cfg: "Config") -> Tuple[str, bool]:
-    """Resolve which checkpoint Phase B should load.
-
-    Mirrors ``utils/model_utils.py:201-226``. Returns ``(path, is_rotated)``.
-
-    Decision tree:
-      cfg.rotate=False + source has untied embeddings ⇒ return cfg.model directly
-      cfg.rotate=False + source has tied embeddings   ⇒ untied checkpoint
-      cfg.rotate=True                                  ⇒ rotated checkpoint
-    """
-    if not cfg.rotate:
-        src_config = AutoConfig.from_pretrained(cfg.model, trust_remote_code=True)
-        if not getattr(src_config, "tie_word_embeddings", False):
-            return cfg.model, False
-        return _prepared_untied_checkpoint_dir(cfg), False
-    return _prepared_rotated_checkpoint_dir(cfg), True
-
-
 def _build_empty_model_from_config(checkpoint_path: str, cfg: "Config"):
     """Construct a meta-tensor model from a saved checkpoint's config.json.
 
@@ -269,20 +251,6 @@ def _build_empty_model_from_config(checkpoint_path: str, cfg: "Config"):
     model.seqlen = cfg.seq_len
     model.eval()
     return model
-
-
-def _assert_aware_akv_disabled(cfg: "Config") -> None:
-    """Defence-in-depth guard. ``Config.__post_init__`` already catches this
-    at parse time; this catches programmatic misconfigurations."""
-    if not cfg.cpu_master:
-        return
-    if cfg.act_quant_aware_gptq or cfg.k_cache_quant_aware_gptq:
-        raise RuntimeError(
-            f"cpu_master + aware AKV not supported in v1 "
-            f"(act_quant_aware_gptq={cfg.act_quant_aware_gptq}, "
-            f"k_cache_quant_aware_gptq={cfg.k_cache_quant_aware_gptq}). "
-            f"See realq/TODO_CPU_MASTER.md for the relaxation plan."
-        )
 
 
 def _fsdp_shard_layers(analyzer: "ModelAnalyzer", cfg: "Config") -> None:
@@ -343,8 +311,6 @@ def prepare_rotated_checkpoint(cfg: "Config") -> Tuple[str, bool]:
       cfg.rotate=False + source has untied embeddings      ⇒ cfg.model returned directly
     """
     from realq.parallel import env as parallel_env
-
-    _assert_aware_akv_disabled(cfg)
 
     if cfg.rotate:
         rotated_dir = _prepared_rotated_checkpoint_dir(cfg)
@@ -449,8 +415,13 @@ def rebuild_asymmetric_for_quant(
 
 
 # ---------------------------------------------------------------------------
-# Legacy fsdp=True path (cpu_master=False). Kept intact for Commit 1's A/B
-# verification. Removed in Commit 2.
+# Replicated fsdp=True path (cpu_master=False). Each rank holds a full CPU
+# model copy; precompute uses FSDP2 to shard the backward pass, then this
+# path saves the post-precompute weights to disk and reloads them on each
+# rank for the per-layer quant streaming. Higher CPU peak (N×M) but no
+# broadcast overhead per quant block and supports aware AKV. Long-term
+# supported alongside the cpu_master path above; see realq/config.py
+# Config.cpu_master for the trade-off summary.
 # ---------------------------------------------------------------------------
 
 

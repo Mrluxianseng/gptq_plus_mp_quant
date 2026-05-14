@@ -15,15 +15,11 @@ def cholesky_inverse_with_damp(
     H: torch.Tensor,
     percdamp: float = 0.01,
     max_doublings: int = 8,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute the upper-triangular Cholesky inverse used by GPTQ.
+) -> torch.Tensor:
+    """Compute the upper-triangular Cholesky factor of inv(H_damped).
 
-    Returns ``(Hinv_init, Hinv)`` where:
-
-    * ``Hinv_init = inverse(H_damped)`` — full inverse, used by the old code's
-      first-order GHinv path; we still return it for API compatibility but
-      RealQ's alpha=0 mode never reads it.
-    * ``Hinv = upper-triangular Cholesky factor of inverse(H_damped)``.
+    Returns the upper-triangular ``Hinv`` factor used by GPTQ's per-column
+    update; ``Hinv[i,i:] @ X = X / (L L^T)[i,i:]``.
 
     On Cholesky failure we double ``percdamp`` up to ``max_doublings`` times,
     then fall back to identity (logging loudly). Matches old behaviour.
@@ -52,13 +48,10 @@ def cholesky_inverse_with_damp(
                     "falling back to identity Hinv.",
                     max_doublings, cur_pct,
                 )
-                eye = torch.eye(columns, device=H.device, dtype=H.dtype)
-                return eye.clone(), eye.clone()
+                return torch.eye(columns, device=H.device, dtype=H.dtype)
             cur_pct *= 2.0
             continue
-        # GPTQ: Hinv = (L L^T)^{-1}, then upper-triangular cholesky of Hinv.
         Hinv_init = torch.cholesky_inverse(L)
-        Hinv = torch.linalg.cholesky(Hinv_init, upper=True)
-        return Hinv_init, Hinv
+        return torch.linalg.cholesky(Hinv_init, upper=True)
 
     raise RuntimeError("cholesky_inverse_with_damp: exhausted retry loop without resolution.")

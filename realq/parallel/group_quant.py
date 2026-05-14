@@ -23,12 +23,6 @@ What is NOT sharded:
 """
 from __future__ import annotations
 
-from typing import Iterable
-
-import torch
-
-from utils import dist_utils
-
 
 def row_slice_for_rank(rank: int, world: int, rows: int) -> slice:
     """Contiguous output-row slice owned by ``rank`` under rank mode.
@@ -46,21 +40,3 @@ def row_slice_for_rank(rank: int, world: int, rows: int) -> slice:
         )
     per_rank = rows // world
     return slice(rank * per_rank, (rank + 1) * per_rank)
-
-
-def all_gather_rows(local_rows: torch.Tensor, full_rows_tensor: torch.Tensor) -> torch.Tensor:
-    """All-gather row-sharded tensors into a full-rows replica.
-
-    ``local_rows`` has shape ``(rows_per_rank, ...)`` on every rank;
-    ``full_rows_tensor`` is a pre-allocated ``(rows, ...)`` buffer. After
-    the collective ``full_rows_tensor[rank * per : (rank+1) * per]`` on
-    rank r holds rank r's contribution; combined across ranks it spans
-    every row.
-    """
-    world = dist_utils.get_world_size()
-    if world <= 1:
-        full_rows_tensor.copy_(local_rows)
-        return full_rows_tensor
-    import torch.distributed as dist
-    dist.all_gather_into_tensor(full_rows_tensor, local_rows.contiguous())
-    return full_rows_tensor

@@ -180,14 +180,6 @@ class RealQLayer:
         assert inp.dim() == 3, f"expected 2/3D input, got {inp.dim()}"
         B = inp.shape[0]
         sal = self.saliency_cpu[self.index : self.index + B].to(self.dev)
-        # DEBUG: dump first add_batch's X for sub-task 3 alignment.
-        import os as _os
-        _name = getattr(self, "_dbg_name", None)
-        if _name is not None and self.index == 0 and int(_os.environ.get("REALQ_DBG", "0")):
-            _os.makedirs("./debug/realq_dbg", exist_ok=True)
-            torch.save({"X_first_batch": inp.detach().cpu(),
-                        "sal_first_batch": sal.detach().cpu()},
-                       f"./debug/realq_dbg/{_name}_X.pt")
         self.index += B
         # Match old code's sink-strip path: if saliency was clipped (sink
         # tokens dropped), trim the activation prefix to align T. Sub-task 3
@@ -292,14 +284,26 @@ class RealQLayer:
             raise ValueError(
                 "w_clip=True requires the quantizer to be configured with mse=True."
             )
-        rank_mode = (
-            group_parallel_quant == "rank"
-            and dist_utils.get_world_size() > 1
-        )
+        # rank_mode is the unified "shard rows across ranks + flat (rows, count)
+        # inner layout" path. world=1 also takes it so that single-GPU produces
+        # bit-equal results to multi-GPU (and to the legacy code's
+        # ``_fasterquant_group_parallel`` single-GPU branch). In single-GPU the
+        # ``world > 1`` gates inside the branch turn the all-gathers into no-ops
+        # and ``row_slice_for_rank(0, 1, rows) == slice(0, rows)``.
+        rank_mode = group_parallel_quant == "rank"
         # NUM_GROUPS>1 rank mode requires the H buffer to have been
         # constructed in shard form via __init__ (so add_batch knew to
         # reduce_scatter per group instead of all-reducing the full tensor).
-        if rank_mode and self.num_groups > 1 and not self.hessian_group_sharded:
+        # Only relevant under DP — at world=1 ``hessian_group_sharded`` stays
+        # False (nothing to shard) and the rank-mode flat layout works on top
+        # of the full ``(num_groups, C, C)`` H buffer.
+        _world = dist_utils.get_world_size()
+        if (
+            rank_mode
+            and self.num_groups > 1
+            and _world > 1
+            and not self.hessian_group_sharded
+        ):
             raise RuntimeError(
                 "rank mode + NUM_GROUPS>1 requires hessian_group_sharded=True; "
                 "pass group_parallel_quant='rank' to RealQLayer.__init__."
@@ -310,13 +314,6 @@ class RealQLayer:
         # For NUM_GROUPS>1 rank mode num_local_groups is the rank's owned
         # group count (always >= 1).
         H_per_group = self.H
-        # DEBUG: dump for first layer to compare against old code.
-        import os
-        _name = getattr(self, "_dbg_name", None)
-        if _name is not None and int(os.environ.get("REALQ_DBG", "0")):
-            os.makedirs("./debug/realq_dbg", exist_ok=True)
-            torch.save({"H": H_per_group.cpu(), "W": W.cpu()},
-                       f"./debug/realq_dbg/{_name}_pre.pt")
 
         # ----------- find_params (row-parallel under rank mode) ------------
         # Per-row scale/zero from the un-permuted W. This MUST run BEFORE
@@ -356,12 +353,6 @@ class RealQLayer:
             else:
                 self.quantizer.find_params(W)
 
-        # DEBUG: dump scale/zero after find_params.
-        if _name is not None and int(os.environ.get("REALQ_DBG", "0")):
-            torch.save({"scale": self.quantizer.scale.detach().cpu(),
-                        "zero": self.quantizer.zero.detach().cpu()},
-                       f"./debug/realq_dbg/{_name}_scale.pt")
-
         # ----------- act_order ------------
         # act_square is all-reduced in finalize_hessian, so perm is identical
         # on every rank. Apply to columns of W and to the (C, C) dims of the
@@ -379,12 +370,11 @@ class RealQLayer:
         # so the result is bit-equal to sub-task 4 (no extra .empty_like +
         # indexed write step that caused observable last-bit drift on Qwen3).
         if self.num_groups == 1:
-            _, Hinv_single = cholesky_inverse_with_damp(H_per_group[0], percdamp=percdamp)
+            Hinv_single = cholesky_inverse_with_damp(H_per_group[0], percdamp=percdamp)
         else:
             Hinv_per_group = torch.empty_like(H_per_group)
             for g in range(H_per_group.shape[0]):
-                _, hinv_g = cholesky_inverse_with_damp(H_per_group[g], percdamp=percdamp)
-                Hinv_per_group[g] = hinv_g
+                Hinv_per_group[g] = cholesky_inverse_with_damp(H_per_group[g], percdamp=percdamp)
 
         Q = torch.zeros_like(W)
         # NUM_GROUPS=1 fast path: keeps the original (R, 1) @ (1, count)
@@ -626,10 +616,12 @@ class RealQLayer:
                         quant_nat_cols = perm[:i2]
                         stitched_nat = W_nat.clone()
                         stitched_nat[:, quant_nat_cols] = Q_nat[:, quant_nat_cols]
-                        full_update = grad_refresh_fn(stitched_nat, 0)
-                        if full_update is not None:
-                            update_permuted = full_update[:, perm]
-                            W_local[:, i2:].sub_(update_permuted[row_sl, i2:])
+                        # Pass perm so the closure re-keys natural-order grad
+                        # into permuted coord before Adam (see block_gd.py
+                        # rationale; mirrors old GPTQPlus permuted-state Adam).
+                        update = grad_refresh_fn(stitched_nat, i2, perm=perm)
+                        if update is not None:
+                            W_local[:, i2:].sub_(update[row_sl])
 
             # All-gather final Q_local into the (rows, columns) Q replica
             # so the module.weight write below sees the same Q on every rank.
@@ -684,17 +676,14 @@ class RealQLayer:
                         quant_nat_cols = perm[:i2]
                         stitched_nat = W_nat.clone()
                         stitched_nat[:, quant_nat_cols] = Q_nat[:, quant_nat_cols]
-                        full_update = grad_refresh_fn(stitched_nat, 0)
-                        if full_update is not None:
-                            update_permuted = full_update[:, perm]
-                            W[:, i2:].sub_(update_permuted[:, i2:])
+                        # Pass perm so the closure re-keys grad to permuted
+                        # coord (see block_gd.py rationale).
+                        update = grad_refresh_fn(stitched_nat, i2, perm=perm)
+                        if update is not None:
+                            W[:, i2:].sub_(update)
 
         if invperm is not None:
             Q = Q[:, invperm]
-        # DEBUG: dump Q at end of quantize.
-        if _name is not None and int(os.environ.get("REALQ_DBG", "0")):
-            torch.save({"Q": Q.detach().cpu()},
-                       f"./debug/realq_dbg/{_name}_Q.pt")
         self.linear.weight.data.copy_(Q.to(self.linear.weight.dtype))
 
     def free(self) -> None:

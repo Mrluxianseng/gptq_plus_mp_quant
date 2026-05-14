@@ -47,9 +47,6 @@ class SaliencyHookManager:
         # _data[layer_idx][module_name] = list of (B, T, num_groups) cpu chunks
         self._data: list[dict[str, list[torch.Tensor]]] = []
         self._handles: list[torch.utils.hooks.RemovableHandle] = []
-        self.enabled = True  # toggled off when the same backward is reused
-        # for non-saliency purposes (e.g. refresh-loss runs); irrelevant in
-        # sub-task 2 but kept for forward-compatibility.
 
     def attach(self, layer_modules: list[dict[str, nn.Module]]) -> None:
         """Register hooks on every module of every layer.
@@ -98,8 +95,6 @@ class SaliencyHookManager:
         clip_pct = self.clip_percentile
 
         def grad_hook(grad: torch.Tensor) -> None:
-            if not self.enabled:
-                return
             # grad: (B, T, H_out)
             B, T, H = grad.shape
             if H % num_groups != 0:
@@ -137,7 +132,6 @@ class FisherHookManager:
         self._sums: list[torch.Tensor | None] = []
         self._handles: list[torch.utils.hooks.RemovableHandle] = []
         self._token_count = 0
-        self.enabled = True
 
     def attach(self, layers: Iterable[nn.Module]) -> None:
         layers = list(layers)
@@ -167,8 +161,6 @@ class FisherHookManager:
 
     def _make_grad_hook(self, layer_idx: int):
         def grad_hook(grad: torch.Tensor) -> None:
-            if not self.enabled:
-                return
             grad_fp32 = grad.detach().float()
             grad_flat = grad_fp32.reshape(-1, grad_fp32.shape[-1])  # (B·T, H)
             # Divide by the loss-grad scaling so the stored value is in the

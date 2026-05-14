@@ -57,11 +57,3 @@ def get_group_modules(layer: nn.Module, group_name: str) -> dict[str, nn.Module]
             mod = mod.module
         out[name] = mod
     return out
-
-
-def all_quantisable_modules(layer: nn.Module) -> dict[str, nn.Module]:
-    """All seven linears, ordered by group then by within-group sequence."""
-    out: "OrderedDict[str, nn.Module]" = OrderedDict()
-    for grp in GROUP_ORDER:
-        out.update(get_group_modules(layer, grp))
-    return out

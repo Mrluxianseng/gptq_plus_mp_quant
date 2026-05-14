@@ -45,17 +45,17 @@ class Config:
     # ``none`` keeps the legacy redundant-replica path (each rank runs the
     # full quantize). Old code's tensor-mode is not ported (RealQ already
     # vectorises across NUM_GROUPS in the per-group fallback).
-    group_parallel_quant: str = "none"  # one of: none, rank
+    group_parallel_quant: str = "rank"  # one of: none, rank
 
     # ----- static end-to-end precompute -----------------------------------
-    global_loss_bsz: int = 4
-    saliency_clip_percentile: float = 0.99
-    grad_hessian_topk: int = -1   # -1 = full vocab
+    global_loss_bsz: int = 16
+    saliency_clip_percentile: float = 1.0
+    grad_hessian_topk: int = 20   # -1 = full vocab
     static_cache_path: Optional[str] = None
     exit_after_precompute: bool = False
 
     # ----- block_gd refresh (Adam + cosine + grad_clip) -------------------
-    grad_lr: float = 1e-4
+    grad_lr: float = 0.0003
     grad_clip: float = 1.0
     # Per-layer lr schedule. "cosine" ramps from `grad_lr * grad_lr_layer_base_ratio`
     # at layer 0 to `grad_lr` at the deepest layer via 0.5*(1-cos(π·x)). "none"
@@ -64,7 +64,7 @@ class Config:
     grad_lr_layer_schedule: str = "cosine"
     grad_lr_layer_base_ratio: float = 0.01
     backward_samples: int = 32
-    backward_bsz: int = 4
+    backward_bsz: int = 32
     # Per-element |delta| clip applied to the refresh-loss delta
     # (= q_out - fp_out) before the fisher quadratic. ``a_loss_ratio`` is
     # the kept-fraction quantile: ratio < 1 caps the top (1 - ratio)
@@ -73,11 +73,11 @@ class Config:
     # (process_args.py:60); see ``_scale_delta_by_abs_quantile`` and
     # the ``_activation_clip_threshold`` torch.quantile/topk fallback.
     # Default 1.0 = disabled (delta passes through).
-    a_loss_ratio: float = 1.0
+    a_loss_ratio: float = 0.95
 
     # ----- batch / memory -------------------------------------------------
-    bsz: int = 4
-    hessian_accum_bsz: int = 128
+    bsz: int = 64
+    hessian_accum_bsz: int = 64
 
     # ----- FSDP single-stage (Stage 3) ------------------------------------
     # When True, wrap the model with FSDP2 for the precompute backward pass,
@@ -89,12 +89,18 @@ class Config:
     fsdp_cpu_offload: bool = False         # forwarded to CPUOffloadPolicy
     fsdp_max_shard_size: str = "5GB"       # for save_pretrained sharding
     fsdp_prepared_dir: Optional[str] = None  # cached checkpoint between phases
-    # TEMPORARY (Commit 1 of cpu_master refactor): opt-in flag for the new
-    # rank0-CPU-master path. When True the pipeline goes through Phase A/B/D
-    # (rank0-only rotate cache + meta init + sharded broadcast load + asymmetric
-    # rebuild). When False the legacy fsdp=True path runs unchanged. This
-    # field is removed in Commit 2 once A/B numerical equivalence is verified;
-    # at that point cfg.fsdp=True unconditionally implies cpu_master.
+    # Opt-in switch for the rank0-CPU-master path. When True the pipeline
+    # goes through Phase A/B/D (rank0-only rotate cache + meta init +
+    # sharded broadcast load + asymmetric rebuild) and the per-node CPU
+    # peak is ~1×M instead of N×M — necessary for large models on
+    # CPU-constrained hosts. When False the model is replicated on every
+    # rank (legacy fsdp=True path), which has faster setup, no broadcast
+    # overhead per quant block, and supports aware AKV. The two paths are
+    # bit-exact equivalent (verified on Qwen3-0.6B, 2-rank, with and
+    # without block_gd); the choice is purely a memory-vs-overhead
+    # trade-off and BOTH are long-term supported. See
+    # realq/TODO_CPU_MASTER.md for the cpu_master path's current
+    # functional restrictions (e.g. no aware AKV).
     cpu_master: bool = False
 
     # ----- AKV quantisation (Stage 2) -------------------------------------
@@ -121,10 +127,10 @@ class Config:
     k_cache_quant_aware_gptq: bool = False
 
     # ----- loss_slide_window (Stage 2) ------------------------------------
-    loss_slide_window: bool = False  # raised by layer_loop; see REFACTOR_NOTES
+    loss_slide_window: bool = True  # raised by layer_loop; see REFACTOR_NOTES
 
     # ----- final layer override (Stage 2) ---------------------------------
-    final_layer_grad_lr: Optional[float] = None
+    final_layer_grad_lr: Optional[float] = 0.00001
     kl_topk: int = 20
 
     # ----- rotate (QuaRot) -------------------------------------------------

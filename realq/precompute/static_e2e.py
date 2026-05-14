@@ -104,13 +104,40 @@ def _find_layer_modules(layer: nn.Module) -> dict[str, nn.Module]:
     return out
 
 
-def _enable_grad_for_model(model: nn.Module) -> None:
-    """Static precompute needs gradients to flow to *all* parameters; the
-    activation gradients we record live on intermediate tensors, but
-    autograd will not run the backward graph at all unless at least one leaf
-    requires grad."""
+def _freeze_model_params(model: nn.Module) -> list[tuple[nn.Parameter, bool]]:
+    """Freeze every param so backward does not allocate per-param grad
+    buffers — the static precompute hooks read activation gradients only,
+    weight gradients are never consumed. On Llama2-70B this skips a 280 GB
+    fp32 grad buffer (8 GB on 4B, ~2.4 GB on Qwen3-0.6B). Returns the prior
+    requires_grad flags so the caller can restore them in a finally clause.
+
+    Pair this with a forward pre-hook on layer[0] (see
+    ``_register_kick_off_hook``) — with all params frozen the embedding
+    output has ``requires_grad=False`` so autograd would not build any
+    graph; the hook re-enters the graph at the first transformer layer's
+    input.
+    """
+    saved = [(p, p.requires_grad) for p in model.parameters()]
     for p in model.parameters():
-        p.requires_grad_(True)
+        p.requires_grad_(False)
+    return saved
+
+
+def _restore_requires_grad(saved: list[tuple[nn.Parameter, bool]]) -> None:
+    for p, flag in saved:
+        p.requires_grad_(flag)
+
+
+def _register_kick_off_hook(layer0: nn.Module) -> torch.utils.hooks.RemovableHandle:
+    """Forward pre-hook on the first transformer layer: flip its input
+    tensor to ``requires_grad=True`` so autograd builds a graph from layer 0
+    onward even though all model params are frozen."""
+
+    def _hook(_module, inputs):
+        if isinstance(inputs, tuple) and len(inputs) > 0 and torch.is_tensor(inputs[0]):
+            inputs[0].requires_grad_(True)
+
+    return layer0.register_forward_pre_hook(_hook)
 
 
 def _shard_local_calibration(trainloader: list, rank: int, world: int) -> list[torch.Tensor]:
@@ -177,8 +204,17 @@ def run(cfg: "Config", analyzer: "ModelAnalyzer") -> StaticStats:
     use_cache = model.config.use_cache
     model.config.use_cache = False
     model.to(dev)
-    _enable_grad_for_model(model)
-    model.train()  # we need backward, but no dropout in pretrained LMs
+    # model.eval(): match old gptq_plus_utils.py:4631 line-for-line. Even
+    # though Qwen3 has no dropout / BatchNorm so train vs eval should be a
+    # no-op, the precompute saliency on Qwen3-0.6B comes out off by ~0.3-
+    # 0.5% per batch under model.train() vs model.eval() (cuBLAS picks a
+    # different attention kernel under model.training=True), and that off-
+    # by-0.5% saliency cascades into a ~5e-2 max-diff in the quantised
+    # weight after Hessian-weighted block update. Forcing eval mode (which
+    # is what old code does) restores bit-exactness with the legacy
+    # reference at lr=0 on 1-GPU AND 2-GPU configurations.
+    model.eval()
+    prev_requires_grad = _freeze_model_params(model)
 
     # 4. Resolve modules per layer + attach hooks.
     layers = analyzer.get_layers()
@@ -190,6 +226,7 @@ def run(cfg: "Config", analyzer: "ModelAnalyzer") -> StaticStats:
     fisher_mgr = hooks_mod.FisherHookManager()
     sal_mgr.attach(layer_modules)
     fisher_mgr.attach(layers)
+    kick_off_handle = _register_kick_off_hook(layers[0])
 
     # 5. Forward + backward loop over the per-rank shard.
     iterator = range(0, n_local, local_bsz)
@@ -244,6 +281,8 @@ def run(cfg: "Config", analyzer: "ModelAnalyzer") -> StaticStats:
     finally:
         sal_mgr.remove()
         fisher_mgr.remove()
+        kick_off_handle.remove()
+        _restore_requires_grad(prev_requires_grad)
 
     # 6. Finalize.
     saliency = sal_mgr.finalize()

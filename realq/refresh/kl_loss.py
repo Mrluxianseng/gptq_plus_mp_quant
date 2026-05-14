@@ -78,7 +78,11 @@ def make_kl_refresh_fn(
     pe = layer_state.position_embeddings
     weight_name = _functional_weight_name(layer, module)
 
-    def refresh(stitched_weight_fp32: torch.Tensor, trailing_col_start: int) -> torch.Tensor | None:
+    def refresh(
+        stitched_weight_fp32: torch.Tensor,
+        trailing_col_start: int,
+        perm: torch.Tensor | None = None,
+    ) -> torch.Tensor | None:
         # Mirror block_gd.refresh under ``--dp_global_shuffle=True``: a
         # GLOBAL scheduler returns the same id list on every rank; each
         # rank filters to its own ``[rank * n_local, (rank+1) * n_local)``
@@ -147,12 +151,12 @@ def make_kl_refresh_fn(
             global_count = int(packed[-1].item())
         else:
             global_count = partial_count
-        if global_count <= 0:
-            raise RuntimeError(
-                f"refresh produced zero samples across all ranks; "
-                f"selected_global={selected_global[:8]}..."
-            )
         accum_grad = partial_grad_sum / float(global_count)
+        # act_order: re-key natural-order grad → permuted column order so the
+        # Adam state slice matches old GPTQ+ subgroup state. See block_gd.py
+        # for the full rationale.
+        if perm is not None:
+            accum_grad = accum_grad[:, perm]
         grad_slice = accum_grad[:, trailing_col_start:]
         if ctx.grad_clip > 0:
             grad_slice = grad_slice.clamp(min=-ctx.grad_clip, max=ctx.grad_clip)

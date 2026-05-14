@@ -29,13 +29,13 @@ torchrun --nproc_per_node="${NUM_GPUS}" --master_port=$((29500 + RANDOM % 1000))
   --model "${MODEL}" \
   --w_bits "${W_BITS}" \
   --num_groups "${NUM_GROUPS:-4}" \
-  --grad_lr "${GRAD_LR:-1e-4}" \
-  --nsamples "${NSAMPLES:-128}" \
+  --grad_lr "${GRAD_LR:-3e-4}" \
+  --nsamples "${NSAMPLES:-2048}" \
   --seq_len "${SEQ_LEN:-2048}" \
-  --bsz "${BSZ:-4}" \
-  --global_loss_bsz "${GLOBAL_LOSS_BSZ:-4}" \
+  --bsz "${BSZ:-64}" \
+  --global_loss_bsz "${GLOBAL_LOSS_BSZ:-16}" \
   --backward_samples "${BACKWARD_SAMPLES:-32}" \
-  --backward_bsz "${BACKWARD_BSZ:-4}" \
+  --backward_bsz "${BACKWARD_BSZ:-32}" \
   --blocksize "${BLOCKSIZE:-128}" \
   --rotate "${ROTATE:-1}" \
   --seed "${SEED:-0}" \
