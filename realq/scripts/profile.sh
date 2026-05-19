@@ -62,7 +62,13 @@ EXP_NAME=${EXP_NAME:-realq_profile}
 OUTPUT_ROOT=${OUTPUT_ROOT:-./outputs}
 NSYS=${NSYS:-1}
 NSYS_OUTPUT=${NSYS_OUTPUT:-${OUTPUT_ROOT}/nsight/${EXP_NAME}}
-NSYS_TRACE=${NSYS_TRACE:-cuda,nvtx}
+# Default trace set: cuda (kernels + driver/runtime), nvtx (our `nvtx_range`
+# annotations), nccl (collective op metadata — communicator, rank list, msg
+# size). Without `nccl` you only see anonymous NCCL kernels in the cuda trace.
+# Add `cublas,cuDNN` if you need GEMM/attention kernel-level breakdown; cost
+# is more CUPTI overhead and bigger reports. CCCL (Thrust/CUB) is not a
+# separate nsys trace category — it surfaces as plain CUDA kernels.
+NSYS_TRACE=${NSYS_TRACE:-cuda,nvtx,nccl}
 NSYS_WAIT=${NSYS_WAIT:-primary}
 if [[ -z "${NSYS_BIN:-}" ]]; then
     if [[ -x /usr/local/bin/nsys ]]; then
