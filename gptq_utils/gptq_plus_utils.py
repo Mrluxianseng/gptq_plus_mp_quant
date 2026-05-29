@@ -3883,7 +3883,7 @@ def _collect_module_output_projections(
             batch_bsz = min(bsz, N_local - j)
             _ = layer(
                 inputs[j : j + batch_bsz].to(dev),
-                attention_mask=attention_mask.expand(batch_bsz, -1, -1, -1),
+                attention_mask=attention_mask.expand(batch_bsz, -1, -1, -1) if attention_mask is not None else None,
                 position_ids=position_ids.expand(batch_bsz, -1),
                 position_embeddings=(
                     position_embeddings[0].expand(batch_bsz, -1, -1),
@@ -4278,7 +4278,7 @@ def collect_layer_output_grad_for_refined_mse(
                         with layer_recorder.section("layer.refined_mse_grad_pool.batch.prepare") if layer_recorder else _NULL_CONTEXT:
                             batch_ids = sample_ids_local[start:start + backward_bsz]
                             bsz = len(batch_ids)
-                            b_attn = attention_mask.expand(bsz, -1, -1, -1)
+                            b_attn = attention_mask.expand(bsz, -1, -1, -1) if attention_mask is not None else None
                             b_pos_ids = position_ids.expand(bsz, -1)
                             b_pos_emb = (
                                 position_embeddings[0].expand(bsz, -1, -1),
@@ -5067,7 +5067,7 @@ def collect_layer_grad_hessian_stats(
             analyzer=analyzer,
             inps=inps,
             fp_inps=fp_inps,
-            batch_attention_mask=attention_mask.expand(bsz, -1, -1, -1),
+            batch_attention_mask=attention_mask.expand(bsz, -1, -1, -1) if attention_mask is not None else None,
             batch_position_ids=position_ids.expand(bsz, -1),
             batch_position_embeddings=(
                 position_embeddings[0].expand(bsz, -1, -1),
@@ -6725,7 +6725,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         batch_bsz = min(hessian_accum_bsz, inps.shape[0] - j)
                         _ = layer(
                             inps[j : j + batch_bsz].to(dev),
-                            attention_mask=attention_mask.expand(batch_bsz, -1, -1, -1),
+                            attention_mask=attention_mask.expand(batch_bsz, -1, -1, -1) if attention_mask is not None else None,
                             position_ids=position_ids.expand(batch_bsz, -1),
                             position_embeddings=(
                                 position_embeddings[0].expand(batch_bsz, -1, -1),
