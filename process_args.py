@@ -11,6 +11,10 @@ from utils.log_utils import init_logging
 
 def parse_gen():
     parser = argparse.ArgumentParser(description="Quantize a model to any precision")
+    parser.add_argument("--mixed_precision", action="store_true", help="Enable mixed precision")
+    parser.add_argument("--mp_target_avg_bits", type=float, default=3.5, help="Target average bits")
+    parser.add_argument("--mp_high_bits", type=int, default=4, help="the higher weight bits")
+    parser.add_argument("--mp_low_bits", type=int, default=3, help="the lower weight bits")
     parser.add_argument("--model", type=str, required=True, help="The model to quantize")
     parser.add_argument("--exp", type=str, required=True, help="Exp name")
     parser.add_argument("--seed", type=int, default=42,
@@ -519,7 +523,7 @@ def parse_gen():
     parser.add_argument("--skip_eval", action="store_true", help="Skip KL/PPL and QA evaluation")
     parser.add_argument("--lm_eval", action="store_true", help="Enable QA eval")
     parser.add_argument("--lm_eval_batch_size", type=int, default=32, help="Batch size for QA tasks")
-    parser.add_argument("--eval_datasets", type=list[str], default=["wikitext2", "ultrachat_2k", "numinamath"],
+    parser.add_argument("--eval_datasets", nargs='+', default=["wikitext2", "ultrachat_2k", "numinamath"],
                         help="Datasets for PPL & KL eval")
     # Exp
     parser.add_argument("--enable_debug", action="store_true", help="Enable debugging")

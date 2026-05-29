@@ -5,5 +5,15 @@ cache*
 *__pycache__*
 
 .vscode
+.idea/
+.claude/
+.venv_wsl/
+${OUT}/
 tmp*
 ablation_results.md
+论文参考/
+papers/
+formal_baseline_commands.md
+formal_baseline_results*.md
+qwen3_0p6b_refined_lr_results.md
+memory_profile.md

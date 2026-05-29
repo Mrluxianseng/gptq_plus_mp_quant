@@ -6,7 +6,10 @@ from tqdm import tqdm
 import torch
 import numpy as np
 import transformers
-from datasets import load_dataset
+import glob
+import pyarrow as pa
+import pyarrow.ipc as ipc
+from datasets import load_dataset, load_from_disk, Dataset
 
 
 def format_messages(messages: list[dict]) -> str:
@@ -32,9 +35,16 @@ def format_messages(messages: list[dict]) -> str:
 
 
 def _get_wikitext2(split):
+    import glob
     assert split in ['train', 'validation', 'test'], f"Unknown split {split} for wikitext2"
 
-    data = load_dataset('./datasets/wikitext', 'wikitext-2-raw-v1', split=split, trust_remote_code=True)
+    parquet_dir = './datasets/wikitext/wikitext-2-raw-v1'
+    if os.path.exists(parquet_dir):
+        parquet_files = glob.glob(f'{parquet_dir}/{split}*.parquet')
+        data = load_dataset('parquet', data_files=parquet_files, split='train')
+    else:
+        logging.info("wikitext not found locally, downloading from HuggingFace...")
+        data = load_dataset('Salesforce/wikitext', 'wikitext-2-raw-v1', split=split, trust_remote_code=True)
     return data['text']
 
 
@@ -52,7 +62,12 @@ def _get_neuralmagic(tokenizer, split):
             text = example["text"]
         return {"text": text}
 
-    data = load_dataset("./datasets/LLM_compression_calibration", split=split, trust_remote_code=True)
+    local_path = "./datasets/LLM_compression_calibration"
+    if os.path.exists(local_path):
+        data = load_dataset(local_path, split=split, trust_remote_code=True)
+    else:
+        logging.info("neuralmagic dataset not found locally, downloading from HuggingFace...")
+        data = load_dataset("neuralmagic/LLM_compression_calibration", split=split, trust_remote_code=True)
     data = data.map(preprocess_fn, remove_columns=data.column_names)
     return data['text']
 
@@ -81,7 +96,16 @@ def _get_numinamath(tokenizer, split):
             text = format_messages(example["messages"])
         return {"text": text}
 
-    data = load_dataset("./datasets/NuminaMath-1.5", split=f"train[:256]" if split == "test" else "train[256:]", trust_remote_code=True)
+    local_path = "./datasets/NuminaMath-1.5"
+    if os.path.exists(local_path):
+        arrow_files = sorted(glob.glob(f'{local_path}/data-*.arrow'))
+        tables = [ipc.open_stream(f).read_all() for f in arrow_files]
+        table = pa.concat_tables(tables).replace_schema_metadata({})
+        data = Dataset(table)
+    else:
+        logging.info("NuminaMath-1.5 not found locally, downloading from HuggingFace...")
+        data = load_dataset("AI-MO/NuminaMath-1.5", split="train", trust_remote_code=True)
+    data = data.select(range(256) if split == "test" else range(256, len(data)))
     data = data.map(preprocess_fn, remove_columns=data.column_names)
     return data['text']
 
@@ -100,7 +124,17 @@ def _get_ultrachat_2k(tokenizer, split):
             text = format_messages(example["messages"])
         return {"text": text}
 
-    data = load_dataset("./datasets/ultrachat_2k", split=f"train_sft[:128]" if split == "test" else "train_sft[128:]", trust_remote_code=True)
+    local_path = "./datasets/ultrachat_2k"
+    if os.path.exists(local_path):
+        arrow_files = sorted(glob.glob(f'{local_path}/data-*.arrow'))
+        tables = [ipc.open_stream(f).read_all() for f in arrow_files]
+        table = pa.concat_tables(tables).replace_schema_metadata({})
+        data = Dataset(table)
+        data = data.select(range(128) if split == "test" else range(128, len(data)))
+    else:
+        logging.info("ultrachat_2k not found locally, downloading from HuggingFace...")
+        hf_split = "train_sft[:128]" if split == "test" else "train_sft[128:2128]"
+        data = load_dataset("HuggingFaceH4/ultrachat_200k", split=hf_split, trust_remote_code=True)
     data = data.map(preprocess_fn, remove_columns=data.column_names)
     return data['text']
 

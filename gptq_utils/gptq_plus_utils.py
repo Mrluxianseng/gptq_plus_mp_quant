@@ -5449,6 +5449,35 @@ def run_pre_quant_gd(
             format_log_value(grad_lr, digits=6),
         )
 
+def compute_mp_bit_map(args, static_saliency_by_layer):
+    if not getattr(args, "mixed_precision", False):
+        return {}
+    scores= {}
+    for layer_idx, layer_saliency in enumerate(static_saliency_by_layer):
+        if layer_saliency is None:
+            continue
+        for module_name, sal in layer_saliency.items():
+            scores[(layer_idx, module_name)] = sal.float().mean().item()
+    ratio =  (args.mp_target_avg_bits - args.mp_low_bits)/(args.mp_high_bits - args.mp_low_bits)
+
+    sorted_items = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    n_hign = int(len(sorted_items) * ratio)
+
+    bit_map = {}
+    for idx, ((layer_idx, module_name), score) in enumerate(sorted_items):
+        if idx < n_hign:
+            bit_map[(layer_idx, module_name)] = args.mp_high_bits
+        else:
+            bit_map[(layer_idx, module_name)] = args.mp_low_bits
+
+    logging.info(
+        "Mixed precision: %d modules total, %d@%dbit, %d@%dbit, avg=%.2f bits",
+        len(bit_map),
+        n_hign, args.mp_high_bits,
+        len(bit_map)-n_hign, args.mp_low_bits,
+        args.mp_target_avg_bits
+    )
+    return bit_map
 
 @torch.no_grad()
 def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
@@ -6037,6 +6066,9 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
         refined_mse_d2h_stream = None
         refined_mse_d2h_event = None
         pbar = tqdm(layer_indices, ncols=120, desc="Quantizing Layers", position=0)
+
+        bit_map = compute_mp_bit_map(args, static_saliency_by_layer)
+
         for i in pbar:
             layer = layers[i].to(dev)
             full = analyzer.get_quantizable_modules(layer)
@@ -6625,14 +6657,15 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
 
             layer_hessian_once = dynsal_refresh_mode == "per_layer"
 
+
             def build_gptq_for_subset(subset_for_setup, saliency_for_setup, gradients_for_setup, reference_loss_for_setup):
                 gptq_local = {}
                 with layer_recorder.section("layer.gptq_setup") if layer_recorder else _NULL_CONTEXT:
                     for module_name, module in subset_for_setup.items():
-                        layer_weight_bits = args.w_bits
                         layer_weight_sym = not args.w_asym
                         if module is None or "lm_head" in module_name:
                             continue
+                        layer_weight_bits = bit_map.get((i, module_name), args.w_bits)
                         saliency = saliency_for_setup.get(module_name, saliency_for_setup.get(module_name + ".module", None))
                         if saliency is None:
                             raise KeyError(
