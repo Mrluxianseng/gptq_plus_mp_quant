@@ -4768,7 +4768,7 @@ def collect_true_weight_gradient(
                         with layer_recorder.section("layer.true_weight_grad.batch.prepare") if layer_recorder else _NULL_CONTEXT:
                             batch_indices = selected_indices[start:start + _step]
                             batch_size = len(batch_indices)
-                            batch_attention_mask = attention_mask.expand(batch_size, -1, -1, -1)
+                            batch_attention_mask = attention_mask.expand(batch_size, -1, -1, -1) if attention_mask is not None else None
                             batch_position_ids = position_ids.expand(batch_size, -1)
                             batch_position_embeddings = (
                                 position_embeddings[0].expand(batch_size, -1, -1),
@@ -5107,7 +5107,7 @@ def collect_layer_grad_hessian_stats(
             leave=False,
         ):
             batch_size = min(bsz, inps.shape[0] - j)
-            batch_attention_mask = attention_mask.expand(batch_size, -1, -1, -1)
+            batch_attention_mask = attention_mask.expand(batch_size, -1, -1, -1) if attention_mask is not None else None
             batch_position_ids = position_ids.expand(batch_size, -1)
             batch_position_embeddings = (
                 position_embeddings[0].expand(batch_size, -1, -1),
@@ -6410,7 +6410,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             mse=args.w_clip,
                         )
 
-            batch_attention_mask = attention_mask.expand(args.bsz, -1, -1, -1)
+            batch_attention_mask = attention_mask.expand(args.bsz, -1, -1, -1) if attention_mask is not None else None
             batch_position_ids = position_ids.expand(args.bsz, -1)
             batch_position_embeddings = (
                 position_embeddings[0].expand(args.bsz, -1, -1),
