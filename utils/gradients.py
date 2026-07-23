@@ -7,6 +7,7 @@ import torch
 
 from utils.dist_utils import distribute_model
 from utils import model_utils
+from utils.saliency_utils import grouped_gradient_norm_squared
 
 
 def _normalize_quant_module_name(name: str) -> str:
@@ -22,8 +23,8 @@ def get_gradients(
 ):
     """
     Calculates weight gradients for the given input tokens. Optionally also calculates
-    'saliency' (mean absolute gradient w.r.t. each module's output activations, grouped
-    by channel) if 'saliency_path' is provided. In that case, we save one file per layer
+    saliency (the squared output-gradient norm within each channel group) if
+    ``saliency_path`` is provided. In that case, we save one file per layer
     under 'saliency_path' directory (e.g., l0.pt, l1.pt, ...).
 
     Args:
@@ -80,16 +81,16 @@ def get_gradients(
                 def grad_hook(grad):
                     """
                     grad shape typically [bsz, seq_len, hidden_dim].
-                    We group the channels, take abs, then average.
+                    We group channels and take the squared Euclidean norm.
                     """
-                    bsz, seq_len, hidden_dim = grad.shape
-                    group_size = hidden_dim // num_groups
-
-                    grad_squared = (grad.float() * 1e3).pow(2).view(bsz, seq_len, num_groups, group_size)
-                    mean_squared_grad = grad_squared.mean(dim=-1)  # -> [bsz, seq_len, num_groups]
+                    saliency = grouped_gradient_norm_squared(
+                        grad.float() * 1e3, num_groups
+                    )
 
                     # Move to CPU and store
-                    saliency_data[layer_idx][module_name].append(mean_squared_grad.bfloat16().cpu())
+                    saliency_data[layer_idx][module_name].append(
+                        saliency.bfloat16().cpu()
+                    )
 
                 # Attach the gradient hook to 'out'
                 out.register_hook(grad_hook)

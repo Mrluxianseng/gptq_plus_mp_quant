@@ -36,6 +36,32 @@ def grouped_gradient_norm_squared(
     )
 
 
+def grouped_channel_gram(
+    matrix: torch.Tensor,
+    num_groups: int,
+) -> torch.Tensor:
+    """Return one unnormalised channel Gram matrix per contiguous row group.
+
+    ``matrix`` has shape ``(output_channels, rank)``.  This is the low-rank
+    counterpart of :func:`grouped_gradient_norm_squared`: both use a channel
+    sum, never a channel mean.
+    """
+    if matrix.dim() != 2:
+        raise ValueError(
+            f"matrix must have shape (channels, rank), got {tuple(matrix.shape)}"
+        )
+    if num_groups <= 0:
+        raise ValueError(f"num_groups must be positive, got {num_groups}")
+    channels, rank = matrix.shape
+    if channels % num_groups:
+        raise ValueError(
+            f"matrix channels {channels} are not divisible by "
+            f"num_groups {num_groups}"
+        )
+    grouped = matrix.float().reshape(num_groups, channels // num_groups, rank)
+    return torch.bmm(grouped.transpose(1, 2), grouped)
+
+
 def _linear_quantile(values: torch.Tensor, percentile: float) -> torch.Tensor:
     """``torch.quantile(..., interpolation='linear')`` without its size cap."""
     flat = values.reshape(-1)

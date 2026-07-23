@@ -8,14 +8,19 @@ torch = pytest.importorskip("torch")
 
 from gptq_utils.gptq_plus_utils import (  # noqa: E402
     GPTQPlus,
+    SaliencyCache,
+    _STATIC_SALIENCY_SCHEMA_TAG,
     compute_layer_lr_scale,
     compute_refresh_loss,
+    refresh_dynamic_saliency,
 )
 from realq.config import Config, parse_cli  # noqa: E402
 from realq.precompute.hooks import (  # noqa: E402
     FisherHookManager,
     LOSS_GRAD_SCALE,
+    SaliencyHookManager,
 )
+from realq.quant.realq_layer import RealQLayer  # noqa: E402
 from realq.refresh.block_gd import layer_lr_for_schedule  # noqa: E402
 from realq.refresh.fisher_loss import fisher_mse_loss  # noqa: E402
 from realq.refresh.kl_loss import kl_topk_loss  # noqa: E402
@@ -25,6 +30,7 @@ from realq.quant.hessian import (  # noqa: E402
 from utils.loss_utils import tokenwise_kl_from_logits  # noqa: E402
 from utils.saliency_utils import (  # noqa: E402
     global_percentile,
+    grouped_channel_gram,
     grouped_gradient_norm_squared,
 )
 
@@ -107,6 +113,114 @@ def test_grouped_saliency_is_paper_squared_norm_not_channel_mean():
     expected = torch.tensor([[[5.0, 25.0], [1.0, 8.0]]])
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     assert not torch.equal(actual, expected / 2.0)
+
+
+def test_dynamic_saliency_gram_uses_channel_sum_scale():
+    matrix = torch.tensor(
+        [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]]
+    )
+    actual = grouped_channel_gram(matrix, num_groups=2)
+    expected = torch.stack(
+        [matrix[:2].T @ matrix[:2], matrix[2:].T @ matrix[2:]]
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert not torch.equal(actual, expected / 2.0)
+
+
+def test_dynamic_saliency_sum_scale_survives_hessian_finalization():
+    projection = torch.eye(4)
+    channel_gram = grouped_channel_gram(projection, num_groups=2)
+    dyn_entry = {
+        "U_Sigma": torch.tensor([[1.0, 2.0, 3.0, 4.0]]),
+        "W_cross_packed": channel_gram,
+        "R_eff": 4,
+    }
+    scale = 1_000_000.0
+    saliency = refresh_dynamic_saliency(
+        dyn_entry=dyn_entry,
+        static_saliency=torch.zeros(1, 1, 2),
+        N_global=1,
+        P_delta=torch.tensor([[[5.0, 6.0, 7.0, 8.0]]]),
+        num_groups=2,
+        dev=torch.device("cpu"),
+        static_saliency_scale=scale,
+    )
+    expected_saliency = torch.tensor([[[34.0, 106.0]]]) * scale
+    torch.testing.assert_close(
+        saliency, expected_saliency, rtol=0, atol=0
+    )
+
+    solver = GPTQPlus(
+        torch.nn.Linear(2, 4, bias=False),
+        saliency,
+        gradient=torch.zeros(2, 2),
+        num_groups=2,
+        alpha=0.0,
+        reference_loss=0.0,
+        hessian_saliency_scale=scale,
+    )
+    inputs = torch.tensor([[[2.0, 3.0]]])
+    solver.add_batch(inputs, out=None)
+    solver.finalize_hessian()
+    outer = inputs.reshape(-1, 2).T @ inputs.reshape(-1, 2)
+    expected_hessian = torch.stack([34.0 * outer, 106.0 * outer])
+    torch.testing.assert_close(
+        solver.H, expected_hessian, rtol=0, atol=0
+    )
+
+
+def test_old_and_new_saliency_collectors_feed_exact_paper_hessian():
+    gradient = torch.tensor(
+        [[[1.0, 2.0, 3.0, 4.0], [-1.0, 0.0, 2.0, -2.0]]]
+    )
+    expected_saliency = torch.tensor([[[5.0, 25.0], [1.0, 8.0]]])
+
+    legacy_output = torch.zeros_like(gradient, requires_grad=True)
+    legacy = SaliencyCache(["proj"], num_groups=2)
+    legacy.hooks_enabled = True
+    legacy.cache_saliency(None, None, legacy_output, "proj")
+    legacy_output.backward(gradient)
+    legacy_saliency = legacy.saliency_cache["proj"][0]
+
+    module = torch.nn.Linear(4, 4, bias=False)
+    refactored = SaliencyHookManager(
+        num_groups=2, clip_percentile=None
+    )
+    refactored.attach([{"proj": module}])
+    refactored_output = module(torch.zeros_like(gradient))
+    refactored_output.backward(gradient)
+    refactored_saliency = refactored.finalize()[0]["proj"]
+    refactored.remove()
+
+    torch.testing.assert_close(
+        legacy_saliency, expected_saliency, rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        refactored_saliency, expected_saliency, rtol=0, atol=0
+    )
+
+    inputs = torch.tensor([[[1.0, 2.0], [3.0, 4.0]]])
+    realq = RealQLayer(
+        torch.nn.Linear(2, 4, bias=False),
+        refactored_saliency,
+        quantizer=None,
+        num_groups=2,
+        dev=torch.device("cpu"),
+    )
+    realq.add_batch(inputs)
+    flat_inputs = inputs.reshape(-1, 2)
+    expected_hessian = torch.stack(
+        [
+            flat_inputs.T
+            @ torch.diag(expected_saliency.reshape(-1, 2)[:, group])
+            @ flat_inputs
+            for group in range(2)
+        ]
+    )
+    torch.testing.assert_close(realq.H, expected_hessian, rtol=0, atol=0)
+    # v1 already existed while the optional dynamic correction still used a
+    # channel mean. v2 is required to invalidate those payloads.
+    assert _STATIC_SALIENCY_SCHEMA_TAG == "salsumv2"
 
 
 def test_activation_aware_uses_reported_constant_lr_but_fp16_flag_is_noop():

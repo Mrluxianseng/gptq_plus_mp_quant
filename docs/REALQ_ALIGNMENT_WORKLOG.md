@@ -88,6 +88,11 @@ different questions:
   several numerically material settings are undisclosed or conflict across
   `Config`, the convenience launcher, and the legacy sweep. See
   `docs/REALQ_PAPER_PROTOCOL.md`.
+- The paper's claim that calibration sampling is the only stochastic source
+  is too strong for the implementation: Stage 0 samples categorical Fisher
+  labels and QuaRot generates a random transform. Dedicated fixed seeds make
+  those products replayable and isolate a calibration-seed sweep, but do not
+  make the underlying operations non-random.
 
 ## Baseline findings
 
@@ -117,21 +122,21 @@ different questions:
 | Feature | Legacy after audit | Refactor after audit | Paper consistency |
 |---|---|---|---|
 | Aggregated Fisher MSE | Full token-aggregated, non-diagonal Fisher and full quadratic | Exact same value/gradient semantics | Yes; independent non-diagonal oracle |
-| Adam Block-GD | One bias-corrected Adam step per refresh, trailing columns only | Same moments, bias correction, clipping, and shrinking active suffix | Yes; independent two-step oracle |
+| Adam Block-GD | One bias-corrected Adam step per refresh, trailing columns only; state resets per linear and persists across that linear's shrinking suffix | Same moments, reset boundary, bias correction, clipping, and shrinking active suffix | Core Adam/update/reset matches; clip operator/threshold and 32-sample scheduler cadence are not disclosed |
 | Loss slide | Historical refresh-only alpha and penultimate-layer skip | Exact historical behavior | **No**; current formula/pseudocode describe a different schedule |
-| Reverse cosine | `sin(pi*x/2)` after correction | Same; constant LR for aware A/K/V | Yes |
-| QuaRot | Full global and local transforms; cloned untied heads rotate normally | Shared implementation and wrapper topology | Yes within floating-point tolerance; tied/untied Llama and Qwen3 whole-model logits oracles |
-| GuidedQuant saliency Hessian | Per-token group `sum(grad²)` after correction | Same shared paper-norm primitive | Yes for the stated squared Euclidean norm; old channel-mean caches are schema-invalidated |
-| A quantization | Per-token linear input fake quant; aware/unaware timing works | Same sites and timing | Yes |
-| V quantization | Per-token `v_proj` output fake quant | Same | Yes |
-| K-cache quantization | Post-RoPE K fake quant, aware/unaware | Same | Yes |
+| Reverse cosine | `sin(pi*x/2)` after correction | Same; constant LR for aware A/K/V | Literal equation matches; endpoint is ambiguous because the separately handled final block consumes the only `x=1` index |
+| QuaRot | Full global and local transforms; path-loaded and directly supplied storage-tied heads are cloned/untied before rotation | Shared implementation and wrapper topology | Yes within floating-point tolerance; tied-source/untied Llama and Qwen3 whole-model logits oracles now execute the full transform |
+| GuidedQuant saliency Hessian | Per-token/module group `sum(grad²)` after correction, including the standalone GuidedQuant cache and optional dynamic correction | Same shared paper-norm primitive | Yes for the stated squared Euclidean norm; old channel-mean caches are schema-invalidated |
+| A quantization | Per-token linear-input fake quant; aware/unaware timing works | Same sites and timing | High-level per-token A is consistent; exact hook sites/axes are an implementation choice |
+| V quantization | Per-token `v_proj`-output fake quant | Same | High-level per-token V is consistent; exact hook site is not specified |
+| K-cache quantization | Post-RoPE K fake quant, aware/unaware | Same | High-level per-token K is consistent; exact post-RoPE site and independent aware switch are not specified |
 | Query/Q quantization | Not implemented | Not implemented | Not claimed by the paper; Q is rotation-only |
-| A/K/V range clip | Symmetric quantization with explicit clip ratios | Same, conditional low-bit default 0.9 | Yes |
-| Activation-loss clip | One global-refresh P95 detached scale, in legacy activation arithmetic order | Same value and gradient after correction | Matches the stated detached P95; the full-refresh/global population is an implementation choice because the paper does not define the percentile axes |
+| A/K/V range clip | Symmetric quantization with explicit clip ratios | Same, conditional low-bit default 0.9 | Stated symmetric/per-token ratios match; signed integer range and rounding rule are not disclosed |
+| Activation-loss clip | A separate detached P95 over every activation-error element of each current/next loss component in one refresh, globally across ranks and refresh micro-batches | Same value, gradient, scope, and legacy activation arithmetic order | Matches detached P95; paper does not define these axes |
 | Per-row weights | Correct | Correct | Yes for W4A16 |
 | Grouped weights | Correct group-128/act-order/short tail | Repaired to match all tested legacy paths | Group-128 operator is consistent; W2/W3 full-pipeline runs were not performed |
 | Final KL | Full-vocabulary fp32 KL | Same | Yes |
-| KL/PPL evaluation | Correct shifted-token PPL and full-vocabulary fp32 KL after fixes | Same evaluator | Yes; actual synthetic held-out smoke exact |
+| KL/PPL evaluation | Correct shifted-token PPL and full-vocabulary fp32 KL after fixes | Same evaluator | Metric math matches; evaluation chunk, tokenizer/revisions, and software version are undisclosed; synthetic held-out smoke only |
 | Ten-task evaluation | Shared exact task list and metric-key handling | Restored rank-0 lifecycle | Task discovery verified; full datasets unavailable on node |
 | Checkpoint reload | Versioned safe manifest plus explicit legacy opt-in | Same format and runtime reconstruction | Stronger than the original paper requirement |
 
@@ -150,9 +155,9 @@ stack.
 | `w4_g128_actorder` | 4 | 128 | off | 16/16/16 | unaware | weight clip | on |
 | `w4a4kv4_unaware_clip09` | 4 | 128 | on | 4/4/4 | unaware | loss + A/K/V 0.9 | on |
 | `w4a4kv4_unaware_clip1` | 4 | 128 | on | 4/4/4 | unaware | disabled | on |
-| `w4a4v4_aware` | 4 | 128 | on | 4/16/4 | aware A/V | A/V 0.9 | on |
-| `w4k4_aware` | 4 | 128 | on | 16/4/16 | aware K | K 0.9 | on |
-| `w4a4kv4_aware` | 4 | 128 | on | 4/4/4 | aware | A/K/V 0.9 | on |
+| `w4a4v4_aware` | 4 | 128 | on | 4/16/4 | aware A/V | loss 0.95 + A/V 0.9 | on |
+| `w4k4_aware` | 4 | 128 | on | 16/4/16 | aware K | loss 0.95 + K 0.9 | on |
+| `w4a4kv4_aware` | 4 | 128 | on | 4/4/4 | aware | loss 0.95 + A/K/V 0.9 | on |
 
 The first bring-up may use only the first transformer layer and smaller hidden
 dimensions. The final matrix must retain at least one three-layer slide case
@@ -194,7 +199,9 @@ and one final-layer full-vocabulary KL case.
   act-order natural-column mapping, rank-group synchronization, and batched
   Hessian inversion arithmetic.
 - Isolated FP teacher/precompute/replay paths from aware A/V/K fake
-  quantization and fixed rotation of cloned-but-untied embeddings/heads.
+  quantization and fixed rotation of cloned-but-untied embeddings/heads,
+  including the direct model-object API rather than only path-loaded
+  checkpoints.
 - Split calibration, rotation, and refresh RNG domains; made token/static/eval
   caches identity-safe, all-rank-consistent, validated, and atomically written.
 - Added a safe versioned quantized-checkpoint manifest. Runtime A/V/K behavior,
@@ -213,18 +220,28 @@ and one final-layer full-vocabulary KL case.
   group/per-row weights, closed-form full-vocabulary KL value/gradient, PPL
   shift, and tied/untied Llama/Qwen3 whole-model QuaRot logit invariance.
 - Corrected GuidedQuant saliency from the historical per-group channel mean
-  to the paper's squared Euclidean norm (`sum(grad²)`) in both implementations.
-  The refactored cache schema and legacy cache tag were advanced so a
-  pre-correction static cache cannot silently survive the semantic change.
+  to the paper's squared Euclidean norm (`sum(grad²)`) in the legacy static
+  collector, refactored static collector, standalone GuidedQuant cache, and
+  optional dynamic-saliency correction. The refactored cache schema and both
+  legacy cache tags were advanced so a pre-correction cache cannot silently
+  survive the semantic change. A direct collector-to-`X^T diag(s) X` oracle
+  prevents the group-size scale error from being hidden by GPTQ's scale
+  invariance.
 - Added a fixture `--tokens-only` mode that materializes all legacy/refactored
   cache names for a new global sample count without rewriting model,
   tokenizer, config, or manifest files. This closed an eight-rank offline
   preflight failure caused by requesting 16 samples from an eight-sample
   synthetic fixture.
+- Made the convenience launcher choose the paper's weight grouping by bit
+  setting: per-row for W4A16 and group 128 for W2/W3 or any A/K/V-low-bit
+  configuration. It remains a template, not an exact paper-row launcher.
 
 ## Validation evidence
 
-- Unit/regression suite on the allocated GPU node: `130 passed`.
+- Unit/regression suite on the allocated GPU node: `134 passed`, including
+  direct legacy/refactored saliency-hook and downstream Hessian oracles,
+  dynamic-saliency-to-finalized-Hessian scale coverage, tied-object full
+  rotation, and cache-schema invalidation.
 - Safe checkpoint tests: new-to-new and new-to-legacy-entry round trips each
   preserved all 51 tiny-Llama state keys bit-for-bit.
 - Root-cause closure
@@ -242,6 +259,19 @@ and one final-layer full-vocabulary KL case.
   corrected numerical source at commit `a4e5e48`; its runner predated the
   provenance fields added in `29c9879`, so this source boundary is recorded
   here rather than inferred from the report.
+- Clean eight-GPU matrix
+  (`/output/realq_alignment/matrix_8gpu_v2/matrix_report.json`): source commit
+  `c5a0dfcfccc813ade8e2efb6cb0287ab3d77a928`, empty tracked-diff hash, and
+  repository status containing only user-owned `main.tex`. The two
+  representative cases (`w4_row_rotate_slide` and `w4a4kv4_aware`) produced
+  eight comparisons and 216 matched refresh-loss points on eight NVIDIA L20C
+  GPUs. Every loss difference, tensor/weight difference, sample-index
+  difference, slide-alpha difference, and manifest difference was exactly
+  zero. The first `matrix_8gpu_v1` attempt stopped during fixture preflight
+  because the isolated node had only eight-sample token caches for a requested
+  global sample count of 16; it did not enter either quantizer. `--tokens-only`
+  created the missing cache variants without altering model/tokenizer
+  artifacts, after which `v2` passed.
 - Production KL/PPL evaluator smoke
   (`/output/realq_alignment/eval_smoke_rootcause.json`): deterministic
   held-out synthetic tokens, full-vocabulary KL and shifted-token PPL;
@@ -260,7 +290,9 @@ and one final-layer full-vocabulary KL case.
   This validates task naming/discovery, not full dataset scoring.
 - Coherent commits:
   - `a4e5e48` — numerical semantics, caches, evaluation, and checkpoints;
-  - `29c9879` — independent oracles and alignment matrix runner.
+  - `29c9879` — independent oracles and alignment matrix runner;
+  - `e0aaf80` — final audit assertions and provenance capture;
+  - `c5a0dfc` — paper-norm saliency and distributed fixture hardening.
 
 ## Known paper/code mismatch: legacy loss slide
 
@@ -290,10 +322,27 @@ whereas both implementations skip the penultimate-to-final transition and
 reserve true KL for the final block. Old and new are mutually consistent, but
 neither is fully consistent with `main.tex:195-203,457-463`.
 
+## Reverse-cosine endpoint ambiguity
+
+The corrected code implements the equation in `main.tex:622-627` literally
+over all `L` transformer-block indices:
+
+```text
+x = layer_index / (L - 1)
+scale = sin(pi*x/2)
+```
+
+The same appendix separately says that the final transformer block uses its
+own final-layer learning rate and true KL. Consequently the scheduled branch
+is used only for indices `0 .. L-2`; its deepest actual non-final block has
+`x=(L-2)/(L-1)` and never reaches the reported scheduled endpoint. An equally
+plausible interpretation would normalize the `L-1` non-final blocks over
+`0 .. L-2`, making the last non-final block reach the target. Old and new use
+the first interpretation exactly. The paper needs to disambiguate the
+denominator before changing this behavior.
+
 ## Evidence still outstanding at this point in the log
 
-- Clean eight-rank end-to-end runs for representative slide/P95 and fully
-  aware A/K/V cases.
 - A clean post-saliency-correction rerun of the full one-GPU matrix; the
   recorded `matrix_v3` result predates the group-squared-norm correction.
 - Full zero-shot task scoring is unavailable on the isolated node because the
@@ -303,5 +352,8 @@ neither is fully consistent with `main.tex:195-203,457-463`.
   tied/untied whole-model rotation oracles, but no full
   static-precompute-to-Block-GD-to-A/K/V-to-evaluation integration run, so the
   tiny-Llama result must not be extrapolated to every paper model family.
+- The paper's 70B FSDP plus activation-checkpointing memory/timing protocol was
+  not reproduced. The eight-GPU tiny-model run validates distributed
+  numerical semantics, not the 70B systems or performance claims.
 - Exact paper-table reproduction remains blocked on the undisclosed settings
   listed in `docs/REALQ_PAPER_PROTOCOL.md`.

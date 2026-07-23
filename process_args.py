@@ -605,16 +605,19 @@ def parse_gen():
         "--backward_bsz",
         type=int,
         default=32,
-        help="Batch size used inside each block-backward refresh (-1 means reuse --bsz).",
+        help=(
+            "Gradient-accumulation chunk size inside each block-backward "
+            "refresh; does not change --backward_samples (-1 means reuse --bsz)."
+        ),
     )
     parser.add_argument(
         "--final_layer_backward_bsz",
         type=int,
         default=None,
         help=(
-            "Optional override for the refresh backward batch size used only in "
-            "the final transformer layer. By default it inherits "
-            "--backward_bsz (32 in the paper protocol)."
+            "Optional override for the refresh gradient-accumulation chunk "
+            "size used only in the final transformer layer. It does not change "
+            "the total --backward_samples and inherits --backward_bsz by default."
         ),
     )
     parser.add_argument(
@@ -902,7 +905,8 @@ def parse_gen():
         args.saliency_cache_path = (f"{args.cache_dir}/saliency/"
                                     f"{args.model_name}-mid{model_artifact_tag}-{args.dataset}_"
                                     f"s{args.nsamples}_blk{args.seq_len}_"
-                                    f"cseed{args.seed}_{rotation_cache_tag}_g{args.num_groups}")
+                                    f"cseed{args.seed}_{rotation_cache_tag}_g{args.num_groups}_"
+                                    "salsumv1")
         args.gradients_cache_path = (f"{args.cache_dir}/gradients/"
                                     f"{args.model_name}-mid{model_artifact_tag}-{args.dataset}_"
                                     f"s{args.nsamples}_blk{args.seq_len}_"

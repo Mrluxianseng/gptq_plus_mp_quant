@@ -84,6 +84,45 @@ def _prepare_config_for_untied_lm_head(model_str: str):
     return config, process_word_embeddings
 
 
+def _untie_model_object_lm_head(model: PreTrainedModel) -> None:
+    """Give a directly supplied tied model the same topology as path loading.
+
+    QuaRot needs independently transformable input embeddings and LM head.
+    Hugging Face checkpoints loaded from a path are already cloned by
+    :func:`load_model`; apply the same transformation to a model object so the
+    public API cannot silently skip every global R1 transform.
+    """
+    input_embeddings = model.get_input_embeddings()
+    output_embeddings = model.get_output_embeddings()
+    if input_embeddings is None or output_embeddings is None:
+        return
+    source_declared_tied = bool(
+        getattr(model.config, "tie_word_embeddings", False)
+    )
+    actually_tied = parameters_share_storage(
+        input_embeddings.weight, output_embeddings.weight
+    )
+    if actually_tied:
+        old_weight = output_embeddings.weight
+        output_embeddings.weight = nn.Parameter(
+            old_weight.detach().clone(),
+            requires_grad=old_weight.requires_grad,
+        )
+        if parameters_share_storage(
+            input_embeddings.weight, output_embeddings.weight
+        ):
+            raise RuntimeError(
+                "Unable to untie input embeddings and LM head on the supplied "
+                f"{type(model).__name__} object; full QuaRot requires separate "
+                "parameter storage."
+            )
+    if source_declared_tied or actually_tied:
+        # Record the source fact separately, while making config describe the
+        # tensor topology that will be transformed and saved.
+        model.tie_word_embeddings = True
+        model.config.tie_word_embeddings = False
+
+
 def load_model(model_str_or_model):
     """Returns a model from a string or a model object. If a string is passed, it will be loaded from the HuggingFace"""
     if isinstance(model_str_or_model, str):
@@ -102,6 +141,7 @@ def load_model(model_str_or_model):
     else:
         assert isinstance(model_str_or_model, PreTrainedModel), "model must be a string or a PreTrainedModel"
         model = model_str_or_model
+        _untie_model_object_lm_head(model)
 
     model.eval()
 

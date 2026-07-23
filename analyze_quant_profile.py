@@ -8,6 +8,7 @@ import torch
 
 from gptq_utils.main import quantize_weights
 from utils import memory_utils
+from utils.cache_identity import artifact_cache_tag
 from utils.log_utils import init_logging
 from utils.model_utils import ModelAnalyzer
 from utils.reproducibility import configure_reproducibility
@@ -147,6 +148,7 @@ def main():
 
     model_name = args.model.split("/")[-1]
     args.model_name = model_name
+    model_artifact_tag = artifact_cache_tag(args.model)
     args.output_dir = os.path.join(args.output_dir, model_name, args.exp)
     args.log_dir = os.path.join(args.output_dir, "logs")
     args.tokens_cache_path = (
@@ -154,8 +156,9 @@ def main():
         f"blk{args.seq_len}_seed{args.seed}.pt"
     )
     args.saliency_cache_path = (
-        f"{args.cache_dir}/saliency/{args.model_name}-{args.dataset}_s{args.nsamples}_"
-        f"blk{args.seq_len}_cseed{args.seed}_rseed{args.rotation_seed}_g{args.num_groups}"
+        f"{args.cache_dir}/saliency/{args.model_name}-mid{model_artifact_tag}-"
+        f"{args.dataset}_s{args.nsamples}_blk{args.seq_len}_cseed{args.seed}_"
+        f"rot1_rseed{args.rotation_seed}_g{args.num_groups}_salsumv1"
     )
     args.gradients_cache_path = (
         f"{args.cache_dir}/gradients/{args.model_name}-{args.dataset}_s{args.nsamples}_"

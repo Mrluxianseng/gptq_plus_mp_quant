@@ -55,7 +55,7 @@
 - GRAD_GATE_SHARPNESS：quant_error_gate和quant_error_gate_optimized用的系数
 - GRAD_GATE_SINE_AMP：quant_error_gate_optimized用的系数
 - GRAD_HESSIAN_TOPK：计算saliency和fisher用的logits topk（如果用的不是端到端的kl(global_loss=0)，一定要设成-1，因为逐层的输出头的topk不一定是一样的）
-- SALIENCY_CLIP_PERCENTILE：在precompute阶段把每个中间层token的saliency（`grad²(NLL_total, module_output).mean(group)`）裁到这个分位数，默认0.99。这里 `NLL_total` 是对输出sample×输出token求和的 sampled NLL；`mean(group)` 只是在模块输出通道group内平均，不是在中间层token维平均。用来压掉深层（layer 24+）NLL backward产生的极端gradient outlier（有几个token的saliency可以比中位数大10-12个数量级）。不裁的话这些outlier会让后续的`inp.T @ diag(s) @ inp`变成近rank-1的病态矩阵，Cholesky即使damp涨到0.5+还是失败。设成1.0可以关掉裁剪。改了这个值会让static_cache_path的cache key变（key里带`salclip{value}`），重新预计算。
+- SALIENCY_CLIP_PERCENTILE：在 precompute 阶段把每个中间层 token 的 saliency（`grad²(NLL_total, module_output).sum(group)`，即论文的组内梯度平方范数）裁到这个分位数，默认 0.99。这里 `NLL_total` 是对输出 sample×输出 token 求和的 sampled NLL；`sum(group)` 只在模块输出通道组内求和，不在中间层 token 维归约。用来压掉深层（layer 24+）NLL backward 产生的极端 gradient outlier（少数 token 的 saliency 可比中位数大 10–12 个数量级）。不裁会让后续 `inp.T @ diag(s) @ inp` 变成近 rank-1 的病态矩阵，Cholesky 即使把 damp 提到 0.5+ 仍可能失败。设成 1.0 可关闭裁剪。saliency 数学语义和该分位数都进入 static-cache schema；修改后必须重新预计算。
 - PROJ_LR_SCALE：调整o_proj层用的学习率
 - DOWN_PROJ_LR_SCALE：调整down_proj层用的学习率（这个层一般比较爆炸）
 - SECOND_ORDER_SCALE：调整gptq式二阶更新的scale，固定为1就行

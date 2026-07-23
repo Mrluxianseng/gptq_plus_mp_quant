@@ -250,6 +250,21 @@ def test_static_cache_key_tracks_only_numerically_relevant_seed_domains(tmp_path
     )
 
 
+def test_refactored_static_cache_schema_invalidates_old_saliency_mean(
+    tmp_path, monkeypatch
+):
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "config.json").write_text('{"hidden_size": 16}')
+    cfg = _static_cache_cfg(model)
+
+    assert cache_mod._CACHE_SCHEMA_VERSION == 5
+    sum_key = cache_mod.build_cache_key(cfg, world_size=1)
+    monkeypatch.setattr(cache_mod, "_CACHE_SCHEMA_VERSION", 4)
+    mean_key = cache_mod.build_cache_key(cfg, world_size=1)
+    assert sum_key != mean_key
+
+
 def test_prepared_rotation_identity_excludes_calibration_seed(tmp_path):
     model = tmp_path / "model"
     model.mkdir()
@@ -308,6 +323,7 @@ def test_cli_defaults_hold_algorithm_seeds_fixed_and_legacy_cache_is_seeded(
     assert args.rotation_seed == 0
     assert args.refresh_seed == 0
     assert args.tokens_cache_path.endswith("_blk2048_seed123.pt")
+    assert args.saliency_cache_path.endswith("_g4_salsumv1")
 
 
 def test_reproducibility_helper_replays_python_numpy_and_torch_rngs():

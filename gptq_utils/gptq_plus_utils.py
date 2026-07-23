@@ -22,6 +22,7 @@ from utils import quant_utils, memory_utils, model_utils, dist_utils, rotation_u
 from utils.saliency_utils import (
     clip_global_percentile_,
     global_percentile,
+    grouped_channel_gram,
     grouped_gradient_norm_squared,
 )
 from utils.loss_utils import tokenwise_kl_from_logits
@@ -37,6 +38,8 @@ from gptq_utils.quant_aware_utils import (
     disable_fp_path_quant,
 )
 
+
+_STATIC_SALIENCY_SCHEMA_TAG = "salsumv2"
 
 # Single reusable no-op context. `nullcontext()` instances are stateless, so we
 # avoid allocating a new one at every `with ... if profile_recorder else
@@ -3767,7 +3770,7 @@ class SaliencyCache:
         def grad_hook(grad):
             """
             grad shape typically [bsz, seq_len, hidden_dim].
-            We group the channels, take abs, then average.
+            We group the channels and take the squared Euclidean norm.
             """
             if not self.hooks_enabled:
                 return
@@ -3775,8 +3778,6 @@ class SaliencyCache:
             if self.sink_size > 0 and g.dim() >= 2 and g.shape[1] > self.sink_size:
                 g = g[:, self.sink_size:]
             bsz, seq_len, hidden_dim = g.shape
-            group_size = hidden_dim // self.num_groups
-
             saliency = grouped_gradient_norm_squared(
                 g, self.num_groups
             )  # -> [bsz, seq_len, num_groups]
@@ -5196,17 +5197,20 @@ def collect_static_end_to_end_saliency_and_fisher(
                         for entry in layer_d.values():
                             V_dev = entry["V"].to(dev, dtype=torch.float32)   # (H_out, R_eff)
                             Sigma_sq_dev = entry["Sigma_sq"].to(dev)          # (R_eff,) fp32
-                            H_out = entry["H_out"]
                             R_eff = entry["R_eff"]
-                            if H_out % G_groups != 0:
-                                raise ValueError(
-                                    f"dynsal pack: H_out ({H_out}) must be divisible by num_groups ({G_groups})."
+                            # Static saliency is a group squared norm
+                            # (channel sum), so its dynamic low-rank
+                            # correction must use the same sum scale.
+                            C_packed = grouped_channel_gram(
+                                V_dev, G_groups
+                            )
+                            if C_packed.shape != (
+                                G_groups, R_eff, R_eff
+                            ):
+                                raise RuntimeError(
+                                    "unexpected grouped dynamic-saliency "
+                                    f"Gram shape {tuple(C_packed.shape)}"
                                 )
-                            group_size = H_out // G_groups
-                            C_packed = torch.empty(G_groups, R_eff, R_eff, dtype=torch.float32, device=dev)
-                            for k in range(G_groups):
-                                Vk = V_dev[k * group_size:(k + 1) * group_size]
-                                C_packed[k] = (Vk.t() @ Vk) / float(group_size)
                             W_cross_packed = C_packed * Sigma_sq_dev.view(1, 1, R_eff)
                             entry["C_packed"] = C_packed.cpu()
                             entry["W_cross_packed"] = W_cross_packed.cpu()
@@ -6500,9 +6504,10 @@ def collect_true_weight_gradient(
     if refresh_mb is not None and refresh_mb > 0 and _lm_head_loss:
         _step = min(bsz, int(refresh_mb))
 
-    # The paper's activation-loss clipping is one P95 over the complete
-    # GLOBAL refresh mini-batch, not one P95 per rank or internal microbatch.
-    # Every rank participates even when global shuffle assigns it zero samples.
+    # The paper's activation-loss clipping is one P95 over the complete GLOBAL
+    # sample set selected for this refresh, not one P95 per rank or internal
+    # accumulation chunk. Every rank participates even when global shuffle
+    # assigns it zero samples.
     a_loss_threshold = None
     next_a_loss_threshold = None
     if (
@@ -7698,7 +7703,8 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     f"g{args.num_groups}_"
                     f"fisherfull_ghtk{args.grad_hessian_topk}_"
                     f"glbsz{args.global_loss_bsz}_cseed{args.seed}_"
-                    f"salclip{sal_clip_tag}_salglobalv1_salsumv1_"
+                    f"salclip{sal_clip_tag}_salglobalv1_"
+                    f"{_STATIC_SALIENCY_SCHEMA_TAG}_"
                     f"rklNA{rkl_na}_fpfinal{fpfinal_tag}"
                     f"_e2els{int(_E2E_PRECOMPUTE_LOSS_GRAD_SCALE)}"
                     f"{grad_stat_tag}{mix_tag}{dynsal_tag}{analysis_tag}"

@@ -71,19 +71,21 @@ class Config:
     # Optional final-transformer-block override. ``None`` reuses
     # ``grad_clip`` exactly like the legacy implementation.
     final_layer_grad_clip: Optional[float] = None
-    # Per-layer lr schedule. "cosine" ramps from `grad_lr * grad_lr_layer_base_ratio`
-    # at layer 0 to `grad_lr` at the deepest layer via sin(π·x/2). "none"
+    # Per-layer lr schedule. "cosine" uses the paper's literal all-L
+    # sin(π·x/2) indexing; the final block has a separate true-KL override, so
+    # the deepest scheduled non-final block does not reach `grad_lr`. "none"
     # disables the ramp entirely so every layer uses `grad_lr` (base_ratio is
     # ignored). Mirrors legacy `--grad_lr_layer_schedule` (process_args.py:393).
     grad_lr_layer_schedule: str = "cosine"
     grad_lr_layer_base_ratio: float = 0.01
     backward_samples: int = 32
-    # These are GLOBAL refresh micro-batch sizes, matching legacy GPTQ+.
+    # These are GLOBAL gradient-accumulation chunk sizes, matching legacy
+    # GPTQ+; they do not change `backward_samples`, hence do not change the
+    # number of samples in one Adam step.
     # Each rank uses value // world_size after validating divisibility.
     backward_bsz: int = 32
-    # ``None`` means inherit ``backward_bsz``.  The paper protocol therefore
-    # uses a global batch of 32 for every layer; an explicit override remains
-    # available for memory-constrained diagnostics.
+    # ``None`` means inherit ``backward_bsz``. An explicit final-layer
+    # override changes only chunking, not the 32-sample optimizer step.
     final_layer_backward_bsz: Optional[int] = None
     # Per-element |delta| clip applied to the refresh-loss delta
     # (= q_out - fp_out) before the fisher quadratic. ``a_loss_ratio`` is
@@ -144,9 +146,10 @@ class Config:
     k_groupsize: int = -1
     k_asym: bool = False
     k_clip_ratio: Optional[float] = None
-    # When True the A/K quantisers fire DURING the weight-Hessian forward
-    # so GPTQ sees the quantised activation (the "aware" path). When False
-    # A/K quant is only applied AFTER weight quant for runtime use.
+    # The first flag makes A/V quantisers fire during the weight-Hessian
+    # student forward; K-cache awareness is controlled independently by the
+    # second flag. When false, the corresponding fake quantiser is installed
+    # only after weight quantization for runtime use.
     act_quant_aware_gptq: bool = False
     k_cache_quant_aware_gptq: bool = False
 

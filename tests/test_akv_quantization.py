@@ -34,7 +34,7 @@ def _manual_sym_per_token(x: torch.Tensor, bits: int, clip: float) -> torch.Tens
 
 
 @pytest.mark.parametrize("clip", [1.0, 0.9])
-def test_a4_symmetric_per_token_matches_paper_equation(clip):
+def test_a4_symmetric_per_token_matches_shared_implementation_equation(clip):
     x = torch.tensor(
         [[[-8.0, -1.0, 0.0, 2.0, 7.0], [0.0, 0.3, 1.1, -2.7, 4.2]]]
     )

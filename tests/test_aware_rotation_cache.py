@@ -315,6 +315,12 @@ def test_tiny_quarot_preserves_full_model_logits(
         seq_len=8,
         tokenizer_source=build_tokenizer(64),
     )
+    assert analyzer.source_tie_word_embeddings is tie_word_embeddings
+    assert analyzer.tie_word_embeddings is False
+    assert not model_utils.parameters_share_storage(
+        analyzer.get_embed_layer().weight,
+        analyzer.get_lm_head().weight,
+    )
     input_ids = torch.randint(4, 64, (1, 8), device="cuda")
     with torch.no_grad():
         before = model(input_ids).logits.cpu()

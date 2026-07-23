@@ -9,7 +9,7 @@ the cache key. Each rank handles a contiguous shard of calibration samples
         labels     = Categorical(softmax(logits)).sample()        # deterministic per global sample id
         loss       = cross_entropy(logits, labels, reduction='sum') * LOSS_GRAD_SCALE
         loss.backward()
-        # forward hooks on per-(layer, module) outputs record `mean_g(grad²)`
+        # forward hooks on per-(layer, module) outputs record `sum_g(grad²)`
         # forward hooks on per-layer outputs accumulate `g g^T`
 
 After the loop:

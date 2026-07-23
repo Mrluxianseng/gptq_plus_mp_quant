@@ -61,11 +61,12 @@ def layer_lr_for_schedule(
     (None, "", "none")`` short-circuit returning 1.0, then
     ``compute_scheduled_layer_lr`` collapsing to ``target_lr`` when scale=1.0.
 
-    schedule="cosine": layer 0 gets ``base_lr * base_ratio``, the deepest
-    layer gets ``base_lr``, intermediate layers use the paper's
-    ``sin(π·x/2)`` reverse-cosine ramp. With ``base_ratio = 0.01`` and
-    ``base_lr = 1e-4``,
-    layer 0 = 1e-6, last layer = 1e-4.
+    schedule="cosine": layer 0 gets ``base_lr * base_ratio`` and indices use
+    the paper's literal all-``L`` ``sin(π·x/2)`` ramp. Index ``L-1`` would
+    reach ``base_lr``, but the actual final transformer block has a separate
+    true-KL LR override; therefore the deepest scheduled non-final block
+    (index ``L-2``) does not reach the endpoint. See
+    ``docs/REALQ_PAPER_PROTOCOL.md`` for this paper ambiguity.
     """
     if activation_aware:
         return base_lr
@@ -338,7 +339,8 @@ def make_grad_refresh_fn(
     that the autograd forward should see — the caller stitches Q for
     already-quantised columns and the working fp32 W for the rest. The
     closure casts it to module dtype for forward via ``functional_call``,
-    runs autograd over ``backward_samples`` mini-batches of ``backward_bsz``,
+    runs autograd over ``backward_samples`` total samples partitioned into
+    gradient-accumulation chunks of at most ``backward_bsz``,
     runs Adam on the trailing column slice of the gradient, and RETURNS
     the fp32 update tensor (rows, trailing_cols).
 
@@ -439,10 +441,11 @@ def make_grad_refresh_fn(
             override_dtype = module.weight.data.dtype
             override_weight = stitched_weight_fp32.to(override_dtype).requires_grad_(True)
 
-        # ``a_loss_ratio`` is defined over the GLOBAL refresh mini-batch.  A
-        # rank-/microbatch-local P95 changes the objective with world size and
-        # partitioning.  Run a graph-free prepass, gather only |delta| values,
-        # and broadcast one exact cap used by every backward microbatch.
+        # ``a_loss_ratio`` is defined over the complete GLOBAL sample set for
+        # this refresh. A rank-/chunk-local P95 changes the objective with
+        # world size and partitioning. Run a graph-free prepass, gather only
+        # |delta| values, and broadcast one exact cap used by every backward
+        # accumulation chunk.
         a_loss_threshold = None
         next_a_loss_threshold = None
         if a_loss_ratio < 1.0:
