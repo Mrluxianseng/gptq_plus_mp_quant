@@ -20,6 +20,6 @@ python -m torch.distributed.run \
     --w_method rtn --w_bits 4 --w_clip \
     --lm_eval --lm_eval_batch_size 32 \
     --rotate \
-    --a_clip_ratio 0.9 --k_clip_ratio 0.9 --k_clip_ratio 0.9 \
+    --a_clip_ratio 0.9 --k_clip_ratio 0.9 --v_clip_ratio 0.9 \
     --w_groupsize 128 \
     --a_bits 4 --k_bits 4 --v_bits 4 \

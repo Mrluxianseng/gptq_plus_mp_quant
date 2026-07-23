@@ -25,11 +25,12 @@ import os
 import logging
 import pprint
 
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
-import transformers
 from accelerate.hooks import remove_hook_from_module
 from tqdm import tqdm
 
@@ -42,6 +43,7 @@ from utils import (
     rotation_utils,
     memory_utils,
 )
+from utils.reproducibility import configure_reproducibility
 from gptq_utils.gptq_plus_utils import gptq_fwrd as gptq_plus_fwrd
 from gptq_utils.gptq_plus_utils import (
     clip_module_weight_to_quant_bounds_,
@@ -1302,7 +1304,9 @@ def _collect_refined_mse_state_for_loss_report(
             f"local refined-mse backward batch size ({rm_bwd_bsz})."
         )
 
-    rng = _rng_mod.Random(args.seed + layer_idx)
+    rng = _rng_mod.Random(
+        int(getattr(args, "refresh_seed", 0)) + layer_idx
+    )
     sample_ids_local = sorted(rng.sample(range(measure_samples_local), n_pool))
     (
         refined_mse_grad_pool,
@@ -2125,7 +2129,7 @@ def _load_or_collect_static_analysis_stats(
                 else 0
             ),
             fisher_rademacher_k=int(getattr(args, "fisher_rademacher_k", 0)),
-            rademacher_seed=int(getattr(args, "seed", 0)) + 1701,
+            rademacher_seed=int(getattr(args, "refresh_seed", 0)) + 1701,
             num_samples_for_grad=int(getattr(args, "num_samples_for_grad", 0)),
         )
         if bool(getattr(args, "exit_after_precompute", False)):
@@ -2954,6 +2958,7 @@ def quantize_and_measure(args, analyzer, trainloader, dev, target_layers, measur
 # ---------------------------------------------------------------------------
 
 def main(args):
+    configure_reproducibility(args.refresh_seed, deterministic=True)
     if "LOCAL_RANK" in os.environ and torch.cuda.is_available():
         torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     dist_utils.init_process_group()
@@ -3039,7 +3044,6 @@ def main(args):
     else:
         quant_utils.add_actquant(analyzer)
 
-    transformers.set_seed(args.seed)
     model.cpu()
     remove_hook_from_module(model, recurse=True)
 

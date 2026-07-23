@@ -1,11 +1,9 @@
 import argparse
 import os
 import logging
-import hashlib
-
-import transformers
 
 from utils import dist_utils
+from utils.cache_identity import artifact_cache_tag
 from utils.log_utils import init_logging
 
 
@@ -13,12 +11,54 @@ def parse_gen():
     parser = argparse.ArgumentParser(description="Quantize a model to any precision")
     parser.add_argument("--model", type=str, required=True, help="The model to quantize")
     parser.add_argument("--exp", type=str, required=True, help="Exp name")
-    parser.add_argument("--seed", type=int, default=42,
-                        help="The random state to use for reproducibility\n"
-                             "[WARNING] May not be reproducible across different machines")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help=(
+            "Calibration-sampling seed. Changing this seed changes only the "
+            "sampled calibration sequences; rotation and refresh sampling use "
+            "their own seeds."
+        ),
+    )
+    parser.add_argument(
+        "--rotation_seed",
+        type=int,
+        default=0,
+        help=(
+            "Seed for generated random Hadamard rotations. Ignored when "
+            "--optimized_rotation_path is supplied. Held fixed by default so "
+            "calibration-seed sweeps do not change the rotation."
+        ),
+    )
+    parser.add_argument(
+        "--refresh_seed",
+        type=int,
+        default=0,
+        help=(
+            "Seed for block-gradient refresh sample order and other optional "
+            "optimization-time sample/sign draws. Held fixed by default so "
+            "calibration-seed sweeps change only the calibration set."
+        ),
+    )
     # Paths
     parser.add_argument("--output_dir", type=str, default="./outputs", help="The directory to save results in")
     parser.add_argument("--cache_dir", type=str, default="./cache", help="The directory to cache results in")
+    parser.add_argument(
+        "--alignment_trace_path",
+        type=str,
+        default=None,
+        help=(
+            "Optional rank-0 JSONL path for one globally aggregated loss "
+            "record per block-GD refresh. Disabled by default."
+        ),
+    )
+    parser.add_argument(
+        "--alignment_run_id",
+        type=str,
+        default="default",
+        help="Run label stored in --alignment_trace_path metadata.",
+    )
     # Datasets
     parser.add_argument("--dataset", type=str, default="neuralmagic",
                         choices=["wikitext2", "neuralmagic", "ultrachat_2k", "numinamath"], help="The dataset to use")
@@ -55,7 +95,12 @@ def parse_gen():
         help="Disable the manual pre-quantization weight clipping stage and skip pre-GD.",
     )
     parser.set_defaults(pre_clip=True)
-    parser.add_argument("--a_clip_ratio", type=float, default=1.0, help="Activation clipping ratio")
+    parser.add_argument(
+        "--a_clip_ratio",
+        type=float,
+        default=None,
+        help="Activation clipping ratio (default: 0.9 for A<16, otherwise 1.0).",
+    )
     parser.add_argument(
         "--a_loss_ratio",
         type=float,
@@ -66,8 +111,18 @@ def parse_gen():
             "the quantile magnitude before computing Fisher/refined/hidden MSE losses."
         ),
     )
-    parser.add_argument("--k_clip_ratio", type=float, default=1.0, help="K cache clipping ratio")
-    parser.add_argument("--v_clip_ratio", type=float, default=1.0, help="V cache clipping ratio")
+    parser.add_argument(
+        "--k_clip_ratio",
+        type=float,
+        default=None,
+        help="K-cache clipping ratio (default: 0.9 for K<16, otherwise 1.0).",
+    )
+    parser.add_argument(
+        "--v_clip_ratio",
+        type=float,
+        default=None,
+        help="V-cache clipping ratio (default: 0.9 for V<16, otherwise 1.0).",
+    )
     parser.add_argument(
         "--act_quant_aware_gptq",
         action="store_true",
@@ -244,7 +299,7 @@ def parse_gen():
             "Use a single globally-shared shuffle of all nsamples across ranks so every "
             "rank selects the same global sample ids each refresh. Each rank filters to "
             "its own shard and contributes a partial (sum, count). Makes DP results "
-            "numerically match a 1-GPU run with the same seed. Default (off) keeps the "
+            "numerically match a 1-GPU run with the same refresh seed. Default (off) keeps the "
             "per-rank stratified scheduler."
         ),
     )
@@ -331,7 +386,8 @@ def parse_gen():
         help=(
             "Optional directory to persist the static end-to-end saliency/fisher caches. "
             "If set and the cache exists (keyed by model/dataset/nsamples/seq_len/num_groups/"
-            "full_fisher/grad_hessian_topk/global_loss_bsz/seed/rotate), the precompute is skipped and the saved "
+            "full_fisher/grad_hessian_topk/global_loss_bsz/calibration seed/"
+            "concrete rotation), the precompute is skipped and the saved "
             "tensors are loaded per rank. First run writes, subsequent runs read."
         ),
     )
@@ -398,7 +454,7 @@ def parse_gen():
             "Per-layer ramp for --grad_lr and --pre_grad_lr. "
             "'none' keeps grad_lr constant across layers (default). "
             "The ramp goes 0 → 1 from layer 0 to the last layer: "
-            "'cosine' = 0.5*(1-cos(π·x)), 'linear' = x, 'sqrt' = √x, "
+            "'cosine' = sin(π·x/2), 'linear' = x, 'sqrt' = √x, "
             "where x = layer_idx / (num_layers - 1). "
             "Does NOT scale --final_layer_grad_lr / --pre_final_layer_grad_lr "
             "(the final layer keeps its dedicated LR)."
@@ -483,11 +539,16 @@ def parse_gen():
         choices=["frozen", "surrogate_block", "surrogate_online", "block_backward", "block_gd"],
         help="How to update the first-order term during GPTQ+ quantization.",
     )
-    parser.add_argument("--kl_topk", type=int, default=20, help="Top-k KL loss")
+    parser.add_argument(
+        "--kl_topk",
+        type=int,
+        default=-1,
+        help="Top-k KL support; <=0 uses the full vocabulary (paper default).",
+    )
     parser.add_argument(
         "--grad_hessian_topk",
         type=int,
-        default=20,
+        default=-1,
         help=(
             "When > 0, restrict the grad/hessian label sampling, saliency NLL, and KL loss "
             "to the full-precision top-k logits support. Disabled when <= 0."
@@ -496,7 +557,7 @@ def parse_gen():
     parser.add_argument(
         "--saliency_clip_percentile",
         type=float,
-        default=1.0,
+        default=0.99,
         help=(
             "In `collect_static_end_to_end_saliency_and_fisher`, clip per-token saliency "
             "(grad² of end-to-end NLL wrt module output) to this percentile before caching. "
@@ -549,8 +610,12 @@ def parse_gen():
     parser.add_argument(
         "--final_layer_backward_bsz",
         type=int,
-        default=8,
-        help="Optional override for the refresh backward batch size used only in the final transformer layer.",
+        default=None,
+        help=(
+            "Optional override for the refresh backward batch size used only in "
+            "the final transformer layer. By default it inherits "
+            "--backward_bsz (32 in the paper protocol)."
+        ),
     )
     parser.add_argument(
         "--final_layer_full_backward",
@@ -558,6 +623,15 @@ def parse_gen():
         help="Use all calibration samples for every block refresh in the final transformer layer while keeping earlier layers on --backward_samples.",
     )
     parser.add_argument("--load_qmodel_path", type=str, default=None, help="The path to load quantized model ckpt")
+    parser.add_argument(
+        "--allow_unsafe_legacy_checkpoint",
+        action="store_true",
+        help=(
+            "Allow weights_only=False pickle loading for a trusted legacy GPTQ+ "
+            "checkpoint containing WeightQuantizer objects. Never enable for "
+            "an untrusted artifact."
+        ),
+    )
     parser.add_argument("--save_qmodel_path", type=str, default=None, help="The path to save quantized model ckpt")
     parser.add_argument("--offload_inps", action="store_true", help="Offload inputs to CPU")
     parser.add_argument("--enable_quant_profile", action="store_true", help="Emit NVTX ranges for Nsight profiling during GPTQ+ quantization.")
@@ -568,8 +642,13 @@ def parse_gen():
     parser.add_argument("--skip_eval", action="store_true", help="Skip KL/PPL and QA evaluation")
     parser.add_argument("--lm_eval", action="store_true", help="Enable QA eval")
     parser.add_argument("--lm_eval_batch_size", type=int, default=32, help="Batch size for QA tasks")
-    parser.add_argument("--eval_datasets", type=list[str], default=["wikitext2", "ultrachat_2k", "numinamath"],
-                        help="Datasets for PPL & KL eval")
+    parser.add_argument(
+        "--eval_datasets",
+        type=str,
+        nargs="+",
+        default=["wikitext2", "ultrachat_2k", "numinamath"],
+        help="Datasets for PPL & KL eval",
+    )
     # Exp
     parser.add_argument("--enable_debug", action="store_true", help="Enable debugging")
     # Diagnostic dump: saves raw matrices at every fasterquant checkpoint for
@@ -677,7 +756,7 @@ def parse_gen():
             "refined_mse only: per-rank size of the end-to-end grad pool collected "
             "fresh before each transformer block's quant loop opens. For each layer, "
             "a random subset of the rank-local calibration samples (seeded with "
-            "seed + layer_idx) is forwarded end-to-end in FP and backward'd to capture "
+            "refresh_seed + layer_idx) is forwarded end-to-end in FP and backward'd to capture "
             "g = ∂KL/∂(layer output) per (sample, token). Refresh mini-batches pull "
             "exact g for samples in the pool and fall back to the pool mean (over "
             "sample, seq) for everyone else. Must be >0, ≤ nsamples // world, and "
@@ -777,29 +856,60 @@ def parse_gen():
     args = parser.parse_args()
     if args.grad_refresh_loss == "layer_mse":
         args.grad_refresh_loss = "hidden_mse"
+    # Paper A/K/V clipping preset. Resolve it only after parsing bit-widths so
+    # an A16/K16/V16 run remains exactly unclipped unless explicitly changed.
+    for _ratio_name, _bits in (
+        ("a_clip_ratio", args.a_bits),
+        ("k_clip_ratio", args.k_bits),
+        ("v_clip_ratio", args.v_bits),
+    ):
+        if getattr(args, _ratio_name) is None:
+            setattr(args, _ratio_name, 0.9 if _bits < 16 else 1.0)
+        _ratio = float(getattr(args, _ratio_name))
+        if not (0.0 < _ratio <= 1.0):
+            raise ValueError(
+                f"`{_ratio_name}` must be in (0, 1]. Got {_ratio}."
+            )
+    for _tensor_name in ("a", "k", "v"):
+        _bits = getattr(args, f"{_tensor_name}_bits")
+        _groupsize = getattr(args, f"{_tensor_name}_groupsize")
+        if not (2 <= _bits <= 16):
+            raise ValueError(
+                f"`{_tensor_name}_bits` must be in [2, 16], where 16 disables "
+                f"fake quantization. Got {_bits}."
+            )
+        if _groupsize != -1 and _groupsize <= 0:
+            raise ValueError(
+                f"`{_tensor_name}_groupsize` must be -1 (per-token) or "
+                f"positive. Got {_groupsize}."
+            )
 
     # set paths & others
     args.model_name = args.model.split("/")[-1]
+    model_artifact_tag = artifact_cache_tag(args.model)
     args.output_dir = os.path.join(args.output_dir, args.model_name, args.exp)
     args.log_dir = os.path.join(args.output_dir, "logs")
     args.tokens_cache_path = (f"{args.cache_dir}/tokens/"
-                              f"{args.model_name}-{args.dataset}_s{args.nsamples}_blk{args.seq_len}.pt")
+                              f"{args.model_name}-{args.dataset}_s{args.nsamples}_"
+                              f"blk{args.seq_len}_seed{args.seed}.pt")
     if args.num_groups is not None:
-        rotation_cache_tag = f"rot{int(bool(args.rotate))}_seed{args.seed}"
-        if args.optimized_rotation_path is not None:
-            opt_hash = hashlib.sha1(str(args.optimized_rotation_path).encode()).hexdigest()[:8]
+        rotation_cache_tag = f"rot{int(bool(args.rotate))}"
+        if args.rotate and args.optimized_rotation_path is not None:
+            opt_hash = artifact_cache_tag(args.optimized_rotation_path, length=10)
             rotation_cache_tag += f"_opt{opt_hash}"
+        elif args.rotate:
+            rotation_cache_tag += f"_rseed{args.rotation_seed}"
         args.saliency_cache_path = (f"{args.cache_dir}/saliency/"
-                                    f"{args.model_name}-{args.dataset}_s{args.nsamples}_blk{args.seq_len}_"
-                                    f"{rotation_cache_tag}_g{args.num_groups}")
+                                    f"{args.model_name}-mid{model_artifact_tag}-{args.dataset}_"
+                                    f"s{args.nsamples}_blk{args.seq_len}_"
+                                    f"cseed{args.seed}_{rotation_cache_tag}_g{args.num_groups}")
         args.gradients_cache_path = (f"{args.cache_dir}/gradients/"
-                                    f"{args.model_name}-{args.dataset}_s{args.nsamples}_blk{args.seq_len}_"
-                                    f"{rotation_cache_tag}_g{args.num_groups}.pt")
+                                    f"{args.model_name}-mid{model_artifact_tag}-{args.dataset}_"
+                                    f"s{args.nsamples}_blk{args.seq_len}_"
+                                    f"cseed{args.seed}_{rotation_cache_tag}_g{args.num_groups}.pt")
     else:
         args.saliency_cache_path = None
         args.gradients_cache_path = None
-
-    transformers.set_seed(args.seed)
 
     init_logging(args.log_dir)
 
@@ -1191,8 +1301,6 @@ def parse_gen():
         raise ValueError(f"`measure_samples` must be positive. Got {args.measure_samples}.")
     if args.measure_batch_size <= 0:
         raise ValueError(f"`measure_batch_size` must be positive. Got {args.measure_batch_size}.")
-    if args.grad_hessian_topk == 0:
-        raise ValueError("`grad_hessian_topk` must be positive or negative to disable. Use -1 to disable.")
     logging.info(args)
 
     # Disable parallelism in tokenizers to prevent warnings when forking in the seed generation step

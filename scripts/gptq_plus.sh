@@ -20,4 +20,4 @@ python -m torch.distributed.run \
     --dataset neuralmagic --nsamples ${N_SAMPLES} --seq_len ${SEQ_LEN} \
     --w_method gptq_plus --w_bits 4 --w_clip --num_groups ${NUM_GROUPS} --act_order \
     --lm_eval --lm_eval_batch_size 32 \
-    --kl_topk 20 --bsz 4 --alpha 0.05 \
+    --kl_topk -1 --grad_hessian_topk -1 --bsz 4 --alpha 0.05 \

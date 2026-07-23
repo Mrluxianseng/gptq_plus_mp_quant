@@ -2,12 +2,15 @@ import argparse
 import logging
 import os
 
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
 import torch
 
 from gptq_utils.main import quantize_weights
 from utils import memory_utils
 from utils.log_utils import init_logging
 from utils.model_utils import ModelAnalyzer
+from utils.reproducibility import configure_reproducibility
 
 
 def build_parser():
@@ -22,7 +25,9 @@ def build_parser():
     )
     parser.add_argument("--nsamples", type=int, default=512, help="Number of calibration samples")
     parser.add_argument("--seq_len", type=int, default=1024, help="Sequence length")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--seed", type=int, default=42, help="Calibration-sampling seed")
+    parser.add_argument("--rotation_seed", type=int, default=0, help="Generated-rotation seed")
+    parser.add_argument("--refresh_seed", type=int, default=0, help="Refresh-sampling seed")
     parser.add_argument("--num_groups", type=int, default=4, help="Number of GPTQ+ row groups")
     parser.add_argument(
         "--fisher_num_groups",
@@ -89,11 +94,14 @@ def build_parser():
     parser.add_argument("--grad_gate_sharpness", type=float, default=5.0, help="Gate sharpness")
     parser.add_argument("--grad_gate_sine_amp", type=float, default=0.0005, help="Sine regularizer amplitude")
     parser.add_argument("--second_order_scale", type=float, default=1.0, help="Second-order update scale in block_gd")
-    parser.add_argument("--kl_topk", type=int, default=20, help="Top-k logits for KL")
+    parser.add_argument(
+        "--kl_topk", type=int, default=-1,
+        help="Top-k logits for KL; <=0 uses the full vocabulary.",
+    )
     parser.add_argument(
         "--grad_hessian_topk",
         type=int,
-        default=20,
+        default=-1,
         help="When > 0, restrict grad/hessian label sampling, saliency NLL, and KL loss to fp top-k logits",
     )
     parser.add_argument("--blocksize", type=int, default=256, help="GPTQ block size")
@@ -142,13 +150,16 @@ def main():
     args.output_dir = os.path.join(args.output_dir, model_name, args.exp)
     args.log_dir = os.path.join(args.output_dir, "logs")
     args.tokens_cache_path = (
-        f"{args.cache_dir}/tokens/{args.model_name}-{args.dataset}_s{args.nsamples}_blk{args.seq_len}.pt"
+        f"{args.cache_dir}/tokens/{args.model_name}-{args.dataset}_s{args.nsamples}_"
+        f"blk{args.seq_len}_seed{args.seed}.pt"
     )
     args.saliency_cache_path = (
-        f"{args.cache_dir}/saliency/{args.model_name}-{args.dataset}_s{args.nsamples}_blk{args.seq_len}_g{args.num_groups}"
+        f"{args.cache_dir}/saliency/{args.model_name}-{args.dataset}_s{args.nsamples}_"
+        f"blk{args.seq_len}_cseed{args.seed}_rseed{args.rotation_seed}_g{args.num_groups}"
     )
     args.gradients_cache_path = (
-        f"{args.cache_dir}/gradients/{args.model_name}-{args.dataset}_s{args.nsamples}_blk{args.seq_len}_g{args.num_groups}.pt"
+        f"{args.cache_dir}/gradients/{args.model_name}-{args.dataset}_s{args.nsamples}_"
+        f"blk{args.seq_len}_cseed{args.seed}_rseed{args.rotation_seed}_g{args.num_groups}.pt"
     )
     args.export_to_et = False
     args.enable_quant_profile = True
@@ -211,8 +222,6 @@ def main():
         raise ValueError("`grad_clip` must be non-zero. Use a negative value to disable clipping.")
     if args.final_layer_grad_lr is not None and args.final_layer_grad_lr < 0:
         raise ValueError(f"`final_layer_grad_lr` must be non-negative when provided. Got {args.final_layer_grad_lr}.")
-    if args.grad_hessian_topk == 0:
-        raise ValueError("`grad_hessian_topk` must be positive or negative to disable. Use -1 to disable.")
     if args.pre_gd_steps < 0:
         raise ValueError(f"`pre_gd_steps` must be non-negative. Got {args.pre_gd_steps}.")
     if args.pre_grad_lr < 0:
@@ -242,6 +251,7 @@ def main():
 
     init_logging(args.log_dir)
     logging.info(args)
+    configure_reproducibility(args.refresh_seed, deterministic=True)
 
     analyzer = ModelAnalyzer(args.model, args.seq_len)
     analyzer.model.cpu()

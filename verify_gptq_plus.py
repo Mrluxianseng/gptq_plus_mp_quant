@@ -24,10 +24,8 @@ import os
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
 import logging
-import random
 import sys
 
-import numpy as np
 import torch
 
 from analyze_quant_profile import build_parser
@@ -35,21 +33,11 @@ from gptq_utils.main import quantize_weights
 from utils import memory_utils, dist_utils
 from utils.log_utils import init_logging
 from utils.model_utils import ModelAnalyzer
+from utils.reproducibility import configure_reproducibility
 
 
 def seed_everything(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    # Determinism: kernel selection + cuBLAS workspace.
-    try:
-        torch.use_deterministic_algorithms(True, warn_only=True)
-    except TypeError:
-        torch.use_deterministic_algorithms(True)
+    configure_reproducibility(seed, deterministic=True)
     # Disable SDPA fast paths that may pick non-deterministic kernels.
     try:
         torch.backends.cuda.enable_flash_sdp(False)
@@ -124,13 +112,16 @@ def finalize_args(args) -> None:
     args.output_dir = os.path.join(args.output_dir, model_name, args.exp)
     args.log_dir = os.path.join(args.output_dir, "logs")
     args.tokens_cache_path = (
-        f"{args.cache_dir}/tokens/{args.model_name}-{args.dataset}_s{args.nsamples}_blk{args.seq_len}.pt"
+        f"{args.cache_dir}/tokens/{args.model_name}-{args.dataset}_s{args.nsamples}_"
+        f"blk{args.seq_len}_seed{args.seed}.pt"
     )
     args.saliency_cache_path = (
-        f"{args.cache_dir}/saliency/{args.model_name}-{args.dataset}_s{args.nsamples}_blk{args.seq_len}_g{args.num_groups}"
+        f"{args.cache_dir}/saliency/{args.model_name}-{args.dataset}_s{args.nsamples}_"
+        f"blk{args.seq_len}_cseed{args.seed}_rseed{args.rotation_seed}_g{args.num_groups}"
     )
     args.gradients_cache_path = (
-        f"{args.cache_dir}/gradients/{args.model_name}-{args.dataset}_s{args.nsamples}_blk{args.seq_len}_g{args.num_groups}.pt"
+        f"{args.cache_dir}/gradients/{args.model_name}-{args.dataset}_s{args.nsamples}_"
+        f"blk{args.seq_len}_cseed{args.seed}_rseed{args.rotation_seed}_g{args.num_groups}.pt"
     )
     args.export_to_et = False
     args.enable_quant_profile = False
@@ -208,7 +199,7 @@ def main() -> None:
                      args.verify_mode, args.verify_output, dist_utils.get_world_size())
         logging.info(args)
 
-    seed_everything(args.seed)
+    seed_everything(args.refresh_seed)
 
     analyzer = ModelAnalyzer(args.model, args.seq_len)
     analyzer.model.cpu()

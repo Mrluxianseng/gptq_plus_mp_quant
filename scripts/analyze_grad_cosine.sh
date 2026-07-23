@@ -83,7 +83,7 @@ python -m torch.distributed.run \
     --w_bits 4 --w_clip --act_order \
     --rotate \
     --skip_eval \
-    --kl_topk 20 --grad_hessian_topk 20 \
+    --kl_topk -1 --grad_hessian_topk -1 \
     --num_groups 4 --bsz "${BSZ}" --global_loss_bsz "${GLOBAL_LOSS_BSZ}" \
     --global_loss --enable_gptq_plus "${ENABLE_GPTQ_PLUS}" \
     --g_update_mode block_gd --grad_refresh_loss fisher_diag_mse \

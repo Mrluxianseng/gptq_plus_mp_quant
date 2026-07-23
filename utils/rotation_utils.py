@@ -115,7 +115,10 @@ def rotate_model(args, analyzer: model_utils.ModelAnalyzer):
         R1 = torch.load(R_cpk)["R1"].cuda().to(torch.float64)
         rotation_gen = None
     else:
-        seed = int(getattr(args, "seed", 0))
+        # Rotation is an algorithmic artifact, not part of calibration
+        # sampling. Keep it stable when ``--seed`` is swept in the paper's
+        # calibration-seed experiment.
+        seed = int(getattr(args, "rotation_seed", 0))
         rotation_gen = torch.Generator(device="cpu").manual_seed(seed)
         R1 = get_orthogonal_matrix(
             analyzer.hidden_size,
@@ -176,9 +179,11 @@ def prepare_model_for_rotated_quantization(args, analyzer: model_utils.ModelAnal
 class QKRotationWrapper(torch.nn.Module):
     def __init__(self, func, head_dim, *args, **kwargs):
         super().__init__()
-        assert hadamard_utils.is_pow2(
-            head_dim
-        ), f"Only power of 2 head_dim is supported for K-cache Quantization!"
+        if not hadamard_utils.is_pow2(head_dim):
+            raise ValueError(
+                "K-cache Q/K Hadamard rotation requires a power-of-two "
+                f"head_dim; got {head_dim}."
+            )
         self.func = func
         self.head_dim = head_dim
         self.k_quantizer = quant_utils.ActQuantizer()
@@ -216,10 +221,12 @@ class QKRotationWrapper(torch.nn.Module):
             self.k_sym = bool(k_sym)
         if k_clip_ratio is not None:
             self.k_clip_ratio = float(k_clip_ratio)
-        assert self.k_groupsize in [
-            -1,
-            self.head_dim,
-        ], f"Only token-wise/{self.head_dim}g quantization is supported for K-cache"
+        if self.k_groupsize not in (-1, self.head_dim):
+            raise ValueError(
+                "K-cache groupsize must be -1 (one per-token scale across all "
+                f"KV heads) or head_dim={self.head_dim} (one scale per head); "
+                f"got {self.k_groupsize}."
+            )
         self.k_quantizer.configure(
             bits=self.k_bits,
             groupsize=-1,  # token-wise; head-wise is handled explicitly below.
@@ -275,6 +282,11 @@ def add_qk_rotation_wrapper_after_function_call_in_forward(
     attr_name = f"{function_name}_qk_rotation_wrapper"
     if hasattr(module, attr_name):
         wrapper = getattr(module, attr_name)
+        if not isinstance(wrapper, QKRotationWrapper):
+            raise TypeError(
+                f"{type(module).__name__}.{attr_name} already exists but is not "
+                "a QKRotationWrapper; refusing to stack an ambiguous patch."
+            )
         if args or kwargs:
             wrapper.configure_k_quant(*args, **kwargs)
         return wrapper

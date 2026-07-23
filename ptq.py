@@ -7,21 +7,33 @@
 
 import os
 os.environ["HF_DATASETS_TRUST_REMOTE_CODE"] = "1"
+# cuBLAS reads this setting when its CUDA context is created, so it must be
+# present before importing torch (and before any transitive CUDA import).
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 import logging
 
 import torch
 import torch.distributed as dist
-import transformers
 
 from process_args import parse_gen
 from gptq_utils.main import quantize_weights
-from utils import data_utils, dist_utils, eval_utils, model_utils, rotation_utils, \
+from gptq_utils.quant_aware_utils import (
+    configure_activation_quantizers_for_gptq,
+    configure_k_cache_quantizers_for_gptq,
+)
+from utils import checkpoint_utils, data_utils, dist_utils, eval_utils, model_utils, rotation_utils, \
                   memory_utils, quant_utils
+from utils.reproducibility import configure_reproducibility
 
 torch.backends.cuda.matmul.allow_tf32 = False
 
 
 def main(args):
+    # Global RNG is an algorithm-time fallback; calibration sampling uses a
+    # local RNG keyed by args.seed and must be the only thing that changes in
+    # a calibration-seed sweep.
+    configure_reproducibility(args.refresh_seed, deterministic=True)
+
     # When launched via torchrun for DP, each rank must pin itself to its
     # assigned GPU BEFORE any CUDA / NCCL op; otherwise rank 1 defaults to
     # cuda:0 (same device as rank 0) and every downstream NCCL collective
@@ -30,23 +42,51 @@ def main(args):
         torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     dist_utils.init_process_group()
 
+    # Read the manifest before preparing the model: ``rotate`` determines
+    # which runtime wrappers must be installed, while A/V/K attributes are
+    # otherwise absent from state_dict.  Keep the normalized payload so the
+    # weight-loading phase does not unpickle a legacy checkpoint twice.
+    if args.load_qmodel_path:
+        loaded_checkpoint = checkpoint_utils.load_quantized_checkpoint(
+            args.load_qmodel_path,
+            allow_unsafe_legacy=args.allow_unsafe_legacy_checkpoint,
+        )
+        checkpoint_utils.apply_runtime_manifest(args, loaded_checkpoint)
+        checkpoint_utils.validate_artifact_identity(args, loaded_checkpoint)
+        args._loaded_quantized_checkpoint = loaded_checkpoint
+
     if bool(getattr(args, "fsdp_meta_init", False)):
         analyzer = model_utils.load_model_fsdp_meta_for_precompute(args)
     elif bool(getattr(args, "stage2_cpu_master", False)):
         analyzer = model_utils.load_model_cpu_master_for_quantization(args)
     else:
-        analyzer = model_utils.load_model_from_prepared_checkpoint_for_quantization(args)
+        # A quantized artifact must be loaded over the original base model.
+        # Reusing a prepared rotated checkpoint would make the FP reference
+        # logits come from already-rotated weights and can also leave runtime
+        # wrappers out of sync with the artifact manifest.
+        analyzer = (
+            None
+            if args.load_qmodel_path
+            else model_utils.load_model_from_prepared_checkpoint_for_quantization(args)
+        )
         if analyzer is None:
             analyzer = model_utils.ModelAnalyzer(args.model, args.seq_len)
     model = analyzer.model
     tokenizer = analyzer.tokenizer
+    if args.load_qmodel_path:
+        checkpoint_utils.validate_artifact_identity(
+            args,
+            args._loaded_quantized_checkpoint,
+            model=model,
+            tokenizer=tokenizer,
+        )
 
     model_pre_rotated = bool(getattr(model, "_gptqplus_checkpoint_is_rotated", False))
 
     def add_activation_quant_wrappers():
         rotation_utils.add_activation_quant_wrappers_for_rotation(analyzer)
 
-    if args.rotate and model_pre_rotated:
+    if not args.load_qmodel_path and args.rotate and model_pre_rotated:
         logging.info(
             "Model was loaded from a pre-rotated checkpoint; installing rotation wrappers "
             "before reference-logit generation."
@@ -86,7 +126,15 @@ def main(args):
         dist.barrier()
 
     # Rotate the weights
-    if args.rotate and not model_pre_rotated:
+    if args.load_qmodel_path:
+        # The artifact already stores the transformed weights. Rebuild only
+        # the activation wrapper topology after the FP reference pass and
+        # before strict state_dict loading.
+        if args.rotate:
+            add_activation_quant_wrappers()
+        else:
+            quant_utils.add_actquant(analyzer)
+    elif args.rotate and not model_pre_rotated:
         rotation_utils.fuse_layer_norms(analyzer)
         rotation_utils.rotate_model(args, analyzer)
         memory_utils.cleanup_memory()
@@ -128,48 +176,21 @@ def main(args):
 
     # Add Input Quantization
     if args.a_bits < 16 or args.v_bits < 16:
-        qlayers = quant_utils.find_qlayers(model, layers=[quant_utils.ActQuantWrapper])
-
-        for name in qlayers:
-            layer_input_bits = args.a_bits
-            layer_groupsize = args.a_groupsize
-            layer_a_sym = not (args.a_asym)
-            layer_a_clip = args.a_clip_ratio
-
-            if "v_proj" in name and args.v_bits < 16:  # Set the v_proj precision
-                qlayers[name].out_quantizer.configure(
-                    bits=args.v_bits,
-                    groupsize=args.v_groupsize,
-                    sym=not (args.v_asym),
-                    clip_ratio=args.v_clip_ratio,
-                )
-
-            if "lm_head" in name:  # Skip lm_head quantization
-                layer_input_bits = 16
-
-            qlayers[name].quantizer.configure(
-                bits=layer_input_bits,
-                groupsize=layer_groupsize,
-                sym=layer_a_sym,
-                clip_ratio=layer_a_clip,
-            )
+        configure_activation_quantizers_for_gptq(args, model)
 
     if args.k_bits < 16:
-        rope_function_name = "apply_rotary_pos_emb"
-        layers = analyzer.get_layers()
-        k_quant_config = {
-            "k_bits": args.k_bits,
-            "k_groupsize": args.k_groupsize,
-            "k_sym": not (args.k_asym),
-            "k_clip_ratio": args.k_clip_ratio,
-        }
-        for layer in layers:
-            rotation_utils.add_qk_rotation_wrapper_after_function_call_in_forward(
-                layer.self_attn,
-                rope_function_name,
-                head_dim=analyzer.head_dim,
-                **k_quant_config,
-            )
+        configure_k_cache_quantizers_for_gptq(args, analyzer)
+
+    # Save only after the deployed A/V/K runtime behavior has been configured.
+    # The state_dict contains weights; the primitive manifest reconstructs
+    # dynamic quantizers and the K-cache forward patch on reload.
+    if args.save_qmodel_path and (
+        not bool(getattr(model, "_gptqplus_stage2_cpu_master", False))
+        or dist_utils.is_main()
+    ):
+        checkpoint_utils.save_quantized_checkpoint(
+            args.save_qmodel_path, model, args, tokenizer
+        )
 
     # Eval
     if not args.skip_eval and rank_runs_eval:

@@ -4,8 +4,6 @@ import logging
 from tqdm import tqdm
 
 import torch
-import numpy as np
-import transformers
 from datasets import load_dataset
 
 
@@ -109,16 +107,17 @@ def _sample_and_tokenize(texts, tokenizer, seq_len, num_samples, seed=None):
     assert num_samples <= len(texts), \
         f"num_samples({num_samples}) should be less than or equal to the number of texts({len(texts)})"
 
-    # this works for None too, effectively setting random seeds
-    random.seed(seed)
-    np.random.seed(seed)
+    # A local RNG makes calibration sampling a self-contained seed domain:
+    # cache misses and calibration-seed sweeps cannot perturb later
+    # optimization RNG state.
+    rng = random.Random(seed)
 
     selected_indices = set()
 
     samples = []
     pbar = tqdm(total=num_samples, desc="Sampling and tokenizing")
     while len(samples) < num_samples:
-        idx = random.randint(0, len(texts) - 1)
+        idx = rng.randint(0, len(texts) - 1)
         if idx in selected_indices:  # we don't want to sample the same text twice
             continue
         text = texts[idx]
@@ -141,15 +140,13 @@ def _sample_and_tokenize_from_middle(texts, tokenizer, seq_len, num_samples, see
     assert num_samples <= len(texts), \
         f"num_samples({num_samples}) should be less than or equal to the number of texts({len(texts)})"
 
-    # this works for None too, effectively setting random seeds
-    random.seed(seed)
-    np.random.seed(seed)
+    rng = random.Random(seed)
 
     selected_indices = set()
     samples = []
     pbar = tqdm(total=num_samples, desc="Sampling and tokenizing")
     while len(samples) < num_samples:
-        idx = random.randint(0, len(texts) - 1)
+        idx = rng.randint(0, len(texts) - 1)
         if idx in selected_indices:  # we don't want to sample the same text twice
             continue
         text = texts[idx]
@@ -158,7 +155,7 @@ def _sample_and_tokenize_from_middle(texts, tokenizer, seq_len, num_samples, see
         if len(tokens) < seq_len:  # if the text is too short, we skip it
             continue
 
-        seq_start = random.randint(0, len(tokens) - seq_len)
+        seq_start = rng.randint(0, len(tokens) - seq_len)
 
         tokens = tokens[seq_start:seq_start + seq_len]
         assert tokens.shape[-1] == seq_len, f"Token length {len(tokens)} != seq_len {seq_len}"
@@ -174,9 +171,7 @@ def _sample_concat_and_tokenize(texts, tokenizer, seq_len, num_samples, seed=Non
     assert num_samples <= len(texts), \
     f"num_samples({num_samples}) should be less than or equal to the number of texts({len(texts)})"
 
-    # this works for None too, effectively setting random seeds
-    random.seed(seed)
-    np.random.seed(seed)
+    rng = random.Random(seed)
 
     selected_indices = set()
 
@@ -185,7 +180,7 @@ def _sample_concat_and_tokenize(texts, tokenizer, seq_len, num_samples, seed=Non
     samples = []
     pbar = tqdm(total=num_samples, desc=f"Sampling {num_samples} samples of length {seq_len}")
     while len(samples) < num_samples:
-        idx = random.randint(0, trainenc.input_ids.shape[1] - seq_len - 1)
+        idx = rng.randint(0, trainenc.input_ids.shape[1] - seq_len - 1)
         
         # if selected_indices:
         #     closest_idx = min(selected_indices, key=lambda x: abs(x - idx), default=idx)
@@ -233,8 +228,18 @@ def get_tokens(dataset_name, split, tokenizer, seq_len, num_samples, save_path=N
 
     if save_path is not None:
         logging.info(f"Saving tokens to {save_path}")
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        torch.save(tokens, save_path)
+        cache_parent = os.path.dirname(save_path) or "."
+        os.makedirs(cache_parent, exist_ok=True)
+        # All DP ranks may observe the same initial miss. They generate
+        # byte-equivalent tensors from the local seeded RNG, but must never
+        # expose a partially-written torch archive to another rank.
+        tmp_path = f"{save_path}.tmp.{os.getpid()}"
+        try:
+            torch.save(tokens, tmp_path)
+            os.replace(tmp_path, save_path)
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
 
     return tokens
 
@@ -247,11 +252,10 @@ def get_loaders(dataset_name, split, tokenizer, seq_len, num_samples, seed=0):
     enc = tokenizer("\n\n".join(texts), return_tensors='pt')
     assert split in ["train", "test"]
     if split == "train":
-        np.random.seed(seed)
-        random.seed(seed)
+        rng = random.Random(seed)
         trainloader = []
         for _ in range(num_samples):
-            i = random.randint(0, enc.input_ids.shape[1] - seq_len - 1)
+            i = rng.randint(0, enc.input_ids.shape[1] - seq_len - 1)
             j = i + seq_len
             inp = enc.input_ids[:, i:j]
             tar = inp.clone()

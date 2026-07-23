@@ -11,7 +11,64 @@ from typing import Any, Iterable
 from utils import dist_utils
 
 
-TRACE_SCHEMA_VERSION = 1
+TRACE_SCHEMA_VERSION = 2
+
+# Keep trace metadata intentionally limited to knobs that exist with the same
+# meaning in both the legacy and refactored implementations.  Implementation-
+# specific performance/debug flags do not belong here: the comparison is
+# intended to reject numerically different runs, not harmless orchestration
+# differences.
+REFRESH_TRACE_CONFIG_KEYS = (
+    "model",
+    "dataset",
+    "seed",
+    "rotation_seed",
+    "refresh_seed",
+    "nsamples",
+    "seq_len",
+    "w_bits",
+    "w_groupsize",
+    "w_asym",
+    "w_clip",
+    "num_groups",
+    "percdamp",
+    "blocksize",
+    "act_order",
+    "group_parallel_quant",
+    "global_loss_bsz",
+    "hessian_accum_bsz",
+    "saliency_clip_percentile",
+    "grad_hessian_topk",
+    "grad_lr",
+    "grad_clip",
+    "final_layer_grad_lr",
+    "final_layer_grad_clip",
+    "grad_lr_layer_schedule",
+    "grad_lr_layer_base_ratio",
+    "backward_samples",
+    "backward_bsz",
+    "final_layer_backward_bsz",
+    "bsz",
+    "a_loss_ratio",
+    "loss_slide_window",
+    "a_bits",
+    "a_groupsize",
+    "a_asym",
+    "a_clip_ratio",
+    "k_bits",
+    "k_groupsize",
+    "k_asym",
+    "k_clip_ratio",
+    "v_bits",
+    "v_groupsize",
+    "v_asym",
+    "v_clip_ratio",
+    "act_quant_aware_gptq",
+    "k_cache_quant_aware_gptq",
+    "rotate",
+    "kl_topk",
+    "quant_stop_layer",
+)
 
 
 @dataclass(frozen=True)
@@ -75,6 +132,18 @@ class RefreshTraceWriter:
                 "config": config,
             }
         )
+
+    @property
+    def enabled(self) -> bool:
+        """Whether all ranks must collect trace statistics.
+
+        Only rank zero owns a file handle, but every rank must take the same
+        instrumentation branches so loss sums can participate in collective
+        aggregation.  Consequently this property is based on ``path`` rather
+        than ``_handle``.
+        """
+
+        return self.path is not None
 
     def _write(self, payload: dict[str, Any]) -> None:
         if self._handle is None:
@@ -171,6 +240,9 @@ def compare_refresh_traces(
 
     ref_meta, ref = load_refresh_trace(reference_path)
     cand_meta, cand = load_refresh_trace(candidate_path)
+    reference_config = ref_meta.get("config", {})
+    candidate_config = cand_meta.get("config", {})
+    config_differences = _mapping_differences(reference_config, candidate_config)
     missing = sorted(set(ref) - set(cand))
     extra = sorted(set(cand) - set(ref))
     rows = []
@@ -178,10 +250,16 @@ def compare_refresh_traces(
         a = ref[identity]
         b = cand[identity]
         loss_diff = symmetric_relative_difference(a.loss, b.loss)
+        current_loss_diff = _optional_relative_difference(
+            a.loss_current, b.loss_current,
+        )
+        next_loss_diff = _optional_relative_difference(a.loss_next, b.loss_next)
         sample_match = a.sample_indices == b.sample_indices
         alpha_diff = _optional_difference(a.slide_alpha, b.slide_alpha)
         passed = (
             loss_diff < max_relative_difference
+            and current_loss_diff < max_relative_difference
+            and next_loss_diff < max_relative_difference
             and sample_match
             and alpha_diff <= 1e-12
         )
@@ -191,18 +269,27 @@ def compare_refresh_traces(
                 "reference_loss": a.loss,
                 "candidate_loss": b.loss,
                 "relative_difference": loss_diff,
+                "current_loss_relative_difference": current_loss_diff,
+                "next_loss_relative_difference": next_loss_diff,
                 "sample_indices_match": sample_match,
                 "slide_alpha_abs_difference": alpha_diff,
                 "passed": passed,
             }
         )
     worst = sorted(rows, key=lambda row: row["relative_difference"], reverse=True)
-    passed = not missing and not extra and all(row["passed"] for row in rows)
+    passed = (
+        not config_differences
+        and not missing
+        and not extra
+        and bool(rows)
+        and all(row["passed"] for row in rows)
+    )
     return {
         "schema_version": TRACE_SCHEMA_VERSION,
         "reference": ref_meta,
         "candidate": cand_meta,
         "threshold": max_relative_difference,
+        "config_differences": config_differences,
         "matched_steps": len(rows),
         "missing_steps": [list(x) for x in missing],
         "extra_steps": [list(x) for x in extra],
@@ -225,6 +312,27 @@ def _optional_difference(a: float | None, b: float | None) -> float:
     return abs(a - b)
 
 
+def _optional_relative_difference(a: float | None, b: float | None) -> float:
+    if a is None and b is None:
+        return 0.0
+    if a is None or b is None:
+        return math.inf
+    return symmetric_relative_difference(a, b)
+
+
+def _mapping_differences(
+    reference: dict[str, Any],
+    candidate: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    differences: dict[str, dict[str, Any]] = {}
+    for key in sorted(set(reference) | set(candidate)):
+        a = reference.get(key)
+        b = candidate.get(key)
+        if a != b:
+            differences[key] = {"reference": a, "candidate": b}
+    return differences
+
+
 def trace_config_subset(config: Any, keys: Iterable[str]) -> dict[str, Any]:
     """Extract a stable primitive-only config subset from args/dataclass objects."""
 
@@ -238,3 +346,61 @@ def trace_config_subset(config: Any, keys: Iterable[str]) -> dict[str, Any]:
         else:
             out[key] = str(value)
     return out
+
+
+def default_refresh_trace_config(config: Any) -> dict[str, Any]:
+    """Return the shared, comparison-safe metadata subset for a run."""
+
+    from utils import model_utils
+
+    out = trace_config_subset(config, REFRESH_TRACE_CONFIG_KEYS)
+    if out.get("quant_stop_layer") is not None:
+        out["quant_stop_layer"] = int(out["quant_stop_layer"])
+    out.update(
+        {
+            "model_artifact_identity": (
+                model_utils.source_model_cache_identity(config)
+            ),
+            "rotation_artifact_identity": (
+                model_utils.rotation_cache_identity(config)
+            ),
+            "world_size": dist_utils.get_world_size(),
+            "a_loss_clip_scope": "global_refresh",
+            "saliency_clip_scope": "global_calibration",
+        }
+    )
+    return out
+
+
+def refresh_step_from_metrics(
+    *,
+    layer: int,
+    module: str,
+    metrics: dict[str, Any],
+) -> RefreshStep:
+    """Convert a legacy block observer payload to the shared trace schema."""
+
+    loss = metrics.get("mean_refresh_loss")
+    if loss is None:
+        raise ValueError(
+            "cannot trace a refresh step without globally aggregated "
+            "`mean_refresh_loss`"
+        )
+    block = int(metrics["block_idx"])
+    return RefreshStep(
+        layer=int(layer),
+        module=str(module),
+        block=block,
+        col_start=int(metrics["col_start"]),
+        col_end=int(metrics["col_end"]),
+        adam_step=int(metrics.get("adam_step", block + 1)),
+        loss=float(loss),
+        loss_current=_optional_float(
+            metrics.get("mean_refresh_loss_current"),
+        ),
+        loss_next=_optional_float(metrics.get("mean_refresh_loss_next")),
+        slide_alpha=_optional_float(metrics.get("slide_alpha")),
+        sample_indices=tuple(
+            int(index) for index in metrics.get("sample_indices", ())
+        ),
+    )

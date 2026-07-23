@@ -95,7 +95,15 @@ class ActQuantizer(torch.nn.Module):
         self.register_buffer("maxq", torch.tensor(0))
         self.register_buffer("scale", torch.zeros(1))
         self.register_buffer("zero", torch.zeros(1))
+        # These values are derived from the primitive runtime configuration
+        # and re-estimated for every input token. Persisting them makes a
+        # checkpoint depend on whichever sample happened to run last while
+        # still failing to restore ``bits/groupsize/sym/clip_ratio``.
+        self._non_persistent_buffers_set.update({"maxq", "scale", "zero"})
         self.bits = 16
+        self.groupsize = -1
+        self.sym = False
+        self.clip_ratio = 1.0
 
     def free(self) -> None:
         self.zero = None
@@ -119,38 +127,76 @@ class ActQuantizer(torch.nn.Module):
     def configure(
         self, bits: int, groupsize: int = -1, sym: bool = False, clip_ratio: float = 1.0
     ) -> None:
+        if not isinstance(bits, int) or isinstance(bits, bool) or not (2 <= bits <= 16):
+            raise ValueError(
+                "Activation/KV bit-width must be an integer in [2, 16], where "
+                f"16 disables fake quantization; got {bits!r}."
+            )
+        if not isinstance(groupsize, int) or isinstance(groupsize, bool):
+            raise ValueError(f"groupsize must be an integer; got {groupsize!r}.")
+        if groupsize != -1 and groupsize <= 0:
+            raise ValueError(
+                f"groupsize must be -1 (per-token) or positive; got {groupsize}."
+            )
+        if not math.isfinite(float(clip_ratio)) or not (0.0 < clip_ratio <= 1.0):
+            raise ValueError(
+                f"Activation/KV clip ratio must be finite and in (0, 1]; got {clip_ratio}."
+            )
         _, self.maxq = get_minq_maxq(bits, sym)
         self.bits = bits
         self.groupsize = groupsize
         self.sym = sym
         self.clip_ratio = clip_ratio
-        assert (
-            self.clip_ratio <= 1 and self.clip_ratio > 0
-        ), "Clip ratio should be in (0, 1]"
 
     def find_params_per_token_groupwise(self, x) -> None:
-        init_shape = x.shape
-        reshaped_x = x.reshape(
-            -1, x.shape[-2], x.shape[-1] // self.groupsize, self.groupsize
-        )
+        """Find one dynamic range per token and feature group.
 
-        xmax = torch.amax(reshaped_x, dim=3, keepdim=True) * self.clip_ratio
-        xmin = torch.amin(reshaped_x, dim=3, keepdim=True) * self.clip_ratio
-        if self.sym:
-            xmax = torch.maximum(torch.abs(xmin), xmax)
-            tmp = xmax == 0
-            self.scale = xmax / self.maxq
-            self.scale[tmp] = 1
-            self.zero = torch.zeros_like(self.scale)
-        else:
-            tmp = (xmin == 0) & (xmax == 0)
-            xmin[tmp] = -1
-            xmax[tmp] = +1
-            self.scale = (xmax - xmin) / self.maxq
-            self.zero = torch.round(-xmin / self.scale)
+        All leading dimensions identify independent token rows; grouping is
+        exclusively over the last (feature) dimension.  A short final group is
+        valid.  Including zero in every affine range mirrors the ordinary
+        per-token path and avoids a negative zero-point for all-positive groups.
+        """
+        if x.ndim == 0 or x.shape[-1] == 0:
+            raise ValueError(
+                "Activation/KV group quantization requires a non-empty feature "
+                f"dimension; got shape {tuple(x.shape)}."
+            )
 
-        self.scale = self.scale.repeat(1, 1, 1, self.groupsize).reshape(init_shape)
-        self.zero = self.zero.repeat(1, 1, 1, self.groupsize).reshape(init_shape)
+        scale_groups = []
+        zero_groups = []
+        for start in range(0, x.shape[-1], self.groupsize):
+            end = min(start + self.groupsize, x.shape[-1])
+            group = x[..., start:end]
+            rows = group.reshape(-1, end - start)
+            zero_ref = torch.zeros(rows.shape[0], device=x.device, dtype=x.dtype)
+            xmin = torch.minimum(rows.min(dim=1).values, zero_ref) * self.clip_ratio
+            xmax = torch.maximum(rows.max(dim=1).values, zero_ref) * self.clip_ratio
+
+            if self.sym:
+                absmax = torch.maximum(torch.abs(xmin), xmax)
+                all_zero = absmax == 0
+                scale = absmax / self.maxq
+                scale[all_zero] = 1
+                zero = torch.zeros_like(scale)
+            else:
+                all_zero = (xmin == 0) & (xmax == 0)
+                xmin = xmin.clone()
+                xmax = xmax.clone()
+                xmin[all_zero] = -1
+                xmax[all_zero] = +1
+                scale = (xmax - xmin) / self.maxq
+                zero = torch.round(-xmin / scale)
+
+            expanded_shape = (*group.shape[:-1], end - start)
+            scale_groups.append(
+                scale.unsqueeze(1).expand(-1, end - start).reshape(expanded_shape)
+            )
+            zero_groups.append(
+                zero.unsqueeze(1).expand(-1, end - start).reshape(expanded_shape)
+            )
+
+        self.scale = torch.cat(scale_groups, dim=-1)
+        self.zero = torch.cat(zero_groups, dim=-1)
 
     def find_params(self, x) -> None:
         if self.bits == 16:
@@ -331,61 +377,107 @@ class WeightQuantizer(torch.nn.Module):
             self.maxq = torch.tensor(2**bits - 1)
 
     def find_params_weight_groupwise(self, x) -> None:
-        init_shape = x.shape
-        x = x.reshape(
-            x.shape[-2], x.shape[-1] // self.weight_groupsize, self.weight_groupsize
-        )
+        if x.dim() != 2:
+            raise ValueError(
+                "weight group quantization expects a 2-D (rows, columns) tensor; "
+                f"got shape {tuple(x.shape)}."
+            )
+        if self.weight_groupsize <= 0:
+            raise ValueError(
+                "find_params_weight_groupwise requires weight_groupsize > 0; "
+                f"got {self.weight_groupsize}."
+            )
 
-        xmax = torch.amax(x, dim=-1, keepdim=True)
-        xmin = torch.amin(x, dim=-1, keepdim=True)
+        rows, columns = x.shape
 
-        if self.sym:
-            self.scale = torch.maximum(torch.abs(xmin), xmax).clamp(min=1e-5) / self.maxq
-            self.zero = torch.zeros_like(self.scale)
-        else:
-            tmp = (xmin == 0) & (xmax == 0)
-            xmin[tmp] = -1
-            xmax[tmp] = +1
-            self.scale = (xmax - xmin).clamp(min=1e-5) / self.maxq
-            self.zero = torch.round(-xmin / self.scale)
+        def _params_for_equal_width_groups(grouped_x):
+            """Return scale/zero expanded to ``grouped_x``'s last dimension.
 
-        self.scale = self.scale.repeat(1, 1, self.weight_groupsize)
-        self.zero = self.zero.repeat(1, 1, self.weight_groupsize)
+            ``grouped_x`` has shape ``(rows, num_groups, group_width)``.  Keeping
+            the MSE search vectorised over all equally-sized groups preserves the
+            old implementation's arithmetic while allowing a final short group
+            to be handled separately below.
+            """
+            xmax = torch.amax(grouped_x, dim=-1, keepdim=True)
+            xmin = torch.amin(grouped_x, dim=-1, keepdim=True)
 
-        if self.mse:
-            best = torch.full(
-                [x.shape[0], x.shape[1]], float("inf"), device=x.device
-            ).type_as(x)
-            for i in range(int(self.maxshrink * self.grid)):
-                for j in range(int(self.maxshrink * self.grid)):
-                    xmin1 = (1 - i / self.grid) * xmin
-                    xmax1 = (1 - j / self.grid) * xmax
+            if self.sym:
+                scale = (
+                    torch.maximum(torch.abs(xmin), xmax).clamp(min=1e-5)
+                    / self.maxq
+                )
+                zero = torch.zeros_like(scale)
+            else:
+                all_zero = (xmin == 0) & (xmax == 0)
+                xmin = xmin.clone()
+                xmax = xmax.clone()
+                xmin[all_zero] = -1
+                xmax[all_zero] = +1
+                scale = (xmax - xmin).clamp(min=1e-5) / self.maxq
+                zero = torch.round(-xmin / scale)
 
-                    if self.sym:
-                        scale1 = torch.maximum(torch.abs(xmin1), xmax1).clamp(min=1e-5) / self.maxq
-                        zero1 = torch.zeros_like(scale1)
-                        scale1 = scale1.repeat(1, 1, self.weight_groupsize)
-                        zero1 = zero1.repeat(1, 1, self.weight_groupsize)
-                        q = sym_quant_dequant(x, scale1, self.maxq)
-                    else:
-                        scale1 = (xmax1 - xmin1) / self.maxq
-                        zero1 = torch.round(-xmin1 / scale1)
-                        scale1 = scale1.repeat(1, 1, self.weight_groupsize)
-                        zero1 = zero1.repeat(1, 1, self.weight_groupsize)
-                        q = asym_quant_dequant(x, scale1, zero1, self.maxq)
+            if self.mse:
+                best = torch.full(
+                    grouped_x.shape[:2],
+                    float("inf"),
+                    device=grouped_x.device,
+                    dtype=grouped_x.dtype,
+                )
+                for i in range(int(self.maxshrink * self.grid)):
+                    for j in range(int(self.maxshrink * self.grid)):
+                        xmin1 = (1 - i / self.grid) * xmin
+                        xmax1 = (1 - j / self.grid) * xmax
 
-                    q -= x
-                    q.abs_()
-                    q.pow_(self.norm)
-                    err = torch.sum(q, -1)
-                    tmp = err < best
-                    if torch.any(tmp):
-                        best[tmp] = err[tmp]
-                        self.scale[tmp] = scale1[tmp]
-                        self.zero[tmp] = zero1[tmp]
+                        if self.sym:
+                            scale1 = (
+                                torch.maximum(torch.abs(xmin1), xmax1)
+                                .clamp(min=1e-5)
+                                / self.maxq
+                            )
+                            zero1 = torch.zeros_like(scale1)
+                            q = sym_quant_dequant(grouped_x, scale1, self.maxq)
+                        else:
+                            scale1 = (xmax1 - xmin1).clamp(min=1e-5) / self.maxq
+                            zero1 = torch.round(-xmin1 / scale1)
+                            q = asym_quant_dequant(
+                                grouped_x, scale1, zero1, self.maxq
+                            )
 
-        self.scale = self.scale.reshape(init_shape)
-        self.zero = self.zero.reshape(init_shape)
+                        err = (q - grouped_x).abs().pow(self.norm).sum(-1)
+                        improved = err < best
+                        if torch.any(improved):
+                            best[improved] = err[improved]
+                            scale[improved] = scale1[improved]
+                            zero[improved] = zero1[improved]
+
+            group_width = grouped_x.shape[-1]
+            return (
+                scale.expand(-1, -1, group_width).reshape(rows, -1),
+                zero.expand(-1, -1, group_width).reshape(rows, -1),
+            )
+
+        # Vectorise all complete groups together.  The legacy implementation
+        # builds one quantizer for ``min(start + groupsize, columns)`` and thus
+        # permits a short final group; the former reshape-based implementation
+        # accidentally rejected that valid case.
+        full_columns = (columns // self.weight_groupsize) * self.weight_groupsize
+        scale_parts = []
+        zero_parts = []
+        if full_columns:
+            grouped = x[:, :full_columns].reshape(
+                rows, full_columns // self.weight_groupsize, self.weight_groupsize
+            )
+            scale, zero = _params_for_equal_width_groups(grouped)
+            scale_parts.append(scale)
+            zero_parts.append(zero)
+        if full_columns < columns:
+            tail = x[:, full_columns:].unsqueeze(1)
+            scale, zero = _params_for_equal_width_groups(tail)
+            scale_parts.append(scale)
+            zero_parts.append(zero)
+
+        self.scale = torch.cat(scale_parts, dim=1)
+        self.zero = torch.cat(zero_parts, dim=1)
 
     def find_params(self, x) -> None:
         if self.bits == 16:
@@ -468,12 +560,37 @@ class WeightQuantizer(torch.nn.Module):
         return x
 
     # Return int value and scale in addtional to fake quantized weight
-    def fake_quantize(self, x, st_idx=None, end_idx=None):
+    def fake_quantize(self, x, st_idx=None, end_idx=None, col_idx=None):
         x_dtype = x.dtype
         if self.ready() and self.bits < 16:
             scale = self.scale.to(x.device)
             if st_idx is not None and end_idx is not None:
                 scale = scale[st_idx:end_idx]
+            if self.weight_groupsize > 0 and col_idx is not None:
+                # Group parameters are stored expanded in natural column order
+                # so full-matrix RTN remains a simple broadcast. GPTQ quantizes
+                # one (possibly act-order permuted) column at a time and must
+                # explicitly select that column's original group.
+                col_idx = torch.as_tensor(
+                    col_idx, dtype=torch.long, device=scale.device
+                ).reshape(-1)
+                if col_idx.numel() != x.shape[-1]:
+                    raise ValueError(
+                        "col_idx must provide one natural column index per input "
+                        f"column; got {col_idx.numel()} indices for x.shape={tuple(x.shape)}."
+                    )
+                if torch.any(col_idx < 0) or torch.any(col_idx >= scale.shape[-1]):
+                    raise IndexError(
+                        f"col_idx is outside [0, {scale.shape[-1]}) for grouped "
+                        "weight quantization."
+                    )
+                scale = scale.index_select(-1, col_idx)
+            elif self.weight_groupsize > 0 and x.shape[-1] != scale.shape[-1]:
+                raise ValueError(
+                    "Grouped fake_quantize on a partial weight tensor requires "
+                    "col_idx in natural (pre-act-order) column coordinates; "
+                    f"got x.shape={tuple(x.shape)} and scale.shape={tuple(scale.shape)}."
+                )
             q = torch.clamp(torch.round(x / scale), -(self.maxq + 1), self.maxq)
             return (scale * q).to(x_dtype), q, scale
         else:

@@ -23,7 +23,10 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn as nn
 
-from realq.quant.hessian import cholesky_inverse_with_damp
+from realq.quant.hessian import (
+    cholesky_inverse_batched_with_damp,
+    cholesky_inverse_with_damp,
+)
 from realq.utils import nvtx
 from utils import dist_utils
 
@@ -294,6 +297,13 @@ class RealQLayer:
         force ``none`` because the rank mode would need extra synchronisation
         to keep the per-rank permutation consistent.
         """
+        # W16 is the explicit no-weight-quantization mode.  The quantizer has
+        # no scale in this mode, so entering the GPTQ column loop would make
+        # fake_quantize return ``None`` and fail while flattening it. Return
+        # before Hessian/w_clip validation as well: disabled weight quantization
+        # is a strict no-op, matching the legacy caller's W16 bypass.
+        if self.quantizer.bits >= 16:
+            return
         if not self._finalized:
             raise RuntimeError("Call finalize_hessian() before quantize().")
         if w_clip and not self.quantizer.mse:
@@ -325,11 +335,28 @@ class RealQLayer:
                 "pass group_parallel_quant='rank' to RealQLayer.__init__."
             )
         W = self.linear.weight.data.clone().float()
+        dynamic_weight_groups = (
+            self.quantizer.weight_groupsize > 0 and not act_order
+        )
+        if (
+            dynamic_weight_groups
+            and self.quantizer.weight_groupsize != blocksize
+        ):
+            raise ValueError(
+                "Dynamic weight groups require weight_groupsize == blocksize, "
+                "matching legacy GPTQ+: "
+                f"got weight_groupsize={self.quantizer.weight_groupsize}, "
+                f"blocksize={blocksize}."
+            )
         # H is (num_local_groups, C, C). For NUM_GROUPS=1 this collapses to
         # (1, C, C) and downstream uses the legacy H_per_group[0] shortcut.
         # For NUM_GROUPS>1 rank mode num_local_groups is the rank's owned
         # group count (always >= 1).
-        H_per_group = self.H
+        # Legacy group-parallel prepares a private Hessian copy, repairs dead
+        # diagonals, and clears the corresponding weight columns before any
+        # act-order permutation or Cholesky.  The dead-column weight reset is
+        # observable (and was previously missing in the refactor).
+        H_per_group = self.H.clone()
 
         # ----------- find_params (row-parallel under rank mode) ------------
         # Per-row scale/zero from the un-permuted W. This MUST run BEFORE
@@ -345,23 +372,25 @@ class RealQLayer:
                 row_sl = row_slice_for_rank(rank, world, self.rows)
             else:
                 row_sl = slice(0, self.rows)
-            if not self.quantizer.ready():
+            if not self.quantizer.ready() and not dynamic_weight_groups:
                 if rank_mode and world > 1:
                     # Each rank computes find_params for its own row slice, then
-                    # all-gathers (rows, 1) scale/zero so the full per-row params
-                    # are visible on every rank for fake_quantize's st_idx/end_idx
-                    # slicing during the inner block.
+                    # all-gathers scale/zero so the full params are visible on
+                    # every rank for fake_quantize's row slicing. Per-row
+                    # quantization has trailing shape (1,); group quantization
+                    # has trailing shape (columns,), so this must not be
+                    # hard-coded to (rows, 1).
                     self.quantizer.find_params(W[row_sl])
                     import torch.distributed as _dist
                     full_scale = torch.empty(
-                        (self.rows, 1),
+                        (self.rows, *self.quantizer.scale.shape[1:]),
                         dtype=self.quantizer.scale.dtype,
                         device=self.quantizer.scale.device,
                     )
                     _dist.all_gather_into_tensor(full_scale, self.quantizer.scale.contiguous())
                     self.quantizer.scale = full_scale
                     full_zero = torch.empty(
-                        (self.rows, 1),
+                        (self.rows, *self.quantizer.zero.shape[1:]),
                         dtype=self.quantizer.zero.dtype,
                         device=self.quantizer.zero.device,
                     )
@@ -369,6 +398,62 @@ class RealQLayer:
                     self.quantizer.zero = full_zero
                 else:
                     self.quantizer.find_params(W)
+
+            def make_dynamic_group_quantizer(weight_block: torch.Tensor):
+                """Legacy-compatible per-block observer for non-act-order GPTQ.
+
+                With act-order disabled, old GPTQ+ observes each group at the
+                start of its block *after* previous blocks' second-order/Adam
+                updates have reached the trailing weight. With act-order
+                enabled groups are instead static and keyed by natural column,
+                which is handled by ``self.quantizer`` above.
+                """
+                block_quantizer = type(self.quantizer)()
+                block_quantizer.configure(
+                    bits=self.quantizer.bits,
+                    perchannel=self.quantizer.perchannel,
+                    sym=self.quantizer.sym,
+                    mse=self.quantizer.mse,
+                    norm=self.quantizer.norm,
+                    grid=self.quantizer.grid,
+                    maxshrink=self.quantizer.maxshrink,
+                    weight_groupsize=-1,
+                )
+                block_quantizer.find_params(weight_block)
+                if rank_mode and world > 1:
+                    import torch.distributed as _dist
+                    full_scale = torch.empty(
+                        (self.rows, *block_quantizer.scale.shape[1:]),
+                        dtype=block_quantizer.scale.dtype,
+                        device=block_quantizer.scale.device,
+                    )
+                    _dist.all_gather_into_tensor(
+                        full_scale, block_quantizer.scale.contiguous()
+                    )
+                    block_quantizer.scale = full_scale
+                    full_zero = torch.empty(
+                        (self.rows, *block_quantizer.zero.shape[1:]),
+                        dtype=block_quantizer.zero.dtype,
+                        device=block_quantizer.zero.device,
+                    )
+                    _dist.all_gather_into_tensor(
+                        full_zero, block_quantizer.zero.contiguous()
+                    )
+                    block_quantizer.zero = full_zero
+                return block_quantizer
+
+        dead = torch.diagonal(
+            H_per_group, dim1=-2, dim2=-1,
+        ) == 0
+        torch.diagonal(
+            H_per_group, dim1=-2, dim2=-1,
+        )[dead] = 1
+        for local_group_pos, global_group_id in enumerate(
+            self.hessian_group_ids.tolist()
+        ):
+            group_row_start = global_group_id * self.rows_per_group
+            group_row_end = group_row_start + self.rows_per_group
+            W[group_row_start:group_row_end, dead[local_group_pos]] = 0
 
         # ----------- act_order ------------
         # act_square is all-reduced in finalize_hessian, so perm is identical
@@ -388,7 +473,16 @@ class RealQLayer:
         # so the result is bit-equal to sub-task 4 (no extra .empty_like +
         # indexed write step that caused observable last-bit drift on Qwen3).
         with nvtx.nvtx_range("quant.hinv"):
-            if self.num_groups == 1:
+            if rank_mode:
+                # Legacy group_parallel={tensor,rank} always invokes one
+                # batched Cholesky over the Hessian groups, including at
+                # world_size=1.  Preserve that exact operation ordering.
+                Hinv_per_group = cholesky_inverse_batched_with_damp(
+                    H_per_group, percdamp=percdamp,
+                )
+                if self.num_groups == 1:
+                    Hinv_single = Hinv_per_group[0]
+            elif self.num_groups == 1:
                 Hinv_single = cholesky_inverse_with_damp(H_per_group[0], percdamp=percdamp)
             else:
                 Hinv_per_group = torch.empty_like(H_per_group)
@@ -428,6 +522,11 @@ class RealQLayer:
                     i2 = min(i1 + blocksize, self.columns)
                     count = i2 - i1
                     W1_local = W_local[:, i1:i2].clone()
+                    block_quantizer = (
+                        make_dynamic_group_quantizer(W1_local)
+                        if dynamic_weight_groups
+                        else self.quantizer
+                    )
                     Q1_local = torch.zeros_like(W1_local)
                     Err1_local = torch.zeros_like(W1_local)
                     Hinv1 = Hinv_single[i1:i2, i1:i2]
@@ -438,10 +537,11 @@ class RealQLayer:
                             w_col = w.unsqueeze(1)
                             # Slice scale/zero to local rows so fake_quantize sees
                             # the per-row params for the rows we own.
-                            q_fake, _, _ = self.quantizer.fake_quantize(
+                            q_fake, _, _ = block_quantizer.fake_quantize(
                                 w_col,
                                 st_idx=row_sl.start,
                                 end_idx=row_sl.stop,
+                                col_idx=perm[i1 + i] if perm is not None else i1 + i,
                             )
                             q = q_fake.flatten()
                             Q1_local[:, i] = q
@@ -599,6 +699,13 @@ class RealQLayer:
                     i2 = min(i1 + blocksize, self.columns)
                     count = i2 - i1
                     W1 = W_local[:, :, i1:i2].clone()              # (G_l, R_l, count)
+                    block_quantizer = (
+                        make_dynamic_group_quantizer(
+                            W1.reshape(-1, count)
+                        )
+                        if dynamic_weight_groups
+                        else self.quantizer
+                    )
                     Q1 = torch.zeros_like(W1)
                     Err1 = torch.zeros_like(W1)
                     Hinv1 = Hinv_per_group[:, i1:i2, i1:i2]        # (G_l, count, count)
@@ -612,10 +719,11 @@ class RealQLayer:
                             # order because local groups are contiguous in
                             # row space.
                             w_col_flat = w_col.reshape(-1, 1)
-                            q_fake, _, _ = self.quantizer.fake_quantize(
+                            q_fake, _, _ = block_quantizer.fake_quantize(
                                 w_col_flat,
                                 st_idx=row_sl.start,
                                 end_idx=row_sl.stop,
+                                col_idx=perm[i1 + i] if perm is not None else i1 + i,
                             )
                             q_col = q_fake.reshape(G_l, R_l)
                             Q1[:, :, i] = q_col
@@ -724,6 +832,11 @@ class RealQLayer:
                     i2 = min(i1 + blocksize, self.columns)
                     count = i2 - i1
                     W1 = W[:, i1:i2].clone()
+                    block_quantizer = (
+                        make_dynamic_group_quantizer(W1)
+                        if dynamic_weight_groups
+                        else self.quantizer
+                    )
                     Q1 = torch.zeros_like(W1)
                     Err1 = torch.zeros_like(W1)
                     W1_g = W1.view(self.num_groups, rpg, count)
@@ -732,7 +845,10 @@ class RealQLayer:
                     with nvtx.nvtx_range("block.inner_cols"):
                         for i in range(count):
                             w_col = W1[:, i].unsqueeze(1)
-                            q_fake, _, _ = self.quantizer.fake_quantize(w_col)
+                            q_fake, _, _ = block_quantizer.fake_quantize(
+                                w_col,
+                                col_idx=perm[i1 + i] if perm is not None else i1 + i,
+                            )
                             q_col = q_fake.flatten()
                             Q1[:, i] = q_col
                             d_g = Hinv1_g[:, i, i]

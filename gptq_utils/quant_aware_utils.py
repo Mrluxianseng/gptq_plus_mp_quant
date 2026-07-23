@@ -4,17 +4,22 @@ from utils import quant_utils, rotation_utils
 
 
 def configure_activation_quantizers_for_gptq(args, model):
-    """Enable ActQuantWrapper fake quant for weight-quantization student paths."""
-    if args.a_bits >= 16 and args.v_bits >= 16:
-        return 0, 0
+    """Configure the shared A/V runtime sites and return enabled-site counts.
+
+    This is intentionally the single source of truth for legacy aware,
+    legacy post-quant (unaware), and refactored REAL-Q paths.  Reconfiguring
+    every site, including the fp16 ones, also makes the operation idempotent:
+    a model previously configured for A4/V4 cannot retain stale low-bit state
+    when reused with A16/V16.
+    """
 
     qlayers = quant_utils.find_qlayers(model, layers=[quant_utils.ActQuantWrapper])
     input_count = 0
     v_count = 0
     for name, wrapper in qlayers.items():
-        layer_input_bits = args.a_bits
-        if "lm_head" in name:
-            layer_input_bits = 16
+        is_lm_head = "lm_head" in name
+        is_v_proj = "v_proj" in name
+        layer_input_bits = 16 if is_lm_head else args.a_bits
 
         wrapper.quantizer.configure(
             bits=layer_input_bits,
@@ -25,19 +30,25 @@ def configure_activation_quantizers_for_gptq(args, model):
         if layer_input_bits < 16:
             input_count += 1
 
-        if "v_proj" in name and args.v_bits < 16:
-            wrapper.out_quantizer.configure(
-                bits=args.v_bits,
-                groupsize=args.v_groupsize,
-                sym=not args.v_asym,
-                clip_ratio=args.v_clip_ratio,
-            )
+        # V is the only separately quantized projection output.  Explicitly
+        # reset every other output site to fp16 so repeated configuration is
+        # deterministic and cannot leak an earlier experimental setting.
+        layer_output_bits = args.v_bits if is_v_proj else 16
+        wrapper.out_quantizer.configure(
+            bits=layer_output_bits,
+            groupsize=args.v_groupsize,
+            sym=not args.v_asym,
+            clip_ratio=args.v_clip_ratio,
+        )
+        if is_v_proj and layer_output_bits < 16:
             v_count += 1
 
     return input_count, v_count
 
 
 def configure_k_cache_quantizers_for_gptq(args, analyzer):
+    if args.k_bits >= 16:
+        return 0
     rope_function_name = "apply_rotary_pos_emb"
     k_quant_config = {
         "k_bits": args.k_bits,

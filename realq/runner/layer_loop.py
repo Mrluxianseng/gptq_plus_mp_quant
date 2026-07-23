@@ -24,6 +24,7 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 
+from realq.alignment import RefreshTraceWriter, default_refresh_trace_config
 from realq.parallel import env as parallel_env
 from realq.parallel.cpu_master import CpuMasterLayerManager
 from realq.quant.realq_layer import RealQLayer
@@ -37,6 +38,7 @@ from realq.refresh.kl_loss import make_kl_refresh_fn
 from realq.runner import module_groups, streams
 from realq.utils import memory as mem_utils
 from realq.utils import nvtx
+from gptq_utils.quant_aware_utils import disable_fp_path_quant
 from utils import dist_utils, quant_utils
 
 if TYPE_CHECKING:
@@ -47,10 +49,20 @@ if TYPE_CHECKING:
 
 def _make_quantizer(cfg: "Config"):
     """Fresh per-linear quantizer matching old code's WeightQuantizer config."""
+    if cfg.w_bits < 16 and cfg.w_asym:
+        raise ValueError(
+            "RealQ weight quantization only supports symmetric weights; "
+            "set w_asym=False. Asymmetric weights are not part of the paper "
+            "algorithm and the previous refactor silently applied symmetric "
+            "fake quantization despite w_asym=True."
+        )
     q = quant_utils.WeightQuantizer()
     q.configure(
         bits=cfg.w_bits,
         perchannel=True,
+        # W16 is a strict no-op, so its nominal symmetry setting is immaterial.
+        # Preserve the requested setting there while rejecting low-bit asymmetry
+        # above; this matches the legacy argument validation.
         sym=not cfg.w_asym,
         mse=cfg.w_clip,   # MSE clip search (sub-task 4 turns this on)
         weight_groupsize=cfg.w_groupsize,
@@ -113,6 +125,23 @@ def _accumulate_hessian_for_group(
             r.finalize_hessian()
 
 
+def _replay_fp_layer(
+    layer: nn.Module,
+    state: streams.LayerInputs,
+    *,
+    inps: torch.Tensor,
+    bsz: int = 1,
+) -> torch.Tensor:
+    """Replay a teacher layer with all runtime A/V/K fake quant disabled.
+
+    The context is deliberately scoped to this helper.  Once it exits the
+    quantisers are restored, so Hessian accumulation, gradient refresh and
+    the final student replay still see the configured aware path.
+    """
+    with disable_fp_path_quant(layer):
+        return streams.replay_layer(layer, state, bsz=bsz, inps=inps)
+
+
 @torch.no_grad()
 def quantize_one_layer(
     cfg: "Config",
@@ -127,6 +156,7 @@ def quantize_one_layer(
     next_fp_inps: "torch.Tensor | None" = None,
     analyzer: "ModelAnalyzer | None" = None,
     layer_manager: "CpuMasterLayerManager | None" = None,
+    trace_writer: "RefreshTraceWriter | None" = None,
 ) -> streams.LayerInputs:
     """Quantise one transformer layer, return updated input state for the
     next layer (= output of this layer with all-quantised weights).
@@ -160,7 +190,12 @@ def quantize_one_layer(
         # so ``fp_outs`` ULP-drifts from old's whenever bsz>1; the drift then
         # propagates into every refresh's ``fp_target``.
         with nvtx.nvtx_range("layer.fp_replay"):
-            fp_outs = streams.replay_layer(layer, state, bsz=1, inps=state.fp_inps)
+            # A/K/V aware fake quantisation is a student-path feature.  The
+            # teacher stream must stay FP even though the same layer object is
+            # already configured for aware Hessian accumulation / refreshes.
+            fp_outs = _replay_fp_layer(
+                layer, state, bsz=1, inps=state.fp_inps,
+            )
 
         # loss_slide_window: pre-stage next_layer to GPU and forward
         # ``fp_outs`` (the FP forward output of THIS layer) through it once to
@@ -186,11 +221,11 @@ def quantize_one_layer(
                 # bf16 kernel for batch>1 vs batch=1; using ``hessian_accum_bsz``
                 # here lets next-layer FP target drift ULP-wise from old's, which
                 # propagates through every slide-arm refresh gradient.
-                next_fp_outs = streams.replay_layer(
+                next_fp_outs = _replay_fp_layer(
                     next_layer, state, bsz=1, inps=fp_outs,
                 )
 
-        # Layer-wise lr (cosine schedule) — same for every module in this layer.
+        # Layer-wise reverse-cosine lr — same for every module in this layer.
         # The last transformer layer can opt in to a separate base lr via
         # ``cfg.final_layer_grad_lr``; loss formula still falls back to
         # fisher_mse for sub-task simplicity (KL-vs-ref_logits override is
@@ -202,7 +237,31 @@ def quantize_one_layer(
         layer_lr = layer_lr_for_schedule(
             base_lr, layer_idx, num_layers,
             cfg.grad_lr_layer_base_ratio, cfg.grad_lr_layer_schedule,
+            # The final transformer block always keeps its separately tuned
+            # LR. For earlier blocks, paper activation-aware rows use the
+            # configured/reported LR as a constant (no base-ratio interpolation).
+            activation_aware=(
+                cfg.activation_aware_quantization_enabled
+                and not is_final_layer
+            ),
         )
+        effective_grad_clip = (
+            cfg.final_layer_grad_clip
+            if is_final_layer and cfg.final_layer_grad_clip is not None
+            else cfg.grad_clip
+        )
+        world = parallel_env.get_world_size()
+        refresh_bsz_global = (
+            cfg.final_layer_backward_bsz
+            if is_final_layer
+            else cfg.backward_bsz
+        )
+        if refresh_bsz_global % world != 0:
+            raise ValueError(
+                f"refresh batch size ({refresh_bsz_global}) must be divisible "
+                f"by world_size ({world}) for layer {layer_idx}."
+            )
+        refresh_bsz_local = refresh_bsz_global // world
         block_gd_enabled = base_lr > 0
         # Final layer drops the fisher_mse loss for the more accurate
         # KL-vs-real-time-FP-logits loss (matches old GPTQ+ ``--grad_refresh_loss=kl``
@@ -316,9 +375,13 @@ def quantize_one_layer(
                                 ctx = RefreshContext(
                                     module=realq.linear,
                                     layer_lr=layer_lr,
-                                    grad_clip=cfg.grad_clip,
-                                    backward_bsz=cfg.backward_bsz,
+                                    grad_clip=effective_grad_clip,
+                                    backward_bsz=refresh_bsz_local,
                                     scheduler=sample_scheduler,
+                                    trace_writer=trace_writer,
+                                    trace_layer=layer_idx,
+                                    trace_module=name,
+                                    blocksize=cfg.blocksize,
                                 )
                                 # slide_alpha closure: returns CURRENT α and advances the
                                 # layer-shared cumulative refresh cursor. Must be called
@@ -376,8 +439,12 @@ def quantize_one_layer(
                 p.grad = None
 
         # Final forward → produces input for next layer (all weights quantised).
+        # Legacy GPTQ+ replays one calibration sample at a time here.  Keeping
+        # that batch shape is numerically significant in bf16: fused attention
+        # and GEMM may select different kernels for batch>1, and even an ULP
+        # drift is amplified by every later Hessian and refresh.
         with nvtx.nvtx_range("layer.final_replay"):
-            new_inps = streams.replay_layer(layer, state, bsz=cfg.hessian_accum_bsz)
+            new_inps = streams.replay_layer(layer, state, bsz=1)
         with nvtx.nvtx_range("layer.teardown"):
             if use_manager:
                 layer_manager.release_layer(layer_idx, layer, orig_device=torch.device("cpu"))
@@ -442,6 +509,25 @@ def quantize_all_layers(
     if cfg.quant_stop_layer is not None:
         n_layers = min(n_layers, cfg.quant_stop_layer + 1)
 
+    alignment_trace_config = {}
+    if cfg.alignment_trace_path is not None:
+        alignment_trace_config = default_refresh_trace_config(cfg)
+        alignment_trace_config.update(
+            {
+                "global_loss": True,
+                "grad_refresh_loss": "fisher_diag_mse",
+                "g_update_mode": "block_gd",
+                "grad_optimizer": "adam",
+                "final_layer_grad_optimizer": "adam",
+                "analytical_first_order_enabled": False,
+                "second_order_scale": 1.0,
+                "block_atomic_quant": False,
+                "pre_clip": False,
+                # Refactored refresh sampling always uses one shared global
+                # scheduler and rank-local filtering.
+                "dp_global_shuffle": True,
+            }
+        )
     # Single GLOBAL scheduler shared across ALL block_gd refreshes for the
     # whole quantisation pass — matches old gptq_plus_utils.py
     # ``--dp_global_shuffle=True`` branch (lines 7885-7895). chunk_size is
@@ -466,31 +552,44 @@ def quantize_all_layers(
         sample_scheduler = _SharedSampleScheduler(
             n_total=cfg.nsamples,
             chunk_size=cfg.backward_samples,
-            seed=cfg.seed,
+            seed=cfg.refresh_seed,
         )
 
-    for layer_idx in tqdm(range(n_layers), ncols=100, desc="Quantising layers",
-                          disable=not parallel_env.is_main()):
-        # loss_slide_window needs the NEXT transformer block on GPU during
-        # this layer's refreshes. Old GPTQ+ (lines 8284-8287) gates slide
-        # on ``i <= final_layer_idx - 2``: i.e. the last TWO layers
-        # (final-1 and final) DON'T slide. Match exactly.
-        next_layer = None
-        if (
-            cfg.loss_slide_window
-            and layer_idx <= len(layers) - 3
-            and layer_idx + 1 < n_layers + 1  # tolerate final-stop runs
+    trace_writer = RefreshTraceWriter(
+        cfg.alignment_trace_path,
+        implementation="realq",
+        run_id=cfg.alignment_run_id,
+        config=alignment_trace_config,
+    )
+    try:
+        for layer_idx in tqdm(
+            range(n_layers),
+            ncols=100,
+            desc="Quantising layers",
+            disable=not parallel_env.is_main(),
         ):
-            next_layer = layers[layer_idx + 1]
-        state = quantize_one_layer(
-            cfg, layer_idx, layers[layer_idx], static, state, dev,
-            num_layers=len(layers), sample_scheduler=sample_scheduler,
-            next_layer=next_layer,
-            next_fp_inps=state.fp_inps if next_layer is not None else None,
-            analyzer=analyzer,
-            layer_manager=layer_manager,
-        )
-
+            # loss_slide_window needs the NEXT transformer block on GPU during
+            # this layer's refreshes. Old GPTQ+ (lines 8284-8287) gates slide
+            # on ``i <= final_layer_idx - 2``: i.e. the last TWO layers
+            # (final-1 and final) DON'T slide. Match exactly.
+            next_layer = None
+            if (
+                cfg.loss_slide_window
+                and layer_idx <= len(layers) - 3
+                and layer_idx + 1 < n_layers + 1  # tolerate final-stop runs
+            ):
+                next_layer = layers[layer_idx + 1]
+            state = quantize_one_layer(
+                cfg, layer_idx, layers[layer_idx], static, state, dev,
+                num_layers=len(layers), sample_scheduler=sample_scheduler,
+                next_layer=next_layer,
+                next_fp_inps=state.fp_inps if next_layer is not None else None,
+                analyzer=analyzer,
+                layer_manager=layer_manager,
+                trace_writer=trace_writer,
+            )
+    finally:
+        trace_writer.close()
     if cfg.quant_stop_layer is not None:
         logging.info(
             "[realq] quant_stop_layer=%d reached; remaining layers stay FP.",

@@ -19,6 +19,13 @@ except ImportError:
     from torch.nn.utils.stateless import functional_call
 
 from utils import quant_utils, memory_utils, model_utils, dist_utils, rotation_utils
+from utils.saliency_utils import clip_global_percentile_, global_percentile
+from utils.loss_utils import tokenwise_kl_from_logits
+from realq.alignment import (
+    RefreshTraceWriter,
+    default_refresh_trace_config,
+    refresh_step_from_metrics,
+)
 from gptq_utils.diagnostics import DiagnosticRegistry, parse_diagnose_targets
 from gptq_utils.quant_aware_utils import (
     configure_activation_quantizers_for_gptq,
@@ -89,12 +96,24 @@ def _activation_clip_threshold(tensor, q):
     return flat.topk(upper_count, largest=True, sorted=False).values.min()
 
 
-def _scale_delta_by_abs_quantile(delta, ratio, profile_recorder=None):
+def _scale_delta_by_abs_quantile(
+    delta,
+    ratio,
+    profile_recorder=None,
+    threshold=None,
+):
     if ratio >= 1.0:
         return delta
     with profile_recorder.section("compute_refresh_loss.a_loss_delta_scale") if profile_recorder else _NULL_CONTEXT:
         abs_delta = delta.detach().float().abs()
-        threshold = _activation_clip_threshold(abs_delta, float(ratio))
+        if threshold is None:
+            threshold = _activation_clip_threshold(
+                abs_delta, float(ratio)
+            )
+        else:
+            threshold = threshold.to(
+                device=abs_delta.device, dtype=abs_delta.dtype
+            )
         if threshold is None:
             return delta
         scale = abs_delta.clamp_min_(torch.finfo(abs_delta.dtype).tiny)
@@ -650,7 +669,7 @@ def compute_layer_lr_scale(layer_idx: int, num_layers: int, schedule: str) -> fl
     x = layer_idx / max(num_layers - 1, 1) ∈ [0, 1]. Mapping:
         "none"   -> 1.0  (no ramp)
         "linear" -> x
-        "cosine" -> 0.5 * (1 - cos(pi * x))   (smooth S-curve from 0 to 1)
+        "cosine" -> sin(pi * x / 2)            (paper reverse-cosine ramp)
         "sqrt"   -> sqrt(x)                   (rises fast early)
 
     Degenerate single-layer models (num_layers <= 1) get scale = 1.0.
@@ -664,7 +683,7 @@ def compute_layer_lr_scale(layer_idx: int, num_layers: int, schedule: str) -> fl
     if schedule == "linear":
         return x
     if schedule == "cosine":
-        return 0.5 * (1.0 - math.cos(math.pi * x))
+        return math.sin(math.pi * x / 2.0)
     if schedule == "sqrt":
         return math.sqrt(x)
     raise ValueError(f"Unknown grad_lr_layer_schedule={schedule!r}")
@@ -822,8 +841,8 @@ class GPTQPlus:
                 f"Quantization{log_context}: `damp_percent` must be positive. current is {damp_percent}"
             )
 
-        H_work = H_sub.clone()
-        diag_idx = torch.arange(H_work.shape[0], device=H_work.device)
+        diag_idx = torch.arange(H_sub.shape[0], device=H_sub.device)
+        diag_mean = torch.mean(torch.diag(H_sub))
         last_error = None
         while 1 > damp_percent > 0:
             try:
@@ -833,7 +852,11 @@ class GPTQPlus:
                     else _NULL_CONTEXT
                 )
                 with section:
-                    damp = damp_percent * torch.mean(torch.diag(H_work))
+                    # Every retry must start from the original Hessian.  Reusing
+                    # the prior H_work cumulatively added both old and new
+                    # damping and even changed the mean used to compute it.
+                    H_work = H_sub.clone()
+                    damp = damp_percent * diag_mean
                     H_work[diag_idx, diag_idx] += damp
                     chol = torch.linalg.cholesky(H_work)
                     Hinv_init = torch.cholesky_inverse(chol)
@@ -917,7 +940,6 @@ class GPTQPlus:
         dtype = H_subs.dtype
         diag_idx = torch.arange(columns, device=device)
         eye = torch.eye(columns, device=device, dtype=dtype)
-        H_work_all = H_subs.clone()
         Hinv_init = torch.empty_like(H_subs) if need_hinv_init else None
         Hinv = torch.empty_like(H_subs)
         damp_percent = torch.full((num_groups,), damp_percent_value, device=device, dtype=torch.float32)
@@ -928,11 +950,12 @@ class GPTQPlus:
 
         while bool(pending.any().item()):
             active_idx = pending.nonzero(as_tuple=False).flatten()
-            H_work = H_work_all.index_select(0, active_idx).clone()
+            # Retry from the pristine subgroup Hessian, not the already damped
+            # previous attempt.
+            H_work = H_subs.index_select(0, active_idx).clone()
             active_damp = damp_percent.index_select(0, active_idx).to(dtype)
             active_diag_mean = torch.diagonal(H_work, dim1=-2, dim2=-1).mean(dim=1)
             H_work[:, diag_idx, diag_idx] += (active_damp * active_diag_mean).unsqueeze(1)
-            H_work_all.index_copy_(0, active_idx, H_work)
 
             section = (
                 profile_recorder.section(profile_section)
@@ -2066,6 +2089,7 @@ class GPTQPlus:
                                         "slide_alpha": None if refresh_meta is None else refresh_meta.get("slide_alpha"),
                                         "mean_refresh_loss_current": None if refresh_meta is None else refresh_meta.get("mean_refresh_loss_current"),
                                         "mean_refresh_loss_next": None if refresh_meta is None else refresh_meta.get("mean_refresh_loss_next"),
+                                        "sample_indices": () if refresh_meta is None else refresh_meta.get("sample_indices", ()),
                                     }
                                 )
 
@@ -3179,6 +3203,7 @@ class GPTQPlus:
                                         "slide_alpha": None if refresh_meta is None else refresh_meta.get("slide_alpha"),
                                         "mean_refresh_loss_current": None if refresh_meta is None else refresh_meta.get("mean_refresh_loss_current"),
                                         "mean_refresh_loss_next": None if refresh_meta is None else refresh_meta.get("mean_refresh_loss_next"),
+                                        "sample_indices": () if refresh_meta is None else refresh_meta.get("sample_indices", ()),
                                     }
                                 )
 
@@ -4231,9 +4256,10 @@ def collect_static_end_to_end_saliency_and_fisher(
     # (`..., static_dynsal = collect_static_...`) always has something to bind.
     static_dynsal = None
     # Stable per-(layer, module) seed for Ω. We need every DP rank to draw the
-    # SAME Gaussian Ω, so we derive a deterministic 31-bit integer from the
-    # global args seed plus the canonical (layer_idx, module_name) — this stays
-    # stable regardless of rank or batching.
+    # SAME Gaussian Ω, so we derive a deterministic 31-bit integer from a
+    # fixed algorithm namespace plus canonical (layer_idx, module_name). It
+    # intentionally does not depend on the calibration seed and stays stable
+    # regardless of rank or batching.
     import zlib as _zlib
     def _omega_seed(_layer_idx, _module_name):
         h = _zlib.crc32(_module_name.encode()) ^ (_layer_idx * 0x9E3779B1)
@@ -4275,20 +4301,6 @@ def collect_static_end_to_end_saliency_and_fisher(
                     group_size,
                 )
                 sal_per_group = grad_squared.mean(dim=-1)
-                # Clip saliency outliers at a configurable percentile. For
-                # deep layers the NLL backward amplifies a handful of tokens
-                # by 10-12 orders of magnitude, which makes the downstream
-                # weighted Hessian (`inp.T @ diag(s) @ inp`) effectively
-                # rank-1 and Cholesky fails (even with big damp). Capping
-                # the top fraction keeps the "which tokens matter" ordering
-                # while bounding dynamic range; default 0.99 keeps 99% of
-                # tokens' saliency untouched.
-                if saliency_clip_percentile is not None and 0 < saliency_clip_percentile < 1:
-                    flat = sal_per_group.detach().flatten()
-                    # torch.quantile is O(n log n) but this tensor is small
-                    # (batch * seq * NG elements per hook call), so negligible.
-                    cap = torch.quantile(flat, saliency_clip_percentile)
-                    sal_per_group = torch.clamp(sal_per_group, max=cap)
                 if collect_saliency:
                     sal_cpu = sal_per_group.detach().cpu()
                     if use_rademacher_stats:
@@ -5237,7 +5249,12 @@ def collect_static_end_to_end_saliency_and_fisher(
                             f"Failed to collect static end-to-end saliency for layer={layer_idx} module={module_name}."
                         )
                     # Rank-local shard of shape (n_local, T, G). Not gathered.
-                    layer_saliency[module_name] = torch.cat(saliency_data[layer_idx][module_name], dim=0)
+                    layer_saliency[module_name] = clip_global_percentile_(
+                        torch.cat(
+                            saliency_data[layer_idx][module_name], dim=0
+                        ),
+                        saliency_clip_percentile,
+                    )
                     # Free the per-batch chunks right after concat. Otherwise both
                     # the list (~14 GB for 8B across all layers) AND the catted
                     # tensor (~14 GB) are alive simultaneously until function exit,
@@ -5624,6 +5641,7 @@ def compute_refresh_loss(
     profile_recorder=None,
     sink_size=0,
     a_loss_ratio=1.0,
+    a_loss_threshold=None,
 ):
     refresh_loss_type = canonical_refresh_loss_type(refresh_loss_type)
     # `sink_size > 0` (driven by --ignore_attention_sink) drops the first
@@ -5641,27 +5659,33 @@ def compute_refresh_loss(
     if refresh_loss_type == "kl":
         with profile_recorder.section("compute_refresh_loss.kl.total") if profile_recorder else _NULL_CONTEXT:
             with profile_recorder.section("compute_refresh_loss.kl.logits_quant") if profile_recorder else _NULL_CONTEXT:
-                logits = hidden2logits(_drop_sink(out_hidden), analyzer)
+                logits = hidden2logits(
+                    _drop_sink(out_hidden), analyzer
+                ).float()
             with profile_recorder.section("compute_refresh_loss.kl.logits_fp") if profile_recorder else _NULL_CONTEXT:
-                logits_fp = hidden2logits(_drop_sink(fp_hidden), analyzer)
+                logits_fp = hidden2logits(
+                    _drop_sink(fp_hidden), analyzer
+                ).float()
             if kl_topk > 0:
                 with profile_recorder.section("compute_refresh_loss.kl.topk_slice") if profile_recorder else _NULL_CONTEXT:
                     logits_fp, indices = logits_fp.topk(kl_topk, dim=-1, sorted=False)
                     logits = logits.gather(-1, indices)
             with profile_recorder.section("compute_refresh_loss.kl.kl_div") if profile_recorder else _NULL_CONTEXT:
-                kl_loss = F.kl_div(
-                    F.log_softmax(logits, dim=-1),
-                    F.softmax(logits_fp, dim=-1),
-                    reduction="none",
-                )
-                return kl_loss.sum(dim=-1).mean()
+                return tokenwise_kl_from_logits(
+                    logits, logits_fp
+                ).mean()
 
     delta = _drop_sink(out_hidden - fp_hidden)
     if (
         is_fisher_backed_loss(refresh_loss_type)
         or is_hidden_mse_loss(refresh_loss_type)
     ) and a_loss_ratio < 1.0:
-        delta = _scale_delta_by_abs_quantile(delta, a_loss_ratio, profile_recorder)
+        delta = _scale_delta_by_abs_quantile(
+            delta,
+            a_loss_ratio,
+            profile_recorder,
+            threshold=a_loss_threshold,
+        )
     if is_hidden_mse_loss(refresh_loss_type):
         with profile_recorder.section("compute_refresh_loss.hidden_mse") if profile_recorder else _NULL_CONTEXT:
             return 0.5 * delta.square().sum(dim=-1).mean()
@@ -5684,20 +5708,19 @@ def compute_refresh_loss(
         with profile_recorder.section("compute_refresh_loss.residual_kl.total") if profile_recorder else _NULL_CONTEXT:
             final_with_delta = fp_final_sliced + delta
             with profile_recorder.section("compute_refresh_loss.residual_kl.logits_perturbed") if profile_recorder else _NULL_CONTEXT:
-                logits_perturbed = hidden2logits(final_with_delta, analyzer)
+                logits_perturbed = hidden2logits(
+                    final_with_delta, analyzer
+                ).float()
             with profile_recorder.section("compute_refresh_loss.residual_kl.logits_fp") if profile_recorder else _NULL_CONTEXT:
-                logits_fp = hidden2logits(fp_final_sliced, analyzer)
+                logits_fp = hidden2logits(fp_final_sliced, analyzer).float()
             if kl_topk > 0:
                 with profile_recorder.section("compute_refresh_loss.residual_kl.topk_slice") if profile_recorder else _NULL_CONTEXT:
                     logits_fp, indices = logits_fp.topk(kl_topk, dim=-1, sorted=False)
                     logits_perturbed = logits_perturbed.gather(-1, indices)
             with profile_recorder.section("compute_refresh_loss.residual_kl.kl_div") if profile_recorder else _NULL_CONTEXT:
-                kl_loss = F.kl_div(
-                    F.log_softmax(logits_perturbed, dim=-1),
-                    F.softmax(logits_fp, dim=-1),
-                    reduction="none",
-                )
-                return kl_loss.sum(dim=-1).mean()
+                return tokenwise_kl_from_logits(
+                    logits_perturbed, logits_fp
+                ).mean()
 
     if refresh_loss_type == "refined_residual_kl":
         # One-step Jacobi refinement of residual_kl. Instead of assuming
@@ -5729,20 +5752,19 @@ def compute_refresh_loss(
                     refined_delta = torch.matmul(delta, _A_cast.t())
             final_with_refined = fp_final_sliced + delta + refined_delta
             with profile_recorder.section("compute_refresh_loss.refined_residual_kl.logits_perturbed") if profile_recorder else _NULL_CONTEXT:
-                logits_perturbed = hidden2logits(final_with_refined, analyzer)
+                logits_perturbed = hidden2logits(
+                    final_with_refined, analyzer
+                ).float()
             with profile_recorder.section("compute_refresh_loss.refined_residual_kl.logits_fp") if profile_recorder else _NULL_CONTEXT:
-                logits_fp = hidden2logits(fp_final_sliced, analyzer)
+                logits_fp = hidden2logits(fp_final_sliced, analyzer).float()
             if kl_topk > 0:
                 with profile_recorder.section("compute_refresh_loss.refined_residual_kl.topk_slice") if profile_recorder else _NULL_CONTEXT:
                     logits_fp, indices = logits_fp.topk(kl_topk, dim=-1, sorted=False)
                     logits_perturbed = logits_perturbed.gather(-1, indices)
             with profile_recorder.section("compute_refresh_loss.refined_residual_kl.kl_div") if profile_recorder else _NULL_CONTEXT:
-                kl_loss = F.kl_div(
-                    F.log_softmax(logits_perturbed, dim=-1),
-                    F.softmax(logits_fp, dim=-1),
-                    reduction="none",
-                )
-                return kl_loss.sum(dim=-1).mean()
+                return tokenwise_kl_from_logits(
+                    logits_perturbed, logits_fp
+                ).mean()
 
     if refresh_loss_type == "refined_diag_residual_kl":
         # Diagonal variant of refined_residual_kl: treat J as diagonal per
@@ -5769,20 +5791,19 @@ def compute_refresh_loss(
                 refined_delta = delta * _A_cast
             final_with_refined = fp_final_sliced + delta + refined_delta
             with profile_recorder.section("compute_refresh_loss.refined_diag_residual_kl.logits_perturbed") if profile_recorder else _NULL_CONTEXT:
-                logits_perturbed = hidden2logits(final_with_refined, analyzer)
+                logits_perturbed = hidden2logits(
+                    final_with_refined, analyzer
+                ).float()
             with profile_recorder.section("compute_refresh_loss.refined_diag_residual_kl.logits_fp") if profile_recorder else _NULL_CONTEXT:
-                logits_fp = hidden2logits(fp_final_sliced, analyzer)
+                logits_fp = hidden2logits(fp_final_sliced, analyzer).float()
             if kl_topk > 0:
                 with profile_recorder.section("compute_refresh_loss.refined_diag_residual_kl.topk_slice") if profile_recorder else _NULL_CONTEXT:
                     logits_fp, indices = logits_fp.topk(kl_topk, dim=-1, sorted=False)
                     logits_perturbed = logits_perturbed.gather(-1, indices)
             with profile_recorder.section("compute_refresh_loss.refined_diag_residual_kl.kl_div") if profile_recorder else _NULL_CONTEXT:
-                kl_loss = F.kl_div(
-                    F.log_softmax(logits_perturbed, dim=-1),
-                    F.softmax(logits_fp, dim=-1),
-                    reduction="none",
-                )
-                return kl_loss.sum(dim=-1).mean()
+                return tokenwise_kl_from_logits(
+                    logits_perturbed, logits_fp
+                ).mean()
 
     if layer_output_fisher is None:
         raise ValueError(
@@ -6042,11 +6063,9 @@ def collect_layer_output_grad_for_refined_mse(
                                 )
                                 logits_student = logits_student.gather(-1, idx_top)
                         with layer_recorder.section("layer.refined_mse_grad_pool.batch.loss_build") if layer_recorder else _NULL_CONTEXT:
-                            kl_loss = F.kl_div(
-                                F.log_softmax(logits_student, dim=-1),
-                                F.softmax(logits_teacher, dim=-1),
-                                reduction="none",
-                            ).sum(dim=-1).sum()
+                            kl_loss = tokenwise_kl_from_logits(
+                                logits_student, logits_teacher
+                            ).sum()
                         with layer_recorder.section("layer.refined_mse_grad_pool.batch.backward") if layer_recorder else _NULL_CONTEXT:
                             if collect_next:
                                 # One backward pass, two gradient outputs — cheaper
@@ -6216,7 +6235,7 @@ def collect_layer_output_fisher_only(
                 with layer_recorder.section("layer.pre_quant_fisher.forward.hidden_extract") if layer_recorder else _NULL_CONTEXT:
                     out_hidden = out[0] if isinstance(out, (tuple, list)) else out
                 with layer_recorder.section("layer.pre_quant_fisher.forward.logits_quant") if layer_recorder else _NULL_CONTEXT:
-                    logits = hidden2logits(out, analyzer)
+                    logits = hidden2logits(out_hidden, analyzer)
                 with layer_recorder.section("layer.pre_quant_fisher.forward.logits_fp") if layer_recorder else _NULL_CONTEXT:
                     logits_fp = hidden2logits(fp_inps[j : j + bsz].to(dev), analyzer)
 
@@ -6244,10 +6263,8 @@ def collect_layer_output_fisher_only(
                         # from the Fisher aggregation below to be consistent.
                         kl_logits = kl_logits[:, sink_size:]
                         kl_logits_fp = kl_logits_fp[:, sink_size:]
-                    kl_loss = F.kl_div(
-                        F.log_softmax(kl_logits, dim=-1),
-                        F.softmax(kl_logits_fp, dim=-1),
-                        reduction="none",
+                    kl_loss = tokenwise_kl_from_logits(
+                        kl_logits, kl_logits_fp
                     )
                     # Sum over output samples/tokens to match the NLL-based
                     # saliency/Fisher convention. The Fisher accumulator below
@@ -6471,6 +6488,112 @@ def collect_true_weight_gradient(
         )
     )
 
+    _lm_head_loss = refresh_loss_type in (
+        "kl",
+        "residual_kl",
+        "refined_residual_kl",
+        "refined_diag_residual_kl",
+    )
+    _step = bsz
+    if refresh_mb is not None and refresh_mb > 0 and _lm_head_loss:
+        _step = min(bsz, int(refresh_mb))
+
+    # The paper's activation-loss clipping is one P95 over the complete
+    # GLOBAL refresh mini-batch, not one P95 per rank or internal microbatch.
+    # Every rank participates even when global shuffle assigns it zero samples.
+    a_loss_threshold = None
+    next_a_loss_threshold = None
+    if (
+        a_loss_ratio < 1.0
+        and (
+            is_fisher_backed_loss(refresh_loss_type)
+            or is_hidden_mse_loss(refresh_loss_type)
+        )
+    ):
+        local_abs_delta = []
+        local_abs_next_delta = []
+        with torch.no_grad():
+            for start in range(0, len(selected_indices), _step):
+                batch_indices = selected_indices[start : start + _step]
+                batch_size = len(batch_indices)
+                batch_attention_mask = attention_mask.expand(
+                    batch_size, -1, -1, -1
+                )
+                batch_position_ids = position_ids.expand(batch_size, -1)
+                batch_position_embeddings = (
+                    position_embeddings[0].expand(batch_size, -1, -1),
+                    position_embeddings[1].expand(batch_size, -1, -1),
+                )
+                out = functional_call(
+                    layer,
+                    {functional_weight_name: override_weight},
+                    (inps[batch_indices].to(dev),),
+                    {
+                        "attention_mask": batch_attention_mask,
+                        "position_ids": batch_position_ids,
+                        "position_embeddings": batch_position_embeddings,
+                    },
+                    strict=False,
+                )
+                out_hidden = (
+                    out[0] if isinstance(out, (tuple, list)) else out
+                )
+                fp_hidden = fp_inps[batch_indices].to(dev)
+                delta_for_clip = out_hidden - fp_hidden
+                if (
+                    sink_size > 0
+                    and delta_for_clip.shape[1] > sink_size
+                ):
+                    delta_for_clip = delta_for_clip[:, sink_size:]
+                local_abs_delta.append(
+                    delta_for_clip.float().abs().reshape(-1)
+                )
+                if slide_active:
+                    next_out = next_layer(
+                        out_hidden,
+                        attention_mask=batch_attention_mask,
+                        position_ids=batch_position_ids,
+                        position_embeddings=batch_position_embeddings,
+                    )
+                    next_hidden = (
+                        next_out[0]
+                        if isinstance(next_out, (tuple, list))
+                        else next_out
+                    )
+                    fp_next = fp_inps_next[batch_indices].to(dev)
+                    next_delta_for_clip = next_hidden - fp_next
+                    if (
+                        sink_size > 0
+                        and next_delta_for_clip.shape[1] > sink_size
+                    ):
+                        next_delta_for_clip = next_delta_for_clip[
+                            :, sink_size:
+                        ]
+                    local_abs_next_delta.append(
+                        next_delta_for_clip.float().abs().reshape(-1)
+                    )
+        empty_clip_values = torch.empty(
+            0, dtype=torch.float32, device=override_weight.device
+        )
+        local_clip_values = (
+            torch.cat(local_abs_delta)
+            if local_abs_delta
+            else empty_clip_values
+        )
+        a_loss_threshold = global_percentile(
+            local_clip_values, float(a_loss_ratio)
+        ).detach()
+        if slide_active:
+            local_next_clip_values = (
+                torch.cat(local_abs_next_delta)
+                if local_abs_next_delta
+                else empty_clip_values
+            )
+            next_a_loss_threshold = global_percentile(
+                local_next_clip_values, float(a_loss_ratio)
+            ).detach()
+        del local_abs_delta, local_abs_next_delta, local_clip_values
+
     if len(selected_indices) > 0:
         grad_modules = [layer]
         if refresh_loss_type in ("kl", "residual_kl", "refined_residual_kl"):
@@ -6494,12 +6617,6 @@ def collect_true_weight_gradient(
                 # gradient is identical to using the full `bsz`. Losses that
                 # don't hit the LM head (fisher MSE variants, hidden_mse) ignore the
                 # cap — memory isn't their bottleneck.
-                _lm_head_loss = refresh_loss_type in (
-                    "kl", "residual_kl", "refined_residual_kl", "refined_diag_residual_kl",
-                )
-                _step = bsz
-                if refresh_mb is not None and refresh_mb > 0 and _lm_head_loss:
-                    _step = min(bsz, int(refresh_mb))
                 for start in range(0, len(selected_indices), _step):
                     with layer_recorder.section("layer.true_weight_grad.batch.total") if layer_recorder else _NULL_CONTEXT:
                         with layer_recorder.section("layer.true_weight_grad.batch.prepare") if layer_recorder else _NULL_CONTEXT:
@@ -6649,6 +6766,7 @@ def collect_true_weight_gradient(
                                 profile_recorder=layer_recorder,
                                 sink_size=sink_size,
                                 a_loss_ratio=a_loss_ratio,
+                                a_loss_threshold=a_loss_threshold,
                             )
                         if slide_active:
                             with layer_recorder.section("layer.true_weight_grad.batch.slide_next_forward") if layer_recorder else _NULL_CONTEXT:
@@ -6694,6 +6812,7 @@ def collect_true_weight_gradient(
                                     profile_recorder=layer_recorder,
                                     sink_size=sink_size,
                                     a_loss_ratio=a_loss_ratio,
+                                    a_loss_threshold=next_a_loss_threshold,
                                 )
                             with layer_recorder.section("layer.true_weight_grad.batch.blend") if layer_recorder else _NULL_CONTEXT:
                                 refresh_loss = (
@@ -6774,13 +6893,11 @@ def collect_layer_grad_hessian_stats(
     layer_refresh_loss_type = canonical_refresh_loss_type(layer_refresh_loss_type)
     gptq_reference_loss_type = canonical_refresh_loss_type(gptq_reference_loss_type)
     need_saliency_collection = precomputed_saliency_dict is None
-    # When the caller sets skip_gradient_backward, we're running pure GPTQ with
-    # enable_gptq_plus=0: no gradient reference loss, no fisher collection on
-    # this path (fisher only feeds fisher MSE / refined_mse refresh,
-    # which is also off).
+    # ``skip_gradient_backward`` disables only GPTQ+'s analytical first-order
+    # reference term (alpha=0). Fisher-backed Block-GD remains independently
+    # active and still needs its layer-output Fisher on the non-global path.
     need_layer_output_fisher_collection = (
-        not skip_gradient_backward
-        and is_fisher_backed_loss(layer_refresh_loss_type)
+        is_fisher_backed_loss(layer_refresh_loss_type)
         and precomputed_layer_output_fisher is None
     )
     need_gradient_backward = not skip_gradient_backward
@@ -6884,7 +7001,7 @@ def collect_layer_grad_hessian_stats(
                     grad_hessian_logits_fp = None
                     if need_output_head:
                         with layer_recorder.section("layer.grad_hessian.forward.logits_quant") if layer_recorder else _NULL_CONTEXT:
-                            logits = hidden2logits(out, analyzer)
+                            logits = hidden2logits(out_hidden, analyzer)
                         with layer_recorder.section("layer.grad_hessian.forward.logits_fp") if layer_recorder else _NULL_CONTEXT:
                             logits_fp = hidden2logits(fp_hidden, analyzer)
                         grad_hessian_logits = logits
@@ -6958,12 +7075,9 @@ def collect_layer_grad_hessian_stats(
                             if sink_size > 0 and kl_logits.shape[1] > sink_size:
                                 kl_logits = kl_logits[:, sink_size:]
                                 kl_logits_fp = kl_logits_fp[:, sink_size:]
-                            gradient_loss = F.kl_div(
-                                F.log_softmax(kl_logits, dim=-1),
-                                F.softmax(kl_logits_fp, dim=-1),
-                                reduction="none",
-                            )
-                            gradient_loss = gradient_loss.sum(dim=-1).mean()
+                            gradient_loss = tokenwise_kl_from_logits(
+                                kl_logits, kl_logits_fp
+                            ).mean()
                         else:
                             fp_final_batch = (
                                 None if fp_inps_final is None
@@ -7458,7 +7572,40 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
             _diag_root,
         )
 
-    with run_recorder.section("run.total") if run_recorder else _NULL_CONTEXT:
+    alignment_trace_path = getattr(args, "alignment_trace_path", None)
+    alignment_trace_config = {}
+    if alignment_trace_path is not None:
+        alignment_trace_config = default_refresh_trace_config(args)
+        alignment_trace_config.update(
+            {
+                "global_loss": bool(getattr(args, "global_loss", False)),
+                "grad_refresh_loss": args.grad_refresh_loss,
+                "g_update_mode": args.g_update_mode,
+                "grad_optimizer": args.grad_optimizer,
+                "final_layer_grad_optimizer": (
+                    args.final_layer_grad_optimizer or args.grad_optimizer
+                ),
+                "analytical_first_order_enabled": bool(args.alpha != 0),
+                "second_order_scale": float(args.second_order_scale),
+                "block_atomic_quant": bool(args.block_atomic_quant),
+                # REAL-Q has no separate destructive pre-clamp stage.  Its
+                # w_clip flag controls only quantizer parameter search, so an
+                # alignment run must explicitly use legacy --no_pre_clip.
+                "pre_clip": bool(getattr(args, "pre_clip", True)),
+                "dp_global_shuffle": bool(
+                    getattr(args, "dp_global_shuffle", False)
+                ),
+            }
+        )
+    with (
+        run_recorder.section("run.total") if run_recorder else _NULL_CONTEXT,
+        RefreshTraceWriter(
+            alignment_trace_path,
+            implementation="legacy",
+            run_id=getattr(args, "alignment_run_id", "default"),
+            config=alignment_trace_config,
+        ) as trace_writer,
+    ):
         # `fp_inps_final` is the rank-local output of the LAST transformer
         # block, needed as the teacher hidden for residual_kl /
         # refined_residual_kl / refined_mse refresh losses. We capture it as
@@ -7471,16 +7618,19 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
         fp_inps_final_cpu = None
         if global_loss_enabled:
             # Optional disk cache. The precompute result depends only on:
-            #   model / dataset / nsamples / seq_len / rotate setting /
+            #   model / dataset / nsamples / seq_len / concrete rotation /
             #   num_groups / grad_hessian_topk /
-            #   global_loss_bsz / seed.
+            #   global_loss_bsz / calibration seed. Optional Rademacher
+            #   statistics additionally depend on refresh_seed.
             # Use `--static_cache_path DIR` to persist. Each rank writes/reads
             # its own shard file since saliency/fisher are rank-local.
             static_cache_dir = getattr(args, "static_cache_path", None)
             static_cache_key = None
             if static_cache_dir is not None:
                 dataset_id = getattr(args, "dataset", "unknown")
+                model_identity_tag = model_utils.source_model_cache_identity(args)[:12]
                 rotate_flag = int(bool(getattr(args, "rotate", False)))
+                rotation_identity_tag = model_utils.rotation_cache_tag(args)
                 sal_clip_pct = getattr(args, "saliency_clip_percentile", 0.99)
                 sal_clip_tag = f"{sal_clip_pct:.4f}".rstrip("0").rstrip(".")
                 rkl_na = int(getattr(args, "refined_rkl_num_A", 1))
@@ -7510,6 +7660,11 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                 num_samples_for_grad = int(getattr(args, "num_samples_for_grad", 0))
                 grad_stat_tag = (
                     f"_radk{fisher_rademacher_k}_ngrad{num_samples_for_grad}"
+                    + (
+                        f"_rseed{int(getattr(args, 'refresh_seed', 0))}"
+                        if fisher_rademacher_k > 0
+                        else ""
+                    )
                     if fisher_rademacher_k > 0 or num_samples_for_grad > 0
                     else ""
                 )
@@ -7536,11 +7691,13 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                 if args.grad_refresh_loss == "legacy_fisher_diag_mse":
                     analysis_tag += "_mainLegacyFisherDiag"
                 static_cache_key = (
-                    f"{args.model_name}_{dataset_id}_s{args.nsamples}_"
-                    f"blk{args.seq_len}_rot{rotate_flag}_g{args.num_groups}_"
+                    f"{args.model_name}_mid{model_identity_tag}_{dataset_id}_s{args.nsamples}_"
+                    f"blk{args.seq_len}_rot{rotate_flag}_rotid{rotation_identity_tag}_"
+                    f"g{args.num_groups}_"
                     f"fisherfull_ghtk{args.grad_hessian_topk}_"
-                    f"glbsz{args.global_loss_bsz}_seed{args.seed}_"
-                    f"salclip{sal_clip_tag}_rklNA{rkl_na}_fpfinal{fpfinal_tag}"
+                    f"glbsz{args.global_loss_bsz}_cseed{args.seed}_"
+                    f"salclip{sal_clip_tag}_salglobalv1_"
+                    f"rklNA{rkl_na}_fpfinal{fpfinal_tag}"
                     f"_e2els{int(_E2E_PRECOMPUTE_LOSS_GRAD_SCALE)}"
                     f"{grad_stat_tag}{mix_tag}{dynsal_tag}{analysis_tag}"
                 )
@@ -7571,9 +7728,41 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         legacy_cache_file,
                     )
                     static_cache_file = legacy_cache_file
-            if stage2_cpu_master and (
-                static_cache_file is None or not os.path.exists(static_cache_file)
-            ):
+            cache_available = (
+                static_cache_file is not None
+                and os.path.exists(static_cache_file)
+            )
+            preloaded_static_cache = None
+            if cache_available:
+                try:
+                    preloaded_static_cache = torch.load(
+                        static_cache_file,
+                        map_location="cpu",
+                        weights_only=True,
+                    )
+                    if not isinstance(preloaded_static_cache, dict):
+                        raise TypeError(
+                            "static cache payload is not a dictionary"
+                        )
+                except Exception as exc:
+                    logging.warning(
+                        "Ignoring unreadable static cache %s: %s",
+                        static_cache_file,
+                        exc,
+                    )
+                    preloaded_static_cache = None
+                    cache_available = False
+            # Static precompute contains collectives. A partial per-rank hit
+            # must never let one rank return to Stage 2 while another enters
+            # the precompute collectives (deadlock). Reuse only when ALL ranks
+            # have their shard; otherwise every rank recomputes.
+            if dist_utils.get_world_size() > 1:
+                cache_hit_flag = torch.tensor(
+                    int(cache_available), device=dev, dtype=torch.int32
+                )
+                dist.all_reduce(cache_hit_flag, op=dist.ReduceOp.MIN)
+                cache_available = bool(cache_hit_flag.item())
+            if stage2_cpu_master and not cache_available:
                 raise RuntimeError(
                     "stage2_cpu_master requires an existing static precompute cache "
                     "for global_loss Stage 2. Run Stage 1 first with matching "
@@ -7581,10 +7770,10 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     f"{static_cache_file}"
                 )
 
-            if static_cache_file is not None and os.path.exists(static_cache_file):
+            if cache_available:
                 with pipeline_recorder.section("pipeline.static_cache.load") if pipeline_recorder else _NULL_CONTEXT:
                     logging.info("Loading static saliency/fisher cache from %s", static_cache_file)
-                    _loaded = torch.load(static_cache_file, map_location="cpu", weights_only=True)
+                    _loaded = preloaded_static_cache
                     static_saliency_by_layer = _loaded["saliency"]
                     static_fisher_by_layer = _loaded.get("fisher", None)
                     if static_fisher_by_layer is None:
@@ -7727,7 +7916,12 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             dynsal_evd_thresh=float(getattr(args, "dyn_sal_evd_thresh", 1e-6)),
                             sink_size=sink_size,
                             fisher_rademacher_k=int(getattr(args, "fisher_rademacher_k", 0)),
-                            rademacher_seed=int(getattr(args, "seed", 0)) + 1701,
+                            # Optional estimator randomness is an
+                            # optimization-time artifact. It must remain fixed
+                            # when only the calibration-sampling seed changes.
+                            rademacher_seed=(
+                                int(getattr(args, "refresh_seed", 0)) + 1701
+                            ),
                             num_samples_for_grad=int(getattr(args, "num_samples_for_grad", 0)),
                         )
                 if static_cache_file is not None:
@@ -7745,7 +7939,15 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             _to_save["fp_inps_final"] = fp_inps_final_cpu
                         if static_dynsal is not None:
                             _to_save["dynsal"] = static_dynsal
-                        torch.save(_to_save, static_cache_file)
+                        tmp_cache_file = (
+                            f"{static_cache_file}.tmp.{os.getpid()}"
+                        )
+                        try:
+                            torch.save(_to_save, tmp_cache_file)
+                            os.replace(tmp_cache_file, static_cache_file)
+                        finally:
+                            if os.path.exists(tmp_cache_file):
+                                os.remove(tmp_cache_file)
                         del _to_save
             logging.info(
                 "Collected frozen end-to-end saliency/Fisher caches before quantization with global_loss_bsz=%d. "
@@ -7884,14 +8086,14 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
         if args.g_update_mode in {"block_backward", "block_gd"} or effective_pre_gd_steps > 0:
             if dp_global_shuffle:
                 # Single globally-shared shuffle. Every rank constructs the
-                # scheduler with the same seed + same total_samples, so
+                # scheduler with the same refresh_seed + same total_samples, so
                 # `next_indices()` returns the identical global id list on
                 # every rank. Each rank then filters to its own shard inside
                 # `collect_true_weight_gradient`.
                 gradient_refresh_scheduler = BackwardSampleScheduler(
                     args.nsamples,
                     args.backward_samples,
-                    seed=args.seed,
+                    seed=int(getattr(args, "refresh_seed", 0)),
                 )
             else:
                 # Stratified: each rank owns a per-rank scheduler over its
@@ -7905,7 +8107,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                 gradient_refresh_scheduler = BackwardSampleScheduler(
                     n_local,
                     backward_samples_local,
-                    seed=args.seed + dp_rank,
+                    seed=int(getattr(args, "refresh_seed", 0)) + dp_rank,
                 )
         final_layer_idx = len(layers) - 1
 
@@ -8011,15 +8213,39 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     "dev": dev,
                     "orig_device": orig_device,
                 }))
-            # Per-layer LR ramp. scale==1.0 when schedule="none", so this is
-            # a no-op for the default config.
-            grad_lr_layer_scale = compute_layer_lr_scale(
-                layer_idx=i,
-                num_layers=len(layers),
-                schedule=getattr(args, "grad_lr_layer_schedule", "none"),
+            # Activation-aware paper runs disable the reverse-cosine ramp at
+            # the first-layer/base LR. Only a *real* low-bit aware path counts:
+            # passing an aware flag alongside A16/V16/K16 is a numerical no-op.
+            activation_aware_enabled = (
+                (
+                    bool(getattr(args, "act_quant_aware_gptq", False))
+                    and (args.a_bits < 16 or args.v_bits < 16)
+                )
+                or (
+                    bool(getattr(args, "k_cache_quant_aware_gptq", False))
+                    and args.k_bits < 16
+                )
+            )
+            activation_aware_schedule_disabled = (
+                activation_aware_enabled and i != final_layer_idx
+            )
+            grad_lr_layer_scale = (
+                1.0
+                if activation_aware_schedule_disabled
+                else compute_layer_lr_scale(
+                    layer_idx=i,
+                    num_layers=len(layers),
+                    schedule=getattr(args, "grad_lr_layer_schedule", "none"),
+                )
             )
             grad_lr_layer_base_ratio = float(getattr(args, "grad_lr_layer_base_ratio", 0.01))
-            if getattr(args, "grad_lr_layer_schedule", "none") != "none":
+            if activation_aware_schedule_disabled:
+                logging.info(
+                    "Layer %d activation-aware LR schedule disabled: using "
+                    "configured LR as a constant (scale=1; base_ratio %.4f ignored)",
+                    i, grad_lr_layer_base_ratio,
+                )
+            elif getattr(args, "grad_lr_layer_schedule", "none") != "none":
                 logging.info(
                     "Layer %d grad_lr schedule scale=%.4f base_ratio=%.4f (schedule=%s)",
                     i, grad_lr_layer_scale, grad_lr_layer_base_ratio, args.grad_lr_layer_schedule,
@@ -8152,7 +8378,9 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                                 f"must be divisible by per-rank backward bsz "
                                 f"({rm_bwd_bsz} = global_loss_bsz // world)."
                             )
-                        rng = random.Random(args.seed + i)
+                        rng = random.Random(
+                            int(getattr(args, "refresh_seed", 0)) + i
+                        )
                         sample_ids_local = sorted(rng.sample(range(n_local), n_pool))
                         # Before reusing any downstream CPU tensor, make sure the
                         # previous layer's async D2H has drained — otherwise the
@@ -9056,16 +9284,50 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             )
                         grad = partial_grad_sum / float(global_count)
                         mean_refresh_loss = global_loss_sum / float(global_count)
+                        trace_sample_indices = sample_indices
+                        if (
+                            trace_writer.enabled
+                            and dp_world > 1
+                            and not dp_global_shuffle
+                        ):
+                            # Stratified schedulers expose rank-local indices.
+                            # The trace schema always stores global calibration
+                            # ids, in deterministic rank-major order.
+                            local_global_indices = torch.tensor(
+                                [
+                                    dp_rank * n_local + int(index)
+                                    for index in sample_indices
+                                ],
+                                dtype=torch.long,
+                                device=partial_grad_sum.device,
+                            )
+                            gathered_indices = [
+                                torch.empty_like(local_global_indices)
+                                for _ in range(dp_world)
+                            ]
+                            dist.all_gather(
+                                gathered_indices,
+                                local_global_indices,
+                            )
+                            trace_sample_indices = torch.cat(
+                                gathered_indices,
+                            ).detach().cpu().tolist()
                         meta = {
                             "mean_refresh_loss": mean_refresh_loss,
-                            "sample_indices": sample_indices,
+                            "sample_indices": trace_sample_indices,
                         }
-                        if "slide_alpha" in grad_extras:
-                            meta["slide_alpha"] = grad_extras["slide_alpha"]
+                        if slide_next_layer is not None:
+                            # Record α=1 explicitly at the first slide step.
+                            # collect_true_weight_gradient deliberately skips
+                            # evaluating the zero-weight next arm there, so its
+                            # diagnostics historically omitted this value.
+                            meta["slide_alpha"] = float(slide_alpha)
                         if "loss_sum_current" in grad_extras:
                             meta["mean_refresh_loss_current"] = (
                                 grad_extras["loss_sum_current"] / float(global_count)
                             )
+                        else:
+                            meta["mean_refresh_loss_current"] = mean_refresh_loss
                         if "loss_sum_next" in grad_extras:
                             meta["mean_refresh_loss_next"] = (
                                 grad_extras["loss_sum_next"] / float(global_count)
@@ -9106,6 +9368,14 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             format_log_value(payload.get("mean_refresh_loss_current"), digits=6),
                             format_log_value(payload.get("mean_refresh_loss_next"), digits=6),
                         )
+                        if trace_writer.enabled and args.g_update_mode == "block_gd":
+                            trace_writer.record(
+                                refresh_step_from_metrics(
+                                    layer=i,
+                                    module=module_name,
+                                    metrics=payload,
+                                )
+                            )
 
                     return observer
 

@@ -2,6 +2,8 @@ import logging
 import os
 import copy
 import hashlib
+import json
+import tempfile
 from tqdm import tqdm
 from collections import OrderedDict
 
@@ -9,13 +11,191 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import lm_eval
-from lm_eval import utils as lm_eval_utils
-from lm_eval.models.huggingface import HFLM
-from lm_eval.models.huggingface import eval_logger
-eval_logger.level = logging.ERROR
-
 from utils import memory_utils, dist_utils, model_utils, log_utils
+from utils.cache_identity import artifact_identity
+from utils.loss_utils import tokenwise_kl_from_logits
+
+
+_REF_LOGITS_SCHEMA_VERSION = 2
+PAPER_QA_TASKS = (
+    "piqa",
+    "hellaswag",
+    "arc_easy",
+    "arc_challenge",
+    "winogrande",
+    "lambada_openai",
+    "ceval-valid",
+    "boolq",
+    "openbookqa",
+    "social_iqa",
+)
+
+
+def _tensor_identity(tensor: torch.Tensor) -> str:
+    """Hash the exact evaluation tokens, including layout metadata."""
+    value = tensor.detach().cpu().contiguous()
+    digest = hashlib.sha256()
+    digest.update(
+        json.dumps(
+            {
+                "shape": list(value.shape),
+                "dtype": str(value.dtype),
+            },
+            sort_keys=True,
+        ).encode()
+    )
+    digest.update(value.numpy().tobytes(order="C"))
+    return digest.hexdigest()
+
+
+def _reference_cache_metadata(args, analyzer, dataset, dataloader) -> dict:
+    """Describe every artifact that changes the FP reference semantics."""
+    model = analyzer.model
+    tokenizer = analyzer.tokenizer
+    prepared_path = getattr(
+        model, "_gptqplus_prepared_checkpoint_path", None
+    )
+    tokenizer_source = getattr(tokenizer, "name_or_path", None)
+    input_ids = dataloader.input_ids
+    tokenizer_vocab_size = getattr(tokenizer, "vocab_size", None)
+    if tokenizer_vocab_size is None:
+        tokenizer_vocab_size = len(tokenizer)
+    model_config = getattr(model, "config", None)
+    model_revision = getattr(model_config, "_commit_hash", None)
+    tokenizer_revision = getattr(tokenizer, "_commit_hash", None)
+    if tokenizer_revision is None:
+        tokenizer_revision = getattr(
+            tokenizer, "init_kwargs", {}
+        ).get("_commit_hash")
+    hidden_size = getattr(model_config, "hidden_size", None)
+    if hidden_size is None:
+        hidden_size = analyzer.model.lm_head.in_features
+    expected_samples = (
+        int(input_ids.numel()) // int(args.eval_seq_len)
+    )
+    return {
+        "schema_version": _REF_LOGITS_SCHEMA_VERSION,
+        "source_model_identity": model_utils.source_model_cache_identity(args),
+        "resolved_model_revision": model_revision,
+        "prepared_checkpoint_identity": artifact_identity(prepared_path),
+        "rotation_identity": model_utils.rotation_cache_identity(args),
+        "checkpoint_is_rotated": bool(
+            getattr(model, "_gptqplus_checkpoint_is_rotated", False)
+        ),
+        "model_dtype": str(next(model.parameters()).dtype),
+        "tokenizer_identity": artifact_identity(tokenizer_source),
+        "resolved_tokenizer_revision": tokenizer_revision,
+        "tokenizer_class": type(tokenizer).__qualname__,
+        "tokenizer_vocab_size": int(tokenizer_vocab_size),
+        "dataset": str(dataset),
+        "eval_seq_len": int(args.eval_seq_len),
+        "eval_tokens_identity": _tensor_identity(input_ids),
+        "hidden_states_shape": [
+            expected_samples,
+            int(args.eval_seq_len),
+            int(hidden_size),
+        ],
+        "hidden_states_dtype": str(next(model.parameters()).dtype),
+    }
+
+
+def _atomic_torch_save(payload: dict, path: str) -> None:
+    """Publish a complete cache archive with a same-filesystem replace."""
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(
+        dir=directory,
+        prefix=f".{os.path.basename(path)}.",
+        suffix=".tmp",
+    )
+    os.close(fd)
+    try:
+        torch.save(payload, temporary)
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def _load_reference_cache(path: str, expected_metadata: dict):
+    try:
+        payload = torch.load(path, map_location="cpu", weights_only=True)
+    except (OSError, RuntimeError, EOFError, ValueError) as exc:
+        logging.warning("Ignoring unreadable reference cache %s: %s", path, exc)
+        return None
+    if (
+        not isinstance(payload, dict)
+        or payload.get("metadata") != expected_metadata
+        or not isinstance(payload.get("hidden_states"), torch.Tensor)
+    ):
+        logging.warning(
+            "Ignoring stale/invalid reference cache %s (schema or identity mismatch).",
+            path,
+        )
+        return None
+    hidden_states = payload["hidden_states"]
+    if (
+        list(hidden_states.shape)
+        != expected_metadata["hidden_states_shape"]
+        or str(hidden_states.dtype)
+        != expected_metadata["hidden_states_dtype"]
+    ):
+        logging.warning(
+            "Ignoring invalid reference cache %s (hidden-state shape/dtype mismatch).",
+            path,
+        )
+        return None
+    flat = hidden_states.reshape(-1)
+    for start in range(0, flat.numel(), 1_048_576):
+        if not torch.isfinite(flat[start : start + 1_048_576]).all():
+            logging.warning(
+                "Ignoring invalid reference cache %s (non-finite hidden state).",
+                path,
+            )
+            return None
+    return hidden_states
+
+
+def _resolve_paper_qa_tasks(pattern_match, all_tasks) -> list[str]:
+    resolved = {
+        task: pattern_match([task], all_tasks)
+        for task in PAPER_QA_TASKS
+    }
+    invalid = {
+        task: matches
+        for task, matches in resolved.items()
+        if len(matches) != 1
+    }
+    if invalid:
+        raise RuntimeError(
+            "qa_eval: each entry in the paper's ten-task protocol must resolve "
+            f"to exactly one task; invalid resolutions={invalid!r}. "
+            f"Requested {list(PAPER_QA_TASKS)!r}. "
+            "Install lm_eval with task configs (`pip install lm-eval`) or "
+            "populate ./datasets/lm_eval_configs/tasks."
+        )
+    task_names = [resolved[task][0] for task in PAPER_QA_TASKS]
+    if len(task_names) != 10 or len(set(task_names)) != 10:
+        raise RuntimeError(
+            "qa_eval: the paper protocol must resolve to ten unique canonical "
+            f"tasks, got {task_names!r}."
+        )
+    return task_names
+
+
+def _task_accuracy(task_name: str, result: dict) -> float:
+    if "acc_norm,none" in result:
+        raw_acc = result["acc_norm,none"]
+    elif "acc,none" in result:
+        raw_acc = result["acc,none"]
+    else:
+        raise RuntimeError(
+            f"qa_eval: task {task_name!r} returned neither "
+            "'acc_norm,none' nor 'acc,none'."
+        )
+    return round(float(raw_acc) * 100, 2)
 
 
 @torch.no_grad()
@@ -111,26 +291,35 @@ def _get_logits(args, analyzer: model_utils.ModelAnalyzer, testenc, dev):
 def get_ref_logits(args, analyzer, dataset, dataloader):
     cache_dir = os.path.join(args.cache_dir, "ref_logits")
     os.makedirs(cache_dir, exist_ok=True)
-    ref_cache_tag = ""
-    prepared_checkpoint_path = getattr(analyzer.model, "_gptqplus_prepared_checkpoint_path", None)
-    if prepared_checkpoint_path:
-        digest = hashlib.sha1(os.path.abspath(prepared_checkpoint_path).encode()).hexdigest()[:10]
-        ref_cache_tag = f"_prepared_rot1_{digest}"
-    elif bool(getattr(analyzer.model, "_gptqplus_checkpoint_is_rotated", False)):
-        ref_cache_tag = "_rot1"
-    ref_logits_path = f'{cache_dir}/{args.model_name}_{dataset}_test_{args.eval_seq_len}{ref_cache_tag}.cache'
-    if not os.path.exists(ref_logits_path):
+    metadata = _reference_cache_metadata(
+        args, analyzer, dataset, dataloader
+    )
+    cache_tag = hashlib.sha256(
+        json.dumps(metadata, sort_keys=True).encode()
+    ).hexdigest()[:20]
+    ref_logits_path = os.path.join(
+        cache_dir,
+        f"{args.model_name}_{dataset}_test_{args.eval_seq_len}_{cache_tag}.cache",
+    )
+    ref_logits = (
+        _load_reference_cache(ref_logits_path, metadata)
+        if os.path.exists(ref_logits_path)
+        else None
+    )
+    if ref_logits is None:
         logging.info(f"Generating reference logits for {dataset} at {ref_logits_path}...")
         ref_logits, _ = _get_logits(args, analyzer, dataloader, torch.device("cuda"))
         if dist_utils.is_main():
-            torch.save(ref_logits, ref_logits_path)
+            _atomic_torch_save(
+                {"metadata": metadata, "hidden_states": ref_logits},
+                ref_logits_path,
+            )
     else:
         logging.info(f"Loading reference logits for {dataset} from {ref_logits_path}...")
-        ref_logits = torch.load(ref_logits_path).cpu()
     orig_lm_head = copy.deepcopy(analyzer.model.lm_head)
-    # Align ref_logits dtype to the current lm_head dtype. Old fp16 caches
-    # collide with bf16-loaded models; casting here keeps old caches usable
-    # and costs one tensor copy at eval time.
+    # Dtype is part of the cache identity.  The conditional is defensive for
+    # malformed/custom models; unlike the legacy basename cache, a fp16 cache
+    # can never silently stand in for a bf16 reference.
     target_dtype = orig_lm_head.weight.dtype
     if ref_logits.dtype != target_dtype:
         ref_logits = ref_logits.to(target_dtype)
@@ -153,8 +342,11 @@ def _kl_ppl_eval(args, analyzer: model_utils.ModelAnalyzer, orig_lm_head, datalo
     nlls = []
     for logits, ref_logits, input_ids in tqdm(zip(logits_list, ref_logits_list, input_ids_list), ncols=80,
                                               total=len(ref_logits_list), desc="Computing PPL & KL"):
-        logits = model.lm_head(logits.to(dev))
-        ref_logits = orig_lm_head(ref_logits.to(dev))
+        # The paper evaluates full-vocabulary distribution shift.  Cast the
+        # LM-head outputs before CE/softmax/KL so bf16 rounding does not erase
+        # small quantisation differences or create a negative reported KL.
+        logits = model.lm_head(logits.to(dev)).float()
+        ref_logits = orig_lm_head(ref_logits.to(dev)).float()
 
         # NLL loss
         shift_labels = input_ids[None, 1:].to(dev)
@@ -164,19 +356,29 @@ def _kl_ppl_eval(args, analyzer: model_utils.ModelAnalyzer, orig_lm_head, datalo
         neg_log_likelihood = loss.float().mean(dim=1)
         nlls.append(neg_log_likelihood)
 
-        # topk kl loss
-        k = 20
-        ref_logits, indices = ref_logits.topk(k, dim=-1, sorted=False)
-        logits = logits.gather(-1, indices)
-        loss = F.kl_div(
-            F.log_softmax(logits, dim=-1),
-            F.softmax(ref_logits, dim=-1),
-            reduction="none",
-        )
-        kl_loss += loss.float().sum(-1).mean()
+        # Paper evaluation uses full-vocabulary KL. Keep an explicit positive
+        # top-k override for diagnostic/legacy runs, but never hard-code one.
+        k = int(getattr(args, "kl_topk", -1))
+        if k > 0:
+            ref_logits, indices = ref_logits.topk(k, dim=-1, sorted=False)
+            logits = logits.gather(-1, indices)
+        kl_loss += tokenwise_kl_from_logits(
+            logits, ref_logits
+        ).mean()
     nlls_tensor = torch.cat(nlls)
     ppl = torch.exp(nlls_tensor.mean())
     kl_loss /= len(ref_logits_list)
+    if kl_loss.item() < -1e-7:
+        raise RuntimeError(
+            "Full-vocabulary fp32 KL became materially negative "
+            f"({kl_loss.item():.3e}); reference/student logits are invalid."
+        )
+    if kl_loss.item() < 0:
+        logging.warning(
+            "Clamping aggregate KL %.3e to zero (fp32 round-off).",
+            kl_loss.item(),
+        )
+        kl_loss = kl_loss.clamp_min(0.0)
 
     model.lm_head.to(orig_device)
     orig_lm_head.to(orig_device)
@@ -197,10 +399,21 @@ def kl_ppl_eval(args, analyzer, orig_lm_head, test_loader_dict, ref_logits_dict)
 
 
 def qa_eval(model, tokenizer, lm_eval_batch_size=32):
+    # Keep lm-eval optional for the normal PPL/KL path.  Importing it at module
+    # load time makes every quantisation run depend on the full QA-evaluation
+    # dependency set even when --lm_eval is disabled.
+    try:
+        import lm_eval
+        from lm_eval import utils as lm_eval_utils
+        from lm_eval.models.huggingface import HFLM, eval_logger
+    except ImportError as exc:
+        raise RuntimeError(
+            "qa_eval requires the optional lm-eval dependencies; install "
+            "`lm-eval==0.4.4` before enabling --lm_eval."
+        ) from exc
+    eval_logger.level = logging.ERROR
     hflm = HFLM(pretrained=model, tokenizer=tokenizer, batch_size=lm_eval_batch_size)
 
-    tasks = ["piqa", "hellaswag", "arc_easy", "arc_challenge", "winogrande", "lambada_openai", "ceval-valid",
-             "boolq", "openbookqa", "social_iqa"]
     # Pick up the project's custom task YAMLs only if that directory exists.
     # Without this guard, `include_defaults=False` + a missing include_path
     # leaves `all_tasks` empty → `pattern_match` returns [] → later division
@@ -211,14 +424,9 @@ def qa_eval(model, tokenizer, lm_eval_batch_size=32):
         task_manager = lm_eval.tasks.TaskManager(include_path=custom_task_dir, include_defaults=True)
     else:
         task_manager = lm_eval.tasks.TaskManager(include_defaults=True)
-    task_names = lm_eval_utils.pattern_match(tasks, task_manager.all_tasks)
-    if not task_names:
-        raise RuntimeError(
-            "qa_eval: no matching tasks found. Requested {tasks!r} but "
-            "`task_manager.all_tasks` resolved nothing. Install lm_eval with task "
-            "configs (`pip install lm-eval`) or populate ./datasets/lm_eval_configs/tasks."
-            .format(tasks=tasks)
-        )
+    task_names = _resolve_paper_qa_tasks(
+        lm_eval_utils.pattern_match, task_manager.all_tasks
+    )
     results, results_str = {}, {}
     for task_name in task_names:
         logging.info(f"Evaluating {task_name}...")
@@ -226,7 +434,7 @@ def qa_eval(model, tokenizer, lm_eval_batch_size=32):
         with log_utils.disable_logging_context():
             result = lm_eval.simple_evaluate(hflm, tasks=[task_name], task_manager=task_manager)['results']
         result = result[task_name]
-        acc = round(result.get('acc_norm,none', result['acc,none']) * 100, 2)
+        acc = _task_accuracy(task_name, result)
         results[task_name] = acc
         logging.info(f"acc: {acc}%")
     results_str.update({task: f"{result:.2f}" for task, result in results.items()})

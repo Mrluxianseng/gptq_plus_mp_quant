@@ -24,7 +24,15 @@ from realq import akv, fsdp as realq_fsdp, precompute, runner
 from realq.parallel import env as parallel_env
 from realq.utils import memory as mem_utils
 from realq.utils import nvtx
-from utils import data_utils, eval_utils, model_utils, quant_utils, rotation_utils
+from utils import (
+    checkpoint_utils,
+    data_utils,
+    dist_utils,
+    eval_utils,
+    model_utils,
+    quant_utils,
+    rotation_utils,
+)
 
 if TYPE_CHECKING:
     from realq.config import Config
@@ -75,12 +83,77 @@ def _maybe_rotate(cfg: "Config", analyzer: model_utils.ModelAnalyzer) -> None:
         analyzer.model._realq_actquant_wrappers_installed = True
 
 
+def _prepare_loaded_runtime_wrappers(
+    cfg: "Config",
+    analyzer: model_utils.ModelAnalyzer,
+) -> None:
+    """Recreate wrapper topology without transforming weights.
+
+    The checkpoint already contains fused/rotated/fake-quantized weights.
+    Re-running rotation before overwriting them is both unnecessary and makes
+    inference depend on the original optimized-rotation file.
+    """
+    if cfg.rotate:
+        rotation_utils.add_activation_quant_wrappers_for_rotation(analyzer)
+        analyzer.model._realq_actquant_wrappers_installed = True
+    else:
+        akv.install_actquant_wrappers(analyzer)
+
+
+def _run_lm_eval_if_requested(
+    cfg: "Config",
+    analyzer: model_utils.ModelAnalyzer,
+) -> bool:
+    """Run rank-0 lm_eval after releasing the torchrun process group.
+
+    Returns ``True`` when lm_eval was requested and the caller must return
+    immediately.  All ranks execute the pre-destroy barrier and destroy their
+    process group; only the original rank 0 dispatches the full CPU model over
+    the now-available visible GPUs and drives QA evaluation.  This mirrors the
+    legacy ``ptq.py`` lifecycle and avoids keeping nonzero ranks in a NCCL
+    barrier while rank 0's Accelerate model uses their GPUs.
+    """
+    if not (getattr(cfg, "lm_eval", False) and not cfg.skip_eval):
+        return False
+
+    run_lm_eval = parallel_env.is_main()
+    if parallel_env.is_dist_available_and_initialized():
+        parallel_env.barrier()
+        dist.destroy_process_group()
+    if run_lm_eval:
+        dist_utils.distribute_model(analyzer.model)
+        with nvtx.nvtx_range("ptq.eval_lm_eval"):
+            eval_utils.qa_eval(
+                analyzer.model,
+                analyzer.tokenizer,
+                cfg.lm_eval_batch_size,
+            )
+    return True
+
+
 def run(cfg: "Config") -> None:
     """End-to-end RealQ pipeline."""
     if cfg.cpu_master:
         return _run_cpu_master(cfg)
+
+    loaded_checkpoint = None
+    if cfg.load_qmodel_path:
+        loaded_checkpoint = checkpoint_utils.load_quantized_checkpoint(
+            cfg.load_qmodel_path,
+            allow_unsafe_legacy=cfg.allow_unsafe_legacy_checkpoint,
+        )
+        checkpoint_utils.apply_runtime_manifest(cfg, loaded_checkpoint)
+        checkpoint_utils.validate_artifact_identity(cfg, loaded_checkpoint)
+
     with nvtx.nvtx_range("ptq.load_model"):
         analyzer = model_utils.ModelAnalyzer(cfg.model, cfg.seq_len)
+    if loaded_checkpoint is not None:
+        checkpoint_utils.validate_artifact_identity(
+            cfg,
+            loaded_checkpoint,
+            model=analyzer.model,
+            tokenizer=analyzer.tokenizer,
+        )
 
     # 1. Reference logits (must be captured BEFORE rotate — KL eval compares
     # quantised lm_head against the unrotated lm_head).
@@ -91,17 +164,46 @@ def run(cfg: "Config") -> None:
 
     # 2. Rotate (optional)
     with nvtx.nvtx_range("ptq.rotate"):
-        _maybe_rotate(cfg, analyzer)
+        if loaded_checkpoint is None:
+            _maybe_rotate(cfg, analyzer)
+        else:
+            _prepare_loaded_runtime_wrappers(cfg, analyzer)
 
-    # 2b. Aware AKV setup: install + configure the activation/K-cache wrappers
-    # BEFORE weight GPTQ runs so the per-linear Hessian forward sees the
-    # quantised input. Unaware paths defer this to step 6.
-    with nvtx.nvtx_range("ptq.akv_setup_pre_quant"):
-        akv.setup_aware_pre_quant(analyzer, cfg)
+    # A quantized artifact already contains the final fake-quantized weights.
+    # Prepare the same wrapper topology, restore the weights, then reconstruct
+    # both aware and unaware runtime A/V/K modes from its manifest.  Static
+    # precompute and the weight quantization loop must not run again.
+    if loaded_checkpoint is not None:
+        # _maybe_rotate installs these in both branches today; keep this
+        # idempotent call adjacent to state loading so a future rotate=False
+        # refactor cannot accidentally load ``*.module.weight`` keys into an
+        # unwrapped model.
+        akv.install_actquant_wrappers(analyzer)
+        checkpoint_utils.load_model_state(analyzer.model, loaded_checkpoint)
+        with nvtx.nvtx_range("ptq.akv_restore"):
+            akv.setup_aware_pre_quant(analyzer, cfg)
+            akv.setup_unaware_post_quant(analyzer, cfg)
+        if cfg.save_qmodel_path and parallel_env.is_main():
+            checkpoint_utils.save_quantized_checkpoint(
+                cfg.save_qmodel_path, analyzer.model, cfg, analyzer.tokenizer
+            )
+        if not cfg.skip_eval:
+            with nvtx.nvtx_range("ptq.eval_kl_ppl"):
+                analyzer.model.cpu()
+                eval_utils.kl_ppl_eval(
+                    cfg, analyzer, orig_lm_head, test_loaders, ref_logits
+                )
+        if _run_lm_eval_if_requested(cfg, analyzer):
+            return
+        if parallel_env.is_dist_available_and_initialized():
+            parallel_env.barrier()
+        return
 
-    # 2c. FSDP single-stage wrap: shard the (rotated, possibly aware-AKV-
-    # configured) model across all visible GPUs so the precompute backward
-    # fits memory budgets that don't admit a full replica per rank.
+    # 2b. FSDP single-stage wrap: shard the rotated model across all visible
+    # GPUs so the precompute backward fits memory budgets that don't admit a
+    # full replica per rank.  Do NOT configure aware A/V/K quantisation yet:
+    # Stage 0 saliency + Fisher are FP teacher statistics in REAL-Q and must
+    # be invariant to the later student-side aware quantisation settings.
     if cfg.fsdp:
         with nvtx.nvtx_range("ptq.fsdp_wrap"):
             realq_fsdp.fsdp_wrap_for_precompute(analyzer, cfg)
@@ -141,6 +243,13 @@ def run(cfg: "Config") -> None:
             else:
                 akv.install_actquant_wrappers(analyzer)
             akv.setup_aware_pre_quant(analyzer, cfg)
+    else:
+        # Aware quantisation belongs exclusively to the student-side weight
+        # GPTQ pass.  Configure it only after the FP Stage 0 statistics have
+        # been computed (or loaded).  Unaware paths remain at FP16 here and
+        # are configured after weight quantisation below.
+        with nvtx.nvtx_range("ptq.akv_setup_pre_quant"):
+            akv.setup_aware_pre_quant(analyzer, cfg)
 
     # 4. Quantise.
     # Reuse the same calibration tokens that drove precompute (same key, so
@@ -159,12 +268,6 @@ def run(cfg: "Config") -> None:
     with nvtx.nvtx_range("ptq.quant_loop"):
         runner.quantize_all_layers(cfg, analyzer, static, trainloader)
 
-    if cfg.save_qmodel_path and parallel_env.is_main():
-        with nvtx.nvtx_range("ptq.save_qmodel"):
-            os.makedirs(os.path.dirname(cfg.save_qmodel_path) or ".", exist_ok=True)
-            torch.save({"model": analyzer.model.state_dict()}, cfg.save_qmodel_path)
-            logging.info("[realq] quantised state_dict saved → %s", cfg.save_qmodel_path)
-
     # 5. Unaware AKV setup: configure the wrappers AFTER weight GPTQ when
     # ``act_quant_aware_gptq=False`` / ``k_cache_quant_aware_gptq=False``.
     # The wrappers were already installed by the rotate path or by
@@ -172,18 +275,26 @@ def run(cfg: "Config") -> None:
     with nvtx.nvtx_range("ptq.akv_setup_post_quant"):
         akv.setup_unaware_post_quant(analyzer, cfg)
 
+    if cfg.save_qmodel_path and parallel_env.is_main():
+        with nvtx.nvtx_range("ptq.save_qmodel"):
+            checkpoint_utils.save_quantized_checkpoint(
+                cfg.save_qmodel_path, analyzer.model, cfg, analyzer.tokenizer
+            )
+            logging.info(
+                "[realq] reproducible quantized checkpoint saved → %s",
+                cfg.save_qmodel_path,
+            )
+
     # 6. Eval (PPL/KL)
     if not cfg.skip_eval:
         with nvtx.nvtx_range("ptq.eval_kl_ppl"):
             analyzer.model.cpu()
             eval_utils.kl_ppl_eval(cfg, analyzer, orig_lm_head, test_loaders, ref_logits)
 
-    # 7. Optional lm_eval QA tasks (Stage 2 — runs on rank 0 only).
-    if getattr(cfg, "lm_eval", False) and parallel_env.is_main():
-        # ``qa_eval`` dispatches the model across all visible GPUs via
-        # accelerate; rank 0 alone is enough for the eval driver.
-        with nvtx.nvtx_range("ptq.eval_lm_eval"):
-            eval_utils.qa_eval(analyzer.model, analyzer.tokenizer, cfg.lm_eval_batch_size)
+    # 7. Optional lm_eval QA tasks.  Release the torchrun process group before
+    # rank 0 dispatches the model over all visible GPUs.
+    if _run_lm_eval_if_requested(cfg, analyzer):
+        return
 
     if parallel_env.is_dist_available_and_initialized():
         parallel_env.barrier()
@@ -292,12 +403,16 @@ def _run_cpu_master(cfg: "Config") -> None:
     )
     runner.quantize_all_layers(cfg, analyzer, static, trainloader)
 
-    if cfg.save_qmodel_path and parallel_env.is_main():
-        os.makedirs(os.path.dirname(cfg.save_qmodel_path) or ".", exist_ok=True)
-        torch.save({"model": analyzer.model.state_dict()}, cfg.save_qmodel_path)
-        logging.info("[realq.cpu_master] quantised state_dict saved → %s", cfg.save_qmodel_path)
-
     akv.setup_unaware_post_quant(analyzer, cfg)
+
+    if cfg.save_qmodel_path and parallel_env.is_main():
+        checkpoint_utils.save_quantized_checkpoint(
+            cfg.save_qmodel_path, analyzer.model, cfg, analyzer.tokenizer
+        )
+        logging.info(
+            "[realq.cpu_master] reproducible quantized checkpoint saved → %s",
+            cfg.save_qmodel_path,
+        )
 
     # Phase F — eval. NO analyzer.model.cpu() under cpu_master: rank 0's model
     # is already CPU-resident after Phase E (manager released every block back
@@ -314,17 +429,7 @@ def _run_cpu_master(cfg: "Config") -> None:
         if parallel_env.is_dist_available_and_initialized():
             parallel_env.barrier()
 
-    if getattr(cfg, "lm_eval", False):
-        # Mirror ptq.py:191-203 verbatim: barrier all → destroy process group
-        # → rank 0 runs qa_eval; rank>0 returns. The atexit hook in
-        # realq.parallel.env._atexit_destroy is now try/except so the second
-        # destroy is a no-op.
-        run_lm_eval = parallel_env.is_main()
-        if parallel_env.is_dist_available_and_initialized():
-            parallel_env.barrier()
-            dist.destroy_process_group()
-        if run_lm_eval:
-            eval_utils.qa_eval(analyzer.model, analyzer.tokenizer, cfg.lm_eval_batch_size)
+    if _run_lm_eval_if_requested(cfg, analyzer):
         return
 
     if parallel_env.is_dist_available_and_initialized():

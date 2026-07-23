@@ -71,21 +71,18 @@ def _prepared_checkpoint_base_dir(cfg: "Config") -> str:
 
 
 def _prepared_rotated_checkpoint_dir(cfg: "Config") -> str:
-    """Path to the per-(model, rotation, seed) rotated checkpoint cache.
+    """Path to the per-(model, concrete rotation) checkpoint cache.
 
-    Mirrors ``utils/model_utils.py:188-198``. The cache key includes the
-    optimised-rotation file basename (or ``"hadamard"``) and the seed so
-    different rotation paths and seeds get different caches.
+    Calibration ``cfg.seed`` is deliberately excluded. Generated rotations
+    use ``cfg.rotation_seed``; optimized rotations use an identity of the
+    concrete artifact and ignore ``rotation_seed`` because it is not read.
     """
-    if cfg.optimized_rotation_path is not None:
-        opt_tag = os.path.basename(str(cfg.optimized_rotation_path)).replace("/", "_")
-    else:
-        opt_tag = "hadamard"
-    seed_tag = f"seed{int(cfg.seed)}"
+    from utils.model_utils import rotation_cache_tag
+
     return os.path.join(
         _prepared_checkpoint_base_dir(cfg),
         "_prepared_checkpoints",
-        f"{cfg.model_name}_rot_{opt_tag}_{seed_tag}",
+        f"{cfg.model_name}_rot_{rotation_cache_tag(cfg)}",
     )
 
 
@@ -134,9 +131,9 @@ def _prepared_checkpoint_ready(
 ) -> bool:
     """True iff ``checkpoint_dir`` has a complete + matching cache.
 
-    Mirrors ``utils/model_utils.py:137-154``. The kind/source/seed/rotate/
-    optimized_rotation_path tuple is compared so a re-run with different
-    parameters won't accidentally reuse the wrong cache.
+    Mirrors ``utils/model_utils.py``. The kind/source/rotate/concrete
+    rotation identity tuple is compared so calibration-seed sweeps reuse the
+    same rotation while a different generated or optimized artifact cannot.
     """
     success_path = os.path.join(checkpoint_dir, "_SUCCESS")
     meta_path = os.path.join(checkpoint_dir, "realq_fsdp_meta.json")
@@ -152,12 +149,17 @@ def _prepared_checkpoint_ready(
             meta = json.load(f)
     except Exception:
         return False
+    from utils.model_utils import rotation_cache_identity, source_model_cache_identity
+
     return (
         meta.get("kind") == kind
         and meta.get("source_model") == cfg.model
-        and int(meta.get("seed", -1)) == int(cfg.seed)
+        and meta.get("source_model_identity") == source_model_cache_identity(cfg)
         and bool(meta.get("rotate")) is bool(rotate)
-        and meta.get("optimized_rotation_path") == cfg.optimized_rotation_path
+        and (
+            not rotate
+            or meta.get("rotation_identity") == rotation_cache_identity(cfg)
+        )
     )
 
 
@@ -171,7 +173,11 @@ def _build_rotated_checkpoint_on_rank0(cfg: "Config", rotated_dir: str) -> None:
     import transformers
     from realq.utils import memory as mem_utils
     from utils import rotation_utils
-    from utils.model_utils import ModelAnalyzer
+    from utils.model_utils import (
+        ModelAnalyzer,
+        rotation_cache_identity,
+        source_model_cache_identity,
+    )
 
     logging.info(
         "[realq.fsdp] cpu_master Phase A: rank0 building rotated checkpoint at %s "
@@ -186,8 +192,12 @@ def _build_rotated_checkpoint_on_rank0(cfg: "Config", rotated_dir: str) -> None:
     meta = {
         "kind": "rotated",
         "source_model": cfg.model,
+        "source_model_identity": source_model_cache_identity(cfg),
         "seq_len": int(cfg.seq_len),
-        "seed": int(cfg.seed),
+        "rotation_seed": (
+            None if cfg.optimized_rotation_path is not None else int(cfg.rotation_seed)
+        ),
+        "rotation_identity": rotation_cache_identity(cfg),
         "rotate": True,
         "optimized_rotation_path": cfg.optimized_rotation_path,
         "transformers_version": transformers.__version__,
@@ -206,7 +216,7 @@ def _build_untied_checkpoint_on_rank0(cfg: "Config", untied_dir: str) -> None:
     """
     import transformers
     from realq.utils import memory as mem_utils
-    from utils.model_utils import ModelAnalyzer
+    from utils.model_utils import ModelAnalyzer, source_model_cache_identity
 
     logging.info(
         "[realq.fsdp] cpu_master Phase A: rank0 building untied checkpoint at %s "
@@ -217,10 +227,10 @@ def _build_untied_checkpoint_on_rank0(cfg: "Config", untied_dir: str) -> None:
     meta = {
         "kind": "untied",
         "source_model": cfg.model,
+        "source_model_identity": source_model_cache_identity(cfg),
         "seq_len": int(cfg.seq_len),
-        "seed": int(cfg.seed),
         "rotate": False,
-        "optimized_rotation_path": cfg.optimized_rotation_path,
+        "rotation_identity": "disabled",
         "transformers_version": transformers.__version__,
     }
     _save_prepared_checkpoint(analyzer, untied_dir, cfg, meta)
@@ -564,6 +574,11 @@ def save_post_precompute_checkpoint(analyzer: "ModelAnalyzer", cfg: "Config") ->
     parallel_env.barrier()
 
     if parallel_env.is_main():
+        from utils.model_utils import (
+            rotation_cache_identity,
+            source_model_cache_identity,
+        )
+
         torch.save(cpu_state, os.path.join(tmp_dir, "state_dict.pt"))
         # Save the model config + tokenizer so a vanilla ``from_pretrained``
         # path could pick the dir up later if needed.
@@ -572,8 +587,10 @@ def save_post_precompute_checkpoint(analyzer: "ModelAnalyzer", cfg: "Config") ->
         meta = {
             "kind": "post_precompute",
             "source_model": cfg.model,
+            "source_model_identity": source_model_cache_identity(cfg),
             "rotate": bool(cfg.rotate),
-            "seed": int(cfg.seed),
+            "calibration_seed": int(cfg.seed),
+            "rotation_identity": rotation_cache_identity(cfg),
         }
         with open(os.path.join(tmp_dir, "realq_meta.json"), "w") as f:
             json.dump(meta, f, indent=2)

@@ -1,4 +1,4 @@
-"""Block-boundary refresh: Adam optimiser + grad_clip + cosine layer schedule.
+"""Block-boundary refresh: Adam optimiser + grad_clip + reverse-cosine schedule.
 
 Per-linear closure that fires at every GPTQ block boundary (except the last
 block of the linear, since there are no trailing columns left to update).
@@ -29,9 +29,11 @@ import torch
 import torch.nn as nn
 from torch.func import functional_call
 
+from realq.alignment import RefreshStep, RefreshTraceWriter
 from realq.refresh.fisher_loss import fisher_mse_loss
 from realq.utils import nvtx
 from utils import dist_utils
+from utils.saliency_utils import global_percentile
 
 if TYPE_CHECKING:
     from realq.runner.streams import LayerInputs
@@ -43,9 +45,16 @@ def layer_lr_for_schedule(
     num_layers: int,
     base_ratio: float,
     schedule: str,
+    *,
+    activation_aware: bool = False,
 ) -> float:
     """Per-layer lr ramp matching old ``compute_layer_lr_scale`` +
     ``compute_scheduled_layer_lr`` (lines 647-676).
+
+    ``activation_aware=True``: every non-final transformer layer uses
+    ``base_lr`` as a constant.  In the paper's learning-rate table, aware rows
+    report this constant directly (whereas scheduled rows report the final
+    value); therefore the schedule's ``base_ratio`` must not be applied again.
 
     schedule="none": every layer uses ``base_lr`` directly. ``base_ratio`` is
     ignored. Mirrors legacy ``compute_layer_lr_scale``'s ``schedule in
@@ -53,10 +62,13 @@ def layer_lr_for_schedule(
     ``compute_scheduled_layer_lr`` collapsing to ``target_lr`` when scale=1.0.
 
     schedule="cosine": layer 0 gets ``base_lr * base_ratio``, the deepest
-    layer gets ``base_lr``, intermediate layers ramp via 0.5*(1-cos(π·x))
-    (warmup S-curve). With ``base_ratio = 0.01`` and ``base_lr = 1e-4``,
+    layer gets ``base_lr``, intermediate layers use the paper's
+    ``sin(π·x/2)`` reverse-cosine ramp. With ``base_ratio = 0.01`` and
+    ``base_lr = 1e-4``,
     layer 0 = 1e-6, last layer = 1e-4.
     """
+    if activation_aware:
+        return base_lr
     if schedule == "none":
         return base_lr
     if schedule != "cosine":
@@ -66,7 +78,8 @@ def layer_lr_for_schedule(
     if num_layers <= 1:
         scale = 1.0
     else:
-        scale = 0.5 * (1.0 - math.cos(math.pi * layer_idx / (num_layers - 1)))
+        x = layer_idx / (num_layers - 1)
+        scale = math.sin(math.pi * x / 2.0)
     return base_lr * (base_ratio + (1.0 - base_ratio) * scale)
 
 
@@ -74,7 +87,7 @@ class _SharedSampleScheduler:
     """Round-robin sample scheduler shared across ALL block_gd refreshes
     in a run. Mirrors old ``BackwardSampleScheduler`` (lines 590-612)
     in the ``--dp_global_shuffle=True`` branch (lines 7885-7895): a
-    single ``random.Random`` seeded with ``cfg.seed`` (NO per-rank
+    single ``random.Random`` seeded with ``cfg.refresh_seed`` (NO per-rank
     offset) over the GLOBAL ``[0, nsamples)`` index range. Every rank
     constructs the scheduler with the same ``(n_total, chunk_size,
     seed)`` so ``next_indices()`` returns the IDENTICAL global id list
@@ -138,12 +151,27 @@ class RefreshContext:
         grad_clip: float,
         backward_bsz: int,
         scheduler: "_SharedSampleScheduler",
+        trace_writer: "RefreshTraceWriter | None" = None,
+        trace_layer: int | None = None,
+        trace_module: str | None = None,
+        blocksize: int | None = None,
     ) -> None:
         self.module = module
         self.layer_lr = float(layer_lr)
         self.grad_clip = float(grad_clip)
         self.backward_bsz = int(backward_bsz)
         self.scheduler = scheduler
+        self.trace_writer = trace_writer
+        self.trace_layer = trace_layer
+        self.trace_module = trace_module
+        self.blocksize = blocksize
+        if self.trace_enabled and (
+            trace_layer is None or trace_module is None or blocksize is None
+        ):
+            raise ValueError(
+                "enabled refresh tracing requires trace_layer, trace_module, "
+                "and blocksize"
+            )
         # Adam state, full-tensor shape; only the trailing column slice is
         # touched per call but keeping the full shape simplifies indexing.
         W = module.weight
@@ -156,6 +184,105 @@ class RefreshContext:
 
     def next_indices(self) -> list[int]:
         return self.scheduler.next_indices()
+
+    @property
+    def trace_enabled(self) -> bool:
+        return self.trace_writer is not None and self.trace_writer.enabled
+
+    def record_trace(
+        self,
+        *,
+        global_loss_sums: torch.Tensor,
+        global_count: int,
+        sample_indices: list[int],
+        slide_alpha: float | None,
+        has_next_loss: bool,
+    ) -> None:
+        """Record globally reduced loss statistics for the current Adam step."""
+
+        if not self.trace_enabled or not dist_utils.is_main():
+            return
+        if global_loss_sums.numel() not in (1, 3):
+            raise ValueError(
+                "refresh trace expects [total] or "
+                "[total, current, next] global loss sums"
+            )
+        block = self.adam_step - 1
+        col_start = block * int(self.blocksize)
+        col_end = min(
+            col_start + int(self.blocksize),
+            int(self.module.weight.shape[1]),
+        )
+        denom = float(global_count)
+        self.trace_writer.record(
+            RefreshStep(
+                layer=int(self.trace_layer),
+                module=str(self.trace_module),
+                block=block,
+                col_start=col_start,
+                col_end=col_end,
+                adam_step=self.adam_step,
+                loss=float(global_loss_sums[0].item()) / denom,
+                loss_current=(
+                    float(global_loss_sums[1].item()) / denom
+                    if global_loss_sums.numel() == 3
+                    else float(global_loss_sums[0].item()) / denom
+                ),
+                loss_next=(
+                    float(global_loss_sums[2].item()) / denom
+                    if has_next_loss and global_loss_sums.numel() == 3
+                    else None
+                ),
+                slide_alpha=slide_alpha,
+                sample_indices=tuple(int(index) for index in sample_indices),
+            )
+        )
+
+
+def _aggregate_refresh_sums(
+    partial_grad_sum: torch.Tensor,
+    partial_count: int,
+    partial_loss_sums: torch.Tensor | None = None,
+) -> tuple[int, torch.Tensor | None]:
+    """All-reduce refresh gradient/count and optional loss sums in one pack.
+
+    With tracing disabled, the packed layout remains exactly the historical
+    ``[grad | count]`` layout.  Tracing appends three diagnostics
+    ``[loss]`` and, only for an evaluated slide arm,
+    ``[loss_current | loss_next]``. This exactly matches the legacy pack width
+    at the corresponding step. The branch is opt-in and every rank
+    participates so rank zero writes global sample sums.
+    """
+
+    if dist_utils.get_world_size() > 1:
+        count_t = torch.tensor(
+            [float(partial_count)],
+            dtype=partial_grad_sum.dtype,
+            device=partial_grad_sum.device,
+        )
+        grad_flat = partial_grad_sum.reshape(-1)
+        parts = [grad_flat, count_t]
+        if partial_loss_sums is not None:
+            parts.append(
+                partial_loss_sums.to(
+                    device=partial_grad_sum.device,
+                    dtype=partial_grad_sum.dtype,
+                )
+            )
+        packed = torch.cat(parts)
+        dist_utils.allreduce_sum_(packed)
+        partial_grad_sum.copy_(packed[: grad_flat.numel()].view_as(partial_grad_sum))
+        scalar_out = packed[grad_flat.numel() :]
+        global_count = int(scalar_out[0].item())
+        global_loss_sums = (
+            scalar_out[1:].clone() if partial_loss_sums is not None else None
+        )
+    else:
+        global_count = int(partial_count)
+        global_loss_sums = partial_loss_sums
+    if global_count <= 0:
+        raise RuntimeError("refresh produced zero samples across all ranks")
+    return global_count, global_loss_sums
 
 
 def _functional_weight_name(layer: nn.Module, module: nn.Module) -> str:
@@ -285,6 +412,21 @@ def make_grad_refresh_fn(
             # is constructed BEFORE the ``if len(selected_indices) > 0`` guard).
             partial_grad_sum = torch.zeros_like(stitched_weight_fp32)
             partial_count = 0
+            partial_loss_sums = (
+                torch.zeros(
+                    (
+                        3
+                        if slide_alpha is not None and slide_alpha < 1.0
+                        else 1
+                    ),
+                    # Legacy accumulates local loss sums as Python floats
+                    # (binary64), then casts only when a distributed packed
+                    # all-reduce is needed. Mirror that precision here.
+                    dtype=torch.float64,
+                    device=partial_grad_sum.device,
+                )
+                if ctx.trace_enabled else None
+            )
             # Cast the stitched fp32 weight to module dtype ONCE per refresh
             # and pass it to functional_call for every backward batch. Old
             # GPTQ+ does the same downcast inside ``collect_true_weight_gradient``
@@ -296,6 +438,116 @@ def make_grad_refresh_fn(
             # ``.grad``, so reusing one leaf across multiple backwards is safe.
             override_dtype = module.weight.data.dtype
             override_weight = stitched_weight_fp32.to(override_dtype).requires_grad_(True)
+
+        # ``a_loss_ratio`` is defined over the GLOBAL refresh mini-batch.  A
+        # rank-/microbatch-local P95 changes the objective with world size and
+        # partitioning.  Run a graph-free prepass, gather only |delta| values,
+        # and broadcast one exact cap used by every backward microbatch.
+        a_loss_threshold = None
+        next_a_loss_threshold = None
+        if a_loss_ratio < 1.0:
+            local_abs_delta: list[torch.Tensor] = []
+            local_abs_next_delta: list[torch.Tensor] = []
+            with torch.no_grad(), nvtx.nvtx_range(
+                "refresh.activation_clip_prepass"
+            ):
+                for start in range(0, len(selected), ctx.backward_bsz):
+                    batch_idx = selected[
+                        start : start + ctx.backward_bsz
+                    ]
+                    batch_size = len(batch_idx)
+                    sample_idx = torch.tensor(
+                        batch_idx,
+                        dtype=torch.long,
+                        device=inps.device,
+                    )
+                    x = inps.index_select(0, sample_idx)
+                    fp_target = fp_out_for_this_layer.index_select(
+                        0, sample_idx
+                    ).to(x.device)
+                    kw = {}
+                    if am is not None:
+                        kw["attention_mask"] = (
+                            am.expand(batch_size, *am.shape[1:])
+                            if am.shape[0] != batch_size
+                            else am
+                        )
+                    if pi is not None:
+                        kw["position_ids"] = (
+                            pi.expand(batch_size, -1)
+                            if pi.shape[0] != batch_size
+                            else pi
+                        )
+                    if pe is not None:
+                        kw["position_embeddings"] = (
+                            (
+                                pe[0].expand(
+                                    batch_size, *pe[0].shape[1:]
+                                )
+                                if pe[0].shape[0] != batch_size
+                                else pe[0]
+                            ),
+                            (
+                                pe[1].expand(
+                                    batch_size, *pe[1].shape[1:]
+                                )
+                                if pe[1].shape[0] != batch_size
+                                else pe[1]
+                            ),
+                        )
+                    out = functional_call(
+                        layer,
+                        {weight_name: override_weight},
+                        (x,),
+                        kw,
+                        strict=False,
+                    )
+                    q_out = out[0] if isinstance(out, tuple) else out
+                    local_abs_delta.append(
+                        (q_out - fp_target).float().abs().reshape(-1)
+                    )
+                    if (
+                        slide_alpha is not None
+                        and slide_alpha < 1.0
+                    ):
+                        next_pkg = next_layer(q_out, **kw)
+                        next_q_out = (
+                            next_pkg[0]
+                            if isinstance(next_pkg, tuple)
+                            else next_pkg
+                        )
+                        fp_target_next = next_fp_out.index_select(
+                            0, sample_idx
+                        ).to(next_q_out.device)
+                        local_abs_next_delta.append(
+                            (next_q_out - fp_target_next)
+                            .float()
+                            .abs()
+                            .reshape(-1)
+                        )
+            empty = torch.empty(
+                0,
+                dtype=torch.float32,
+                device=override_weight.device,
+            )
+            local_values = (
+                torch.cat(local_abs_delta)
+                if local_abs_delta
+                else empty
+            )
+            a_loss_threshold = global_percentile(
+                local_values, float(a_loss_ratio)
+            ).detach()
+            if slide_alpha is not None and slide_alpha < 1.0:
+                local_next_values = (
+                    torch.cat(local_abs_next_delta)
+                    if local_abs_next_delta
+                    else empty
+                )
+                next_a_loss_threshold = global_percentile(
+                    local_next_values, float(a_loss_ratio)
+                ).detach()
+            del local_abs_delta, local_abs_next_delta, local_values
         iter_idx = 0
         for start in range(0, len(selected), ctx.backward_bsz):
             with nvtx.nvtx_range(f"refresh.iter_{iter_idx}"):
@@ -325,7 +577,13 @@ def make_grad_refresh_fn(
                         )
                         q_out = out[0] if isinstance(out, tuple) else out
                     with nvtx.nvtx_range("refresh.loss"):
-                        loss_curr = fisher_mse_loss(q_out, fp_target, fisher, a_loss_ratio=a_loss_ratio)
+                        loss_curr = fisher_mse_loss(
+                            q_out,
+                            fp_target,
+                            fisher,
+                            a_loss_ratio=a_loss_ratio,
+                            a_loss_threshold=a_loss_threshold,
+                        )
                         loss_next = None
                         # Old GPTQ+ ``collect_true_weight_gradient`` only triggers the
                         # next-layer arm when ``slide_alpha < 1.0`` (line 6450).
@@ -339,7 +597,11 @@ def make_grad_refresh_fn(
                                 next_q_out = next_q_out_pkg[0] if isinstance(next_q_out_pkg, tuple) else next_q_out_pkg
                             fp_target_next = next_fp_out.index_select(0, sample_idx).to(next_q_out.device)
                             loss_next = fisher_mse_loss(
-                                next_q_out, fp_target_next, next_fisher, a_loss_ratio=a_loss_ratio,
+                                next_q_out,
+                                fp_target_next,
+                                next_fisher,
+                                a_loss_ratio=a_loss_ratio,
+                                a_loss_threshold=next_a_loss_threshold,
                             )
                             loss = slide_alpha * loss_curr + (1.0 - slide_alpha) * loss_next
                         else:
@@ -350,6 +612,20 @@ def make_grad_refresh_fn(
                     batch_grad_fp32 = batch_grad.detach().float()
                     partial_grad_sum.add_(batch_grad_fp32, alpha=float(batch_size))
                     partial_count += batch_size
+                    if partial_loss_sums is not None:
+                        partial_loss_sums[0].add_(
+                            loss.detach().float(), alpha=float(batch_size),
+                        )
+                        if partial_loss_sums.numel() == 3:
+                            partial_loss_sums[1].add_(
+                                loss_curr.detach().float(),
+                                alpha=float(batch_size),
+                            )
+                        if loss_next is not None and partial_loss_sums.numel() == 3:
+                            partial_loss_sums[2].add_(
+                                loss_next.detach().float(),
+                                alpha=float(batch_size),
+                            )
                 iter_idx += 1
         # All-reduce per-rank partial sum + count, then divide. ALWAYS
         # runs on every rank (even with partial_count == 0) so NCCL stays
@@ -357,20 +633,22 @@ def make_grad_refresh_fn(
         # (lines 9026-9057) — packed all-reduce of (grad_flat, count) so
         # summation order is identical across runs.
         with nvtx.nvtx_range("refresh.grad_allreduce"):
-            if dist_utils.get_world_size() > 1:
-                global_count_t = torch.tensor(
-                    [float(partial_count)],
-                    dtype=partial_grad_sum.dtype,
-                    device=partial_grad_sum.device,
-                )
-                grad_flat = partial_grad_sum.reshape(-1)
-                packed = torch.cat([grad_flat, global_count_t])
-                dist_utils.allreduce_sum_(packed)
-                partial_grad_sum.copy_(packed[:grad_flat.numel()].view_as(partial_grad_sum))
-                global_count = int(packed[-1].item())
-            else:
-                global_count = partial_count
+            global_count, global_loss_sums = _aggregate_refresh_sums(
+                partial_grad_sum,
+                partial_count,
+                partial_loss_sums,
+            )
             accum_grad = partial_grad_sum / float(global_count)
+        if global_loss_sums is not None:
+            ctx.record_trace(
+                global_loss_sums=global_loss_sums,
+                global_count=global_count,
+                sample_indices=selected_global,
+                slide_alpha=slide_alpha,
+                has_next_loss=(
+                    slide_alpha is not None and slide_alpha < 1.0
+                ),
+            )
         with nvtx.nvtx_range("refresh.adam_step"):
             # act_order: re-key the natural-order grad into PERMUTED column order
             # so the Adam state slice [:, trailing_col_start:] sees only the

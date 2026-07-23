@@ -12,6 +12,8 @@ import os
 
 # datasets needs this for some loaders; same setting as the old ptq.py.
 os.environ.setdefault("HF_DATASETS_TRUST_REMOTE_CODE", "1")
+# Must be set before torch/CUDA is imported or creates a cuBLAS context.
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
 import torch  # noqa: E402  (env var must come first)
 
@@ -20,6 +22,7 @@ from realq import pipeline
 from realq.parallel import env as parallel_env
 from realq.utils import log as log_utils
 from realq.utils import nvtx as nvtx_utils
+from utils.reproducibility import configure_reproducibility
 
 torch.backends.cuda.matmul.allow_tf32 = False
 
@@ -28,6 +31,7 @@ def main() -> None:
     cfg = cfg_mod.parse_cli()
     nvtx_utils.set_enabled(cfg.nsys_profile)
     log_utils.init(cfg.output_dir, cfg.exp)
+    configure_reproducibility(cfg.refresh_seed, deterministic=True)
     parallel_env.init()
     pipeline.run(cfg)
 

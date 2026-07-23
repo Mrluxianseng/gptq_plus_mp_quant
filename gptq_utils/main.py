@@ -8,20 +8,16 @@
 # This code is based on QuaRot(https://github.com/spcl/QuaRot/tree/main/quarot).
 # Licensed under Apache License 2.0.
 
-import os
 import logging
 
 import torch
-import transformers
 from accelerate.hooks import remove_hook_from_module
 
 from gptq_utils import gptq_utils, gptaq_utils, gptq_guided_utils, gptq_plus_utils
-from utils import data_utils, dist_utils, model_utils
+from utils import checkpoint_utils, data_utils, model_utils
 
 
 def quantize_weights(args, analyzer: model_utils.ModelAnalyzer):
-    transformers.set_seed(args.seed)
-
     model = analyzer.model
     if (
         not bool(getattr(model, "_gptqplus_fsdp_prepared", False))
@@ -30,14 +26,18 @@ def quantize_weights(args, analyzer: model_utils.ModelAnalyzer):
         model.cpu()
     remove_hook_from_module(model, recurse=True)
 
-    if args.w_bits < 16:
-        save_dict = {}
+    if args.w_bits < 16 or args.load_qmodel_path:
         if bool(getattr(model, "_gptqplus_stage2_cpu_master", False)) and args.load_qmodel_path:
             raise RuntimeError("stage2_cpu_master does not support --load_qmodel_path yet.")
         if args.load_qmodel_path:  # Load Quantized Rotated Model
-            logging.info("Load quantized model from ", args.load_qmodel_path)
-            save_dict = torch.load(args.load_qmodel_path)
-            model.load_state_dict(save_dict["model"])
+            logging.info("Load quantized model from %s", args.load_qmodel_path)
+            checkpoint = getattr(args, "_loaded_quantized_checkpoint", None)
+            if checkpoint is None:
+                checkpoint = checkpoint_utils.load_quantized_checkpoint(
+                    args.load_qmodel_path,
+                    allow_unsafe_legacy=args.allow_unsafe_legacy_checkpoint,
+                )
+            checkpoint_utils.load_model_state(model, checkpoint)
 
         else:
             trainloader = data_utils.get_tokens(args.dataset, "train", analyzer.tokenizer, args.seq_len,
@@ -59,23 +59,14 @@ def quantize_weights(args, analyzer: model_utils.ModelAnalyzer):
                 dp_dev = "cpu"
 
             if args.w_method == "rtn":
-                quantizers = gptq_utils.rtn_fwrd(args, analyzer, dp_dev)
+                gptq_utils.rtn_fwrd(args, analyzer, dp_dev)
             elif args.w_method == "gptq":
-                quantizers = gptq_utils.gptq_fwrd(args, analyzer, trainloader, dp_dev)
+                gptq_utils.gptq_fwrd(args, analyzer, trainloader, dp_dev)
             elif args.w_method == "gptaq":
-                quantizers = gptaq_utils.gptq_fwrd(args, analyzer, trainloader, dp_dev)
+                gptaq_utils.gptq_fwrd(args, analyzer, trainloader, dp_dev)
             elif args.w_method == "gptq_guided":
-                quantizers = gptq_guided_utils.gptq_fwrd(args, analyzer, trainloader, dp_dev)
+                gptq_guided_utils.gptq_fwrd(args, analyzer, trainloader, dp_dev)
             elif args.w_method == "gptq_plus":
-                quantizers = gptq_plus_utils.gptq_fwrd(args, analyzer, trainloader, dp_dev)
-            save_dict["w_quantizers"] = quantizers
-
-        if args.save_qmodel_path and (
-            not bool(getattr(model, "_gptqplus_stage2_cpu_master", False))
-            or dist_utils.is_main()
-        ):
-            os.makedirs(os.path.dirname(args.save_qmodel_path), exist_ok=True)
-            save_dict["model"] = model.state_dict()
-            torch.save(save_dict, args.save_qmodel_path)
+                gptq_plus_utils.gptq_fwrd(args, analyzer, trainloader, dp_dev)
 
     return model

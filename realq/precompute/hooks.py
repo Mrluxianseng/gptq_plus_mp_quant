@@ -24,6 +24,8 @@ from typing import Iterable
 import torch
 import torch.nn as nn
 
+from utils.saliency_utils import clip_global_percentile_
+
 
 # Loss-grad scaling: the NLL is multiplied by this scalar before backward, so
 # fp16 activations don't underflow on the way down. Saliency is `grad²` and
@@ -78,7 +80,10 @@ class SaliencyHookManager:
                         f"SaliencyHookManager.finalize: no batches recorded for "
                         f"module {name}"
                     )
-                layer_out[name] = torch.cat(chunks, dim=0)  # (N_local, T, G)
+                combined = torch.cat(chunks, dim=0)  # (N_local, T, G)
+                layer_out[name] = clip_global_percentile_(
+                    combined, self.clip_percentile
+                )
                 chunks.clear()
             out.append(layer_out)
         return out
@@ -92,8 +97,6 @@ class SaliencyHookManager:
 
     def _make_grad_hook(self, layer_idx: int, module_name: str):
         num_groups = self.num_groups
-        clip_pct = self.clip_percentile
-
         def grad_hook(grad: torch.Tensor) -> None:
             # grad: (B, T, H_out)
             B, T, H = grad.shape
@@ -109,13 +112,6 @@ class SaliencyHookManager:
                 .view(B, T, num_groups, group_size)
                 .mean(dim=-1)
             )  # (B, T, G)
-            # Per-batch percentile clip: caps the top (1-p) fraction of
-            # token×group entries. Without this, a few outlier tokens push
-            # the weighted Hessian into rank-1 territory and Cholesky fails
-            # (see README — this is why the default is 0.99).
-            if clip_pct is not None and 0.0 < clip_pct < 1.0:
-                cap = torch.quantile(sal.flatten(), clip_pct)
-                sal = torch.clamp(sal, max=cap)
             self._data[layer_idx][module_name].append(sal.cpu())
         return grad_hook
 

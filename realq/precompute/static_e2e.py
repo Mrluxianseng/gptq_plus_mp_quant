@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
@@ -152,6 +153,32 @@ def _shard_local_calibration(trainloader: list, rank: int, world: int) -> list[t
     return [trainloader[i] for i in range(sl.start, sl.stop)]
 
 
+def _all_ranks_have_cache(local_hit: bool, world: int) -> bool:
+    """Return true only when every distributed rank has its local cache file.
+
+    Static precompute contains several collectives.  It is therefore invalid
+    for a rank with a local hit to return while a rank with a miss recomputes:
+    the latter would deadlock at the first Fisher all-reduce.  A MIN reduction
+    makes all-hit the only early-return case.  For NCCL the control tensor must
+    live on the rank's current CUDA device; CPU backends use a CPU tensor.
+    """
+    if world <= 1:
+        return local_hit
+    if not parallel_env.is_dist_available_and_initialized():
+        raise RuntimeError(
+            "static_e2e cache consensus requires an initialized process group "
+            f"when world_size={world}"
+        )
+    backend = str(dist.get_backend()).lower()
+    if "nccl" in backend:
+        device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    else:
+        device = torch.device("cpu")
+    hit = torch.tensor([int(local_hit)], dtype=torch.int32, device=device)
+    dist.all_reduce(hit, op=dist.ReduceOp.MIN)
+    return bool(hit.item())
+
+
 def run(cfg: "Config", analyzer: "ModelAnalyzer") -> StaticStats:
     """Top-level entry. Returns the StaticStats; also writes to disk if
     ``cfg.static_cache_path`` is set."""
@@ -163,12 +190,29 @@ def run(cfg: "Config", analyzer: "ModelAnalyzer") -> StaticStats:
         with nvtx.nvtx_range("precompute.cache_lookup"):
             key = cache_mod.build_cache_key(cfg, world)
             cached = cache_mod.try_load(cfg.static_cache_path, key, world, rank)
-            if cached is not None:
+            local_hit = cached is not None
+            all_hit = _all_ranks_have_cache(local_hit, world)
+            if all_hit:
                 logging.info(
                     "[realq.precompute] cache hit (rank %d): %s",
                     rank, cache_mod.cache_path(cfg.static_cache_path, key, world, rank),
                 )
                 return StaticStats(saliency=cached["saliency"], fisher=cached["fisher"])
+            if local_hit:
+                logging.warning(
+                    "[realq.precompute] rank %d has a cache file but at least "
+                    "one peer does not; all ranks will recompute Stage 0.",
+                    rank,
+                )
+            elif world > 1:
+                logging.info(
+                    "[realq.precompute] cache miss on rank %d; all ranks will "
+                    "recompute Stage 0.",
+                    rank,
+                )
+            # A rank-local hit can be very large.  Once consensus rejects the
+            # early return, release it before allocating Stage-0 activations.
+            cached = None
 
     # 2. Calibration data, sharded per rank.
     with nvtx.nvtx_range("precompute.load_data"):

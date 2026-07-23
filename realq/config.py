@@ -22,7 +22,12 @@ class Config:
     model: str = ""
     dataset: str = "wikitext2"
     eval_datasets: list[str] = field(default_factory=lambda: ["wikitext2"])
-    seed: int = 0
+    # ``seed`` deliberately means calibration sampling only.  The paper's
+    # seed sweep changes the calibration set while holding every other
+    # stochastic artifact fixed.
+    seed: int = 42
+    rotation_seed: int = 0
+    refresh_seed: int = 0
     nsamples: int = 128
     seq_len: int = 2048
     eval_seq_len: int = 2048
@@ -49,22 +54,35 @@ class Config:
 
     # ----- static end-to-end precompute -----------------------------------
     global_loss_bsz: int = 16
-    saliency_clip_percentile: float = 1.0
-    grad_hessian_topk: int = 20   # -1 = full vocab
+    saliency_clip_percentile: float = 0.99
+    grad_hessian_topk: int = -1   # <= 0 = full vocab (paper protocol)
     static_cache_path: Optional[str] = None
     exit_after_precompute: bool = False
+    # Optional old/new numerical-alignment trace. Only distributed rank zero
+    # writes JSONL; all ranks still aggregate the traced loss statistics.
+    alignment_trace_path: Optional[str] = None
+    alignment_run_id: str = "default"
 
-    # ----- block_gd refresh (Adam + cosine + grad_clip) -------------------
+    # ----- block_gd refresh (Adam + reverse-cosine + grad_clip) -----------
     grad_lr: float = 0.0003
     grad_clip: float = 1.0
+    # Optional final-transformer-block override. ``None`` reuses
+    # ``grad_clip`` exactly like the legacy implementation.
+    final_layer_grad_clip: Optional[float] = None
     # Per-layer lr schedule. "cosine" ramps from `grad_lr * grad_lr_layer_base_ratio`
-    # at layer 0 to `grad_lr` at the deepest layer via 0.5*(1-cos(π·x)). "none"
+    # at layer 0 to `grad_lr` at the deepest layer via sin(π·x/2). "none"
     # disables the ramp entirely so every layer uses `grad_lr` (base_ratio is
     # ignored). Mirrors legacy `--grad_lr_layer_schedule` (process_args.py:393).
     grad_lr_layer_schedule: str = "cosine"
     grad_lr_layer_base_ratio: float = 0.01
     backward_samples: int = 32
+    # These are GLOBAL refresh micro-batch sizes, matching legacy GPTQ+.
+    # Each rank uses value // world_size after validating divisibility.
     backward_bsz: int = 32
+    # ``None`` means inherit ``backward_bsz``.  The paper protocol therefore
+    # uses a global batch of 32 for every layer; an explicit override remains
+    # available for memory-constrained diagnostics.
+    final_layer_backward_bsz: Optional[int] = None
     # Per-element |delta| clip applied to the refresh-loss delta
     # (= q_out - fp_out) before the fisher quadratic. ``a_loss_ratio`` is
     # the kept-fraction quantile: ratio < 1 caps the top (1 - ratio)
@@ -73,7 +91,7 @@ class Config:
     # (process_args.py:60); see ``_scale_delta_by_abs_quantile`` and
     # the ``_activation_clip_threshold`` torch.quantile/topk fallback.
     # Default 1.0 = disabled (delta passes through).
-    a_loss_ratio: float = 0.95
+    a_loss_ratio: float = 1.0
 
     # ----- batch / memory -------------------------------------------------
     bsz: int = 64
@@ -111,15 +129,19 @@ class Config:
     a_bits: int = 16
     a_groupsize: int = -1
     a_asym: bool = False
-    a_clip_ratio: float = 1.0
+    # ``None`` selects the paper preset conditionally: 0.9 only when the
+    # corresponding tensor is actually quantised, otherwise 1.0.  This keeps
+    # W4A16 configuration/log/cache identities free of meaningless A/K/V clip
+    # changes while making W*x*A4KV4 use the documented clipping by default.
+    a_clip_ratio: Optional[float] = None
     v_bits: int = 16
     v_groupsize: int = -1
     v_asym: bool = False
-    v_clip_ratio: float = 1.0
+    v_clip_ratio: Optional[float] = None
     k_bits: int = 16
     k_groupsize: int = -1
     k_asym: bool = False
-    k_clip_ratio: float = 1.0
+    k_clip_ratio: Optional[float] = None
     # When True the A/K quantisers fire DURING the weight-Hessian forward
     # so GPTQ sees the quantised activation (the "aware" path). When False
     # A/K quant is only applied AFTER weight quant for runtime use.
@@ -131,7 +153,7 @@ class Config:
 
     # ----- final layer override (Stage 2) ---------------------------------
     final_layer_grad_lr: Optional[float] = 0.00001
-    kl_topk: int = 20
+    kl_topk: int = -1  # <= 0 = full vocab (paper protocol)
 
     # ----- rotate (QuaRot) -------------------------------------------------
     rotate: bool = True
@@ -155,6 +177,8 @@ class Config:
     nsys_profile: bool = False
 
     # ----- output ---------------------------------------------------------
+    load_qmodel_path: Optional[str] = None
+    allow_unsafe_legacy_checkpoint: bool = False
     save_qmodel_path: Optional[str] = None
     output_dir: str = "./output"
     exp: str = "realq"
@@ -171,13 +195,130 @@ class Config:
             raise ValueError(
                 f"`a_loss_ratio` must be in (0, 1]. Got {self.a_loss_ratio}."
             )
+        if (
+            not isinstance(self.w_bits, int)
+            or isinstance(self.w_bits, bool)
+            or not 2 <= self.w_bits <= 16
+        ):
+            raise ValueError(
+                "`w_bits` must be an integer in [2, 16], where 16 disables "
+                f"weight quantization. Got {self.w_bits!r}."
+            )
+        if (
+            not isinstance(self.w_groupsize, int)
+            or isinstance(self.w_groupsize, bool)
+            or (self.w_groupsize != -1 and self.w_groupsize <= 0)
+        ):
+            raise ValueError(
+                "`w_groupsize` must be -1 (per-row) or a positive integer. "
+                f"Got {self.w_groupsize!r}."
+            )
+        if self.w_bits < 16:
+            if self.w_asym:
+                raise ValueError(
+                    "`w_asym=True` is unsupported: REAL-Q's weight fake-quant "
+                    "path does not preserve asymmetric zero-points."
+                )
+            if (
+                self.w_groupsize != -1
+                and self.w_groupsize != self.blocksize
+            ):
+                raise ValueError(
+                    "`w_groupsize` must be -1 or equal to `blocksize`, "
+                    "matching legacy GPTQ+ dynamic/static group semantics. "
+                    f"Got w_groupsize={self.w_groupsize}, "
+                    f"blocksize={self.blocksize}."
+                )
+        if self.num_groups <= 0:
+            raise ValueError(
+                f"`num_groups` must be positive. Got {self.num_groups}."
+            )
+        if self.blocksize <= 0:
+            raise ValueError(
+                f"`blocksize` must be positive. Got {self.blocksize}."
+            )
+        if self.percdamp <= 0:
+            raise ValueError(
+                f"`percdamp` must be positive. Got {self.percdamp}."
+            )
+        if self.group_parallel_quant not in ("none", "rank"):
+            raise ValueError(
+                "`group_parallel_quant` must be 'none' or 'rank'. Got "
+                f"{self.group_parallel_quant!r}."
+            )
+        if not (0.0 < self.saliency_clip_percentile <= 1.0):
+            raise ValueError(
+                "`saliency_clip_percentile` must be in (0, 1]. Got "
+                f"{self.saliency_clip_percentile}."
+            )
+        for ratio_name, bits in (
+            ("a_clip_ratio", self.a_bits),
+            ("k_clip_ratio", self.k_bits),
+            ("v_clip_ratio", self.v_bits),
+        ):
+            ratio = getattr(self, ratio_name)
+            if ratio is None:
+                ratio = 0.9 if bits < 16 else 1.0
+                setattr(self, ratio_name, ratio)
+            if not (0.0 < float(ratio) <= 1.0):
+                raise ValueError(
+                    f"`{ratio_name}` must be in (0, 1]. Got {ratio}."
+                )
+        for tensor_name in ("a", "k", "v"):
+            bits = getattr(self, f"{tensor_name}_bits")
+            groupsize = getattr(self, f"{tensor_name}_groupsize")
+            if not isinstance(bits, int) or isinstance(bits, bool) or not (
+                2 <= bits <= 16
+            ):
+                raise ValueError(
+                    f"`{tensor_name}_bits` must be an integer in [2, 16], "
+                    f"where 16 disables fake quantization. Got {bits!r}."
+                )
+            if (
+                not isinstance(groupsize, int)
+                or isinstance(groupsize, bool)
+                or (groupsize != -1 and groupsize <= 0)
+            ):
+                raise ValueError(
+                    f"`{tensor_name}_groupsize` must be -1 (per-token) or a "
+                    f"positive integer. Got {groupsize!r}."
+                )
+        if self.grad_clip == 0:
+            raise ValueError(
+                "`grad_clip` must be non-zero; use a negative value to disable clipping."
+            )
+        if self.final_layer_grad_clip == 0:
+            raise ValueError(
+                "`final_layer_grad_clip` must be non-zero when provided; "
+                "use a negative value to disable clipping."
+            )
         if self.grad_lr_layer_schedule not in ("none", "cosine"):
             raise ValueError(
                 "`grad_lr_layer_schedule` must be 'none' or 'cosine'. "
                 f"Got {self.grad_lr_layer_schedule!r}."
             )
+        if self.backward_samples <= 0:
+            raise ValueError(
+                f"`backward_samples` must be positive. Got {self.backward_samples}."
+            )
+        if self.backward_bsz <= 0:
+            raise ValueError(
+                f"`backward_bsz` must be positive. Got {self.backward_bsz}."
+            )
+        if self.final_layer_backward_bsz is None:
+            self.final_layer_backward_bsz = self.backward_bsz
+        if self.final_layer_backward_bsz <= 0:
+            raise ValueError(
+                "`final_layer_backward_bsz` must be positive. Got "
+                f"{self.final_layer_backward_bsz}."
+            )
         if self.cpu_master and not self.fsdp:
             raise ValueError("`cpu_master=True` requires `fsdp=True`.")
+        if self.cpu_master and self.load_qmodel_path:
+            raise ValueError(
+                "`cpu_master=True` does not support `load_qmodel_path`; load "
+                "the artifact with the ordinary replicated runtime path."
+            )
         if self.cpu_master and (
             self.act_quant_aware_gptq or self.k_cache_quant_aware_gptq
         ):
@@ -187,6 +328,20 @@ class Config:
                 f"k_cache_quant_aware_gptq={self.k_cache_quant_aware_gptq}). "
                 "See realq/TODO_CPU_MASTER.md."
             )
+
+    @property
+    def activation_aware_quantization_enabled(self) -> bool:
+        """Whether an aware flag activates a real low-bit A/V/K path.
+
+        Merely passing an aware flag alongside A16/V16/K16 must not alter the
+        learning-rate schedule.
+        """
+        return (
+            self.act_quant_aware_gptq
+            and (self.a_bits < 16 or self.v_bits < 16)
+        ) or (
+            self.k_cache_quant_aware_gptq and self.k_bits < 16
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -215,7 +370,15 @@ def _build_parser() -> argparse.ArgumentParser:
             continue  # derived
         default = getattr(defaults, f.name)
         flag = f"--{f.name}"
-        if f.type is bool or isinstance(default, bool):
+        if f.name in {"a_clip_ratio", "k_clip_ratio", "v_clip_ratio"}:
+            # Preserve the omitted-vs-explicit distinction so Config can apply
+            # its conditional paper preset after all bit-widths are known.
+            p.add_argument(flag, type=float, default=None)
+        elif f.name == "final_layer_grad_clip":
+            p.add_argument(flag, type=float, default=None)
+        elif f.name == "allow_unsafe_legacy_checkpoint":
+            p.add_argument(flag, action="store_true", default=False)
+        elif f.type is bool or isinstance(default, bool):
             p.add_argument(flag, type=_str2bool, default=default)
         elif f.name == "eval_datasets":
             p.add_argument(flag, type=str, nargs="+", default=default)
@@ -244,7 +407,10 @@ def parse_cli(argv: list[str] | None = None) -> Config:
         v = raw.get(f.name)
         if v is None:
             continue
-        # quant_stop_layer is Optional[int]; CLI gave us a str.
-        if f.name == "quant_stop_layer" and isinstance(v, str):
+        # Optional[int] fields are accepted as strings by the generic parser.
+        if f.name in {
+            "quant_stop_layer",
+            "final_layer_backward_bsz",
+        } and isinstance(v, str):
             raw[f.name] = int(v)
     return Config(**raw)

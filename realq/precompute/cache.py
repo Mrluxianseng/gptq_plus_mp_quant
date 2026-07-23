@@ -20,34 +20,58 @@ add it to ``build_cache_key`` too.
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
+import tempfile
 from typing import Any
 
 import torch
+
+from utils.cache_identity import artifact_identity
+
+
+_CACHE_SCHEMA_VERSION = 4
 
 
 def build_cache_key(cfg, world_size: int) -> str:
     """Stable string key for the precompute output.
 
     Inputs that DO change the cache contents (and so are part of the key):
-        model_name, dataset, nsamples, seq_len, rotate, num_groups,
-        saliency_clip_percentile, grad_hessian_topk, global_loss_bsz,
-        seed, world_size.
+        exact model artifact, dataset, nsamples, seq_len, rotation artifact,
+        num_groups, saliency_clip_percentile, grad_hessian_topk,
+        global_loss_bsz, calibration seed, generated-rotation seed,
+        world_size.
 
     Excluded on purpose: anything that only affects the quantisation phase
-    (grad_lr, blocksize, w_bits, ...).
+    (grad_lr, blocksize, w_bits, A/V/K aware settings, ...).  Stage 0 is an
+    FP teacher pass, so aware settings cannot change its output.
     """
+    model_identity = artifact_identity(cfg.model)
+    if cfg.rotate:
+        rotation_identity = (
+            artifact_identity(cfg.optimized_rotation_path)
+            if cfg.optimized_rotation_path is not None
+            else (
+                "generated_hadamard:"
+                f"rotation_seed={int(getattr(cfg, 'rotation_seed', 0))}"
+            )
+        )
+    else:
+        rotation_identity = "disabled"
     parts = [
+        f"schema={_CACHE_SCHEMA_VERSION}",
         f"model={cfg.model_name}",
+        f"modelid={model_identity}",
         f"ds={cfg.dataset}",
         f"n={cfg.nsamples}",
         f"sl={cfg.seq_len}",
         f"rot={int(bool(cfg.rotate))}",
+        f"rotid={rotation_identity}",
         f"ng={cfg.num_groups}",
         f"salclip={cfg.saliency_clip_percentile:g}",
         f"topk={cfg.grad_hessian_topk}",
         f"glbsz={cfg.global_loss_bsz}",
-        f"seed={cfg.seed}",
+        f"calibration_seed={cfg.seed}",
         f"world={world_size}",
     ]
     raw = "|".join(parts)
@@ -63,11 +87,54 @@ def try_load(cache_dir: str, key: str, world_size: int, rank: int) -> dict | Non
     path = cache_path(cache_dir, key, world_size, rank)
     if not os.path.isfile(path):
         return None
-    return torch.load(path, weights_only=False)
+    try:
+        payload = torch.load(path, weights_only=False)
+    except Exception as exc:
+        # A cache read failure must be treated as a local miss.  In
+        # distributed precompute every rank subsequently participates in a
+        # hit-consensus collective; raising here on just one rank would strand
+        # the other ranks in that collective.
+        logging.warning(
+            "[realq.precompute] ignoring unreadable cache file %s: %s",
+            path,
+            exc,
+        )
+        return None
+    if not isinstance(payload, dict) or not {"saliency", "fisher"}.issubset(payload):
+        logging.warning(
+            "[realq.precompute] ignoring invalid cache payload at %s "
+            "(expected a dict containing saliency and fisher)",
+            path,
+        )
+        return None
+    return payload
 
 
 def save(cache_dir: str, key: str, world_size: int, rank: int, payload: dict[str, Any]) -> str:
+    """Atomically replace one rank's cache file.
+
+    The temporary file is created in ``cache_dir`` so ``os.replace`` stays on
+    the same filesystem and is atomic.  A unique temporary name also makes
+    concurrent runs targeting the same cache key safe: readers see either the
+    previous complete file or one complete new file, never a partially-written
+    torch archive.
+    """
     os.makedirs(cache_dir, exist_ok=True)
     path = cache_path(cache_dir, key, world_size, rank)
-    torch.save(payload, path)
+    fd, tmp_path = tempfile.mkstemp(
+        dir=cache_dir,
+        prefix=f".{os.path.basename(path)}.",
+        suffix=".tmp",
+    )
+    os.close(fd)
+    try:
+        torch.save(payload, tmp_path)
+        os.replace(tmp_path, path)
+    finally:
+        # os.replace removes tmp_path on success.  On serialization/replace
+        # failure, clean up only this invocation's unique temporary file.
+        try:
+            os.unlink(tmp_path)
+        except FileNotFoundError:
+            pass
     return path

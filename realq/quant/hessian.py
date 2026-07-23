@@ -11,6 +11,129 @@ import logging
 import torch
 
 
+def cholesky_inverse_batched_with_damp(
+    hessians: torch.Tensor,
+    percdamp: float = 0.01,
+    damp_auto_increment: float = 0.0015,
+) -> torch.Tensor:
+    """Legacy-compatible batched upper-Cholesky factors of damped inverses.
+
+    This intentionally follows ``GPTQPlus.
+    _compute_hessian_inverse_batched_with_fallback`` operation-for-operation.
+    A Python loop over groups is mathematically equivalent but selects
+    different CUDA kernels and can move borderline weights across a quantizer
+    cell, which then compounds through later REAL-Q blocks.
+    """
+    damp_percent_value = float(percdamp)
+    if damp_percent_value <= 0:
+        raise ValueError(
+            f"`percdamp` must be positive. Got {damp_percent_value}."
+        )
+    num_groups, columns, _ = hessians.shape
+    device = hessians.device
+    dtype = hessians.dtype
+    diag_idx = torch.arange(columns, device=device)
+    eye = torch.eye(columns, device=device, dtype=dtype)
+    hinv = torch.empty_like(hessians)
+    damp_percent = torch.full(
+        (num_groups,), damp_percent_value, device=device, dtype=torch.float32,
+    )
+    pending = torch.ones(num_groups, device=device, dtype=torch.bool)
+    last_info = torch.zeros(num_groups, device=device, dtype=torch.int32)
+
+    while bool(pending.any().item()):
+        active_idx = pending.nonzero(as_tuple=False).flatten()
+        work = hessians.index_select(0, active_idx).clone()
+        active_damp = damp_percent.index_select(0, active_idx).to(dtype)
+        diag_mean = torch.diagonal(work, dim1=-2, dim2=-1).mean(dim=1)
+        work[:, diag_idx, diag_idx] += (active_damp * diag_mean).unsqueeze(1)
+        chol, info = torch.linalg.cholesky_ex(work)
+
+        ok = info == 0
+        failed = info != 0
+        if bool(ok.any().item()):
+            ok_local_idx = ok.nonzero(as_tuple=False).flatten()
+            ok_global_idx = active_idx.index_select(0, ok_local_idx)
+            inverse = torch.cholesky_inverse(
+                chol.index_select(0, ok_local_idx)
+            )
+            upper, upper_info = torch.linalg.cholesky_ex(inverse, upper=True)
+            finite = (
+                torch.isfinite(inverse).flatten(1).all(dim=1)
+                & torch.isfinite(upper).flatten(1).all(dim=1)
+            )
+            ok2 = (upper_info == 0) & finite
+            if bool(ok2.any().item()):
+                ok2_local_idx = ok2.nonzero(as_tuple=False).flatten()
+                ok2_global_idx = ok_global_idx.index_select(
+                    0, ok2_local_idx
+                )
+                hinv.index_copy_(
+                    0, ok2_global_idx, upper.index_select(0, ok2_local_idx)
+                )
+                pending.index_fill_(0, ok2_global_idx, False)
+            failed_ok = ~ok2
+            if bool(failed_ok.any().item()):
+                failed_positions = failed_ok.nonzero(
+                    as_tuple=False
+                ).flatten()
+                failed_local_idx = ok_local_idx.index_select(
+                    0, failed_positions
+                )
+                failed[failed_local_idx] = True
+                failed_global_idx = ok_global_idx.index_select(
+                    0, failed_positions
+                )
+                last_info.index_copy_(
+                    0,
+                    failed_global_idx,
+                    upper_info.index_select(0, failed_positions).to(
+                        torch.int32
+                    ),
+                )
+
+        failed_positions = failed.nonzero(as_tuple=False).flatten()
+        failed_global_idx = active_idx.index_select(0, failed_positions)
+        if failed_global_idx.numel() > 0:
+            last_info.index_copy_(
+                0,
+                failed_global_idx,
+                info.index_select(0, failed_positions).to(torch.int32),
+            )
+            damp_percent.index_add_(
+                0,
+                failed_global_idx,
+                torch.full(
+                    (failed_global_idx.numel(),),
+                    damp_auto_increment,
+                    device=device,
+                    dtype=torch.float32,
+                ),
+            )
+            still_retry = (
+                damp_percent.index_select(0, failed_global_idx) < 1
+            )
+            giveup_idx = failed_global_idx.index_select(
+                0, (~still_retry).nonzero(as_tuple=False).flatten()
+            )
+            if giveup_idx.numel() > 0:
+                hinv.index_copy_(
+                    0,
+                    giveup_idx,
+                    eye.expand(giveup_idx.numel(), -1, -1),
+                )
+                pending.index_fill_(0, giveup_idx, False)
+                for idx in giveup_idx.detach().cpu().tolist():
+                    logging.warning(
+                        "[realq.hessian] subgroup=%d reached damp %.5f; "
+                        "using identity inverse (last info=%d).",
+                        idx,
+                        float(damp_percent[idx].item()),
+                        int(last_info[idx].item()),
+                    )
+    return hinv
+
+
 def cholesky_inverse_with_damp(
     H: torch.Tensor,
     percdamp: float = 0.01,

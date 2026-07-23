@@ -17,9 +17,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.func import functional_call
 
-from realq.refresh.block_gd import _functional_weight_name
+from realq.refresh.block_gd import (
+    _aggregate_refresh_sums,
+    _functional_weight_name,
+)
 from realq.utils import nvtx
 from utils import dist_utils
+from utils.loss_utils import tokenwise_kl_from_logits
 
 if TYPE_CHECKING:
     from realq.refresh.block_gd import RefreshContext
@@ -42,17 +46,16 @@ def kl_topk_loss(
     """
     norm = analyzer.get_layernorm_before_head()
     lm_head = analyzer.get_lm_head()
-    logits = lm_head(norm(q_hidden))
-    logits_fp = lm_head(norm(fp_hidden))
+    # The LM head itself follows the model dtype, but KL distribution math
+    # must be fp32.  Keeping softmax/log_softmax in bf16 can round away the
+    # small student/teacher differences this "true KL" final-layer objective
+    # is supposed to optimize.
+    logits = lm_head(norm(q_hidden)).float()
+    logits_fp = lm_head(norm(fp_hidden)).float()
     if kl_topk > 0:
         logits_fp, indices = logits_fp.topk(kl_topk, dim=-1, sorted=False)
         logits = logits.gather(-1, indices)
-    kl = F.kl_div(
-        F.log_softmax(logits, dim=-1),
-        F.softmax(logits_fp, dim=-1),
-        reduction="none",
-    )
-    return kl.sum(dim=-1).mean()
+    return tokenwise_kl_from_logits(logits, logits_fp).mean()
 
 
 def make_kl_refresh_fn(
@@ -106,6 +109,16 @@ def make_kl_refresh_fn(
             # ``if len(selected_indices) > 0`` guard.
             partial_grad_sum = torch.zeros_like(stitched_weight_fp32)
             partial_count = 0
+            partial_loss_sums = (
+                torch.zeros(
+                    1,
+                    # Match the legacy Python-float (binary64) local
+                    # accumulation before any distributed fp32 pack.
+                    dtype=torch.float64,
+                    device=partial_grad_sum.device,
+                )
+                if ctx.trace_enabled else None
+            )
             # Cast stitched fp32 weight to module dtype ONCE per refresh and
             # reuse the bf16 leaf across all backward batches. ``autograd.grad``
             # doesn't touch ``.grad``, so reusing one leaf across multiple
@@ -149,24 +162,29 @@ def make_kl_refresh_fn(
                     batch_grad_fp32 = batch_grad.detach().float()
                     partial_grad_sum.add_(batch_grad_fp32, alpha=float(batch_size))
                     partial_count += batch_size
+                    if partial_loss_sums is not None:
+                        weighted_loss = loss.detach().float()
+                        partial_loss_sums[0].add_(
+                            weighted_loss, alpha=float(batch_size),
+                        )
                 iter_idx += 1
         # All-reduce ALWAYS (even with partial_count == 0) so NCCL stays
         # synchronised across ranks under global-shuffle load imbalance.
         with nvtx.nvtx_range("kl_refresh.grad_allreduce"):
-            if dist_utils.get_world_size() > 1:
-                global_count_t = torch.tensor(
-                    [float(partial_count)],
-                    dtype=partial_grad_sum.dtype,
-                    device=partial_grad_sum.device,
-                )
-                grad_flat = partial_grad_sum.reshape(-1)
-                packed = torch.cat([grad_flat, global_count_t])
-                dist_utils.allreduce_sum_(packed)
-                partial_grad_sum.copy_(packed[:grad_flat.numel()].view_as(partial_grad_sum))
-                global_count = int(packed[-1].item())
-            else:
-                global_count = partial_count
+            global_count, global_loss_sums = _aggregate_refresh_sums(
+                partial_grad_sum,
+                partial_count,
+                partial_loss_sums,
+            )
             accum_grad = partial_grad_sum / float(global_count)
+        if global_loss_sums is not None:
+            ctx.record_trace(
+                global_loss_sums=global_loss_sums,
+                global_count=global_count,
+                sample_indices=selected_global,
+                slide_alpha=None,
+                has_next_loss=False,
+            )
         with nvtx.nvtx_range("kl_refresh.adam_step"):
             # act_order: re-key natural-order grad → permuted column order so the
             # Adam state slice matches old GPTQ+ subgroup state. See block_gd.py

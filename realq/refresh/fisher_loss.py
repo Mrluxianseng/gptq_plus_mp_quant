@@ -49,7 +49,11 @@ def _activation_clip_threshold(tensor: torch.Tensor, q: float) -> torch.Tensor |
     return flat.topk(upper_count, largest=True, sorted=False).values.min()
 
 
-def _scale_delta_by_abs_quantile(delta: torch.Tensor, ratio: float) -> torch.Tensor:
+def _scale_delta_by_abs_quantile(
+    delta: torch.Tensor,
+    ratio: float,
+    threshold: torch.Tensor | None = None,
+) -> torch.Tensor:
     """Cap each element of ``delta`` at the ``ratio``-quantile of ``|delta|``.
 
     Returns ``delta * scale`` where ``scale`` is a DETACHED, per-element
@@ -64,7 +68,12 @@ def _scale_delta_by_abs_quantile(delta: torch.Tensor, ratio: float) -> torch.Ten
     if ratio >= 1.0:
         return delta
     abs_delta = delta.detach().float().abs()
-    threshold = _activation_clip_threshold(abs_delta, float(ratio))
+    if threshold is None:
+        threshold = _activation_clip_threshold(abs_delta, float(ratio))
+    else:
+        threshold = threshold.to(
+            device=abs_delta.device, dtype=abs_delta.dtype
+        )
     if threshold is None:
         return delta
     scale = abs_delta.clamp_min_(torch.finfo(abs_delta.dtype).tiny)
@@ -78,6 +87,7 @@ def fisher_mse_loss(
     fp_out: torch.Tensor,
     fisher: torch.Tensor,
     a_loss_ratio: float = 1.0,
+    a_loss_threshold: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """``0.5 * mean_{b,t} (Δy_{b,t}^T F Δy_{b,t})``.
 
@@ -91,9 +101,10 @@ def fisher_mse_loss(
             (gptq_plus_utils.py:5660-5664).
 
     Notes:
-        * ``q_out`` and ``fp_out`` must come from the SAME ``fp_inps`` slice
-          (a.k.a. teacher-forced FP path) so Δy reflects only the weight
-          quantisation error, not any drift from earlier-layer quant choices.
+        * ``q_out`` is replayed from the current quantized input stream, while
+          ``fp_out`` is the matching full-precision block-output target for
+          the same sample ids.  This deliberately includes accumulated
+          upstream drift, matching REAL-Q's upstream-correction motivation.
         * Reduction matches old ``compute_refresh_loss(fisher_diag_mse)`` at
           line 5821-5826: per-token quadratic ``Δy^T F Δy``, then ``.mean()``
           over the FLATTENED ``(B*T,)`` axis. Earlier RealQ summed over T
@@ -114,9 +125,20 @@ def fisher_mse_loss(
         raise ValueError(
             f"fisher_mse_loss: fisher hidden dim {fisher.shape[0]} != q_out hidden dim {H}"
         )
-    delta = (q_out - fp_out).float()                              # (B, T, H) fp32
+    # Preserve the legacy arithmetic order exactly.  The original path forms
+    # Δ and, when enabled, applies the detached activation-loss clip in the
+    # activation dtype (normally bf16), then promotes the clipped value for the
+    # Fisher quadratic.  Promoting before clipping changes both the value and
+    # bf16 gradient at the clipped tail and is amplified by subsequent Adam
+    # refreshes.
+    delta = q_out - fp_out                                        # (B, T, H)
     if a_loss_ratio < 1.0:
-        delta = _scale_delta_by_abs_quantile(delta, float(a_loss_ratio))
+        delta = _scale_delta_by_abs_quantile(
+            delta,
+            float(a_loss_ratio),
+            threshold=a_loss_threshold,
+        )
+    delta = delta.float()
     fisher = fisher.to(device=delta.device, dtype=torch.float32)  # (H, H)
     delta_flat = delta.reshape(-1, H)                             # (B*T, H)
     quad = (delta_flat @ fisher * delta_flat).sum(dim=-1)         # (B*T,)

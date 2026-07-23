@@ -18,6 +18,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from gptq_utils.quant_aware_utils import (
+    configure_activation_quantizers_for_gptq,
+    configure_k_cache_quantizers_for_gptq,
+)
 from utils import quant_utils, rotation_utils
 
 if TYPE_CHECKING:
@@ -36,7 +40,14 @@ def install_actquant_wrappers(analyzer: "ModelAnalyzer") -> None:
     ``Wrapper(Wrapper(Linear))`` and breaking every downstream isinstance check.
     """
     model = analyzer.model
-    if bool(getattr(model, "_realq_actquant_wrappers_installed", False)):
+    if (
+        bool(getattr(model, "_realq_actquant_wrappers_installed", False))
+        or bool(getattr(model, "_gptqplus_rotation_wrappers_installed", False))
+    ):
+        # QuaRot owns the shared wrapper installation but historically set
+        # only its legacy marker.  Synchronise the RealQ marker rather than
+        # rediscovering and wrapping each inner Linear a second time.
+        model._realq_actquant_wrappers_installed = True
         return
     quant_utils.add_actquant(analyzer)
     model._realq_actquant_wrappers_installed = True
@@ -49,27 +60,7 @@ def configure_a_v_quantizers(analyzer: "ModelAnalyzer", cfg: "Config") -> None:
     V applies to v_proj's wrapper OUTPUT.
     Skipped for ``lm_head`` (always fp16).
     """
-    if cfg.a_bits >= 16 and cfg.v_bits >= 16:
-        return
-    qlayers = quant_utils.find_qlayers(analyzer.model, layers=[quant_utils.ActQuantWrapper])
-    for name, w in qlayers.items():
-        # V output quantiser only on v_proj.
-        if cfg.v_bits < 16 and "v_proj" in name:
-            w.out_quantizer.configure(
-                bits=cfg.v_bits,
-                groupsize=cfg.v_groupsize,
-                sym=not cfg.v_asym,
-                clip_ratio=cfg.v_clip_ratio,
-            )
-        # A input quantiser on every wrapper EXCEPT lm_head.
-        if cfg.a_bits < 16:
-            bits = 16 if "lm_head" in name else cfg.a_bits
-            w.quantizer.configure(
-                bits=bits,
-                groupsize=cfg.a_groupsize,
-                sym=not cfg.a_asym,
-                clip_ratio=cfg.a_clip_ratio,
-            )
+    configure_activation_quantizers_for_gptq(cfg, analyzer.model)
 
 
 def install_k_cache_wrappers(analyzer: "ModelAnalyzer", cfg: "Config") -> None:
@@ -80,18 +71,7 @@ def install_k_cache_wrappers(analyzer: "ModelAnalyzer", cfg: "Config") -> None:
     """
     if cfg.k_bits >= 16:
         return
-    rope_function_name = "apply_rotary_pos_emb"
-    layers = analyzer.get_layers()
-    for layer in layers:
-        rotation_utils.add_qk_rotation_wrapper_after_function_call_in_forward(
-            layer.self_attn,
-            rope_function_name,
-            head_dim=analyzer.head_dim,
-            k_bits=cfg.k_bits,
-            k_groupsize=cfg.k_groupsize,
-            k_sym=not cfg.k_asym,
-            k_clip_ratio=cfg.k_clip_ratio,
-        )
+    configure_k_cache_quantizers_for_gptq(cfg, analyzer)
 
 
 def setup_aware_pre_quant(analyzer: "ModelAnalyzer", cfg: "Config") -> None:

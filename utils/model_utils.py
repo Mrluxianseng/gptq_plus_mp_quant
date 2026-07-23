@@ -1,6 +1,7 @@
 import re
 import os
 import json
+import hashlib
 import logging
 import shutil
 from types import MethodType
@@ -17,9 +18,61 @@ from transformers import AutoModelForCausalLM, PreTrainedModel, AutoTokenizer, \
 from transformers.models.qwen3.modeling_qwen3 import Qwen3DecoderLayer
 
 from utils import dist_utils
+from utils.cache_identity import artifact_identity
 
 
 LINEAR_LAYERS = (nn.Linear, _ConvNd)
+
+
+def rotation_cache_identity(args) -> str:
+    """Stable identity for the rotation that ``rotate_model`` will apply.
+
+    Generated Hadamard rotations are identified only by ``rotation_seed``.
+    An optimized rotation is independent of that seed, so its identity uses
+    the concrete artifact path and mutation-sensitive file metadata instead.
+    This distinction is important for calibration-seed sweeps: changing
+    ``seed`` must not invalidate or silently change the rotation artifact.
+    """
+    if not bool(getattr(args, "rotate", False)):
+        return "disabled"
+
+    optimized_path = getattr(args, "optimized_rotation_path", None)
+    if optimized_path is None:
+        return f"generated_hadamard:rotation_seed={int(getattr(args, 'rotation_seed', 0))}"
+
+    return f"optimized:{artifact_identity(optimized_path)}"
+
+
+def rotation_cache_tag(args) -> str:
+    """Filename-safe short tag for :func:`rotation_cache_identity`."""
+    identity = rotation_cache_identity(args)
+    return hashlib.sha1(identity.encode()).hexdigest()[:12]
+
+
+def source_model_cache_identity(args) -> str:
+    """Mutation-sensitive identity of the checkpoint being transformed."""
+    return artifact_identity(getattr(args, "model", None))
+
+
+def parameters_share_storage(left: nn.Parameter, right: nn.Parameter) -> bool:
+    """Whether two parameters are genuinely tied in the loaded model.
+
+    ``load_model`` intentionally clones ``lm_head.weight`` when the source
+    checkpoint declares tied embeddings.  The historical
+    ``model.tie_word_embeddings`` marker records that source fact, not the
+    post-load tensor topology, and therefore must not be used to decide
+    whether QuaRot is safe.  Identity covers standard Hugging Face tying;
+    the storage check also handles tied views while avoiding meta tensors,
+    whose synthetic data pointers are all zero.
+    """
+    if left is right:
+        return True
+    if left.device.type == "meta" or right.device.type == "meta":
+        return False
+    try:
+        return left.untyped_storage().data_ptr() == right.untyped_storage().data_ptr()
+    except (AttributeError, RuntimeError):
+        return False
 
 
 def _prepare_config_for_untied_lm_head(model_str: str):
@@ -123,8 +176,14 @@ def _build_rotated_checkpoint_on_rank0(args, rotated_dir: str) -> None:
     meta = {
         "kind": "rotated",
         "source_model": args.model,
+        "source_model_identity": source_model_cache_identity(args),
         "seq_len": int(args.seq_len),
-        "seed": int(getattr(args, "seed", 0)),
+        "rotation_seed": (
+            None
+            if getattr(args, "optimized_rotation_path", None) is not None
+            else int(getattr(args, "rotation_seed", 0))
+        ),
+        "rotation_identity": rotation_cache_identity(args),
         "rotate": True,
         "optimized_rotation_path": getattr(args, "optimized_rotation_path", None),
         "transformers_version": transformers.__version__,
@@ -148,9 +207,12 @@ def _prepared_checkpoint_ready(checkpoint_dir: str, args, *, kind: str, rotate: 
     return (
         meta.get("kind") == kind
         and meta.get("source_model") == args.model
-        and int(meta.get("seed", -1)) == int(getattr(args, "seed", 0))
+        and meta.get("source_model_identity") == source_model_cache_identity(args)
         and bool(meta.get("rotate")) is bool(rotate)
-        and meta.get("optimized_rotation_path") == getattr(args, "optimized_rotation_path", None)
+        and (
+            not rotate
+            or meta.get("rotation_identity") == rotation_cache_identity(args)
+        )
     )
 
 
@@ -167,10 +229,10 @@ def _build_untied_checkpoint_on_rank0(args, untied_dir: str) -> None:
     meta = {
         "kind": "untied",
         "source_model": args.model,
+        "source_model_identity": source_model_cache_identity(args),
         "seq_len": int(args.seq_len),
-        "seed": int(getattr(args, "seed", 0)),
         "rotate": False,
-        "optimized_rotation_path": getattr(args, "optimized_rotation_path", None),
+        "rotation_identity": "disabled",
         "transformers_version": transformers.__version__,
     }
     _save_prepared_checkpoint(analyzer, untied_dir, args, meta)
@@ -186,15 +248,11 @@ def _prepared_checkpoint_base_dir(args) -> str:
 
 
 def _prepared_rotated_checkpoint_dir(args) -> str:
-    if getattr(args, "optimized_rotation_path", None) is not None:
-        opt_tag = os.path.basename(str(args.optimized_rotation_path)).replace("/", "_")
-    else:
-        opt_tag = "hadamard"
-    seed_tag = f"seed{int(getattr(args, 'seed', 0))}"
+    rotation_tag = rotation_cache_tag(args)
     return os.path.join(
         _prepared_checkpoint_base_dir(args),
         "_prepared_checkpoints",
-        f"{getattr(args, 'model_name', os.path.basename(args.model))}_rot_{opt_tag}_{seed_tag}",
+        f"{getattr(args, 'model_name', os.path.basename(args.model))}_rot_{rotation_tag}",
     )
 
 
@@ -413,7 +471,22 @@ class ModelAnalyzer:
         self.num_key_value_heads = getattr(self.config, "num_key_value_heads", self.num_attention_heads)
         self.num_key_value_groups = self.num_attention_heads // self.num_key_value_heads
         self.head_dim = getattr(self.config, "head_dim", self.hidden_size // self.num_attention_heads)
-        self.tie_word_embeddings = self.model.tie_word_embeddings
+        # This must describe the tensors we are about to transform, not the
+        # source config.  String-loaded tied checkpoints have already cloned
+        # lm_head.weight in ``load_model``; treating the old source marker as
+        # an active tie caused every global QuaRot operation (LN fusion, R1
+        # embedding/head and attention/MLP rotations) to be skipped.
+        self.source_tie_word_embeddings = bool(
+            getattr(
+                self.model,
+                "tie_word_embeddings",
+                getattr(self.config, "tie_word_embeddings", False),
+            )
+        )
+        self.tie_word_embeddings = parameters_share_storage(
+            self.get_embed_layer().weight,
+            self.get_lm_head().weight,
+        )
 
     def get_lm_head(self):
         if self.model_arch in ["Qwen3ForCausalLM", "Qwen3MoeForCausalLM", "LlamaForCausalLM"]:
