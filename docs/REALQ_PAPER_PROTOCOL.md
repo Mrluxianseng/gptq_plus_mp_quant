@@ -17,6 +17,7 @@ The paper source is intentionally not modified by the implementation audit.
 | Final block | True full-vocabulary KL against the LM head and its own LR (`main.tex:620,635`). |
 | Activation-loss clip | P95 detached scaling for Qwen3-0.6B/1.7B/4B (`main.tex:629`). |
 | Saliency clip | P99 before saliency-weighted Hessian construction (`main.tex:631`). |
+| Group saliency | Squared Euclidean norm of the output gradient restricted to each row group, hence a channel sum rather than mean (`main.tex:133-138`). |
 | Rotation | QuaRot for every method (`main.tex:235`). |
 | Evaluation | Held-out WikiText-2 KL/PPL plus ten zero-shot tasks (`main.tex:235,237`). |
 | Reported calibration seed | Seed 1 for the reported Qwen3-0.6B W4A16 row (`main.tex:836-848`). |
@@ -34,6 +35,8 @@ not state:
   accumulation batch size;
 - final-block backward mini-batch size if it differs from the stated Adam
   mini-batch 32;
+- the population/axes over which activation-loss P95 and saliency P99 are
+  computed (the implementation uses the complete global refresh population);
 - calibration, rotation, and refresh/sample-shuffle seed domains for every
   table row;
 - concrete model/tokenizer/dataset revisions;

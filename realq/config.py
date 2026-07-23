@@ -1,8 +1,10 @@
 """Configuration for RealQ.
 
-A single dataclass replaces process_args.py's ~99 argparse fields. Anything
-that the old codebase had hard-coded "always X" or that RealQ deliberately
-skips (FSDP, A/V/K quant, alpha, pre-GD, regularisation, ...) is gone.
+A single dataclass replaces ``process_args.py``'s large argparse surface.
+It retains the numerical and runtime controls used by the refactored pipeline,
+including FSDP precompute, A/V/K fake quantization, the analytical GPTQ+ term,
+Block-GD, and regularization compatibility settings. Deprecated pre-GD knobs
+are accepted only where legacy CLI/checkpoint compatibility requires them.
 
 The dataclass exposes attribute names that match what `utils.eval_utils` /
 `utils.rotation_utils` / `utils.data_utils` already read from `args.X`, so we

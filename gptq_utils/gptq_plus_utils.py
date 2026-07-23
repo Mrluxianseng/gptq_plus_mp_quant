@@ -19,7 +19,11 @@ except ImportError:
     from torch.nn.utils.stateless import functional_call
 
 from utils import quant_utils, memory_utils, model_utils, dist_utils, rotation_utils
-from utils.saliency_utils import clip_global_percentile_, global_percentile
+from utils.saliency_utils import (
+    clip_global_percentile_,
+    global_percentile,
+    grouped_gradient_norm_squared,
+)
 from utils.loss_utils import tokenwise_kl_from_logits
 from realq.alignment import (
     RefreshTraceWriter,
@@ -3773,10 +3777,11 @@ class SaliencyCache:
             bsz, seq_len, hidden_dim = g.shape
             group_size = hidden_dim // self.num_groups
 
-            grad_squared = g.float().pow(2).view(bsz, seq_len, self.num_groups, group_size)
-            mean_squared_grad = grad_squared.mean(dim=-1)  # -> [bsz, seq_len, num_groups]
+            saliency = grouped_gradient_norm_squared(
+                g, self.num_groups
+            )  # -> [bsz, seq_len, num_groups]
 
-            self.saliency_cache[name].append(mean_squared_grad)
+            self.saliency_cache[name].append(saliency)
 
         # Attach the gradient hook to 'out'
         out.register_hook(grad_hook)
@@ -4289,18 +4294,15 @@ def collect_static_end_to_end_saliency_and_fisher(
                         f"Module output dim ({hidden_dim}) must be divisible by saliency num_groups ({saliency_num_groups})."
                     )
                 group_size = hidden_dim // saliency_num_groups
-                # Single fp32 cast shared between saliency (grad² group-mean) and
+                # Single fp32 cast shared between saliency (group ||grad||²) and
                 # dynsal (G^T G). Before merging these into one hook we cast
                 # grad → fp32 twice per module per backward; now once.
                 grad_fp32 = grad.detach().float()
                 # --- saliency branch ---
-                grad_squared = grad_fp32.pow(2).view(
-                    bsz_local,
-                    seq_len_local,
+                sal_per_group = grouped_gradient_norm_squared(
+                    grad_fp32,
                     saliency_num_groups,
-                    group_size,
                 )
-                sal_per_group = grad_squared.mean(dim=-1)
                 if collect_saliency:
                     sal_cpu = sal_per_group.detach().cpu()
                     if use_rademacher_stats:
@@ -7696,7 +7698,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     f"g{args.num_groups}_"
                     f"fisherfull_ghtk{args.grad_hessian_topk}_"
                     f"glbsz{args.global_loss_bsz}_cseed{args.seed}_"
-                    f"salclip{sal_clip_tag}_salglobalv1_"
+                    f"salclip{sal_clip_tag}_salglobalv1_salsumv1_"
                     f"rklNA{rkl_na}_fpfinal{fpfinal_tag}"
                     f"_e2els{int(_E2E_PRECOMPUTE_LOSS_GRAD_SCALE)}"
                     f"{grad_stat_tag}{mix_tag}{dynsal_tag}{analysis_tag}"

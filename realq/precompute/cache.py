@@ -30,7 +30,7 @@ import torch
 from utils.cache_identity import artifact_identity
 
 
-_CACHE_SCHEMA_VERSION = 4
+_CACHE_SCHEMA_VERSION = 5
 
 
 def build_cache_key(cfg, world_size: int) -> str:

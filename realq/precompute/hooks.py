@@ -3,8 +3,9 @@
 Two managers, attached together once per model:
 
 * ``SaliencyHookManager`` — per-(layer, module) tensor backward hook on each
-  linear module's output. Records ``mean_g(grad²)`` over output channel
-  groups; the result is the rank-local saliency tensor used to weight the
+  linear module's output. Records the squared gradient norm (sum of
+  ``grad²``) over each output-channel group; the result is the rank-local
+  saliency tensor used to weight the
   GPTQ Hessian when quantising that module.
 
 * ``FisherHookManager`` — per-layer tensor backward hook on the transformer
@@ -24,7 +25,10 @@ from typing import Iterable
 import torch
 import torch.nn as nn
 
-from utils.saliency_utils import clip_global_percentile_
+from utils.saliency_utils import (
+    clip_global_percentile_,
+    grouped_gradient_norm_squared,
+)
 
 
 # Loss-grad scaling: the NLL is multiplied by this scalar before backward, so
@@ -105,12 +109,8 @@ class SaliencyHookManager:
                     f"SaliencyHookManager: module {module_name} output dim {H} "
                     f"not divisible by num_groups {num_groups}."
                 )
-            group_size = H // num_groups
-            grad_fp32 = grad.detach().float()
-            sal = (
-                grad_fp32.pow(2)
-                .view(B, T, num_groups, group_size)
-                .mean(dim=-1)
+            sal = grouped_gradient_norm_squared(
+                grad.detach(), num_groups
             )  # (B, T, G)
             self._data[layer_idx][module_name].append(sal.cpu())
         return grad_hook

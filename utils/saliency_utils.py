@@ -8,6 +8,34 @@ import torch.distributed as dist
 from utils import dist_utils
 
 
+def grouped_gradient_norm_squared(
+    gradient: torch.Tensor,
+    num_groups: int,
+) -> torch.Tensor:
+    """Return the paper's per-token, per-row-group squared gradient norm.
+
+    The output-channel dimension is partitioned into equal contiguous groups.
+    For each token and group, saliency is ``sum_i gradient_i**2``—the squared
+    Euclidean norm in ``main.tex``—not its channel mean.  Keeping this primitive
+    shared prevents the legacy and refactored collectors from drifting.
+    """
+    if num_groups <= 0:
+        raise ValueError(f"num_groups must be positive, got {num_groups}")
+    hidden_size = gradient.shape[-1]
+    if hidden_size % num_groups:
+        raise ValueError(
+            f"gradient width {hidden_size} is not divisible by "
+            f"num_groups {num_groups}"
+        )
+    group_size = hidden_size // num_groups
+    return (
+        gradient.float()
+        .reshape(*gradient.shape[:-1], num_groups, group_size)
+        .square()
+        .sum(dim=-1)
+    )
+
+
 def _linear_quantile(values: torch.Tensor, percentile: float) -> torch.Tensor:
     """``torch.quantile(..., interpolation='linear')`` without its size cap."""
     flat = values.reshape(-1)

@@ -227,9 +227,8 @@ def quantize_one_layer(
 
         # Layer-wise reverse-cosine lr — same for every module in this layer.
         # The last transformer layer can opt in to a separate base lr via
-        # ``cfg.final_layer_grad_lr``; loss formula still falls back to
-        # fisher_mse for sub-task simplicity (KL-vs-ref_logits override is
-        # documented as a follow-up in REFACTOR_NOTES.md).
+        # ``cfg.final_layer_grad_lr`` and, when Block-GD is enabled, uses the
+        # full-vocabulary KL refresh constructed below rather than Fisher MSE.
         is_final_layer = (layer_idx == num_layers - 1)
         base_lr = cfg.grad_lr
         if is_final_layer and cfg.final_layer_grad_lr is not None:

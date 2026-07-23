@@ -8,7 +8,7 @@
 
 1. rotate
 
-2. 预计算整个模型的Saliency（用来得到每一层对端到端loss的hessian）和fisher系数（fisher diag mse loss使用）
+2. 预计算整个模型的 Saliency（用来得到每一层对端到端 loss 的 Hessian）和完整、非对角的 aggregated Fisher 矩阵（历史配置名仍为 `fisher_diag_mse`，但当前实现并非 diagonal-only）
 
 3. 开始量化每个layer，计算hessian和此时的loss、gradient。
 

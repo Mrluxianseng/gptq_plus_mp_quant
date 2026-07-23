@@ -29,7 +29,9 @@ Acceptance requires all of the following:
    deliberate compatibility constraint for this audit and are reported as a
    paper mismatch rather than silently treated as paper-correct.
 2. Legacy and refactored implementations use the same numerical semantics for
-   every supported configuration.
+   every explicitly tested configuration and numerical mechanism listed in
+   the validation matrix; this does not assert an exhaustive Cartesian test
+   of unrelated backends, model families, or bit widths.
 3. Every block-GD refresh loss is captured and compared.  Each matched old/new
    step must have symmetric relative difference below 1%.
 4. Repeating the same implementation with the same seed must keep every
@@ -102,6 +104,7 @@ different questions:
 | A/K/V clipping | Operators work; several scripts omit V clip | Operators work; no paper preset | Validate and provide explicit paper settings |
 | Activation-loss clip | Operator is correct; default disabled | Operator is correct; default unexpectedly 0.95 | Default to 1.0; test explicit 0.95 |
 | Rotation | Tied checkpoints skip the global rotation after untying | Same shared bug | Rotate the now-untied embedding/head normally |
+| GuidedQuant saliency | Uses channel-mean squared gradient inside each row group | Same paper mismatch | Use the group squared Euclidean norm (channel sum) and invalidate old static caches |
 | Per-row weight quant | Correct | Correct | Regression-test |
 | Group-128 weight quant | Correct, including act-order group mapping | Scale/column shapes are incompatible | Repair and compare against legacy |
 | Cholesky retry | Damping accumulates across retries | Fresh retry is correct | Repair legacy retry |
@@ -118,14 +121,15 @@ different questions:
 | Loss slide | Historical refresh-only alpha and penultimate-layer skip | Exact historical behavior | **No**; current formula/pseudocode describe a different schedule |
 | Reverse cosine | `sin(pi*x/2)` after correction | Same; constant LR for aware A/K/V | Yes |
 | QuaRot | Full global and local transforms; cloned untied heads rotate normally | Shared implementation and wrapper topology | Yes within floating-point tolerance; tied/untied Llama and Qwen3 whole-model logits oracles |
+| GuidedQuant saliency Hessian | Per-token group `sum(grad²)` after correction | Same shared paper-norm primitive | Yes for the stated squared Euclidean norm; old channel-mean caches are schema-invalidated |
 | A quantization | Per-token linear input fake quant; aware/unaware timing works | Same sites and timing | Yes |
 | V quantization | Per-token `v_proj` output fake quant | Same | Yes |
 | K-cache quantization | Post-RoPE K fake quant, aware/unaware | Same | Yes |
 | Query/Q quantization | Not implemented | Not implemented | Not claimed by the paper; Q is rotation-only |
 | A/K/V range clip | Symmetric quantization with explicit clip ratios | Same, conditional low-bit default 0.9 | Yes |
-| Activation-loss clip | One global-refresh P95 detached scale, in legacy activation arithmetic order | Same value and gradient after correction | Yes |
+| Activation-loss clip | One global-refresh P95 detached scale, in legacy activation arithmetic order | Same value and gradient after correction | Matches the stated detached P95; the full-refresh/global population is an implementation choice because the paper does not define the percentile axes |
 | Per-row weights | Correct | Correct | Yes for W4A16 |
-| Grouped weights | Correct group-128/act-order/short tail | Repaired to match all legacy paths | Yes for paper low-bit/A4KV4 settings |
+| Grouped weights | Correct group-128/act-order/short tail | Repaired to match all tested legacy paths | Group-128 operator is consistent; W2/W3 full-pipeline runs were not performed |
 | Final KL | Full-vocabulary fp32 KL | Same | Yes |
 | KL/PPL evaluation | Correct shifted-token PPL and full-vocabulary fp32 KL after fixes | Same evaluator | Yes; actual synthetic held-out smoke exact |
 | Ten-task evaluation | Shared exact task list and metric-key handling | Restored rank-0 lifecycle | Task discovery verified; full datasets unavailable on node |
@@ -208,10 +212,19 @@ and one final-layer full-vocabulary KL case.
   reverse cosine, A/K/V quantizers and clips, global activation-loss clipping,
   group/per-row weights, closed-form full-vocabulary KL value/gradient, PPL
   shift, and tied/untied Llama/Qwen3 whole-model QuaRot logit invariance.
+- Corrected GuidedQuant saliency from the historical per-group channel mean
+  to the paper's squared Euclidean norm (`sum(grad²)`) in both implementations.
+  The refactored cache schema and legacy cache tag were advanced so a
+  pre-correction static cache cannot silently survive the semantic change.
+- Added a fixture `--tokens-only` mode that materializes all legacy/refactored
+  cache names for a new global sample count without rewriting model,
+  tokenizer, config, or manifest files. This closed an eight-rank offline
+  preflight failure caused by requesting 16 samples from an eight-sample
+  synthetic fixture.
 
 ## Validation evidence
 
-- Unit/regression suite on the allocated GPU node: `123 passed`.
+- Unit/regression suite on the allocated GPU node: `130 passed`.
 - Safe checkpoint tests: new-to-new and new-to-legacy-entry round trips each
   preserved all 51 tiny-Llama state keys bit-for-bit.
 - Root-cause closure
@@ -281,8 +294,14 @@ neither is fully consistent with `main.tex:195-203,457-463`.
 
 - Clean eight-rank end-to-end runs for representative slide/P95 and fully
   aware A/K/V cases.
+- A clean post-saliency-correction rerun of the full one-GPU matrix; the
+  recorded `matrix_v3` result predates the group-squared-norm correction.
 - Full zero-shot task scoring is unavailable on the isolated node because the
   task datasets are not present locally; only real task registration plus
   mocked evaluator lifecycle can be validated without network data.
+- End-to-end integration matrices use the tiny Llama fixture. Qwen3 has
+  tied/untied whole-model rotation oracles, but no full
+  static-precompute-to-Block-GD-to-A/K/V-to-evaluation integration run, so the
+  tiny-Llama result must not be extrapolated to every paper model family.
 - Exact paper-table reproduction remains blocked on the undisclosed settings
   listed in `docs/REALQ_PAPER_PROTOCOL.md`.

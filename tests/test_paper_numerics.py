@@ -23,7 +23,10 @@ from realq.quant.hessian import (  # noqa: E402
     cholesky_inverse_batched_with_damp,
 )
 from utils.loss_utils import tokenwise_kl_from_logits  # noqa: E402
-from utils.saliency_utils import global_percentile  # noqa: E402
+from utils.saliency_utils import (  # noqa: E402
+    global_percentile,
+    grouped_gradient_norm_squared,
+)
 
 
 def test_old_and_new_reverse_cosine_match_paper_equation():
@@ -94,6 +97,16 @@ def test_aggregated_fisher_and_non_diagonal_quadratic_match_paper_oracle():
     torch.testing.assert_close(
         actual_grad, expected_grad, rtol=1e-6, atol=1e-7
     )
+
+
+def test_grouped_saliency_is_paper_squared_norm_not_channel_mean():
+    gradient = torch.tensor(
+        [[[1.0, 2.0, 3.0, 4.0], [-1.0, 0.0, 2.0, -2.0]]]
+    )
+    actual = grouped_gradient_norm_squared(gradient, num_groups=2)
+    expected = torch.tensor([[[5.0, 25.0], [1.0, 8.0]]])
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert not torch.equal(actual, expected / 2.0)
 
 
 def test_activation_aware_uses_reported_constant_lr_but_fp16_flag_is_noop():
