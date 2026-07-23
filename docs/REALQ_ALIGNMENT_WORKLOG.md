@@ -253,6 +253,26 @@ and one final-layer full-vocabulary KL case.
   (legacy repeat, refactor repeat, and old/new repeat 0/1), 27 refreshes each,
   maximum loss difference 0, complete tensor-state difference 0, checkpoint
   manifest match.
+- Final frozen one-GPU matrix
+  (`/output/realq_alignment/matrix_v5/matrix_report.json`): source commit
+  `1a88d2bba821e4d93068843fe1d441a7bfd31df9`, empty tracked-diff SHA-256
+  (`e3b0c442...b855`), and status containing only user-owned `main.tex`.
+  All eight cases above ran twice per implementation: 32 comparisons and 864
+  matched refresh-comparison points. The report and an independent pass over
+  every raw JSONL record found exact equality for the main/current/next
+  losses, refresh identity and Adam step, sample IDs, and slide alpha. All 32
+  comparisons had 30/30 canonical tensor keys bit-exact with no missing/extra
+  keys, maximum weight absolute difference 0, and exact checkpoint
+  manifests/configs.
+- Final frozen eight-GPU matrix
+  (`/output/realq_alignment/matrix_8gpu_v4/matrix_report.json`): the same
+  source commit and clean provenance, world size 8 on eight NVIDIA L20C GPUs,
+  with 16 global calibration/refresh samples. The representative
+  `w4_row_rotate_slide` and fully aware `w4a4kv4_aware` cases produced eight
+  comparisons and 216 matched refresh-comparison points. Raw loss/components,
+  identities, Adam steps, all 16 sample IDs, slide alpha, 30/30 canonical
+  tensor keys, and manifests were all bit-exact (maximum loss and weight
+  differences 0).
 - Clean one-GPU matrix
   (`/output/realq_alignment/matrix_v3/matrix_report.json`): all eight cases
   above, two repetitions per implementation, 32 comparisons and 864 matched
@@ -286,6 +306,13 @@ and one final-layer full-vocabulary KL case.
   runtime wrappers, then ran the real decoder on deterministic held-out
   tokens. Both produced KL `0.006344683468341827` and PPL
   `576.2203979492188`; both relative differences were 0.
+- Final-HEAD fully aware A4KV4 production-evaluator smoke
+  (`/output/realq_alignment/eval_smoke_aware_v5.json`): restored the final
+  matrix-v5 legacy/refactored checkpoints and executed the real decoder,
+  rotation/runtime A/K/V wrappers, full-vocabulary fp32 KL, and shifted-token
+  PPL on deterministic held-out tokens. Both produced KL
+  `0.006439953576773405` and PPL `583.7960205078125`; both symmetric relative
+  differences were exactly 0.
 - Real `lm-eval` task discovery on the node loaded 2,953 task definitions.
   Each paper task resolved uniquely:
   `piqa`, `hellaswag`, `arc_easy`, `arc_challenge`, `winogrande`,
@@ -295,7 +322,11 @@ and one final-layer full-vocabulary KL case.
   - `a4e5e48` — numerical semantics, caches, evaluation, and checkpoints;
   - `29c9879` — independent oracles and alignment matrix runner;
   - `e0aaf80` — final audit assertions and provenance capture;
-  - `c5a0dfc` — paper-norm saliency and distributed fixture hardening.
+  - `c5a0dfc` — paper-norm saliency and distributed fixture hardening;
+  - `5c75cff` — dynamic-saliency/cache, tied-object rotation, and protocol
+    closure;
+  - `e8539ca` — reject invalid K-aware/K16 no-op configurations;
+  - `1a88d2b` — keep checkpoint-manifest tests on valid placeholder configs.
 
 ## Known paper/code mismatch: legacy loss slide
 
@@ -344,10 +375,8 @@ plausible interpretation would normalize the `L-1` non-final blocks over
 the first interpretation exactly. The paper needs to disambiguate the
 denominator before changing this behavior.
 
-## Evidence still outstanding at this point in the log
+## Validation boundaries and paper-reproduction blockers
 
-- A clean post-saliency-correction rerun of the full one-GPU matrix; the
-  recorded `matrix_v3` result predates the group-squared-norm correction.
 - Full zero-shot task scoring is unavailable on the isolated node because the
   task datasets are not present locally; only real task registration plus
   mocked evaluator lifecycle can be validated without network data.
