@@ -5,7 +5,12 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from transformers import LlamaConfig, LlamaForCausalLM
+from transformers import (
+    LlamaConfig,
+    LlamaForCausalLM,
+    Qwen3Config,
+    Qwen3ForCausalLM,
+)
 
 from realq import akv
 from realq.config import Config
@@ -272,13 +277,25 @@ def test_untied_clone_runs_all_global_rotation_steps(monkeypatch):
     ]
 
 
+@pytest.mark.parametrize(
+    ("model_family", "config_cls", "model_cls"),
+    [
+        ("llama", LlamaConfig, LlamaForCausalLM),
+        ("qwen3", Qwen3Config, Qwen3ForCausalLM),
+    ],
+)
 @pytest.mark.parametrize("tie_word_embeddings", [False, True])
-def test_tiny_llama_quarot_preserves_full_model_logits(tie_word_embeddings):
+def test_tiny_quarot_preserves_full_model_logits(
+    model_family,
+    config_cls,
+    model_cls,
+    tie_word_embeddings,
+):
     if not torch.cuda.is_available():
         pytest.skip("production rotation utilities require CUDA")
 
     torch.manual_seed(3)
-    config = LlamaConfig(
+    config_kwargs = dict(
         vocab_size=64,
         hidden_size=64,
         intermediate_size=128,
@@ -288,8 +305,11 @@ def test_tiny_llama_quarot_preserves_full_model_logits(tie_word_embeddings):
         max_position_embeddings=64,
         tie_word_embeddings=tie_word_embeddings,
     )
-    config.architectures = ["LlamaForCausalLM"]
-    model = LlamaForCausalLM(config).double().eval().cuda()
+    if model_family == "qwen3":
+        config_kwargs["head_dim"] = 16
+    config = config_cls(**config_kwargs)
+    config.architectures = [model_cls.__name__]
+    model = model_cls(config).double().eval().cuda()
     analyzer = model_utils.ModelAnalyzer(
         model,
         seq_len=8,

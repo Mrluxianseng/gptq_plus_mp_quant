@@ -200,9 +200,14 @@ def test_kl_ppl_uses_fp32_distribution_math(monkeypatch):
         teacher_logits = original_head.to(device)(
             reference_hidden[0].to(device)
         ).float()
-        expected = eval_utils.tokenwise_kl_from_logits(
-            student_logits, teacher_logits
-        ).mean()
+        # Independent formula oracle: do not call the production
+        # tokenwise_kl_from_logits helper here, otherwise this test could only
+        # prove that the evaluator and its expected value share the same bug.
+        log_student = torch.log_softmax(student_logits, dim=-1)
+        log_teacher = torch.log_softmax(teacher_logits, dim=-1)
+        expected = (
+            log_teacher.exp() * (log_teacher - log_student)
+        ).sum(dim=-1).mean()
         expected_ppl = torch.exp(
             F.cross_entropy(
                 student_logits[:-1],

@@ -22,6 +22,7 @@ from realq.refresh.kl_loss import kl_topk_loss  # noqa: E402
 from realq.quant.hessian import (  # noqa: E402
     cholesky_inverse_batched_with_damp,
 )
+from utils.loss_utils import tokenwise_kl_from_logits  # noqa: E402
 from utils.saliency_utils import global_percentile  # noqa: E402
 
 
@@ -325,6 +326,27 @@ class _TinyKLAnalyzer:
 
     def get_lm_head(self):
         return self.head
+
+
+def test_full_vocab_kl_matches_closed_form_value_and_student_gradient():
+    # Teacher p=(3/4, 1/4), student q=(1/2, 1/2).  This closed-form oracle
+    # deliberately does not call softmax/log_softmax outside the production
+    # primitive under test.
+    student = torch.tensor([[0.0, 0.0]], requires_grad=True)
+    teacher = torch.tensor([[math.log(3.0), 0.0]])
+    loss = tokenwise_kl_from_logits(student, teacher).sum()
+    gradient = torch.autograd.grad(loss, student)[0]
+
+    expected_loss = 0.75 * math.log(1.5) + 0.25 * math.log(0.5)
+    torch.testing.assert_close(
+        loss, torch.tensor(expected_loss), rtol=1e-6, atol=1e-7
+    )
+    torch.testing.assert_close(
+        gradient,
+        torch.tensor([[-0.25, 0.25]]),
+        rtol=1e-6,
+        atol=1e-7,
+    )
 
 
 def test_old_new_final_kl_use_same_fp32_value_and_gradient():

@@ -1,5 +1,11 @@
 # 算法流程
 
+> 论文/代码一致性审计见
+> [REALQ_ALIGNMENT_WORKLOG.md](docs/REALQ_ALIGNMENT_WORKLOG.md)；论文实验协议中已明确和未披露的参数见
+> [REALQ_PAPER_PROTOCOL.md](docs/REALQ_PAPER_PROTOCOL.md)。当前 loss-slide
+> 仍保留旧实现的 refresh 计数与末层边界，和 `main.tex` 的现有公式并不完全一致。
+> `A4KV4` 也不包含独立的 Q/query fake quant：Q 只与 K 一起做保持内积的旋转。
+
 1. rotate
 
 2. 预计算整个模型的Saliency（用来得到每一层对端到端loss的hessian）和fisher系数（fisher diag mse loss使用）
@@ -64,7 +70,7 @@
 - `GRAD_REFRESH_LOSS=legacy_fisher_diag_mse` 会保存每个 rank-local sample/token 的 Fisher 对角项 `g^2`，不再从完整 Fisher 矩阵取对角线。这个 loss 需要 `GLOBAL_LOSS=1`，并且不能和 `FISHER_RADEMACHER_K>0` 或 `NUM_SAMPLES_FOR_GRAD>0` 同时使用。
 - LOSS_SLIDE_WINDOW：开启后会同时计算本层和下一层的loss并线性配比
 - DP_GLOBAL_SHUFFLE：开启dp后的数据shuffle模式，固定为1就行
-- GRAD_LR_LAYER_SCHEDULE：跨layer的学习率调度器。`cosine` 时非 final layer 的有效学习率为 `base_lr + (lr - base_lr) * 0.5 * (1 - cos(pi * layer_idx / (num_layers - 1)))`
+- GRAD_LR_LAYER_SCHEDULE：跨layer的学习率调度器。`cosine` 时非 final layer 的有效学习率为 `base_lr + (lr - base_lr) * sin(pi/2 * layer_idx / (num_layers - 1))`，即论文的 reverse-cosine 调度。
 - GRAD_LR_LAYER_BASE_RATIO：跨layer调度器的起始学习率比例，默认0.01，即 `base_lr = 0.01 * GRAD_LR` / `0.01 * PRE_GRAD_LR`。设成0可恢复旧的从0起步的cosine
 - ALPHA：中兴的算法用的，固定为0就行
 - KL_TOPK：计算kl和res kl用的topk
