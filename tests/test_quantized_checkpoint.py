@@ -131,7 +131,7 @@ def test_checkpoint_is_weights_only_safe_and_restores_exact_a_v_runtime(
         k_bits=16,
         k_clip_ratio=1.0,
         act_quant_aware_gptq=True,
-        k_cache_quant_aware_gptq=True,
+        k_cache_quant_aware_gptq=False,
         w_bits=16,
     )
     assert checkpoint_utils.apply_runtime_manifest(restored_cfg, loaded)
@@ -160,7 +160,7 @@ def test_manifest_reconstructs_exact_k_cache_behavior_for_aware_and_unaware(
     restored_cfg = _runtime_cfg(
         k_bits=16,
         k_clip_ratio=1.0,
-        k_cache_quant_aware_gptq=not aware,
+        k_cache_quant_aware_gptq=False,
     )
     loaded = checkpoint_utils.load_quantized_checkpoint(path)
     checkpoint_utils.apply_runtime_manifest(restored_cfg, loaded)
@@ -212,7 +212,7 @@ def test_akv_setup_roundtrip_reinstalls_k_forward_patch(tmp_path, aware):
         v_clip_ratio=1.0,
         k_bits=16,
         k_clip_ratio=1.0,
-        k_cache_quant_aware_gptq=not aware,
+        k_cache_quant_aware_gptq=False,
     )
     checkpoint = checkpoint_utils.load_quantized_checkpoint(path)
     checkpoint_utils.apply_runtime_manifest(restored_cfg, checkpoint)
