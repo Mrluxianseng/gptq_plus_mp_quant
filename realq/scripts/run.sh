@@ -6,8 +6,10 @@
 # Example:
 #   bash realq/scripts/run.sh models/Qwen/Qwen3-0.6B 4 0,1,2,3
 #
-# Match the old gptq_plus_lr_sweep.sh defaults so sub-task validations stay
-# comparable. Any flag you omit falls back to realq.config.Config defaults.
+# This is a convenience template, not an exact paper-table launcher.  The
+# paper does not currently disclose every numerical knob (notably gradient
+# clipping), and its model/setting-specific learning rates cannot be expressed
+# by one default.  See docs/REALQ_PAPER_PROTOCOL.md before reproducing tables.
 
 set -euo pipefail
 
@@ -38,7 +40,7 @@ torchrun --nproc_per_node="${NUM_GPUS}" --master_port=$((29500 + RANDOM % 1000))
   --backward_bsz "${BACKWARD_BSZ:-32}" \
   --blocksize "${BLOCKSIZE:-128}" \
   --rotate "${ROTATE:-1}" \
-  --seed "${SEED:-0}" \
+  --seed "${SEED:-1}" \
   --output_dir "${OUTPUT_ROOT}" \
   --exp "${EXP}" \
   ${EXTRA_ARGS:-}
