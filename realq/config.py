@@ -288,6 +288,11 @@ class Config:
                     f"`{tensor_name}_groupsize` must be -1 (per-token) or a "
                     f"positive integer. Got {groupsize!r}."
                 )
+        if self.k_cache_quant_aware_gptq and self.k_bits >= 16:
+            raise ValueError(
+                "`k_cache_quant_aware_gptq=True` requires `k_bits < 16`; "
+                "an aware K-cache path without K fake quantization is invalid."
+            )
         if self.grad_clip == 0:
             raise ValueError(
                 "`grad_clip` must be non-zero; use a negative value to disable clipping."

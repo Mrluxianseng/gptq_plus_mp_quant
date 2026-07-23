@@ -84,13 +84,26 @@ reproduction entry point.
 | Learning rate | Per model/setting table | one convenience default `3e-4` | sweep-specific values |
 | Small-Qwen activation-loss P95 | 0.95 for Qwen3-0.6B/1.7B/4B | `Config` / template 1.0 unless explicitly overridden | sweep 1.0 unless explicitly overridden |
 | Weight grouping | W4A16 per-row; W2/W3 and W*x*A4KV4 group 128 | template now selects this from bit widths; `Config` alone defaults per-row | sweep defaults per-row unless overridden |
-| Eval datasets | Held-out WikiText-2 plus ten tasks | KL/PPL default only WikiText-2 | parser defaults multiple KL/PPL datasets |
+| Eval datasets | Held-out WikiText-2 plus ten tasks | KL/PPL defaults to WikiText-2 and `lm_eval=False`; template does not enable tasks | parser defaults multiple KL/PPL datasets but task scoring still requires its enable flag |
 
 `realq/scripts/run.sh` is therefore explicitly a convenience template.  It
 must not be cited as the command that generated a paper row. In particular,
 setting only `A_BITS`, `K_BITS`, and `V_BITS` does not enable the corresponding
 activation-aware flags, and model-specific activation-loss clipping and
 learning rates still require explicit arguments.
+
+Legacy parser defaults and refactored `Config` defaults are not intended to be
+equivalent. They differ materially in weight bits, LR/final LR, enabled
+rotation/slide/weight clipping/act-order switches, dataset, sample count, and
+several batch sizes. Exact old/new comparisons in this audit pin every
+numerically relevant knob; they do not imply that invoking each entry point
+with no arguments yields the same experiment.
+
+The paper also says that “each method” is evaluated in aware and unaware
+activation variants (`main.tex:335`), while the following text/table reports
+both variants for REAL-Q but only aware baselines (`main.tex:339,349-371`).
+This is an internal reporting ambiguity that must be resolved before the
+activation-table protocol is fully reproducible.
 
 ## Reverse-cosine endpoint ambiguity
 

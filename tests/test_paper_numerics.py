@@ -245,6 +245,11 @@ def test_activation_aware_uses_reported_constant_lr_but_fp16_flag_is_noop():
         act_quant_aware_gptq=True,
         a_bits=4,
     ).activation_aware_quantization_enabled is True
+    with pytest.raises(ValueError, match="requires `k_bits < 16`"):
+        Config(
+            k_cache_quant_aware_gptq=True,
+            k_bits=16,
+        )
 
 
 def test_paper_defaults_and_conditional_akv_clip_presets():

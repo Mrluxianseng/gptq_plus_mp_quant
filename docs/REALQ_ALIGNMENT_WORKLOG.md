@@ -235,6 +235,9 @@ and one final-layer full-vocabulary KL case.
 - Made the convenience launcher choose the paper's weight grouping by bit
   setting: per-row for W4A16 and group 128 for W2/W3 or any A/K/V-low-bit
   configuration. It remains a template, not an exact paper-row launcher.
+- Aligned the refactored K-aware configuration contract with legacy GPTQ+:
+  `k_cache_quant_aware_gptq=True` now requires an actual low-bit K path rather
+  than silently becoming a K16 no-op.
 
 ## Validation evidence
 
