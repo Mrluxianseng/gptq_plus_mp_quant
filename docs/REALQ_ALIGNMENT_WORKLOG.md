@@ -406,3 +406,37 @@ denominator before changing this behavior.
   numerical semantics, not the 70B systems or performance claims.
 - Exact paper-table reproduction remains blocked on the undisclosed settings
   listed in `docs/REALQ_PAPER_PROTOCOL.md`.
+
+## Formal schedule A/B completion and performance handoff
+
+The controlled formal campaign completed on 2026-07-24 under source commit
+`2702d78836cc1a3eb9f8ab5f9c7a0b2b9c26ff14`, empty tracked diff, and wrapper
+SHA256
+`0a7c70f9fe9dcd34a816c75ca13025aacf6b94df906deec2b29795e1ae88e0b3`.
+
+The Q4 literal-sine arm produced raw KL/PPL
+`0.22162500023841858 / 14.133820533752441`; historical cos-squared produced
+`0.09558671712875366 / 13.663459777832031`. Literal sine therefore increased
+KL by 131.8575% and PPL by 3.4425% in the locked current protocol.
+
+The Q8 aware arms ordered as constant, literal sine, then historical
+cos-squared:
+
+```text
+constant aware: 0.9197931289672852 / 20.18940544128418
+literal sine:   0.9449643492698669 / 20.760927200317383
+historical:     0.9737851023674011 / 21.33316421508789
+```
+
+Constant-aware reduced KL/PPL by 5.5445%/5.3614% versus historical
+cos-squared. The best arm remained 19.9209% above the paper KL anchor and
+2.5884% above its PPL anchor. The primary and independent validators passed;
+the independent pass ran 782 checks with no failure and recomputed the eight
+current Q8 cache hashes.
+
+Full evidence is in
+[`REALQ_AB_PERF_RESULTS.md`](REALQ_AB_PERF_RESULTS.md). Performance work starts
+only after this boundary and follows
+[`REALQ_PERFORMANCE_WORKLOG.md`](REALQ_PERFORMANCE_WORKLOG.md): exact candidates
+must pass raw-byte and real-model checkpoint gates; potentially
+numerically-different candidates remain explicit default-off switches.

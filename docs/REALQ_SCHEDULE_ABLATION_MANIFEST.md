@@ -256,3 +256,25 @@ whereas a result in the predeclared small/negligible bands is not evidence of
 a schedule effect by itself. If wall time permits, the current `paper` arm
 will be repeated under a separately warmed experiment root; otherwise the
 reported conclusion must explicitly retain this nondeterminism limitation.
+
+## Completion record
+
+All five formal arms completed on 2026-07-24. The main validator passed, and
+an independent validator passed 782 checks with zero failures, zero rank
+spread, and byte-recomputed hashes for the current Q8 cache artifacts.
+
+The durable metrics, pairwise effects, paper-anchor gaps, timing-scope
+comparison, memory telemetry, provenance hashes, and limitations are recorded
+in [`REALQ_AB_PERF_RESULTS.md`](REALQ_AB_PERF_RESULTS.md).
+
+Headline outcomes:
+
+- Qwen3-4B W4A16 literal sine versus historical cos-squared:
+  KL `+131.8575%`, PPL `+3.4425%`.
+- Qwen3-8B W2A4KV4 aware constant versus literal sine:
+  KL `-2.6637%`, PPL `-2.7529%`.
+- Qwen3-8B W2A4KV4 aware constant versus historical cos-squared:
+  KL `-5.5445%`, PPL `-5.3614%`.
+
+The post-A/B performance protocol and rolling optimization evidence are kept
+in [`REALQ_PERFORMANCE_WORKLOG.md`](REALQ_PERFORMANCE_WORKLOG.md).
