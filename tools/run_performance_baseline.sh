@@ -146,10 +146,17 @@ command -v nvidia-smi >/dev/null || die "nvidia-smi is required"
 
 cd "$REPO_ROOT"
 
+repo_git() {
+    # Canoe workers run as root while this shared checkout belongs to the
+    # submitting user. Scope the exception to this command; do not mutate
+    # root's global Git configuration.
+    git -c "safe.directory=$REPO_ROOT" "$@"
+}
+
 if ((ALLOW_DIRTY_SOURCE == 0)); then
-    git diff --quiet --ignore-submodules -- ||
+    repo_git diff --quiet --ignore-submodules -- ||
         die "tracked working-tree changes exist; commit/stash them first"
-    git diff --cached --quiet --ignore-submodules -- ||
+    repo_git diff --cached --quiet --ignore-submodules -- ||
         die "staged source changes exist; commit/stash them first"
 fi
 
@@ -159,7 +166,7 @@ if ((free_kib < MIN_FREE_KIB && ALLOW_LOW_DISK == 0)); then
     die "less than 40 GiB free under $OUTPUT_PARENT; use --allow-low-disk only after checking checkpoint capacity"
 fi
 
-commit_sha="$(git rev-parse HEAD)"
+commit_sha="$(repo_git rev-parse HEAD)"
 short_sha="${commit_sha:0:12}"
 raw_job_id="${CANOE_JOB_ID:-${JOB_ID:-$(hostname -s)}}"
 job_slug="$(printf '%s' "$raw_job_id" | tr -c 'A-Za-z0-9._-' '_')"
