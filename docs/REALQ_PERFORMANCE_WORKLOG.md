@@ -613,3 +613,66 @@ necessary but not sufficient: the next gates are same-HEAD canonical
 Qwen3-4B checkpoint A/B, Block-GD loss/optimizer trace equality, isolated
 same-HEAD A/A+A/B timing, allocator peaks, Nsight attribution, and
 representative full-model Q4/Q8 evaluation.
+
+### 2026-07-24 - final-HEAD Qwen3-4B checkpoint gates
+
+The single-quartet correctness harness was rerun from clean commit
+`02e2f0adf8e02c9f4023a90b45db432d43085b7d`, always with physical GPUs
+4--7 and the same model/cache identities within each A/B family.  Each run
+quantized Qwen3-4B layer 0 and saved a complete checkpoint.  The independent
+comparator checks canonical per-tensor raw bytes and also fails unless commit,
+case, world size, physical GPU IDs and UUIDs, model, caches, harness,
+comparator, baseline ID, and the exact declared Config delta all agree.
+
+| Case | Arm | Only candidate fields | Canonical state SHA256 | Tensors | Sampled peak MiB on physical 4/5/6/7 |
+|---|---|---|---|---:|---|
+| `group_stress` | legacy | none | `9587755d521e46b3e65b2139864dab6985674ceda219475c24b0606841cfb595` | 435 | 11838 / 11520 / 11838 / 11838 |
+| `group_stress` | P01+P02+P04 | inner fastpath; union clip search; compact qparams | same | 435 | 11840 / 11840 / 11522 / 11840 |
+| `group_stress` | P03 | `where(out=)` clip-winner update | same | 435 | 11838 / 11802 / 11776 / 11760 |
+| `block_gd_stress` | legacy | none | `cf12ef2e5a977530624105b4a550c917585c0037d3c20c7e6737cfdec1b1d698` | 435 | 19832 / 19492 / 19674 / 19832 |
+| `block_gd_stress` | P05+P06 | FP32 Fisher cache; exact prefix-Q stitch | same | 435 | 18126 / 19548 / 19548 / 20062 |
+
+All three cross-arm reports pass: 435/435 tensors are raw-byte equal, with no
+missing, extra, or mismatched key.  P05+P06 therefore preserve the final
+checkpoint on a real Adam-driven Block-GD/loss-slide path, rather than only on
+the LR-zero fixture.
+
+Immutable run roots:
+
+```text
+/minimax-avatar-new/zhangqian/realq/experiment_data/perf_stage1_correctness_zhangqian/j-7x9o0je4pk_20260724T145522Z_02e2f0adf8e0_group_stress_legacy
+/minimax-avatar-new/zhangqian/realq/experiment_data/perf_stage1_correctness_zhangqian/j-7x9o0je4pk_20260724T145835Z_02e2f0adf8e0_group_stress_p01_p02_p04
+/minimax-avatar-new/zhangqian/realq/experiment_data/perf_stage1_correctness_zhangqian/j-7x9o0je4pk_20260724T150326Z_02e2f0adf8e0_group_stress_p03
+/minimax-avatar-new/zhangqian/realq/experiment_data/perf_stage1_correctness_zhangqian/j-7x9o0je4pk_20260724T150732Z_02e2f0adf8e0_block_gd_stress_legacy
+/minimax-avatar-new/zhangqian/realq/experiment_data/perf_stage1_correctness_zhangqian/j-7x9o0je4pk_20260724T151247Z_02e2f0adf8e0_block_gd_stress_p05_p06
+```
+
+The recorded full-process wall times are deliberately ineligible for a
+speedup claim: these are correctness runs with checkpoint serialization and
+concurrent node load, not warm-up plus repeated synchronized layer timings.
+
+The Block-GD runs also expose a pre-existing PyTorch warning: memory-efficient
+attention backward defaults to a non-deterministic CUDA algorithm because the
+shared reproducibility helper currently requests deterministic algorithms
+with `warn_only=True`.  Raw-byte equality across the independent legacy and
+P05+P06 runs is reassuring but is not a proof of repeatability.  This remains
+an explicit risk pending a same-arm A/A replay and backend/strict-mode audit.
+
+### 2026-07-24 - correction to the preliminary P03/P04 CUDA evidence
+
+An adversarial review found that the first small-fixture P03/P04 CUDA probe
+hard-coded `num_groups=1` in its DP2/DP4 cases, injected an already-finalized
+Hessian, used Python `assert`, and did not bind every log to immutable source
+and command provenance.  It therefore did not exercise the production
+`num_groups=4` Hessian reduce-scatter and multi-group BMM path and could
+false-pass under optimized Python.  The earlier bullet list in this worklog
+must be read as preliminary implementation evidence, not a completed
+promotion gate.
+
+The replacement gate is fail-closed: DP2 uses two groups and DP4 uses four,
+constructs the Hessian through the real add-batch/reduce-scatter/finalize
+path, explicitly verifies all relevant branch counters and collectives,
+rejects `python -O`, checks cross-rank updates and Adam moments, and records
+commit/probe/runner/command/log/GPU-mapping hashes.  Its CUDA rerun on physical
+GPUs 4--7 was in progress when this entry was written.  No P03/P04 default
+promotion or speed claim may rely on the superseded artifacts.

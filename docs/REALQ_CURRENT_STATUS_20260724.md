@@ -564,3 +564,42 @@ datasets/ultrachat_2k
   wall-time 区间；新的代码级优化尚无合格端到端 speedup 数字。
 - **当前动作**：GPU 被用户占用期间只做 CPU/static 工作；释放后继续
   严格的 baseline → candidate → exact gate → Nsight 循环。
+
+## 2026-07-24 23:18 CST 增量状态
+
+此前“GPU 暂停”段落已经过期。当前仍严格避开用户的物理 GPU 0–3，
+仅在物理 GPU 4–7 上执行性能正确性门禁。
+
+final main commit
+`02e2f0adf8e02c9f4023a90b45db432d43085b7d` 的真实 Qwen3-4B
+layer-0 完整 checkpoint 结果如下：
+
+| 路径 | legacy canonical SHA256 | candidate | 逐 tensor 原始字节 |
+|---|---|---|---|
+| W2 group-128，LR=0 | `9587755d…b595` | P01+P02+P04 | 435/435 相同 |
+| W2 group-128，LR=0 | `9587755d…b595` | P03 | 435/435 相同 |
+| W2 group-128，Block-GD `grad_lr=3e-4` + loss slide | `cf12ef2e…d698` | P05+P06 | 435/435 相同 |
+
+三个独立 comparator 均同时确认：无 missing/extra/mismatch，commit、
+case、world size、模型、缓存、物理 GPU 4–7 的 ID/UUID、harness 与
+comparator hash 相同，Config 差异精确等于声明的候选开关。P05/P06
+因此已从 CPU toy 证据推进到真实 Adam/Block-GD checkpoint 逐 bit
+一致。对应 immutable roots 已写入
+`docs/REALQ_PERFORMANCE_WORKLOG.md`。
+
+这些 correctness run 的总 wall 包含模型加载、旋转、保存 8.8 GB
+checkpoint，并且节点有并发负载，明确不能用于加速结论。下一步仍是
+同一 HEAD 的隔离 warm-up + 重复计时与 nsys attribution。
+
+另有两项明确风险：
+
+1. Block-GD 的 memory-efficient attention backward 发出
+   nondeterministic warning；当前 helper 使用
+   `torch.use_deterministic_algorithms(..., warn_only=True)`。虽然两个
+   独立 arm 的 checkpoint 已逐 bit 相同，仍需同臂 A/A 和 strict
+   backend 审查，不能把单次相同误写成普遍确定性证明。
+2. 独立审查否定了第一版小型 P03/P04 CUDA probe 的 promotion
+   充分性：它没有覆盖 `num_groups=4` 的真实 Hessian
+   reduce-scatter/multi-group BMM，且证据 provenance 不够严格。
+   旧结果降级为预备证据；强化后的 fail-closed gate 正在物理 4–7
+   上重跑，完成前不据此提升默认值或宣称 CUDA promotion。
