@@ -1,6 +1,6 @@
 # REAL-Q 阶段结论与当前状态
 
-更新时间：2026-07-24 21:16 CST
+更新时间：2026-07-24 21:35 CST
 
 ## 一页结论
 
@@ -406,18 +406,25 @@ GPU、CUDA/PyTorch、文件系统、batch 和历史 runner 都不同。
 
 | 候选 | 当前状态 | 初步证据 | 尚缺 |
 |---|---|---|---|
-| P01 `quantizer_inner_fastpath` | 实现已完成，默认 `false`；独立审查进行中 | 独立 94/94 CPU targeted tests 通过，默认数值路径 no-op；原作者 CPU primitive：per-row 1.30×，grouped 84.26× | 更多 adversarial、CUDA checkpoint、隔离计时 |
-| P02 `w_clip_search_impl=symmetric_union_exact` | 实现已完成，默认历史 Cartesian；尚未合入主线 | 每个 equal-width observer batch 的 625 个 QDQ/error candidate 降至最多 50；短 tail 是两个 batch，即 1250→100；候选 80 个相关测试和独立 98 个 CPU 对抗项均逐 bit 通过；CPU primitive 约 11.4×–12.5× | CUDA kernel 逐 bit、真实 checkpoint、峰值显存、隔离计时 |
+| P01 `quantizer_inner_fastpath` | 隔离组合分支完成，默认 `false`；独立审查完成 | 55 个额外 CPU 对抗项、2-rank Gloo 和组合全量 suite 通过；当前 main/default-off 九 case aggregate SHA 相同；早期 CPU primitive：per-row 1.30×，grouped 84.26× | CUDA raw-byte、真实 checkpoint、隔离计时 |
+| P02 `w_clip_search_impl=symmetric_union_exact` | 隔离组合分支完成，默认历史 Cartesian；独立数学/实现审查完成 | 每个 equal-width observer batch 的 625 个 QDQ/error candidate 降至最多 50；独立 98 个 CPU 对抗项和 271-config raw-bit campaign 通过；早期 CPU primitive 约 11.4×–12.5× | CUDA kernel 逐 bit、真实 checkpoint、峰值显存、隔离计时 |
+| P05 `fisher_fp32_cache` | 隔离组合分支完成，默认 `false`；暂按 `N` 管理 | BF16→FP32 值、loss、gradient、两步 slide refresh、Adam state/update 在 CPU raw-byte 相同；已跳过 opt-in final-KL 无效缓存并在 final replay 前释放引用 | CUDA allocator 数值门禁、峰值显存、真实 checkpoint、隔离计时 |
 
-P02 可能临时保留 `O(2M × rows × groups)` 的 errors/scales/keys；对大
-linear 可能增加数百 MiB 到数 GiB，具体取决于层型。它在 GPU 显存
-实测前不会被默认打开。
+P02 临时保留 `O(2M × lanes)` 的 candidates/errors/scales/keys；
+formal rank 路径预计是几十到低数百 MiB 量级，none 路径可能更高。
+这只是张量形状估算，不是 sampled/CUDA peak；显存实测前不会默认打开。
 
 P01 默认关闭时模型 tensor 数值路径不变，但新增的 provenance 字段会
 改变 checkpoint manifest/raw archive bytes；因此只能称“数值 no-op”，
 不能称整个文件 artifact 逐字节 no-op。开启后还需防范通过 `.data` 或
 底层 storage 绕过 Tensor `_version` 导致 prepared scale stale 的边界，
-独立审查尚未结束。
+生产调用依靠 block 内独占满足该 trusted contract。
+
+组合分支当前完整 CPU 结果为
+`388 passed, 6 skipped, 1 xfailed`；唯一 xfail 是当前 PyTorch 不支持
+private fastpath 的 `torch.compile(fullgraph=True)` capability。三项新
+字段均保持历史默认、追加在原 Config positional ABI 之后，并补齐了
+checkpoint 类型/enum 校验和旧 v1 manifest 的历史默认恢复。
 
 ### 当前暂停点
 

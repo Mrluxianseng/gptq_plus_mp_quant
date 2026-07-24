@@ -126,6 +126,13 @@ Required cases:
 | `group_stress` | W2 G128, act-order, weight clip | A/K/V16 unaware | grouped params, clip search, inner loop, collectives |
 | `per_row` | W2 per-row, act-order, weight clip | A/K/V16 unaware | per-row oracle/control |
 | `group_akv_aware` | W2 G128, act-order, weight clip | A/K/V4 aware, clips 0.9 | aware replay and activation layout |
+| `block_gd_stress` | W2 G128, act-order, weight clip, Block-GD + loss sliding | A/K/V16 unaware | repeated Fisher conversion/cache and refresh closures |
+
+The first three cases retain `grad_lr=0` and isolate weight quantization.
+`block_gd_stress` overrides the common fixture with `grad_lr=3e-4` and
+`loss_slide_window=true`; it is required for P05 because an LR-zero fixture
+does not construct any Fisher refresh and would report a meaningless no-op
+timing.
 
 Correctness cases may run concurrently on disjoint quartets. Timed and Nsight
 runs run alone. The planned A/A group repeat uses the same physical GPUs
@@ -185,7 +192,7 @@ All switches remain proposed until implementation lands.
 | P02 | symmetric clip-search union, `w_clip_search_impl` | X | expensive candidates 625 to at most 50 per row/group | tie order, non-finite fallback | legacy Cartesian |
 | P03 | clip winner `where`, `w_clip_update_impl` | X | remove host-visible `torch.any` guard | NaN/tie masked-write semantics | guarded |
 | P04 | compact grouped weight qparams, `w_group_param_layout` | X | storage `2RC` to `2R ceil(C/G)` | act-order/tail/API mapping | expanded |
-| P05 | layer-resident FP32 Fisher, `fisher_fp32_cache` | X initially | BF16-to-FP32 expansion once per layer | allocator/workspace changes | off |
+| P05 | layer-resident FP32 Fisher, `fisher_fp32_cache` | N | BF16-to-FP32 expansion once per layer | allocator/workspace and longer residency can change later CUDA kernels | off |
 | P06 | trailing-only act-order stitch, `act_order_stitch_impl` | X | remove redundant full-weight gather | boundary or collective asymmetry | full gather |
 | P07 | compact A/K/V qparams, `act_qparam_layout` | N | avoid activation-sized scale/zero tensors | broadcast kernel and allocator drift | expanded |
 | P08 | reuse next-layer FP replay, `reuse_next_fp_outs` | N | regular teacher forwards `2L-2` to `L` | replay/allocator/stale-state drift | off |
@@ -320,3 +327,113 @@ The group-128 A/A comparison on the same physical GPUs passed exactly:
 This baseline establishes E0 and E3 oracles for the first structural
 optimization candidates. It does not yet satisfy the isolated timing
 protocol or E4.
+
+### 2026-07-24 - P01/P02/P05 CPU integration gate
+
+Integration branch:
+
+```text
+codex/perf-integration-20260724
+```
+
+No GPU process was started for this gate. Every test and probe explicitly
+set `CUDA_VISIBLE_DEVICES=''`.
+
+Three independent, default-safe switches are staged:
+
+| Candidate | Explicit opt-in | Default | Current class | CPU decision |
+|---|---|---|---|---|
+| P01 | `--quantizer_inner_fastpath true` | `false` | provisional `X` | retain for CUDA E1--E4 |
+| P02 | `--w_clip_search_impl symmetric_union_exact` | `cartesian_legacy` | provisional `X` | retain for CUDA E1--E4 |
+| P05 | `--fisher_fp32_cache true` | `false` | `N` until allocator-sensitive CUDA gates pass | retain default-off for measurement |
+
+P01 preserves the hot-column arithmetic
+`divide → round → tensor-maxq clamp → multiply → cast`. It moves readiness,
+row-slice, and grouped natural-column validation to the enclosing block and
+keeps per-column object/version/shape checks. Ordinary tensor replacement or
+in-place mutation invalidates the context. Raw `.data`/NumPy/storage writes
+and unsynchronised concurrent mutation are explicitly outside the trusted
+contract; the production loop has exclusive ownership. The private path also
+rejects inference tensors and currently records `torch.compile(fullgraph)`
+as an unsupported capability rather than silently changing behavior.
+
+P02 proves that every symmetric Cartesian candidate
+`max(abs((1-i/grid)xmin), (1-j/grid)xmax)` belongs to the union of the two
+endpoint lists. It evaluates at most `2M` QDQ errors instead of `M²` and
+reconstructs each endpoint's first Cartesian visit so the legacy strict-`<`
+winner and tie order are preserved. Finite float32 symmetric inputs use the
+union; asymmetric, non-finite, unsupported dtype, and nonstandard search
+settings fall back to the historical implementation.
+
+P05 gives `fisher_mse_loss` the same BF16-derived FP32 Fisher values but
+materializes them once per layer. The matrix-multiply and loss expression are
+unchanged. It is nevertheless class `N` until CUDA proves otherwise because
+the longer-lived allocation can alter allocator/workspace choices in later
+GEMM/BMM calls. The integration hardening:
+
+- does not allocate an unused FP32 Fisher on the final KL path;
+- drops the last closure and both Fisher references immediately after the
+  last module refresh, before final replay;
+- performs no allocator flush, synchronization, or cleanup in that release;
+- preserves the historical unused BF16 final-KL allocation when the switch
+  is off, so default orchestration remains unchanged.
+
+Relative to the persisted BF16 tensors, the opt-in residency increase is
+`2H²` bytes for one Fisher and `4H²` with loss sliding. This is +32/+64 MiB
+at `H=4096` and +50/+100 MiB at `H=5120`. The refresh-local conversion
+temporary disappears, so the actual layer peak can move either direction;
+only sampled/CUDA peak measurements may decide the candidate.
+
+#### Provenance and compatibility hardening
+
+All three build switches are appended after the pre-existing Config fields,
+are validated independently, and are recorded in checkpoint weight-build
+provenance. A version-1 checkpoint that predates a field restores the
+historical implementation:
+
+```text
+quantizer_inner_fastpath = false
+w_clip_search_impl       = cartesian_legacy
+fisher_fp32_cache         = false
+```
+
+This prevents a load command from falsely relabeling an old Cartesian
+checkpoint as union-built. Present malformed bool/enum values are rejected
+before any live Config field is changed. New manifests include the three
+fields even when disabled, so archive bytes may differ from older versions;
+exact gates compare canonical model state and separately validate the
+expected provenance delta.
+
+#### CPU evidence
+
+- combined full suite after all integration hardening:
+  `388 passed, 6 skipped, 1 xfailed`;
+- P01 independent adversarial coverage includes 2/3/4/8/15-bit,
+  FP16/BF16/FP32/FP64, NaN/Inf/signed-zero/ties, group tails, act-order,
+  non-diagonal Hessian, rank/none, and mutation-contract probes;
+- P02 independent coverage contributes 98 CPU cases plus one CUDA-gated
+  case and a separate 271-configuration raw-bit proof campaign;
+- four combined P01+P02 RealQLayer cases (per-row, dynamic/static grouped,
+  rank/none, act-order) match the all-legacy output raw bytes;
+- P05 BF16-vs-cached-FP32 Fisher loss, gradient, two-step slide refresh,
+  Adam moments, and updates match raw bytes on CPU;
+- two-rank Gloo P01 probe passes four rank/group/act-order/tail cases;
+- current main versus all-switches-default-off produces the same nine-case
+  aggregate output SHA256:
+  `b1d4d1e3c86c8da1d0cd8c272d962a58c8766ce69839f59d2e7d8d4dbbeb20aa`.
+
+These results are operator/integration CPU evidence, not GPU E1--E4 and not
+a speedup claim. No candidate is enabled by default. Required next gates are:
+
+1. CUDA raw-byte operator coverage, including combined P01+P02 and P05
+   loss/gradient;
+2. same-source A/A followed by tiny decoder and Qwen3-4B one-layer canonical
+   state comparisons;
+3. representative end-to-end group/per-row/AKV-aware checkpoint and metric
+   regression;
+4. isolated warm-up + at least three timings, memory peaks, then Nsight
+   attribution for candidates whose benefit exceeds A/A noise.
+
+The timing harness now includes the dedicated `block_gd_stress` fixture so
+P05 cannot accidentally be benchmarked under the original LR-zero no-op
+case.

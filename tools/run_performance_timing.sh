@@ -52,6 +52,7 @@ Cases:
   group_stress       W2 group-128, A16/K16/V16, unaware
   per_row            W2 per-row, A16/K16/V16, unaware
   group_akv_aware    W2 group-128, A4/K4/V4 clip=0.9, aware
+  block_gd_stress    W2 group-128 with Block-GD + loss sliding enabled
 
 Modes:
   --run               Prepare, run one warm-up, then serial repetitions.
@@ -186,7 +187,7 @@ done
     die "choose --run or --prepare-only"
 }
 case "$CASE_NAME" in
-    group_stress|per_row|group_akv_aware) ;;
+    group_stress|per_row|group_akv_aware|block_gd_stress) ;;
     "") die "--case is required" ;;
     *) die "unknown case: $CASE_NAME" ;;
 esac
@@ -351,6 +352,21 @@ case "$CASE_NAME" in
             --k_clip_ratio 0.9
             --act_quant_aware_gptq true
             --k_cache_quant_aware_gptq true
+        )
+        ;;
+    block_gd_stress)
+        CASE_CONFIG_ARGS=(
+            --w_groupsize 128
+            --a_bits 16
+            --a_clip_ratio 1
+            --v_bits 16
+            --v_clip_ratio 1
+            --k_bits 16
+            --k_clip_ratio 1
+            --act_quant_aware_gptq false
+            --k_cache_quant_aware_gptq false
+            --grad_lr 0.0003
+            --loss_slide_window true
         )
         ;;
 esac
