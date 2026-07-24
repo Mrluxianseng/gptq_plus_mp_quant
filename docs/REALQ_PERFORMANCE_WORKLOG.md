@@ -513,3 +513,103 @@ collective sizes can change CUDA allocator/workspace choices. It must not be
 promoted until E0--E4, including canonical Qwen3-4B checkpoint equality and
 representative end-to-end metrics, pass on the fixed GPU quartet. Any byte
 difference requires repair or reclassification to `N`.
+
+### 2026-07-24 - P01/P02 selected-quartet diagnostic timing
+
+The timing harness was repaired before interpreting any performance number.
+PyTorch 2.6 reports a CUDA UUID without NVML's `GPU-` prefix on this node, so
+the first completed warm-up could not pass the physical-device mapping gate.
+Commit `5c64890` canonicalizes both representations. A later suite completed
+all four GPU runs but saw an unrelated user-created untracked output file
+between the before/after source snapshots. Commit `2af6ac8` keeps commit,
+tracked/staged diff, harness hash, model, cache, and physical GPU gates strict
+while retaining untracked status as audit-only evidence.
+
+The first fully passing same-source family used commit
+`2af6ac8fa2d8586bbc4e116e838158f0d29f368d`, physical GPUs 4--7, one excluded
+warm-up, and three measured repetitions. The primary metric is the maximum
+rank elapsed time inside the synchronized
+`quantize_one_layer(layer=0)` boundary. Every arm used the same
+`group_stress` fixture and differed only in the declared candidate fields:
+
+| Arm | Measured critical seconds | Median (s) | Range / median | Versus legacy median | Sampled per-run max-memory median (MiB) |
+|---|---|---:|---:|---:|---:|
+| legacy | 11.948799, 11.319186, 10.695197 | 11.319186 | 11.08% | control | 19,362 |
+| P01 only | 7.587516, 7.217533, 7.410053 | 7.410053 | 4.99% | -34.54%, 1.53× | 19,388 |
+| P02 only | 7.694021, 9.708484, 6.595919 | 7.694021 | 40.45% | -32.03%, 1.47× | 19,438 |
+| P01 + P02 | 5.012874, 3.810617, 3.293130 | 3.810617 | 45.13% | -66.33%, 2.97× | 19,438 |
+
+For all 16 launches:
+
+- the requested process and every per-run validator returned zero;
+- the commit and tracked/staged source state were unchanged;
+- the copied static/token caches were unchanged and every run hit them;
+- rank-to-physical-GPU UUID order was exactly 4,5,6,7;
+- the resolved Config diff was exactly empty, P01, P02, or P01+P02 as
+  declared; evaluation and checkpoint saving were disabled.
+
+These are **concurrent diagnostic timings, not an isolated speedup claim**.
+The user was running changing workloads on physical GPUs 0--3 throughout the
+family (first an `nsamples=2048` job and later an `nsamples=256` Block-GD
+job). Although the selected quartet was exclusive, node CPU, storage, and
+interconnect load were not stationary. P02 and the combined arm have
+unacceptably high dispersion. Their large effect establishes that both
+candidates merit continued profiling, but it does not establish a publishable
+speedup magnitude or justify changing defaults. The full-process wall medians
+are also ineligible because model load, rotation, and setup dominate that
+scope.
+
+Immutable evidence roots:
+
+```text
+/minimax-avatar-new/zhangqian/realq/experiment_data/perf_stage1_timing_zhangqian/j-7x9o0je4pk_20260724T140656Z_2af6ac8fa2d8_group_stress_legacy
+/minimax-avatar-new/zhangqian/realq/experiment_data/perf_stage1_timing_zhangqian/j-7x9o0je4pk_20260724T141421Z_2af6ac8fa2d8_group_stress_p01
+/minimax-avatar-new/zhangqian/realq/experiment_data/perf_stage1_timing_zhangqian/j-7x9o0je4pk_20260724T142145Z_2af6ac8fa2d8_group_stress_p02
+/minimax-avatar-new/zhangqian/realq/experiment_data/perf_stage1_timing_zhangqian/j-7x9o0je4pk_20260724T142913Z_2af6ac8fa2d8_group_stress_p01_p02
+```
+
+### 2026-07-24 - P03/P04/P06 integration and CUDA exactness
+
+P03, P04, and P06 were integrated with P01, P02, and P05 behind independent
+default-safe switches. The original 79 Config fields retain their exact order;
+the three new fields are appended as
+`act_order_stitch_impl`, `w_clip_update_impl`, and
+`w_group_param_layout`. Historical defaults remain
+`full_weight_legacy`, `guarded`, and `expanded`.
+
+Independent integration review and probes established:
+
+- the nine-case cross-revision default aggregate remains
+  `b1d4d1e3c86c8da1d0cd8c272d962a58c8766ce69839f59d2e7d8d4dbbeb20aa`;
+- world-1 CUDA covers 80 `none`/`rank` combinations;
+- DP2 and DP4 NCCL each cover per-row plus grouped short-tail
+  P01/P02/P03/P04 combinations;
+- expanded qparams, quantized integers, stitched Fisher-MSE inputs, updates,
+  Adam `exp_avg`/`exp_avg_sq`, final weights, and cross-rank replicas are
+  raw-byte equal to the legacy arms;
+- the P04 toy grouped-qparam collective width changes from 9 to 3 while its
+  collective count remains 7;
+- the integrated P06 four-card NCCL probe reproduces the prior raw-byte hashes
+  and reduces refresh collective counts from 7 to 5 or 4 to 3 as expected;
+- existing P02, aware rotation/cache, and evaluator CUDA tests pass
+  `114/114` on physical GPU 4;
+- after the checkpoint hardening below, the complete CPU suite passes
+  `586 passed, 6 skipped, 1 xfailed`.
+
+The CUDA probe's sampled peaks are approximately 32.0 MiB for world 1 and
+64.0 MiB per card for DP2/DP4. These are small-fixture correctness peaks, not
+Qwen3 allocator measurements.
+
+The review also found a pre-existing global checkpoint atomicity defect:
+malformed `artifact_identity.rotation_seed` could raise only after runtime and
+weight-provenance fields had already been written to the target Config.
+Commit `78f3093` centralizes artifact-manifest validation, accepts only a true
+integer seed (not bool/float/string), and validates runtime, P01--P06
+provenance, and artifact identity before any mutation. Direct-apply malicious
+payloads now leave a complete Config snapshot unchanged.
+
+All six optimization switches remain default-safe. CUDA operator exactness is
+necessary but not sufficient: the next gates are same-HEAD canonical
+Qwen3-4B checkpoint A/B, Block-GD loss/optimizer trace equality, isolated
+same-HEAD A/A+A/B timing, allocator peaks, Nsight attribution, and
+representative full-model Q4/Q8 evaluation.

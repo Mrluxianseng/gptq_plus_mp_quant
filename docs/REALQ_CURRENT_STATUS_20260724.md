@@ -1,6 +1,6 @@
 # REAL-Q 阶段结论与当前状态
 
-更新时间：2026-07-24 21:35 CST
+更新时间：2026-07-24 22:52 CST
 
 ## 一页结论
 
@@ -31,9 +31,11 @@
    UltraChat 2k。8 个 payload 均固定 revision 和 SHA256。论文十项
    zero-shot task 的完整数据尚未做离线镜像；打开完整 `lm_eval` 时仍
    可能需要这些 task 的本地 cache。
-7. 性能优化目前完成了正确性基线和同步层计时探针，还没有给任何优化
-   候选宣布端到端加速。用户当前占用 GPU 0–3，因此隔离 GPU 计时暂停；
-   此期间只进行 CPU/static 审查，不会碰用户进程。
+7. 性能优化已完成 P01--P06 的默认安全接线、CPU/Gloo 组合门禁和
+   P03/P04/P06 CUDA/NCCL 逐字节门禁。P01/P02 在 4--7 卡的并发诊断
+   layer-0 计时中，单开关中位数分别缩短 34.54%/32.03%，组合缩短
+   66.33%；但 P02/组合离散度达 40.45%/45.13%，且 0--3 上有用户
+   workload，所以这些不是隔离加速结论。全部开关仍保持 legacy 默认。
 
 ## 当前代码与证据边界
 
@@ -41,12 +43,12 @@
 |---|---|
 | 主 checkout | `/minimax-avatar-new/zhangqian/realq/gptq_plus` |
 | 当前分支 | `zq` |
-| 本报告前 HEAD | `6f462b2` |
+| 本报告前 HEAD | `78f3093` |
 | 当前 Canoe job | `j-7x9o0je4pk` |
 | 任务名 | `zhangqian_debugging_0724_1301` |
 | 队列 / 集群 | `minimax-avatar-h800new` / `pa-cne02-prod-01` |
 | GPU | 8 × NVIDIA L20C，每卡 183,359 MiB |
-| 用户文件保护 | `main.tex` 和 `output/` 保持未跟踪，未被加入提交 |
+| 用户文件保护 | `main.tex`、`output/` 及其他用户未跟踪目录/文档均未被加入提交 |
 
 结论分为三种证据等级：
 
@@ -198,6 +200,50 @@ Qwen3-4B 每 rank 16 的 Stage-0 probe 达到 182,624 MiB 后又申请
 
 五个正式 artifact 均通过主 validator；独立 validator 完成 782 个检查、
 0 failure，并重新计算约 9.4 GB 关键 cache 的 SHA256。
+
+## 性能优化当前证据
+
+六个候选都具有独立开关，且默认值保持历史路径：
+
+| 候选 | 开关 / opt-in | 默认 | 当前证据 | 当前结论 |
+|---|---|---|---|---|
+| P01 | `quantizer_inner_fastpath=true` | `false` | CPU/Gloo/CUDA raw-byte；并发诊断 -34.54% | 保留，待隔离复验 |
+| P02 | `w_clip_search_impl=symmetric_union_exact` | `cartesian_legacy` | 625→≤50 候选的数学证明、CUDA raw-byte；诊断 -32.03% | 保留，待隔离复验 |
+| P03 | `w_clip_update_impl=where_out` | `guarded` | CPU/CUDA row/group/short-tail raw-byte | 默认关闭，尚无正式计时 |
+| P04 | `w_group_param_layout=compact` | `expanded` | CPU/CUDA/NCCL raw-byte；toy gather width 9→3 | 默认关闭，待 Qwen3 显存/通信实测 |
+| P05 | `fisher_fp32_cache=true` | `false` | CPU loss/gradient/Adam raw-byte | `N` 类，待 CUDA allocator/Block-GD |
+| P06 | `act_order_stitch_impl=prefix_q_trailing_w_exact` | `full_weight_legacy` | DP2/DP4 raw-byte；refresh collectives 7→5 或 4→3 | 默认关闭，待真实计时 |
+
+同一 `2af6ac8` 上的 4--7 卡 layer-0 诊断计时为：
+
+| Arm | 三次关键段秒数 | 中位数 | range/median | 相对 legacy |
+|---|---|---:|---:|---:|
+| legacy | 11.9488 / 11.3192 / 10.6952 | 11.3192 | 11.08% | — |
+| P01 | 7.5875 / 7.2175 / 7.4101 | 7.4101 | 4.99% | -34.54%，1.53× |
+| P02 | 7.6940 / 9.7085 / 6.5959 | 7.6940 | 40.45% | -32.03%，1.47× |
+| P01+P02 | 5.0129 / 3.8106 / 3.2931 | 3.8106 | 45.13% | -66.33%，2.97× |
+
+16 个 launch 的 commit、tracked/staged diff、cache、GPU UUID、resolved
+Config diff 和每次运行 validator 均通过。由于 0--3 同时运行且 workload
+中途变化，P02/组合的离散度不可接受；表中数字只能说明优化信号很大，
+不能作为论文用时表或稳定加速结论。完整 artifact 路径和逐次 rank/显存
+数据见 `docs/REALQ_PERFORMANCE_WORKLOG.md`。
+
+P03/P04/P06 集成后，完整 CPU suite 为
+`586 passed, 6 skipped, 1 xfailed`；P02、A/K/V-aware rotation/cache 和
+evaluator 的现有 CUDA suite 为 `114 passed`。world1、DP2/NCCL、DP4/NCCL
+组合 probe 的 expanded qparams、量化整数、Fisher-MSE 输入、update、Adam
+moments 和最终权重全部逐字节一致。
+
+独立复审还发现并修复了一个早于本轮优化的 checkpoint 原子性问题：
+非法 `artifact_identity.rotation_seed` 现在会与 P01--P06 provenance
+一样，在任何 Config 字段写入前被严格拒绝；恶意 direct-apply payload
+已验证完整 Config 快照零变化。
+
+下一门槛是同一最终 HEAD 上的 Qwen3-4B canonical checkpoint A/B、
+Block-GD trace、节点空闲 A/A+A/B、真实 allocator peak 和 Nsight；通过
+前不会把任何优化改成默认，也不会拿上述 layer-0 数据直接对比论文的
+全模型用时表。
 
 ## Column-block backward loss / 学习率诊断
 
