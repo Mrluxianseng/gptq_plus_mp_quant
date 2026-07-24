@@ -601,8 +601,11 @@ checkpoint，并且节点有并发负载，明确不能用于加速结论。下�
 2. 独立审查否定了第一版小型 P03/P04 CUDA probe 的 promotion
    充分性：它没有覆盖 `num_groups=4` 的真实 Hessian
    reduce-scatter/multi-group BMM，且证据 provenance 不够严格。
-   旧结果降级为预备证据；强化后的 fail-closed gate 正在物理 4–7
-   上重跑，完成前不据此提升默认值或宣称 CUDA promotion。
+   旧结果已降级并标记为 superseded；强化后的 fail-closed gate 已在
+   物理 4–7 完成。world1、真实 `NUM_GROUPS=2` DP2、真实
+   `NUM_GROUPS=4` DP4 和 P06 world4 全部逐 bit通过，分支与 collective
+   也由 instrumentation 强制核验。完整证据见
+   `docs/REALQ_P03_P04_CUDA_GATE_20260724.md`。
 
 平台健康证据也已补齐。Canoe 的 `job_hang=true` 来自调试入口有意执行
 七天 `sleep`，不是量化进程挂起。13:04--23:22 CST 内唯一节点持续
@@ -612,3 +615,9 @@ checkpoint，并且节点有并发负载，明确不能用于加速结论。下�
 因此旧性能数字的主要已知污染仍是同节点并发，而不是过温、XID、OOM
 或 CPU quota；它们继续只算诊断计时。MetaGod 硬件/维修状态因当前身份
 无读权限，明确保留为未验证层。
+
+强化 gate 合入主分支后，316 项 targeted CPU 测试通过；权威
+`pytest tests` 全量结果为 `608 passed, 6 skipped, 1 xfailed`。
+根目录裸 `pytest` 会额外收集用户未跟踪的 `YAQA/qtip-kernels`，并因其
+独立扩展未安装而 collection error；该目录未被修改，也不计作 REAL-Q
+回归失败。

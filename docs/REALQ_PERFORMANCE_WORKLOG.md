@@ -673,9 +673,24 @@ The replacement gate is fail-closed: DP2 uses two groups and DP4 uses four,
 constructs the Hessian through the real add-batch/reduce-scatter/finalize
 path, explicitly verifies all relevant branch counters and collectives,
 rejects `python -O`, checks cross-rank updates and Adam moments, and records
-commit/probe/runner/command/log/GPU-mapping hashes.  Its CUDA rerun on physical
-GPUs 4--7 was in progress when this entry was written.  No P03/P04 default
-promotion or speed claim may rely on the superseded artifacts.
+commit/probe/runner/command/log/GPU-mapping hashes.
+
+The hardened rerun is complete.  World 1, DP2, and DP4 all passed on physical
+GPUs 4--7; DP2/DP4 exercised the real `NUM_GROUPS=2/4` sharded-Hessian and
+rank multi-group-BMM paths.  P06's independent world-four gate also passed
+all three cases, reducing tested gather counts from `7 -> 5`, `7 -> 5`, and
+`4 -> 3`; its maximum small-fixture allocated peak was 64.053 MiB per rank.
+All mathematical tensors in the documented coverage were raw-byte exact.
+The complete immutable hashes, dispatch/collective contracts, limitations,
+and superseded-artifact pointers are in
+`docs/REALQ_P03_P04_CUDA_GATE_20260724.md`.
+
+After integrating the gate tooling, the main checkout passed 316 targeted
+CPU cases and the complete authoritative `tests/` suite:
+`608 passed, 6 skipped, 1 xfailed`.  A bare repository-root `pytest` also
+discovers the user's untracked `YAQA/qtip-kernels` tests and fails collection
+because their separate `qtip_kernels` extension is not installed; that
+untracked tree was neither changed nor treated as a REAL-Q regression.
 
 ### 2026-07-24 - Canoe and node-health evidence for timing validity
 
