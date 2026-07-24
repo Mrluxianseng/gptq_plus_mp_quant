@@ -17,6 +17,7 @@ def _quantizer(
     bits: int = 4,
     mse: bool = False,
     w_clip_search_impl: str = "cartesian_legacy",
+    w_clip_update_impl: str = "guarded",
     w_group_param_layout: str = "expanded",
 ):
     quantizer = WeightQuantizer()
@@ -29,6 +30,7 @@ def _quantizer(
         maxshrink=0.5,
         weight_groupsize=groupsize,
         w_clip_search_impl=w_clip_search_impl,
+        w_clip_update_impl=w_clip_update_impl,
         w_group_param_layout=w_group_param_layout,
     )
     return quantizer
@@ -139,6 +141,7 @@ def _run_realq(
     quantizer_inner_fastpath: bool = False,
     w_clip: bool = False,
     w_clip_search_impl: str = "cartesian_legacy",
+    w_clip_update_impl: str = "guarded",
     w_group_param_layout: str = "expanded",
 ) -> torch.Tensor:
     linear = nn.Linear(weight.shape[1], weight.shape[0], bias=False)
@@ -147,6 +150,7 @@ def _run_realq(
         groupsize=groupsize,
         mse=w_clip,
         w_clip_search_impl=w_clip_search_impl,
+        w_clip_update_impl=w_clip_update_impl,
         w_group_param_layout=w_group_param_layout,
     )
     realq = RealQLayer(
@@ -286,13 +290,15 @@ def test_clip_union_and_inner_fastpath_compose_raw_byte_exactly(
     "w_clip_search_impl",
     ["cartesian_legacy", "symmetric_union_exact"],
 )
+@pytest.mark.parametrize("w_clip_update_impl", ["guarded", "where_out"])
 @pytest.mark.parametrize(
     "num_groups,group_parallel_quant",
     [(1, "rank"), (2, "rank"), (2, "none")],
 )
-def test_compact_layout_composes_with_p01_p02_and_rank_paths_raw_byte_exactly(
+def test_compact_layout_composes_with_p01_p02_p03_and_rank_paths_raw_bytes(
     quantizer_inner_fastpath,
     w_clip_search_impl,
+    w_clip_update_impl,
     num_groups,
     group_parallel_quant,
 ):
@@ -306,6 +312,7 @@ def test_compact_layout_composes_with_p01_p02_and_rank_paths_raw_byte_exactly(
         quantizer_inner_fastpath=quantizer_inner_fastpath,
         w_clip=True,
         w_clip_search_impl=w_clip_search_impl,
+        w_clip_update_impl=w_clip_update_impl,
     )
     expanded = _run_realq(
         weight,
@@ -323,7 +330,7 @@ def test_compact_layout_composes_with_p01_p02_and_rank_paths_raw_byte_exactly(
     )
 
 
-def test_all_three_weight_optimizations_compose_against_legacy_raw_bytes():
+def test_all_four_weight_optimizations_compose_against_legacy_raw_bytes():
     weight = _structured_weight(rows=4, columns=129)
     baseline = _run_realq(
         weight,
@@ -347,6 +354,7 @@ def test_all_three_weight_optimizations_compose_against_legacy_raw_bytes():
         quantizer_inner_fastpath=True,
         w_clip=True,
         w_clip_search_impl="symmetric_union_exact",
+        w_clip_update_impl="where_out",
         w_group_param_layout="compact",
     )
     assert torch.equal(

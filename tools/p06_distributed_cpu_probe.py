@@ -2,15 +2,17 @@
 
 CPU/Gloo is the default and requires CUDA to be hidden:
 
-    CUDA_VISIBLE_DEVICES='' torchrun --standalone --nproc_per_node=2 \
+    CUDA_VISIBLE_DEVICES='' PYTHONPATH=. \
+      torchrun --standalone --nproc_per_node=2 \
         tools/p06_distributed_cpu_probe.py
-    CUDA_VISIBLE_DEVICES='' torchrun --standalone --nproc_per_node=4 \
+    CUDA_VISIBLE_DEVICES='' PYTHONPATH=. \
+      torchrun --standalone --nproc_per_node=4 \
         tools/p06_distributed_cpu_probe.py
 
 CUDA/NCCL is opt-in. The caller must set ``CUBLAS_WORKSPACE_CONFIG`` before
 Python imports torch:
 
-    CUBLAS_WORKSPACE_CONFIG=:4096:8 REALQ_P06_PROBE_DEVICE=cuda \
+    CUBLAS_WORKSPACE_CONFIG=:4096:8 REALQ_P06_PROBE_DEVICE=cuda PYTHONPATH=. \
       torchrun --standalone --nproc_per_node=4 \
         tools/p06_distributed_cpu_probe.py
 
