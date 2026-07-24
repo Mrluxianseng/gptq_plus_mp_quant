@@ -5,7 +5,10 @@ import torch
 
 from realq.config import Config, parse_cli
 from realq.refresh.fisher_loss import fisher_mse_loss
-from realq.runner.layer_loop import _stage_fisher_for_refresh
+from realq.runner.layer_loop import (
+    _should_stage_fisher_for_refresh,
+    _stage_fisher_for_refresh,
+)
 
 
 def _raw_bytes(tensor: torch.Tensor) -> torch.Tensor:
@@ -54,6 +57,30 @@ def test_opt_in_staging_matches_per_call_conversion_and_is_reusable():
     # allocating and expanding BF16 again.
     reused = staged.to(device=staged.device, dtype=torch.float32)
     assert reused is staged
+
+
+def test_opt_in_skips_unused_final_kl_fisher_without_changing_default_path():
+    assert not _should_stage_fisher_for_refresh(
+        block_gd_enabled=False,
+        use_kl_refresh=False,
+        fp32_cache=False,
+    )
+    assert _should_stage_fisher_for_refresh(
+        block_gd_enabled=True,
+        use_kl_refresh=False,
+        fp32_cache=True,
+    )
+    # Default-off deliberately retains the historical unused BF16 allocation.
+    assert _should_stage_fisher_for_refresh(
+        block_gd_enabled=True,
+        use_kl_refresh=True,
+        fp32_cache=False,
+    )
+    assert not _should_stage_fisher_for_refresh(
+        block_gd_enabled=True,
+        use_kl_refresh=True,
+        fp32_cache=True,
+    )
 
 
 def test_opt_in_staging_preserves_fisher_loss_and_gradient_raw_bytes():

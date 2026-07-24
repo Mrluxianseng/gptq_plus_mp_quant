@@ -11,7 +11,13 @@ from utils import dist_utils
 from utils.quant_utils import WeightQuantizer
 
 
-def _quantizer(*, groupsize: int, bits: int = 4, mse: bool = False):
+def _quantizer(
+    *,
+    groupsize: int,
+    bits: int = 4,
+    mse: bool = False,
+    w_clip_search_impl: str = "cartesian_legacy",
+):
     quantizer = WeightQuantizer()
     quantizer.configure(
         bits=bits,
@@ -21,6 +27,7 @@ def _quantizer(*, groupsize: int, bits: int = 4, mse: bool = False):
         grid=4,
         maxshrink=0.5,
         weight_groupsize=groupsize,
+        w_clip_search_impl=w_clip_search_impl,
     )
     return quantizer
 
@@ -128,10 +135,16 @@ def _run_realq(
     hessian: torch.Tensor | None = None,
     blocksize: int = 128,
     quantizer_inner_fastpath: bool = False,
+    w_clip: bool = False,
+    w_clip_search_impl: str = "cartesian_legacy",
 ) -> torch.Tensor:
     linear = nn.Linear(weight.shape[1], weight.shape[0], bias=False)
     linear.weight.data.copy_(weight)
-    quantizer = _quantizer(groupsize=groupsize)
+    quantizer = _quantizer(
+        groupsize=groupsize,
+        mse=w_clip,
+        w_clip_search_impl=w_clip_search_impl,
+    )
     realq = RealQLayer(
         linear=linear,
         saliency=torch.ones(1, 1, num_groups),
@@ -151,7 +164,7 @@ def _run_realq(
         blocksize=blocksize,
         percdamp=0.01,
         act_order=act_order,
-        w_clip=False,
+        w_clip=w_clip,
         group_parallel_quant=group_parallel_quant,
         quantizer_inner_fastpath=quantizer_inner_fastpath,
     )
@@ -217,6 +230,49 @@ def test_quantizer_inner_fastpath_is_raw_byte_identical_end_to_end(
     )
     assert torch.equal(
         fast.contiguous().view(torch.uint8),
+        baseline.contiguous().view(torch.uint8),
+    )
+
+
+@pytest.mark.parametrize(
+    "groupsize,num_groups,group_parallel_quant,act_order,columns",
+    [
+        (-1, 1, "rank", True, 129),
+        (128, 1, "rank", False, 129),
+        (128, 2, "rank", True, 129),
+        (128, 2, "none", True, 129),
+    ],
+)
+def test_clip_union_and_inner_fastpath_compose_raw_byte_exactly(
+    groupsize,
+    num_groups,
+    group_parallel_quant,
+    act_order,
+    columns,
+):
+    weight = _structured_weight(rows=4, columns=columns)
+    baseline = _run_realq(
+        weight,
+        groupsize=groupsize,
+        num_groups=num_groups,
+        group_parallel_quant=group_parallel_quant,
+        act_order=act_order,
+        blocksize=min(128, columns),
+        w_clip=True,
+    )
+    optimized = _run_realq(
+        weight,
+        groupsize=groupsize,
+        num_groups=num_groups,
+        group_parallel_quant=group_parallel_quant,
+        act_order=act_order,
+        blocksize=min(128, columns),
+        quantizer_inner_fastpath=True,
+        w_clip=True,
+        w_clip_search_impl="symmetric_union_exact",
+    )
+    assert torch.equal(
+        optimized.contiguous().view(torch.uint8),
         baseline.contiguous().view(torch.uint8),
     )
 

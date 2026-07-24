@@ -666,6 +666,35 @@ def test_symmetric_union_covers_exact_pair_set_and_first_tie_order():
         assert represented == exhaustive
 
 
+def test_production_symmetric_union_first_keys_match_legacy_pair_order():
+    xmin = torch.tensor([-10.0, -12.0, -1.0, -0.0])
+    xmax = torch.tensor([12.0, 10.0, 1.0, 0.0])
+    grid, count = 8, 4
+    candidates, keys = (
+        quant_utils._symmetric_union_candidates_and_first_keys(
+            xmin,
+            xmax,
+            grid=grid,
+            candidate_count=count,
+        )
+    )
+    negative = candidates[:count]
+    positive = candidates[count:]
+    for lane in range(xmin.numel()):
+        exhaustive: dict[float, int] = {}
+        for i, j in itertools.product(range(count), repeat=2):
+            value = float(torch.maximum(negative[i, lane], positive[j, lane]))
+            exhaustive.setdefault(value, i * count + j)
+
+        represented: dict[float, int] = {}
+        for candidate in range(candidates.shape[0]):
+            key = int(keys[candidate, lane])
+            if key < count * count:
+                value = float(candidates[candidate, lane])
+                represented[value] = min(represented.get(value, key), key)
+        assert represented == exhaustive
+
+
 @pytest.mark.parametrize("groupsize,columns", [(-1, 9), (128, 129)])
 @pytest.mark.parametrize(
     "nonfinite",

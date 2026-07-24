@@ -76,6 +76,22 @@ def _stage_fisher_for_refresh(
     return fisher.to(dev)
 
 
+def _should_stage_fisher_for_refresh(
+    *,
+    block_gd_enabled: bool,
+    use_kl_refresh: bool,
+    fp32_cache: bool,
+) -> bool:
+    """Whether layer entry should materialize its Fisher tensor.
+
+    KL does not consume Fisher. The legacy/default-off branch nevertheless
+    keeps its historical BF16 allocation for exact orchestration compatibility;
+    only the opt-in cache removes that otherwise wasted allocation.
+    """
+
+    return block_gd_enabled and not (fp32_cache and use_kl_refresh)
+
+
 def _utc_now_iso() -> str:
     """Return an unambiguous UTC timestamp for performance artifacts."""
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -470,13 +486,22 @@ def quantize_one_layer(
         # propagated through later refreshes). Hoisting the alloc here keeps the
         # GPU memory layout deterministic across all per-module quantize calls.
         with nvtx.nvtx_range("layer.fisher_to_gpu"):
+            # Keep the default-off path byte-for-byte faithful, including its
+            # historical (unused) BF16 allocation on a final KL layer. The
+            # opt-in FP32 cache may safely omit that allocation because the KL
+            # closure never reads Fisher.
+            stage_fisher = _should_stage_fisher_for_refresh(
+                block_gd_enabled=block_gd_enabled,
+                use_kl_refresh=use_kl_refresh,
+                fp32_cache=cfg.fisher_fp32_cache,
+            )
             fisher_dev = (
                 _stage_fisher_for_refresh(
                     static.fisher[layer_idx],
                     dev,
                     fp32_cache=cfg.fisher_fp32_cache,
                 )
-                if block_gd_enabled
+                if stage_fisher
                 else None
             )
             # next-layer fisher for slide_window. Hoisted to layer entry so
@@ -608,6 +633,17 @@ def quantize_one_layer(
             for p in layer.parameters():
                 p.requires_grad_(False)
                 p.grad = None
+        if cfg.fisher_fp32_cache:
+            # The final loop locals otherwise retain the last refresh closure,
+            # which in turn retains both FP32 Fisher matrices through the
+            # final replay and teardown. Drop every direct/closure reference
+            # once the last module refresh has completed. Do not empty the
+            # allocator cache or synchronize: later work may reuse the freed
+            # blocks without changing the mathematical operation sequence.
+            grad_refresh_fn = None
+            ctx = None
+            fisher_dev = None
+            next_fisher_dev = None
 
         # Final forward → produces input for next layer (all weights quantised).
         # Legacy GPTQ+ replays one calibration sample at a time here.  Keeping
