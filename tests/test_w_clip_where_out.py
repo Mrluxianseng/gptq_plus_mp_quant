@@ -81,6 +81,49 @@ def _assert_observers_raw_equal(
     _assert_raw_equal(actual_scale, guarded_scale)
 
 
+@pytest.mark.parametrize("groupsize", [-1, 4])
+def test_implicit_default_update_matches_explicit_guarded_raw(groupsize):
+    """Keep the repository-local half of the cross-revision default gate.
+
+    The actual parent/candidate comparison is intentionally performed with
+    ``tools/p01_cross_revision_probe.py`` in two checkouts: a fixed hash in a
+    unit test would be unnecessarily tied to the PyTorch build and CPU math
+    libraries.  This test makes any local change from the public implicit
+    default to the explicit historical implementation immediately visible.
+    """
+
+    weight = torch.randn(
+        4, 10, generator=torch.Generator().manual_seed(20260727)
+    )
+    implicit = WeightQuantizer()
+    implicit.configure(
+        bits=4,
+        perchannel=True,
+        sym=True,
+        mse=True,
+        norm=2.4,
+        grid=8,
+        maxshrink=0.5,
+        weight_groupsize=groupsize,
+    )
+    explicit = _quantizer(
+        update_impl="guarded",
+        groupsize=groupsize,
+        perchannel=True,
+        sym=True,
+    )
+
+    assert implicit.w_clip_update_impl == "guarded"
+    implicit.find_params(weight.clone())
+    explicit.find_params(weight.clone())
+    _assert_raw_equal(implicit.scale, explicit.scale)
+    _assert_raw_equal(implicit.zero, explicit.zero)
+    for actual, expected in zip(
+        implicit.fake_quantize(weight), explicit.fake_quantize(weight)
+    ):
+        _assert_raw_equal(actual, expected)
+
+
 @pytest.mark.parametrize(
     "groupsize,perchannel,sym,columns",
     [
@@ -290,6 +333,47 @@ def test_symmetric_union_asymmetric_fallback_composes_with_where_out(
     assert out_calls > 0
 
 
+@pytest.mark.parametrize(
+    "groupsize,cartesian_batches",
+    [(-1, 1), (4, 2)],
+)
+def test_symmetric_union_nonfinite_fallback_uses_where_out_raw(
+    groupsize,
+    cartesian_batches,
+    monkeypatch,
+):
+    # Group size four gives two vectorized batches: two complete groups and a
+    # short two-column tail.  NaN/Inf make P02 reject its finite-only union and
+    # must hand the exact Cartesian selection back to P03.
+    weight = torch.tensor(
+        [
+            [float("nan"), -0.0, 1.0, -2.0, 3.0, -4.0, 5.0, -6.0, 0.0, 2.0],
+            [float("inf"), 0.0, -1.0, 2.0, -3.0, 4.0, -5.0, 6.0, -0.0, -2.0],
+        ],
+        dtype=torch.float32,
+    )
+    out_calls = 0
+    original_where = torch.where
+
+    def counted_where(*args, **kwargs):
+        nonlocal out_calls
+        if kwargs.get("out") is not None:
+            out_calls += 1
+        return original_where(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "where", counted_where)
+    _assert_observers_raw_equal(
+        weight,
+        groupsize=groupsize,
+        perchannel=True,
+        sym=True,
+        search_impl="symmetric_union_exact",
+    )
+
+    candidate_count = int(8 * 0.5)
+    assert out_calls == 3 * candidate_count**2 * cartesian_batches
+
+
 def _realq_result(
     weight: torch.Tensor,
     *,
@@ -386,3 +470,71 @@ def test_dynamic_group_quantizer_propagates_where_out(monkeypatch):
     )
     assert configured_updates
     assert configured_updates == ["where_out"] * len(configured_updates)
+
+
+def _dynamic_realq_result(
+    weight: torch.Tensor,
+    hessian: torch.Tensor,
+    *,
+    update_impl: str,
+    quantizer_inner_fastpath: bool,
+    group_parallel_quant: str,
+) -> torch.Tensor:
+    linear = nn.Linear(weight.shape[1], weight.shape[0], bias=False)
+    linear.weight.data.copy_(weight)
+    quantizer = _quantizer(
+        update_impl=update_impl,
+        groupsize=4,
+        perchannel=True,
+        sym=True,
+    )
+    realq = RealQLayer(
+        linear=linear,
+        saliency=torch.ones(1, 1, 1),
+        quantizer=quantizer,
+        num_groups=1,
+        dev=torch.device("cpu"),
+        group_parallel_quant=group_parallel_quant,
+    )
+    realq.H = hessian.unsqueeze(0)
+    realq.act_square = torch.arange(weight.shape[1], dtype=torch.float32)
+    realq._finalized = True
+    realq.quantize(
+        blocksize=4,
+        percdamp=0.01,
+        act_order=False,
+        w_clip=True,
+        group_parallel_quant=group_parallel_quant,
+        quantizer_inner_fastpath=quantizer_inner_fastpath,
+    )
+    return linear.weight.detach().clone()
+
+
+@pytest.mark.parametrize("group_parallel_quant", ["none", "rank"])
+@pytest.mark.parametrize("quantizer_inner_fastpath", [False, True])
+def test_dynamic_group_where_out_matches_guarded_p01_matrix_raw(
+    group_parallel_quant,
+    quantizer_inner_fastpath,
+):
+    generator = torch.Generator().manual_seed(20260728)
+    weight = torch.randn(4, 9, generator=generator)
+    weight[:, ::2].mul_(0.125)
+    weight[:, 1::3].mul_(4.0)
+    factor = torch.randn(9, 9, generator=generator)
+    hessian = factor.matmul(factor.T).add_(torch.eye(9))
+
+    guarded = _dynamic_realq_result(
+        weight,
+        hessian,
+        update_impl="guarded",
+        quantizer_inner_fastpath=quantizer_inner_fastpath,
+        group_parallel_quant=group_parallel_quant,
+    )
+    where_out = _dynamic_realq_result(
+        weight,
+        hessian,
+        update_impl="where_out",
+        quantizer_inner_fastpath=quantizer_inner_fastpath,
+        group_parallel_quant=group_parallel_quant,
+    )
+    _assert_raw_equal(where_out, guarded)
