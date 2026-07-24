@@ -137,6 +137,7 @@ def build_runtime_manifest(
         for name in _WEIGHT_PROVENANCE_FIELDS
         if hasattr(config, name)
     }
+    _validate_weight_provenance(provenance)
     manifest = {
         "runtime_quantization": runtime,
         "weight_quantization": provenance,
@@ -179,6 +180,22 @@ def _validate_runtime_manifest(runtime: Mapping[str, Any]) -> None:
             raise ValueError(
                 f"Checkpoint field {prefix}_clip_ratio must be in (0, 1]."
             )
+
+
+def _validate_weight_provenance(provenance: Mapping[str, Any]) -> None:
+    """Validate typed fields that may be restored onto a live Config."""
+
+    if not isinstance(provenance, Mapping):
+        raise ValueError(
+            "Checkpoint weight-quantization provenance must be a mapping."
+        )
+    if (
+        "quantizer_inner_fastpath" in provenance
+        and type(provenance["quantizer_inner_fastpath"]) is not bool
+    ):
+        raise ValueError(
+            "Checkpoint field 'quantizer_inner_fastpath' must be bool."
+        )
 
 
 def save_quantized_checkpoint(
@@ -297,8 +314,7 @@ def load_quantized_checkpoint(
         raise ValueError("Quantized checkpoint runtime manifest must be a mapping.")
     _validate_runtime_manifest(runtime)
     weight_quantization = payload.get("weight_quantization", {})
-    if not isinstance(weight_quantization, Mapping):
-        raise ValueError("Checkpoint weight-quantization provenance must be a mapping.")
+    _validate_weight_provenance(weight_quantization)
     artifact_manifest = payload.get("artifact_identity")
     if not isinstance(artifact_manifest, Mapping):
         raise ValueError("Checkpoint artifact-identity manifest must be a mapping.")
@@ -336,6 +352,8 @@ def apply_runtime_manifest(config: Any, checkpoint: Mapping[str, Any]) -> bool:
     if runtime is None:
         return False
     _validate_runtime_manifest(runtime)
+    provenance = checkpoint.get("weight_quantization", {})
+    _validate_weight_provenance(provenance)
     for name in _RUNTIME_FIELDS:
         previous = getattr(config, name, None)
         restored = runtime[name]
@@ -350,7 +368,6 @@ def apply_runtime_manifest(config: Any, checkpoint: Mapping[str, Any]) -> bool:
     # These fields no longer execute quantization when loading, but restoring
     # them keeps evaluation labels/config dumps truthful and, importantly,
     # prevents the legacy entry point from treating a W4 artifact as W16.
-    provenance = checkpoint.get("weight_quantization", {})
     for name in _WEIGHT_PROVENANCE_FIELDS:
         if name in provenance and hasattr(config, name):
             setattr(config, name, provenance[name])

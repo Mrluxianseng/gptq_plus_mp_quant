@@ -289,6 +289,28 @@ def test_checkpoint_rejects_incomplete_or_invalid_runtime_manifest(tmp_path):
         checkpoint_utils.load_quantized_checkpoint(path)
 
 
+def test_checkpoint_rejects_non_boolean_inner_fastpath_provenance(tmp_path):
+    model = _RuntimeModel()
+    cfg = _runtime_cfg()
+    path = tmp_path / "bad-fastpath-provenance.pt"
+    checkpoint_utils.save_quantized_checkpoint(path, model, cfg)
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    payload["weight_quantization"]["quantizer_inner_fastpath"] = "false"
+    torch.save(payload, path)
+
+    with pytest.raises(
+        ValueError, match="'quantizer_inner_fastpath' must be bool"
+    ):
+        checkpoint_utils.load_quantized_checkpoint(path)
+
+    target_cfg = _runtime_cfg(a_bits=16, a_clip_ratio=1.0)
+    with pytest.raises(
+        ValueError, match="'quantizer_inner_fastpath' must be bool"
+    ):
+        checkpoint_utils.apply_runtime_manifest(target_cfg, payload)
+    assert target_cfg.a_bits == 16
+
+
 def test_artifact_identity_strictly_checks_source_rotation_tokenizer_and_dtype(
     tmp_path
 ):

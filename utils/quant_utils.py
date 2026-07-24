@@ -355,9 +355,15 @@ class _PrevalidatedWeightFakeQuant:
 
     This private context moves the checks to the enclosing block boundary.
     It also snapshots every quantizer object that can affect the arithmetic.
-    The hot-path method checks the cheap Python/Tensor version metadata before
-    each use and raises if anything is stale; it must never silently execute
-    with parameters different from those that were prevalidated.
+    The hot-path method checks object identity and PyTorch Tensor version
+    counters before each use, detecting ordinary buffer replacement and
+    tracked in-place mutation.
+
+    This is not a concurrency or raw-storage safety boundary.  PyTorch's
+    explicitly unsafe ``.data`` API, a NumPy alias, or a custom raw-storage
+    writer can mutate bytes without advancing ``_version``; callers must not
+    use those escape hatches or concurrently mutate the quantizer while a
+    context is live.  REAL-Q gives each quantization loop exclusive ownership.
     """
 
     __slots__ = (
@@ -377,6 +383,17 @@ class _PrevalidatedWeightFakeQuant:
         "grouped",
     )
 
+    @staticmethod
+    def _tracked_version(tensor, label):
+        try:
+            return tensor._version
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "The prevalidated weight fast path requires version-tracked "
+                f"{label} tensors and cannot run under torch.inference_mode(); "
+                "use the REAL-Q runner's torch.no_grad() path."
+            ) from exc
+
     def __init__(
         self,
         *,
@@ -392,11 +409,17 @@ class _PrevalidatedWeightFakeQuant:
     ) -> None:
         self.owner = owner
         self.source_scale = source_scale
-        self.source_scale_version = source_scale._version
+        self.source_scale_version = self._tracked_version(
+            source_scale, "source scale"
+        )
         self.source_maxq = source_maxq
-        self.source_maxq_version = source_maxq._version
+        self.source_maxq_version = self._tracked_version(
+            source_maxq, "source maxq"
+        )
         self.prepared_scale = prepared_scale
-        self.prepared_scale_version = prepared_scale._version
+        self.prepared_scale_version = self._tracked_version(
+            prepared_scale, "prepared scale"
+        )
         self.bits = owner.bits
         self.weight_groupsize = owner.weight_groupsize
         self.input_rows = input_rows
@@ -802,6 +825,11 @@ class WeightQuantizer(torch.nn.Module):
         Arithmetic intentionally stays byte-for-byte in the public method's
         order: divide, round, clamp with the *tensor* ``maxq`` operand,
         multiply, then cast back to the input dtype.
+
+        The context relies on tracked Tensor mutations and exclusive ownership;
+        ``.data``/raw-storage writes and concurrent quantizer mutation are
+        unsupported for the same reason documented on
+        :class:`_PrevalidatedWeightFakeQuant`.
         """
 
         if not isinstance(prepared, _PrevalidatedWeightFakeQuant):

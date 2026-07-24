@@ -53,13 +53,6 @@ class Config:
     # full quantize). Old code's tensor-mode is not ported (RealQ already
     # vectorises across NUM_GROUPS in the per-group fallback).
     group_parallel_quant: str = "rank"  # one of: none, rank
-    # Opt-in performance experiment: prevalidate WeightQuantizer state and
-    # grouped natural-column coordinates once per GPTQ block, then use the
-    # private exact-arithmetic inner primitive. Default-off until full-model
-    # raw-byte A/B promotion is complete. A stale context raises instead of
-    # silently using changed scale/maxq state.
-    quantizer_inner_fastpath: bool = False
-
     # ----- static end-to-end precompute -----------------------------------
     global_loss_bsz: int = 16
     saliency_clip_percentile: float = 0.99
@@ -208,6 +201,12 @@ class Config:
 
     # ----- derived (auto-filled by __post_init__) -------------------------
     model_name: str = ""
+    # Opt-in performance experiment: prevalidate WeightQuantizer state and
+    # grouped natural-column coordinates once per GPTQ block, then use the
+    # private exact-arithmetic inner primitive. Keep this newly added field
+    # last so existing positional Config construction retains its field ABI.
+    # The production runner uses keyword arguments/CLI flags.
+    quantizer_inner_fastpath: bool = False
 
     # Appended after every pre-existing field to preserve Config's positional
     # constructor ABI. Optional human-readable diagnostic: rank zero logs the

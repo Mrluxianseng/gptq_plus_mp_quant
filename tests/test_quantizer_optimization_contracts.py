@@ -229,6 +229,23 @@ def test_trusted_fake_quant_rejects_replaced_or_mutated_scale_as_stale():
         quantizer._fake_quantize_prevalidated(weight[:, :1], prepared, 0)
 
 
+def test_trusted_fake_quant_rejects_inference_tensors_with_actionable_error():
+    quantizer = _quantizer(groupsize=-1)
+    weight = torch.randn(3, 5, generator=torch.Generator().manual_seed(44))
+    with torch.inference_mode():
+        quantizer.find_params(weight)
+        with pytest.raises(
+            RuntimeError,
+            match="cannot run under torch.inference_mode",
+        ):
+            quantizer._prepare_fake_quantize_inner(
+                input_rows=3,
+                column_count=5,
+                device=weight.device,
+                dtype=weight.dtype,
+            )
+
+
 def test_trusted_fake_quant_rejects_mutated_maxq_or_quantizer_metadata():
     quantizer = _quantizer(groupsize=-1)
     weight = torch.randn(3, 2, generator=torch.Generator().manual_seed(42))
