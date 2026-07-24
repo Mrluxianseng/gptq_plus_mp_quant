@@ -250,6 +250,7 @@ def _make_quantizer(cfg: "Config"):
         w_clip_search_impl=getattr(
             cfg, "w_clip_search_impl", "cartesian_legacy"
         ),
+        w_clip_update_impl=getattr(cfg, "w_clip_update_impl", "guarded"),
     )
     return q
 

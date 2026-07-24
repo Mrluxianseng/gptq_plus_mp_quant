@@ -52,6 +52,7 @@ _WEIGHT_PROVENANCE_FIELDS = (
     "w_clip_search_impl",
     "fisher_fp32_cache",
     "act_order_stitch_impl",
+    "w_clip_update_impl",
 )
 _WEIGHT_PROVENANCE_HISTORICAL_DEFAULTS = {
     # Checkpoint format v1 predates these opt-in build switches. Missing
@@ -61,6 +62,7 @@ _WEIGHT_PROVENANCE_HISTORICAL_DEFAULTS = {
     "w_clip_search_impl": "cartesian_legacy",
     "fisher_fp32_cache": False,
     "act_order_stitch_impl": "full_weight_legacy",
+    "w_clip_update_impl": "guarded",
 }
 _BOOL_FIELDS = {
     "rotate",
@@ -221,6 +223,14 @@ def _validate_weight_provenance(provenance: Mapping[str, Any]) -> None:
         raise ValueError(
             "Checkpoint field 'act_order_stitch_impl' must be "
             "'full_weight_legacy' or 'prefix_q_trailing_w_exact'."
+        )
+    if (
+        "w_clip_update_impl" in provenance
+        and provenance["w_clip_update_impl"] not in ("guarded", "where_out")
+    ):
+        raise ValueError(
+            "Checkpoint field 'w_clip_update_impl' must be "
+            "'guarded' or 'where_out'."
         )
 
 

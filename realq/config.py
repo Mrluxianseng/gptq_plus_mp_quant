@@ -227,6 +227,12 @@ class Config:
     # historical collective as the default until distributed CUDA exactness
     # and timing gates pass.
     act_order_stitch_impl: str = "full_weight_legacy"
+    # Replace the per-candidate CUDA-tensor Python guard in the exact
+    # Cartesian weight-clip search with fixed-shape ``torch.where(..., out=)``
+    # updates.  The optimized implementation is restricted to the production
+    # FP32/no-grad observer domain; every other input follows the historical
+    # guarded implementation exactly.
+    w_clip_update_impl: str = "guarded"
 
     def __post_init__(self) -> None:
         if not self.model_name:
@@ -297,6 +303,11 @@ class Config:
                 "`act_order_stitch_impl` must be 'full_weight_legacy' or "
                 "'prefix_q_trailing_w_exact'. Got "
                 f"{self.act_order_stitch_impl!r}."
+            )
+        if self.w_clip_update_impl not in ("guarded", "where_out"):
+            raise ValueError(
+                "`w_clip_update_impl` must be 'guarded' or 'where_out'. Got "
+                f"{self.w_clip_update_impl!r}."
             )
         if self.num_groups <= 0:
             raise ValueError(

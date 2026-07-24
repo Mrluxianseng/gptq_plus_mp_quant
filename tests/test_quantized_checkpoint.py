@@ -64,17 +64,24 @@ def _runtime_cfg(**overrides):
 def test_weight_clip_search_backend_roundtrips_as_build_provenance():
     source_cfg = _runtime_cfg(
         w_clip_search_impl="symmetric_union_exact",
+        w_clip_update_impl="where_out",
     )
     manifest = checkpoint_utils.build_runtime_manifest(source_cfg)
     assert manifest["weight_quantization"]["w_clip_search_impl"] == (
         "symmetric_union_exact"
     )
+    assert (
+        manifest["weight_quantization"]["w_clip_update_impl"]
+        == "where_out"
+    )
 
     restored_cfg = _runtime_cfg(
         w_clip_search_impl="cartesian_legacy",
+        w_clip_update_impl="guarded",
     )
     assert checkpoint_utils.apply_runtime_manifest(restored_cfg, manifest)
     assert restored_cfg.w_clip_search_impl == "symmetric_union_exact"
+    assert restored_cfg.w_clip_update_impl == "where_out"
 
 
 def test_missing_performance_provenance_restores_historical_build_defaults():
@@ -85,6 +92,7 @@ def test_missing_performance_provenance_restores_historical_build_defaults():
         "w_clip_search_impl",
         "fisher_fp32_cache",
         "act_order_stitch_impl",
+        "w_clip_update_impl",
     ):
         manifest["weight_quantization"].pop(name)
 
@@ -93,12 +101,14 @@ def test_missing_performance_provenance_restores_historical_build_defaults():
         w_clip_search_impl="symmetric_union_exact",
         fisher_fp32_cache=True,
         act_order_stitch_impl="prefix_q_trailing_w_exact",
+        w_clip_update_impl="where_out",
     )
     assert checkpoint_utils.apply_runtime_manifest(restored_cfg, manifest)
     assert restored_cfg.quantizer_inner_fastpath is False
     assert restored_cfg.w_clip_search_impl == "cartesian_legacy"
     assert restored_cfg.fisher_fp32_cache is False
     assert restored_cfg.act_order_stitch_impl == "full_weight_legacy"
+    assert restored_cfg.w_clip_update_impl == "guarded"
 
 
 def _rope(q, k):
@@ -367,6 +377,11 @@ def test_checkpoint_rejects_non_boolean_inner_fastpath_provenance(tmp_path):
             "'act_order_stitch_impl' must be 'full_weight_legacy' or "
             "'prefix_q_trailing_w_exact'",
         ),
+        (
+            "w_clip_update_impl",
+            "unknown",
+            "'w_clip_update_impl' must be 'guarded' or 'where_out'",
+        ),
     ],
 )
 def test_checkpoint_rejects_invalid_performance_provenance(
@@ -382,10 +397,15 @@ def test_checkpoint_rejects_invalid_performance_provenance(
 
     with pytest.raises(ValueError, match=error):
         checkpoint_utils.load_quantized_checkpoint(path)
-    target_cfg = _runtime_cfg(a_bits=16, a_clip_ratio=1.0)
+    target_cfg = _runtime_cfg(
+        a_bits=16,
+        a_clip_ratio=1.0,
+        w_clip_update_impl="where_out",
+    )
     with pytest.raises(ValueError, match=error):
         checkpoint_utils.apply_runtime_manifest(target_cfg, payload)
     assert target_cfg.a_bits == 16
+    assert target_cfg.w_clip_update_impl == "where_out"
 
 
 def test_artifact_identity_strictly_checks_source_rotation_tokenizer_and_dtype(

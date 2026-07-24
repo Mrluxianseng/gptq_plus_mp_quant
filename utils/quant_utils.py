@@ -61,6 +61,7 @@ def sym_quant_dequant(x, scale, maxq):
 _W_CLIP_SEARCH_IMPLEMENTATIONS = frozenset(
     {"cartesian_legacy", "symmetric_union_exact"}
 )
+_W_CLIP_UPDATE_IMPLEMENTATIONS = frozenset({"guarded", "where_out"})
 
 
 def _symmetric_union_candidates_and_first_keys(
@@ -605,11 +606,17 @@ class WeightQuantizer(torch.nn.Module):
         maxshrink: float = 0.5,
         weight_groupsize: int = -1,
         w_clip_search_impl: str = "cartesian_legacy",
+        w_clip_update_impl: str = "guarded",
     ) -> None:
         if w_clip_search_impl not in _W_CLIP_SEARCH_IMPLEMENTATIONS:
             raise ValueError(
                 "w_clip_search_impl must be 'cartesian_legacy' or "
                 f"'symmetric_union_exact'; got {w_clip_search_impl!r}."
+            )
+        if w_clip_update_impl not in _W_CLIP_UPDATE_IMPLEMENTATIONS:
+            raise ValueError(
+                "w_clip_update_impl must be 'guarded' or 'where_out'; "
+                f"got {w_clip_update_impl!r}."
             )
         self.bits = bits
         self.perchannel = perchannel
@@ -620,6 +627,7 @@ class WeightQuantizer(torch.nn.Module):
         self.maxshrink = maxshrink
         self.weight_groupsize = weight_groupsize
         self.w_clip_search_impl = w_clip_search_impl
+        self.w_clip_update_impl = w_clip_update_impl
         if sym:
             self.maxq = torch.tensor(2 ** (bits - 1) - 1)
         else:
@@ -639,6 +647,7 @@ class WeightQuantizer(torch.nn.Module):
 
         rows, columns = x.shape
         use_symmetric_union = self._can_use_symmetric_union(x)
+        use_where_out_update = self._can_use_where_out_clip_update(x)
 
         def _params_for_equal_width_groups(grouped_x):
             """Return scale/zero expanded to ``grouped_x``'s last dimension.
@@ -707,7 +716,16 @@ class WeightQuantizer(torch.nn.Module):
 
                         err = (q - grouped_x).abs().pow(self.norm).sum(-1)
                         improved = err < best
-                        if torch.any(improved):
+                        if use_where_out_update:
+                            torch.where(improved, err, best, out=best)
+                            value_mask = improved.unsqueeze(-1)
+                            torch.where(
+                                value_mask, scale1, scale, out=scale
+                            )
+                            torch.where(
+                                value_mask, zero1, zero, out=zero
+                            )
+                        elif torch.any(improved):
                             best[improved] = err[improved]
                             scale[improved] = scale1[improved]
                             zero[improved] = zero1[improved]
@@ -776,6 +794,22 @@ class WeightQuantizer(torch.nn.Module):
         # domain.
         return bool(torch.isfinite(x).all())
 
+    def _can_use_where_out_clip_update(self, x) -> bool:
+        """Whether fixed-shape winner updates preserve historical behavior.
+
+        ``out=`` operators do not support autograd and the historical
+        ordinary-row observer has dtype-specific behavior outside FP32.
+        RealQLayer observes cloned FP32 weights under no-grad, so optimize
+        exactly that production domain and leave all other cases on the
+        original guarded/indexed implementation.
+        """
+
+        return (
+            self.w_clip_update_impl == "where_out"
+            and x.dtype == torch.float32
+            and not x.requires_grad
+        )
+
     def find_params(self, x) -> None:
         if self.bits == 16:
             return
@@ -794,6 +828,7 @@ class WeightQuantizer(torch.nn.Module):
         else:
             x = x.flatten().unsqueeze(0)
 
+        use_where_out_update = self._can_use_where_out_clip_update(x)
         tmp = torch.zeros(x.shape[0], device=dev)
         xmin = torch.minimum(x.min(1)[0], tmp)
         xmax = torch.maximum(x.max(1)[0], tmp)
@@ -843,7 +878,15 @@ class WeightQuantizer(torch.nn.Module):
                     q.pow_(self.norm)
                     err = torch.sum(q, 1)
                     tmp = err < best
-                    if torch.any(tmp):
+                    if use_where_out_update:
+                        torch.where(tmp, err, best, out=best)
+                        torch.where(
+                            tmp, scale1, self.scale, out=self.scale
+                        )
+                        torch.where(
+                            tmp, zero1, self.zero, out=self.zero
+                        )
+                    elif torch.any(tmp):
                         best[tmp] = err[tmp]
                         self.scale[tmp] = scale1[tmp]
                         self.zero[tmp] = zero1[tmp]

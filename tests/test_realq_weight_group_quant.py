@@ -512,6 +512,8 @@ def test_make_quantizer_plumbs_opt_in_clip_search_backend():
         w_clip=True,
         w_groupsize=128,
         w_clip_search_impl="symmetric_union_exact",
+        w_clip_update_impl="where_out",
     )
     quantizer = _make_quantizer(cfg)
     assert quantizer.w_clip_search_impl == "symmetric_union_exact"
+    assert quantizer.w_clip_update_impl == "where_out"
