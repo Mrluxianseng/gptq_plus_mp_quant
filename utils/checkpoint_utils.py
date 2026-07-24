@@ -53,6 +53,7 @@ _WEIGHT_PROVENANCE_FIELDS = (
     "fisher_fp32_cache",
     "act_order_stitch_impl",
     "w_clip_update_impl",
+    "w_group_param_layout",
 )
 _WEIGHT_PROVENANCE_HISTORICAL_DEFAULTS = {
     # Checkpoint format v1 predates these opt-in build switches. Missing
@@ -63,6 +64,7 @@ _WEIGHT_PROVENANCE_HISTORICAL_DEFAULTS = {
     "fisher_fp32_cache": False,
     "act_order_stitch_impl": "full_weight_legacy",
     "w_clip_update_impl": "guarded",
+    "w_group_param_layout": "expanded",
 }
 _BOOL_FIELDS = {
     "rotate",
@@ -231,6 +233,14 @@ def _validate_weight_provenance(provenance: Mapping[str, Any]) -> None:
         raise ValueError(
             "Checkpoint field 'w_clip_update_impl' must be "
             "'guarded' or 'where_out'."
+        )
+    if (
+        "w_group_param_layout" in provenance
+        and provenance["w_group_param_layout"] not in ("expanded", "compact")
+    ):
+        raise ValueError(
+            "Checkpoint field 'w_group_param_layout' must be "
+            "'expanded' or 'compact'."
         )
 
 

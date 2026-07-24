@@ -17,6 +17,7 @@ def _quantizer(
     bits: int = 4,
     mse: bool = False,
     w_clip_search_impl: str = "cartesian_legacy",
+    w_group_param_layout: str = "expanded",
 ):
     quantizer = WeightQuantizer()
     quantizer.configure(
@@ -28,6 +29,7 @@ def _quantizer(
         maxshrink=0.5,
         weight_groupsize=groupsize,
         w_clip_search_impl=w_clip_search_impl,
+        w_group_param_layout=w_group_param_layout,
     )
     return quantizer
 
@@ -137,6 +139,7 @@ def _run_realq(
     quantizer_inner_fastpath: bool = False,
     w_clip: bool = False,
     w_clip_search_impl: str = "cartesian_legacy",
+    w_group_param_layout: str = "expanded",
 ) -> torch.Tensor:
     linear = nn.Linear(weight.shape[1], weight.shape[0], bias=False)
     linear.weight.data.copy_(weight)
@@ -144,6 +147,7 @@ def _run_realq(
         groupsize=groupsize,
         mse=w_clip,
         w_clip_search_impl=w_clip_search_impl,
+        w_group_param_layout=w_group_param_layout,
     )
     realq = RealQLayer(
         linear=linear,
@@ -277,6 +281,80 @@ def test_clip_union_and_inner_fastpath_compose_raw_byte_exactly(
     )
 
 
+@pytest.mark.parametrize("quantizer_inner_fastpath", [False, True])
+@pytest.mark.parametrize(
+    "w_clip_search_impl",
+    ["cartesian_legacy", "symmetric_union_exact"],
+)
+@pytest.mark.parametrize(
+    "num_groups,group_parallel_quant",
+    [(1, "rank"), (2, "rank"), (2, "none")],
+)
+def test_compact_layout_composes_with_p01_p02_and_rank_paths_raw_byte_exactly(
+    quantizer_inner_fastpath,
+    w_clip_search_impl,
+    num_groups,
+    group_parallel_quant,
+):
+    weight = _structured_weight(rows=4, columns=129)
+    common = dict(
+        groupsize=128,
+        num_groups=num_groups,
+        group_parallel_quant=group_parallel_quant,
+        act_order=True,
+        blocksize=128,
+        quantizer_inner_fastpath=quantizer_inner_fastpath,
+        w_clip=True,
+        w_clip_search_impl=w_clip_search_impl,
+    )
+    expanded = _run_realq(
+        weight,
+        **common,
+        w_group_param_layout="expanded",
+    )
+    compact = _run_realq(
+        weight,
+        **common,
+        w_group_param_layout="compact",
+    )
+    assert torch.equal(
+        compact.contiguous().view(torch.uint8),
+        expanded.contiguous().view(torch.uint8),
+    )
+
+
+def test_all_three_weight_optimizations_compose_against_legacy_raw_bytes():
+    weight = _structured_weight(rows=4, columns=129)
+    baseline = _run_realq(
+        weight,
+        groupsize=128,
+        num_groups=2,
+        group_parallel_quant="rank",
+        act_order=True,
+        blocksize=128,
+        quantizer_inner_fastpath=False,
+        w_clip=True,
+        w_clip_search_impl="cartesian_legacy",
+        w_group_param_layout="expanded",
+    )
+    optimized = _run_realq(
+        weight,
+        groupsize=128,
+        num_groups=2,
+        group_parallel_quant="rank",
+        act_order=True,
+        blocksize=128,
+        quantizer_inner_fastpath=True,
+        w_clip=True,
+        w_clip_search_impl="symmetric_union_exact",
+        w_group_param_layout="compact",
+    )
+    assert torch.equal(
+        optimized.contiguous().view(torch.uint8),
+        baseline.contiguous().view(torch.uint8),
+    )
+
+
 def _legacy_dynamic_group_reference(
     weight: torch.Tensor,
     hessian: torch.Tensor,
@@ -340,6 +418,32 @@ def test_non_act_order_group128_uses_legacy_dynamic_block_observer():
     assert not torch.equal(expected, static_q)
 
 
+def test_compact_layout_is_noop_for_non_act_order_dynamic_group_observer():
+    weight = _structured_weight(rows=4, columns=256)
+    expanded = _run_realq(
+        weight,
+        groupsize=128,
+        num_groups=1,
+        group_parallel_quant="none",
+        act_order=False,
+        blocksize=128,
+        w_group_param_layout="expanded",
+    )
+    compact = _run_realq(
+        weight,
+        groupsize=128,
+        num_groups=1,
+        group_parallel_quant="none",
+        act_order=False,
+        blocksize=128,
+        w_group_param_layout="compact",
+    )
+    assert torch.equal(
+        compact.contiguous().view(torch.uint8),
+        expanded.contiguous().view(torch.uint8),
+    )
+
+
 def test_dynamic_group_size_must_match_blocksize():
     weight = _structured_weight(rows=4, columns=256)
     with pytest.raises(ValueError, match="weight_groupsize == blocksize"):
@@ -353,9 +457,16 @@ def test_dynamic_group_size_must_match_blocksize():
         )
 
 
-@pytest.mark.parametrize("groupsize, expected_param_columns", [(-1, 1), (128, 256)])
+@pytest.mark.parametrize(
+    "groupsize,w_group_param_layout,expected_param_columns",
+    [
+        (-1, "expanded", 1),
+        (128, "expanded", 256),
+        (128, "compact", 2),
+    ],
+)
 def test_rank_gather_preserves_per_row_and_group_parameter_shapes(
-    monkeypatch, groupsize, expected_param_columns
+    monkeypatch, groupsize, w_group_param_layout, expected_param_columns
 ):
     # Simulate rank 0 of a two-rank job. Both row shards are intentionally
     # identical, allowing a deterministic fake all-gather without launching
@@ -383,6 +494,7 @@ def test_rank_gather_preserves_per_row_and_group_parameter_shapes(
         num_groups=1,
         group_parallel_quant="rank",
         act_order=True,
+        w_group_param_layout=w_group_param_layout,
     )
     reference_quantizer = _quantizer(groupsize=groupsize)
     reference_quantizer.find_params(weight)
@@ -513,7 +625,9 @@ def test_make_quantizer_plumbs_opt_in_clip_search_backend():
         w_groupsize=128,
         w_clip_search_impl="symmetric_union_exact",
         w_clip_update_impl="where_out",
+        w_group_param_layout="compact",
     )
     quantizer = _make_quantizer(cfg)
     assert quantizer.w_clip_search_impl == "symmetric_union_exact"
     assert quantizer.w_clip_update_impl == "where_out"
+    assert quantizer.w_group_param_layout == "compact"

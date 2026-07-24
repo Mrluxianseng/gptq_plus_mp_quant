@@ -437,3 +437,79 @@ a speedup claim. No candidate is enabled by default. Required next gates are:
 The timing harness now includes the dedicated `block_gd_stress` fixture so
 P05 cannot accidentally be benchmarked under the original LR-zero no-op
 case.
+
+### 2026-07-24 - P04 compact grouped weight-qparam CPU gate
+
+P04 is implemented behind:
+
+```text
+--w_group_param_layout {expanded,compact}
+```
+
+The historical `expanded` layout remains the default and retains the original
+observer expansion and public fake-quant paths. The opt-in `compact` layout
+stores one scale and zero per natural weight group, with shape
+`(output_rows, ceil(input_columns / w_groupsize))`. It also records the exact
+natural input-column count because the width of a short final group cannot be
+recovered from the compact tensor shape alone.
+
+Every consumer maps natural column `c` to compact group
+`floor(c / w_groupsize)`. In particular:
+
+- static grouped parameters are observed before act-order, and the existing
+  natural-column permutation is mapped only at fake-quant use;
+- P01 maps and validates an entire block once, then retains the same
+  contiguous `(block_columns, local_rows, 1)` hot-loop operand;
+- rank mode all-gathers `(local_rows, num_groups)` scale/zero tensors rather
+  than `(local_rows, input_columns)` tensors; this remains a copy-only
+  collective and row slicing is unchanged;
+- full-matrix `quantize` and RTN reconstruct the historical expanded operand,
+  including symmetric/asymmetric and FP16/BF16/FP32 public behavior;
+- non-act-order dynamic grouped REAL-Q remains a per-block, per-row observer
+  and therefore sees no P04 storage benefit;
+- legacy quantizer objects without layout metadata fall back to `expanded`;
+  malformed or incomplete compact metadata fails closed.
+
+P04 composes with P01 and P02. The compact observer retains the exact
+group-level scale/zero that exists immediately before the old expansion copy;
+P02's candidate search and winner selection are unchanged. P01 snapshots the
+layout and natural-column metadata as part of its stale-context contract.
+Checkpoint build provenance records the new enum, missing version-1 fields
+restore `expanded`, and malformed values are rejected before any live Config
+field is changed.
+
+For output rows `R`, input columns `C`, group size `G`, and qparam element
+size `b`, scale plus zero storage changes from `2RCb` to
+`2R ceil(C/G)b`. With the production float32 weight observer and `G=128`,
+the locally installed model configs give:
+
+| Model | Per-layer seven-linear logical qparams | Four-rank logical receive per rank | Largest single linear | Largest resident module group |
+|---|---:|---:|---:|---:|
+| Qwen3-4B | 770.0 → 6.015625 MiB | 577.5 → 4.511719 MiB | 190 → 1.484375 MiB | MLP up+gate 380 → 2.96875 MiB |
+| Qwen3-8B | 1472.0 → 11.5 MiB | 1104 → 8.625 MiB | 384 → 3 MiB | MLP up+gate 768 → 6 MiB |
+
+These are formula-derived logical storage/copy counts, not allocator peaks,
+wire-level NCCL traffic, or measured speedups. Qwen3-4B uses
+`q_proj.out_features=4096` and `k/v.out_features=1024`; treating every
+attention projection as hidden width 2560 would undercount its qparams.
+
+CPU-only evidence (`CUDA_VISIBLE_DEVICES=''`):
+
+- 102 P04 operator/API cases pass, covering `G=1`, divisible widths, short
+  tails, `G>C`, Cartesian/union clipping, P01 act-order/row slicing,
+  FP16/BF16/FP32/FP64, symmetric/asymmetric `quantize`, selector coercion,
+  stale/malformed metadata, legacy fallback, Config/CLI, and RTN;
+- 64 REAL-Q grouped/checkpoint tests pass, including all P01×P02 combinations,
+  rank/none paths, dynamic no-act-order behavior, compact collective shapes,
+  provenance round-trip, historical defaults, and no-partial-write rejection;
+- the nine-case default-`expanded` cross-revision probe matches the pristine
+  parent aggregate SHA256
+  `b1d4d1e3c86c8da1d0cd8c272d962a58c8766ce69839f59d2e7d8d4dbbeb20aa`;
+- the complete CPU suite passes: `506 passed, 6 skipped, 1 xfailed`.
+
+P04 remains provisional class `X`, default `expanded`. The compact source and
+reconstructed operands match raw bytes on CPU, but reduced allocations and
+collective sizes can change CUDA allocator/workspace choices. It must not be
+promoted until E0--E4, including canonical Qwen3-4B checkpoint equality and
+representative end-to-end metrics, pass on the fixed GPU quartet. Any byte
+difference requires repair or reclassification to `N`.

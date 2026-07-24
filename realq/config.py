@@ -233,6 +233,10 @@ class Config:
     # FP32/no-grad observer domain; every other input follows the historical
     # guarded implementation exactly.
     w_clip_update_impl: str = "guarded"
+    # Store grouped weight scale/zero either once per natural column
+    # (historical) or once per natural group. Compact is an opt-in exact
+    # candidate until the CUDA E0--E4 gates are complete.
+    w_group_param_layout: str = "expanded"
 
     def __post_init__(self) -> None:
         if not self.model_name:
@@ -308,6 +312,11 @@ class Config:
             raise ValueError(
                 "`w_clip_update_impl` must be 'guarded' or 'where_out'. Got "
                 f"{self.w_clip_update_impl!r}."
+            )
+        if self.w_group_param_layout not in ("expanded", "compact"):
+            raise ValueError(
+                "`w_group_param_layout` must be 'expanded' or 'compact'. Got "
+                f"{self.w_group_param_layout!r}."
             )
         if self.num_groups <= 0:
             raise ValueError(

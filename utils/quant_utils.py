@@ -62,6 +62,7 @@ _W_CLIP_SEARCH_IMPLEMENTATIONS = frozenset(
     {"cartesian_legacy", "symmetric_union_exact"}
 )
 _W_CLIP_UPDATE_IMPLEMENTATIONS = frozenset({"guarded", "where_out"})
+_W_GROUP_PARAM_LAYOUTS = frozenset({"expanded", "compact"})
 
 
 def _symmetric_union_candidates_and_first_keys(
@@ -533,6 +534,8 @@ class _PrevalidatedWeightFakeQuant:
         "prepared_scale_version",
         "bits",
         "weight_groupsize",
+        "w_group_param_layout",
+        "weight_ncolumns",
         "input_rows",
         "column_count",
         "device",
@@ -579,6 +582,10 @@ class _PrevalidatedWeightFakeQuant:
         )
         self.bits = owner.bits
         self.weight_groupsize = owner.weight_groupsize
+        self.w_group_param_layout = getattr(
+            owner, "w_group_param_layout", "expanded"
+        )
+        self.weight_ncolumns = getattr(owner, "weight_ncolumns", None)
         self.input_rows = input_rows
         self.column_count = column_count
         self.device = device
@@ -594,6 +601,13 @@ class WeightQuantizer(torch.nn.Module):
         self.register_buffer("maxq", torch.tensor(0))
         self.register_buffer("scale", torch.zeros(shape))
         self.register_buffer("zero", torch.zeros(shape))
+        # Python metadata is sufficient here: REAL-Q checkpoints persist the
+        # already fake-dequantized model weights, not these build-time
+        # quantizer buffers.  ``weight_ncolumns`` is nevertheless required for
+        # compact grouped parameters because ``ceil(C / groupsize)`` cannot be
+        # inverted when the final natural-column group is short.
+        self.w_group_param_layout = "expanded"
+        self.weight_ncolumns = None
 
     def configure(
         self,
@@ -607,6 +621,7 @@ class WeightQuantizer(torch.nn.Module):
         weight_groupsize: int = -1,
         w_clip_search_impl: str = "cartesian_legacy",
         w_clip_update_impl: str = "guarded",
+        w_group_param_layout: str = "expanded",
     ) -> None:
         if w_clip_search_impl not in _W_CLIP_SEARCH_IMPLEMENTATIONS:
             raise ValueError(
@@ -618,6 +633,11 @@ class WeightQuantizer(torch.nn.Module):
                 "w_clip_update_impl must be 'guarded' or 'where_out'; "
                 f"got {w_clip_update_impl!r}."
             )
+        if w_group_param_layout not in _W_GROUP_PARAM_LAYOUTS:
+            raise ValueError(
+                "w_group_param_layout must be 'expanded' or 'compact'; "
+                f"got {w_group_param_layout!r}."
+            )
         self.bits = bits
         self.perchannel = perchannel
         self.sym = sym
@@ -628,6 +648,8 @@ class WeightQuantizer(torch.nn.Module):
         self.weight_groupsize = weight_groupsize
         self.w_clip_search_impl = w_clip_search_impl
         self.w_clip_update_impl = w_clip_update_impl
+        self.w_group_param_layout = w_group_param_layout
+        self.weight_ncolumns = None
         if sym:
             self.maxq = torch.tensor(2 ** (bits - 1) - 1)
         else:
@@ -650,12 +672,15 @@ class WeightQuantizer(torch.nn.Module):
         use_where_out_update = self._can_use_where_out_clip_update(x)
 
         def _params_for_equal_width_groups(grouped_x):
-            """Return scale/zero expanded to ``grouped_x``'s last dimension.
+            """Return scale/zero in the configured grouped storage layout.
 
             ``grouped_x`` has shape ``(rows, num_groups, group_width)``.  Keeping
             the MSE search vectorised over all equally-sized groups preserves the
             old implementation's arithmetic while allowing a final short group
-            to be handled separately below.
+            to be handled separately below.  Compact storage retains the exact
+            one-value-per-group result before the historical expansion copy;
+            the default expanded branch deliberately keeps the original
+            expand/reshape expressions unchanged.
             """
             xmax = torch.amax(grouped_x, dim=-1, keepdim=True)
             xmin = torch.amin(grouped_x, dim=-1, keepdim=True)
@@ -730,6 +755,9 @@ class WeightQuantizer(torch.nn.Module):
                             scale[improved] = scale1[improved]
                             zero[improved] = zero1[improved]
 
+            if self._resolved_w_group_param_layout() == "compact":
+                return scale.squeeze(-1), zero.squeeze(-1)
+
             group_width = grouped_x.shape[-1]
             return (
                 scale.expand(-1, -1, group_width).reshape(rows, -1),
@@ -758,6 +786,7 @@ class WeightQuantizer(torch.nn.Module):
 
         self.scale = torch.cat(scale_parts, dim=1)
         self.zero = torch.cat(zero_parts, dim=1)
+        self.weight_ncolumns = columns
 
     def _can_use_symmetric_union(self, x) -> bool:
         """Whether the exact union backend supports this observer input.
@@ -900,10 +929,120 @@ class WeightQuantizer(torch.nn.Module):
         self.zero = self.zero.reshape(shape)
         return
 
+    def _resolved_w_group_param_layout(self) -> str:
+        """Return the grouped-qparam layout, including legacy-object fallback."""
+
+        layout = getattr(self, "w_group_param_layout", "expanded")
+        if layout not in _W_GROUP_PARAM_LAYOUTS:
+            raise RuntimeError(
+                "WeightQuantizer has an invalid w_group_param_layout "
+                f"{layout!r}; expected 'expanded' or 'compact'."
+            )
+        return layout
+
+    def _compact_group_ncolumns(
+        self, parameter: torch.Tensor, *, label: str
+    ) -> int:
+        """Validate compact grouped metadata and return natural column count."""
+
+        ncolumns = getattr(self, "weight_ncolumns", None)
+        if (
+            not isinstance(ncolumns, int)
+            or isinstance(ncolumns, bool)
+            or ncolumns <= 0
+        ):
+            raise RuntimeError(
+                "Compact grouped weight parameters require the positive "
+                "natural-column count recorded by find_params; got "
+                f"weight_ncolumns={ncolumns!r}."
+            )
+        expected_groups = (
+            ncolumns + self.weight_groupsize - 1
+        ) // self.weight_groupsize
+        if parameter.dim() == 0 or parameter.shape[-1] != expected_groups:
+            raise RuntimeError(
+                f"Compact grouped {label} has invalid shape "
+                f"{tuple(parameter.shape)}: expected final dimension "
+                f"ceil({ncolumns} / {self.weight_groupsize})="
+                f"{expected_groups}."
+            )
+        return ncolumns
+
+    def _expand_compact_group_parameter(
+        self,
+        parameter: torch.Tensor,
+        x: torch.Tensor,
+        *,
+        col_idx=None,
+        label: str,
+    ) -> torch.Tensor:
+        """Map compact natural groups to a full or selected column operand.
+
+        ``col_idx`` follows :meth:`fake_quantize`'s historical public
+        coercion: values are converted to ``long`` (including truncation of
+        floating inputs) before bounds checks.  The stricter private P01 path
+        keeps its existing integer-only contract.
+        """
+
+        ncolumns = self._compact_group_ncolumns(parameter, label=label)
+        if col_idx is not None:
+            natural_columns = torch.as_tensor(
+                col_idx, dtype=torch.long, device=parameter.device
+            ).reshape(-1)
+            if natural_columns.numel() != x.shape[-1]:
+                raise ValueError(
+                    "col_idx must provide one natural column index per input "
+                    f"column; got {natural_columns.numel()} indices for "
+                    f"x.shape={tuple(x.shape)}."
+                )
+            if torch.any(natural_columns < 0) or torch.any(
+                natural_columns >= ncolumns
+            ):
+                raise IndexError(
+                    f"col_idx is outside [0, {ncolumns}) for grouped "
+                    "weight quantization."
+                )
+        else:
+            if x.shape[-1] != ncolumns:
+                raise ValueError(
+                    "Grouped quantization on a partial weight tensor requires "
+                    "col_idx in natural (pre-act-order) column coordinates; "
+                    f"got x.shape={tuple(x.shape)} and natural columns="
+                    f"{ncolumns}."
+                )
+            natural_columns = torch.arange(
+                ncolumns, dtype=torch.long, device=parameter.device
+            )
+        group_indices = torch.div(
+            natural_columns,
+            self.weight_groupsize,
+            rounding_mode="floor",
+        )
+        return parameter.index_select(-1, group_indices)
+
     # TODO: This should be better refactored into `forward`, which applies quantize and dequantize. A new method `quantize` should be added (if needed) to return the quantized integers and scales, like in ActQuantizer.
     def quantize(self, x):
         x_dtype = x.dtype
         if self.ready() and self.bits < 16:
+            if (
+                self.weight_groupsize > 0
+                and self._resolved_w_group_param_layout() == "compact"
+            ):
+                scale = self._expand_compact_group_parameter(
+                    self.scale.to(x.device),
+                    x,
+                    label="scale",
+                )
+                if self.sym:
+                    return STEQuantize.apply(x, scale, self.maxq).to(x_dtype)
+                zero = self._expand_compact_group_parameter(
+                    self.zero.to(x.device),
+                    x,
+                    label="zero",
+                )
+                return AsymSTEQuantize.apply(
+                    x, scale, zero, self.maxq
+                ).to(x_dtype)
             if self.sym:
                 return STEQuantize.apply(x, self.scale, self.maxq).to(x_dtype)
             return AsymSTEQuantize.apply(x, self.scale, self.zero, self.maxq).to(
@@ -918,7 +1057,17 @@ class WeightQuantizer(torch.nn.Module):
             scale = self.scale.to(x.device)
             if st_idx is not None and end_idx is not None:
                 scale = scale[st_idx:end_idx]
-            if self.weight_groupsize > 0 and col_idx is not None:
+            if (
+                self.weight_groupsize > 0
+                and self._resolved_w_group_param_layout() == "compact"
+            ):
+                scale = self._expand_compact_group_parameter(
+                    scale,
+                    x,
+                    col_idx=col_idx,
+                    label="scale",
+                )
+            elif self.weight_groupsize > 0 and col_idx is not None:
                 # Group parameters are stored expanded in natural column order
                 # so full-matrix RTN remains a simple broadcast. GPTQ quantizes
                 # one (possibly act-order permuted) column at a time and must
@@ -966,13 +1115,15 @@ class WeightQuantizer(torch.nn.Module):
         :class:`realq.quant.realq_layer.RealQLayer`.  Public callers must keep
         using :meth:`fake_quantize`.
 
-        Grouped parameters are stored in natural (pre-act-order) column
-        coordinates.  ``col_idx`` therefore names every natural column in the
-        block, in the exact order in which the inner loop will consume them.
-        The complete mapping is bounds-checked once here.  Selected scales are
-        transposed into a contiguous ``(columns, rows, 1)`` layout so each hot
-        iteration sees the same contiguous ``(rows, 1)`` operand as the public
-        scalar ``index_select`` path.
+        Grouped parameters are keyed in natural (pre-act-order) coordinates.
+        ``col_idx`` therefore names every natural column in the block, in the
+        exact order in which the inner loop will consume them. Expanded
+        storage indexes those columns directly; compact storage maps each
+        natural column to ``column // weight_groupsize``. The complete mapping
+        is bounds-checked once here. Selected scales are transposed into a
+        contiguous ``(columns, rows, 1)`` layout so each hot iteration sees
+        the same contiguous ``(rows, 1)`` operand as the public scalar
+        ``index_select`` path.
         """
 
         if (
@@ -1028,6 +1179,13 @@ class WeightQuantizer(torch.nn.Module):
 
         grouped = self.weight_groupsize > 0
         if grouped:
+            layout = self._resolved_w_group_param_layout()
+            if layout == "compact":
+                natural_ncolumns = self._compact_group_ncolumns(
+                    scale, label="scale"
+                )
+            else:
+                natural_ncolumns = scale.shape[-1]
             if col_idx is None:
                 raise ValueError(
                     "Grouped prevalidated fake quantization requires one "
@@ -1054,13 +1212,22 @@ class WeightQuantizer(torch.nn.Module):
                     f"column_count={column_count}."
                 )
             if torch.any(natural_columns < 0) or torch.any(
-                natural_columns >= scale.shape[-1]
+                natural_columns >= natural_ncolumns
             ):
                 raise IndexError(
-                    f"col_idx is outside [0, {scale.shape[-1]}) for grouped "
+                    f"col_idx is outside [0, {natural_ncolumns}) for grouped "
                     "weight quantization."
                 )
-            selected = scale.index_select(-1, natural_columns)
+            parameter_columns = (
+                torch.div(
+                    natural_columns,
+                    self.weight_groupsize,
+                    rounding_mode="floor",
+                )
+                if layout == "compact"
+                else natural_columns
+            )
+            selected = scale.index_select(-1, parameter_columns)
             prepared_scale = selected.transpose(0, 1).contiguous().unsqueeze(-1)
         else:
             # The public column path broadcasts one per-row scale over a
@@ -1113,12 +1280,17 @@ class WeightQuantizer(torch.nn.Module):
             or self.maxq._version != prepared.source_maxq_version
             or self.bits != prepared.bits
             or self.weight_groupsize != prepared.weight_groupsize
+            or getattr(self, "w_group_param_layout", "expanded")
+            != prepared.w_group_param_layout
+            or getattr(self, "weight_ncolumns", None)
+            != prepared.weight_ncolumns
             or prepared.prepared_scale._version
             != prepared.prepared_scale_version
         ):
             raise RuntimeError(
                 "Stale prevalidated fake-quant context: scale, maxq, bits, or "
-                "weight_groupsize changed after block-boundary validation."
+                "grouped-parameter metadata changed after block-boundary "
+                "validation."
             )
         if (
             not isinstance(column_offset, int)

@@ -343,6 +343,9 @@ def rtn_fwrd(args, analyzer: model_utils.ModelAnalyzer, dev):
                 sym=not (args.w_asym),
                 mse=args.w_clip,
                 weight_groupsize=w_groupsize,
+                w_group_param_layout=getattr(
+                    args, "w_group_param_layout", "expanded"
+                ),
             )
             W = subset[name].weight.data
             quantizer.find_params(W)

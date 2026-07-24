@@ -1921,6 +1921,9 @@ def _apply_rtn_quant_to_module(args, module):
         sym=not args.w_asym,
         mse=args.w_clip,
         weight_groupsize=args.w_groupsize,
+        w_group_param_layout=getattr(
+            args, "w_group_param_layout", "expanded"
+        ),
     )
     W = module.weight.data
     quantizer.find_params(W)

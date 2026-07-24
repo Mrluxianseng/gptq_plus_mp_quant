@@ -422,9 +422,9 @@ class RealQLayer:
                     # Each rank computes find_params for its own row slice, then
                     # all-gathers scale/zero so the full params are visible on
                     # every rank for fake_quantize's row slicing. Per-row
-                    # quantization has trailing shape (1,); group quantization
-                    # has trailing shape (columns,), so this must not be
-                    # hard-coded to (rows, 1).
+                    # quantization has trailing shape (1,); grouped
+                    # quantization has either natural-column or compact-group
+                    # width, so this must not be hard-coded to (rows, 1).
                     self.quantizer.find_params(W[row_sl])
                     import torch.distributed as _dist
                     full_scale = torch.empty(
@@ -465,6 +465,11 @@ class RealQLayer:
                     weight_groupsize=-1,
                     w_clip_search_impl=self.quantizer.w_clip_search_impl,
                     w_clip_update_impl=self.quantizer.w_clip_update_impl,
+                    w_group_param_layout=getattr(
+                        self.quantizer,
+                        "w_group_param_layout",
+                        "expanded",
+                    ),
                 )
                 block_quantizer.find_params(weight_block)
                 if rank_mode and world > 1:
