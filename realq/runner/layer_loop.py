@@ -119,6 +119,23 @@ def _atomic_json_dump(path: Path, payload: dict[str, object]) -> None:
             pass
 
 
+def _canonical_cuda_device_uuid(value: object | None) -> str | None:
+    """Match PyTorch device UUIDs to NVML/nvidia-smi's canonical spelling.
+
+    PyTorch 2.6 on the L20C image returns the hexadecimal UUID without the
+    ``GPU-`` prefix, while ``nvidia-smi --query-gpu=uuid`` includes it.  The
+    value identifies the same device; normalize only the representation so
+    the timing harness can validate the physical rank mapping.
+    """
+
+    if value is None:
+        return None
+    uuid = str(value)
+    if uuid and not uuid.startswith(("GPU-", "MIG-")):
+        uuid = f"GPU-{uuid}"
+    return uuid
+
+
 def _measure_quantize_one_layer(
     cfg: "Config",
     layer_idx: int,
@@ -141,9 +158,7 @@ def _measure_quantize_one_layer(
     properties = torch.cuda.get_device_properties(device_index)
     device_name = str(properties.name)
     device_uuid_value = getattr(properties, "uuid", None)
-    device_uuid = (
-        str(device_uuid_value) if device_uuid_value is not None else None
-    )
+    device_uuid = _canonical_cuda_device_uuid(device_uuid_value)
 
     # GPU metadata/context discovery happens above so it cannot contaminate
     # either the timed interval or the reset peak counters.

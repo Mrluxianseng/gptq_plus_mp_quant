@@ -259,6 +259,19 @@ def test_enabled_perf_measurement_call_order_and_json_schema(
     }
 
 
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (None, None),
+        ("GPU-test-uuid", "GPU-test-uuid"),
+        ("MIG-test-uuid", "MIG-test-uuid"),
+        ("test-uuid", "GPU-test-uuid"),
+    ],
+)
+def test_cuda_device_uuid_is_canonicalized_for_nvml_mapping(raw, expected):
+    assert layer_loop._canonical_cuda_device_uuid(raw) == expected
+
+
 def test_perf_measure_layer_cli_and_validation():
     assert parse_cli(["--perf_measure_layer", "7"]).perf_measure_layer == 7
     with pytest.raises(ValueError, match="non-negative integer"):
