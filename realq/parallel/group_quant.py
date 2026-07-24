@@ -6,20 +6,22 @@ runs find_params + the per-row inner block update on that slice only;
 the resulting per-rank Q rows are all-gathered at the END of quantize so
 the linear's ``weight`` ends up identical on every rank.
 
-This is a correctness-preserving sharding: for the same calibration data
-+ same H + deterministic float32 ops, ``rank`` mode and ``none`` mode
-produce identical Q. The point is throughput — under ``rank`` each
-rank does ``rows / world_size`` of the per-row work instead of every
-rank doing the full ``rows``.
+This preserves the row-separable real-valued algorithm: under ``rank`` each
+rank does ``rows / world_size`` of the per-row work instead of every rank
+doing the full ``rows``. It is not a universal bit-equivalence guarantee:
+rank/none can use different floating-point reduction trees, tensor layouts,
+and kernels even when they implement the same equations.
 
 What is NOT sharded:
-- The Hessian itself is fully replicated on every rank (already all-
-  reduced during ``finalize_hessian``).
+- Every rank still computes each output group's local Hessian contribution.
+  With ``num_groups > 1`` those blocks are reduced/scattered per calibration
+  batch and each owner retains only the groups needed by its output rows;
+  the ``num_groups == 1`` path remains replicated.
 - The per-block outer compensation runs on every rank's local row slice;
   no extra collective is needed because each rank's slice is independent.
-- block_gd refresh runs on the FULL replicated weight (``module.weight``
-  is gathered before refresh) so the autograd graph sees the same set of
-  parameters on every rank.
+- Before every block_gd refresh, quantized-prefix and working trailing rows
+  are gathered into a full stitched weight, so every rank's autograd closure
+  sees the same complete parameter tensor.
 """
 from __future__ import annotations
 

@@ -54,6 +54,16 @@ Copy-only collective changes can be exact candidates. Any change to a
 reduction message or summation tree is numerical-equivalence work and remains
 opt-in.
 
+Two existing protocol controls are explicitly excluded from the structural
+optimization track:
+
+- changing fixed global refresh sampling to rank-stratified sampling changes
+  sample membership/order per Adam step and is class `A`, even if it improves
+  DP load balance;
+- changing `group_parallel_quant=rank` to `none` preserves the exact-real
+  row-separable algorithm but changes Hessian reduction topology and kernel
+  layout, so it is at least class `N`, not `X`.
+
 ## Correctness gates
 
 ### E0: source and input identity

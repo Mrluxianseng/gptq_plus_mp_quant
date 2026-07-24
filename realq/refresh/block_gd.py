@@ -99,10 +99,11 @@ class _SharedSampleScheduler:
     chunk_size here = ``backward_samples`` (the GLOBAL per-refresh sample
     count, NOT divided by world). After per-rank filtering, the local
     sub-list lengths sum to ``backward_samples`` across the world but
-    are not individually balanced — that is the deliberate trade-off of
-    global shuffle (some refreshes have a slight load imbalance, but
-    the consumed sample distribution matches the old gptq_plus_utils.py
-    ``--dp_global_shuffle=True`` reference exactly for bit-exactness).
+    are not individually balanced. The first epoch is deliberately ordered,
+    so contiguous DP shards can make that imbalance extreme (including empty
+    ranks); later globally shuffled chunks remain variably imbalanced. This
+    reproduces old GPTQ+ ``--dp_global_shuffle=True`` exactly and makes the
+    consumed global sample sequence match a one-rank run.
 
     Shared state means consecutive ``next_indices()`` calls — across
     different layers and different modules within a layer — return

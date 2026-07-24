@@ -61,6 +61,18 @@ not state:
 - `lm-eval` version, task-config revisions, and evaluation batch size;
 - the exact legacy loss-slide indexing and terminal-layer policy.
 
+The audited reproduction protocol currently fixes two additional multi-GPU
+choices that are not stated by the paper:
+
+- `dp_global_shuffle=true`: one model-wide refresh scheduler selects global
+  calibration IDs, then each rank filters to its contiguous data shard. This
+  changes per-step sample membership relative to the old stratified mode and
+  is therefore an algorithm/protocol choice, not a performance-only toggle.
+- `group_parallel_quant=rank`: output-row quantization and, for multiple
+  output groups, Hessian reduction are rank-parallel. It preserves the same
+  real-valued row-separable algorithm, but its reduction/kernels are not
+  universally bit-exact with `none`.
+
 For clarity, the audited implementation exposes the unspecified
 activation-loss percentile population rather than silently choosing one:
 

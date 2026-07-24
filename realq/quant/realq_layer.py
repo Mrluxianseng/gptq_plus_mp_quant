@@ -293,9 +293,9 @@ class RealQLayer:
         ``group_parallel_quant``: ``"rank"`` shards the per-row find_params
         + per-row inner block update across DP ranks, with an all-gather at
         the end to replicate Q. ``"none"`` runs the full quantize on every
-        rank (correct but redundant). For act_order paths we currently
-        force ``none`` because the rank mode would need extra synchronisation
-        to keep the per-rank permutation consistent.
+        rank (correct but redundant). ``act_order`` is supported in rank mode:
+        its globally reduced ``act_square`` produces the same permutation on
+        every rank, and natural-column qparams are computed before permutation.
         """
         # W16 is the explicit no-weight-quantization mode.  The quantizer has
         # no scale in this mode, so entering the GPTQ column loop would make

@@ -1,6 +1,6 @@
 # REAL-Q 阶段结论与当前状态
 
-更新时间：2026-07-24 20:58 CST
+更新时间：2026-07-24 21:16 CST
 
 ## 一页结论
 
@@ -237,6 +237,125 @@ loss、不增加 collective，也不发生 `.item()` 同步。Fisher、最终层
 行为的针对性测试为 `14 passed`；当前完整 CPU suite 为
 `203 passed, 5 skipped`。验证显式设置
 `CUDA_VISIBLE_DEVICES=''`，没有占用实验 GPU。
+
+## Multi-GPU refresh sampling 与 group-parallel 审查
+
+### `dp_global_shuffle`
+
+这个开关只控制 Block-GD/pre-GD 的 refresh backward 如何从已经生成的
+校准集选择样本；它不控制 Stage-0 static Fisher/saliency 的数据成员，
+也不控制 GPTQ Hessian 是否按 output row 并行。
+
+设全局校准样本数为 `N`、一次 Adam refresh 的全局样本数为 `B`、DP
+world size 为 `W`：
+
+| 实现/模式 | scheduler 范围与 chunk | 每 rank 行为 | seed |
+|---|---|---|---|
+| 旧代码 `dp_global_shuffle=true` | 一个全局 `[0,N)` scheduler，每次先取 `B` 个 global IDs | 每个 rank 得到相同 IDs，再按自己连续的 `N/W` shard 过滤；local count 可为 0，所有 rank 合计仍为 `B` | 所有 rank 都是 `refresh_seed` |
+| 旧代码默认 `false` | 每个 rank 一个本地 `[0,N/W)` scheduler，每次取 `B/W` 个 local IDs | 每个 rank 始终等量处理 `B/W` 个自己 shard 内的样本；不是每 rank 各取 `B` 个 | `refresh_seed + rank` |
+| 新 `realq` | 只实现了第一行的全局模式 | Config/CLI 没有关闭开关，传 `--dp_global_shuffle` 会是未知参数 | 所有 rank 都是 `refresh_seed` |
+
+“旧代码默认 false”指裸 `process_args.py` CLI；旧实验常用的
+`gptq_plus_lr_sweep.sh` 把 `DP_GLOBAL_SHUFFLE` 默认设为 `1`，README
+也要求固定为 1。因此当前新默认对应的是旧 intended launcher，而不是
+旧裸 CLI。
+
+用户对 true 模式的理解基本正确：先产生一组全局 sample IDs，再由各
+rank 按校准样本所属 shard 过滤并贡献 partial gradient/count。这里分配
+的是 **refresh backward 计算**，不是把不同 weight columns 分给 rank。
+
+还有一个容易被名称掩盖的重要事实：旧/新 scheduler 的第一轮不是
+shuffle。它以 `range(N)` 开始，只有完整耗尽一轮后才原地 shuffle。
+例如正式 Qwen3-4B 的 `N=2048, B=32, W=4`：
+
+- 第一轮共 64 个 refresh；
+- 前 16 个 refresh 的 32 个样本全部在 rank 0，其他三张卡为空；
+- 接下来 16 个全部在 rank 1，然后依次 rank 2、rank 3；
+- 第二轮以后才是全局乱序，但每个 chunk 的 rank 负载仍不保证相等。
+
+因此 true 模式可能造成严重 straggler/空卡，不只是“轻微不平衡”；
+false 模式每次严格平衡 `B/W`。但 false 不是纯性能开关：多卡下两种
+模式在每个 Adam step 使用的 sample membership/order 不同，Adam 更新
+又不可交换，所以会改变 refresh loss、梯度轨迹、最终量化权重和指标。
+在 local backward cap 更小、同一 rank 还需拆多个 backward chunks 的
+其他配置中，样本分块还可能改变 local-chunk P95 clip；当前正式
+`B=32`、非 final local cap 为 32。若两种模式恰好选中同一全局集合，
+各 rank 都是 8 个样本且只形成一个 chunk，因此当前配置不靠这一效应
+区分两种模式。world size 为 1 时两种构造才退化为同一 scheduler。
+
+此前旧/新 alignment runner 在旧端**显式传了**
+`--dp_global_shuffle`，新端使用固定全局模式；8 卡代表 case 的
+sample IDs/loss/weights 逐 bit 一致。因此旧/新比较没有混用两种采样
+策略。正式 schedule A/B 全部走新代码，也都固定为全局模式。论文没有
+披露该选择；它是值得单独做复现 A/B 的 protocol 参数，但需要先给
+`realq` 增加一个默认保持当前 `true` 的显式开关，不能把 false arm
+当作不改数学的性能优化。
+
+证据边界也要说明：既有 alignment 的一卡 case 在 `W=1` 时两模式天然
+相同；八卡代表 case 使用 `N=B=16`，每次已经取完整校准集。因此它们
+证明的是“旧 true 路径与新固定 true 路径一致”，没有实测
+`W>1, B<N` 时 true/false 对正式 Qwen3 指标的影响。
+
+### `group_parallel_quant=rank`
+
+默认值必须区分入口：
+
+| 入口 | 默认值 |
+|---|---|
+| 旧 Python CLI `process_args.py` | `none` |
+| 旧实验常用 `scripts/gptq_plus_lr_sweep.sh` | `rank` |
+| 新顶层 `realq.Config` / production runner | `rank` |
+| 新低层 `RealQLayer(...)` / `quantize(...)` API | `none`，但顶层 runner 会显式传 Config 的 `rank` |
+
+所以，如果“旧代码默认”指裸 Python CLI，答案是否；如果指论文实验常用
+sweep launcher，答案是。新 production pipeline 把旧 launcher 的
+`rank` 选择提升成了真实 Config 默认。
+
+新 `realq` 的 `rank` 实现把每个 linear 的连续 output rows 分给 DP
+ranks：
+
+- 每个 rank 只对自己的 rows 做 per-row weight qparam search、inner
+  column loop 和 outer GPTQ compensation；
+- `num_groups>1` 时，每个 calibration batch 的 group Hessian 用
+  reduce-scatter 汇总，owner 只常驻自己 rows 需要的 groups；
+- Block-GD 前重建完整 stitched weight，所有 rank 计算同一全局
+  refresh gradient/Adam state，随后只把 update 的 owned rows 应用到
+  本地 working weight；
+- 最终 all-gather 完整 Q，因此保存的不是 sharded checkpoint；
+- 这个开关不改变 refresh scheduler、sample IDs 或 LR。
+
+在精确实数和相同 Hessian/qparams 下，各 output row 的 GPTQ 与逐元素
+Adam 更新相互独立，所以 `rank` 与 `none` 是同一数学算法。但它不是
+通用的逐 bit no-op：
+
+- `num_groups>1` 多卡 rank 使用“每 batch、每 group reduce-scatter”，
+  none 使用“先各 rank 本地累加、最后全 H all-reduce”，浮点加法树不同；
+- rank 使用 batched Cholesky/不同张量布局和 CUDA kernel；
+- group-quant + `act_order=false` 会在前序更新后的 block weight 上重新
+  观察动态 scale，前面的 ulp 差异可进入最终 dequantized weight。
+
+CPU toy 对抗验证了这个边界。固定相同非对角 SPD Hessian，world size 1：
+
+- 论文协议形态 `act_order=true, num_groups=4` 下，缩小尺寸的 per-row
+  和 group toy 两组各 50 个 seed 的 rank/none 输出均逐 bit 相同；
+- dynamic group、`act_order=false, num_groups=1` 下，50 个 seed 有
+  34 个输出不逐 bit，115 个元素不同，最大绝对差
+  `2.384185791015625e-7`。
+
+这个反例没有改变目标函数或量化公式，但证明不能把 rank/none 宣称为
+所有配置下的文件/权重逐 bit 等价。当前论文复现实验固定
+`act_order=true`，不落入该 dynamic-group 反例。更强的现有证据是：
+旧/新 alignment 的一卡 8 cases 和八卡代表 per-row/group-128 aware
+case 两端都显式使用 rank，最终 loss/state/weights 逐 bit一致；这证明
+“旧 rank vs 新 rank”的受测路径正确，不证明“rank vs none”在真实
+Qwen3/CUDA 上逐 bit。
+
+结论：保留 `rank` 作为当前默认是合理的性能实现，但任何性能 A/B 必须
+把它固定在两边。若要切到 `none`，应归类为“实数算法相同、浮点轨迹
+可能漂移”的数值 arm，重新比较 checkpoint 和指标，不能当成无损开关。
+另有一个 provenance 缺口：checkpoint 当前没有记录
+`group_parallel_quant`；这不影响加载后的推理行为，但不足以单凭
+checkpoint manifest 还原量化过程。
 
 ## 与论文用时表格的现有比较
 
