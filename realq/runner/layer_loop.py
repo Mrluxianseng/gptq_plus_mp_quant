@@ -113,6 +113,12 @@ def _measure_quantize_one_layer(
 
     # GPU metadata/context discovery happens above so it cannot contaminate
     # either the timed interval or the reset peak counters.
+    # Drain every rank's preceding CUDA work *before* admitting it to the
+    # rendezvous.  A bare NCCL barrier may otherwise be enqueued while work on
+    # another CUDA stream is still outstanding, making that work leak into the
+    # measured layer on some ranks.  The second synchronization also makes the
+    # post-rendezvous boundary explicit across backends.
+    torch.cuda.synchronize(dev)
     parallel_env.barrier()
     torch.cuda.synchronize(dev)
     torch.cuda.reset_peak_memory_stats(dev)

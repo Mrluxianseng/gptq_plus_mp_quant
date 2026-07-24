@@ -175,6 +175,7 @@ def test_enabled_perf_measurement_call_order_and_json_schema(
     assert result is marker
     assert events == [
         "properties:3",
+        "synchronize:cuda:3",
         "barrier",
         "synchronize:cuda:3",
         "reset:cuda:3",
