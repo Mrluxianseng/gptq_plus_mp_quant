@@ -18,6 +18,11 @@
 #   bash realq/scripts/profile.sh                      # 0.6B single-GPU defaults
 #   DEVICE=0,1,2,3 bash realq/scripts/profile.sh modelzoo/Qwen/Qwen3-8B
 #   QUANT_STOP_LAYER=1 NSAMPLES=128 bash realq/scripts/profile.sh
+#   NSYS_MODE=all_nvtx DEVICE=0,1,2,3 bash realq/scripts/profile.sh MODEL
+#
+# Multi-rank Nsight modes:
+#   rank0_cuda  rank 0 traces CUDA+NVTX; other ranks run without Nsight
+#   all_nvtx    every rank traces NVTX only (low-overhead straggler view)
 
 set -euo pipefail
 
@@ -61,14 +66,14 @@ QUANT_STOP_LAYER=${QUANT_STOP_LAYER:-}   # empty = full quant (Config default = 
 EXP_NAME=${EXP_NAME:-realq_profile}
 OUTPUT_ROOT=${OUTPUT_ROOT:-./outputs}
 NSYS=${NSYS:-1}
+NVTX=${NVTX:-${NSYS}}
 NSYS_OUTPUT=${NSYS_OUTPUT:-${OUTPUT_ROOT}/nsight/${EXP_NAME}}
-# Default trace set: cuda (kernels + driver/runtime), nvtx (our `nvtx_range`
-# annotations), nccl (collective op metadata — communicator, rank list, msg
-# size). Without `nccl` you only see anonymous NCCL kernels in the cuda trace.
-# Add `cublas,cuDNN` if you need GEMM/attention kernel-level breakdown; cost
-# is more CUPTI overhead and bigger reports. CCCL (Thrust/CUB) is not a
-# separate nsys trace category — it surfaces as plain CUDA kernels.
-NSYS_TRACE=${NSYS_TRACE:-cuda,nvtx,nccl}
+# Nsight 2024.6.2 in the experiment image does not expose `nccl` as a trace
+# category. NCCL CUDA kernels remain visible in a CUDA trace, but requesting
+# `nccl` makes nsys reject the command before launch.
+NSYS_MODE=${NSYS_MODE:-rank0_cuda}
+NSYS_TRACE_RANK0=${NSYS_TRACE_RANK0:-${NSYS_TRACE:-cuda,nvtx}}
+NSYS_TRACE_ALL=${NSYS_TRACE_ALL:-nvtx}
 NSYS_WAIT=${NSYS_WAIT:-primary}
 if [[ -z "${NSYS_BIN:-}" ]]; then
     if [[ -x /usr/local/bin/nsys ]]; then
@@ -84,6 +89,18 @@ if [[ "${CPU_MASTER}" == "1" && "${FSDP}" != "1" ]]; then
     echo "[realq.profile] CPU_MASTER=1 implies FSDP=1; auto-enabling FSDP." >&2
     FSDP=1
 fi
+if [[ "${NSYS}" != "0" && "${NSYS}" != "1" ]]; then
+    echo "ERROR: NSYS must be 0 or 1; got ${NSYS}." >&2
+    exit 2
+fi
+if [[ "${NVTX}" != "0" && "${NVTX}" != "1" ]]; then
+    echo "ERROR: NVTX must be 0 or 1; got ${NVTX}." >&2
+    exit 2
+fi
+if [[ "${NSYS_MODE}" != "rank0_cuda" && "${NSYS_MODE}" != "all_nvtx" ]]; then
+    echo "ERROR: NSYS_MODE must be rank0_cuda or all_nvtx; got ${NSYS_MODE}." >&2
+    exit 2
+fi
 
 export CUDA_VISIBLE_DEVICES=${DEVICE}
 IFS=',' read -r -a _DEVICE_LIST <<< "${DEVICE}"
@@ -94,7 +111,8 @@ echo "============================================================"
 echo "RealQ profile quick"
 echo "  model    : ${MODEL_PATH}"
 echo "  device   : ${DEVICE} (N_GPUS=${N_GPUS})"
-echo "  nsys     : ${NSYS} output=${NSYS_OUTPUT}"
+echo "  nsys     : ${NSYS} mode=${NSYS_MODE} output=${NSYS_OUTPUT}"
+echo "  traces   : rank0=${NSYS_TRACE_RANK0} all=${NSYS_TRACE_ALL} nvtx=${NVTX}"
 echo "  dataset  : ${DATASET}  n=${NSAMPLES}  seq=${SEQ_LEN}  bsz=${BSZ}"
 echo "  quant    : w_bits=${W_BITS}  groups=${NUM_GROUPS}  grad_lr=${GRAD_LR}"
 echo "  shard    : cpu_master=${CPU_MASTER}  fsdp=${FSDP}"
@@ -102,11 +120,11 @@ echo "  stop@    : ${QUANT_STOP_LAYER:-<none, full quant>}"
 echo "============================================================"
 
 # ---- realq.ptq arg list ----------------------------------------------------
-# When NSYS=1 we always pass --nsys_profile true so realq's NVTX wrappers
-# (controlled by Config.nsys_profile → realq/utils/nvtx.set_enabled) actually
-# emit ranges into the trace.
+# NVTX emission is independently controllable. By default it follows NSYS,
+# while `NSYS=0 NVTX=1` supports an externally attached profiler without
+# launching nsys here.
 NSYS_PROFILE_ARG=()
-if [[ "${NSYS}" == "1" ]]; then
+if [[ "${NVTX}" == "1" ]]; then
     NSYS_PROFILE_ARG=(--nsys_profile true)
 fi
 
@@ -147,7 +165,8 @@ if [[ -z "${NSYS_BIN:-}" || ! -x "${NSYS_BIN}" ]]; then
     echo "ERROR: NSYS=1 but nsys binary not found." >&2
     echo "  Searched: \$NSYS_BIN=${NSYS_BIN:-<unset>}, /usr/local/bin/nsys, PATH." >&2
     echo "  Install Nsight Systems CLI, or export NSYS_BIN=/path/to/nsys." >&2
-    echo "  Or pass NSYS=0 to run without nsys (NVTX ranges still emitted)." >&2
+    echo "  Or pass NSYS=0 to run without nsys." >&2
+    echo "  Add NVTX=1 only if an external profiler should receive ranges." >&2
     echo "================================================================" >&2
     exit 1
 fi
@@ -158,9 +177,14 @@ if [[ "${N_GPUS}" -le 1 ]]; then
     # Single-GPU: wrap nsys around the whole launcher. With nproc_per_node=1
     # there are no NCCL collectives and CUPTI has nothing to race against, so
     # the simple outer wrap is safe.
+    if [[ "${NSYS_MODE}" == "all_nvtx" ]]; then
+        SINGLE_TRACE="${NSYS_TRACE_ALL}"
+    else
+        SINGLE_TRACE="${NSYS_TRACE_RANK0}"
+    fi
     "${NSYS_BIN}" profile \
         --force-overwrite=true \
-        --trace="${NSYS_TRACE}" \
+        --trace="${SINGLE_TRACE}" \
         --sample=none \
         --cpuctxsw=none \
         --backtrace=none \
@@ -176,10 +200,10 @@ fi
 # traces the launcher — workers spawn as children and either get skipped or
 # (with default --children=true on recent nsys) all share one trace ring
 # buffer, which races with NCCL kernel callbacks and SIGSEGVs randomly. The
-# fix is to let torchrun launch a per-rank bash wrapper that execs
-# `nsys profile python -m realq.ptq ...`, so each rank gets its own
-# .nsys-rep and CUPTI instance.
-export NSYS_BIN NSYS_TRACE NSYS_WAIT
+# fix is to let torchrun launch a per-rank bash wrapper. In `rank0_cuda` only
+# rank 0 execs nsys and all other ranks exec Python directly; in `all_nvtx`
+# every rank gets an independent NVTX-only .nsys-rep.
+export NSYS_BIN NSYS_MODE NSYS_TRACE_RANK0 NSYS_TRACE_ALL NSYS_WAIT
 NSYS_OUTPUT_BASE="${NSYS_OUTPUT}"
 export NSYS_OUTPUT_BASE
 
@@ -188,9 +212,17 @@ trap 'rm -f "${RANK_WRAPPER}"' EXIT
 cat >"${RANK_WRAPPER}" <<'EOF'
 #!/bin/bash
 set -e
+if [[ "${NSYS_MODE}" == "rank0_cuda" && "${LOCAL_RANK:-0}" != "0" ]]; then
+    exec "$@"
+fi
+if [[ "${NSYS_MODE}" == "all_nvtx" ]]; then
+    NSYS_RANK_TRACE="${NSYS_TRACE_ALL}"
+else
+    NSYS_RANK_TRACE="${NSYS_TRACE_RANK0}"
+fi
 exec "${NSYS_BIN}" profile \
     --force-overwrite=true \
-    --trace="${NSYS_TRACE}" \
+    --trace="${NSYS_RANK_TRACE}" \
     --sample=none \
     --cpuctxsw=none \
     --backtrace=none \
@@ -206,9 +238,9 @@ chmod +x "${RANK_WRAPPER}"
 #   0: python   1: -m   2: torch.distributed.run
 #   3..5: torchrun flags (--nnodes / --nproc_per_node / --rdzv_endpoint)
 #   6: -m       7: realq.ptq    8+: realq args
-# Re-launch torchrun with --no-python; each worker execs
-# `${RANK_WRAPPER} python -m realq.ptq ...`, which in turn execs
-# `nsys profile python -m realq.ptq ...`.
+# Re-launch torchrun with --no-python; each worker enters RANK_WRAPPER, which
+# either execs Python directly or execs `nsys profile python` according to
+# NSYS_MODE and LOCAL_RANK.
 python -m torch.distributed.run \
     --nnodes=1 --nproc_per_node=${N_GPUS} --rdzv_endpoint=localhost:${RDZV_PORT} \
     --no-python \

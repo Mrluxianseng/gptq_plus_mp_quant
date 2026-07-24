@@ -17,8 +17,16 @@ layer schedule + fisher_mse loss) wired per linear.
 """
 from __future__ import annotations
 
+import json
 import logging
-from typing import TYPE_CHECKING
+import os
+import socket
+import tempfile
+import time
+from collections.abc import Callable
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import TYPE_CHECKING, TypeVar
 
 import torch
 import torch.nn as nn
@@ -45,6 +53,124 @@ if TYPE_CHECKING:
     from realq.config import Config
     from realq.precompute import StaticStats
     from utils.model_utils import ModelAnalyzer
+
+
+_T = TypeVar("_T")
+
+
+def _utc_now_iso() -> str:
+    """Return an unambiguous UTC timestamp for performance artifacts."""
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _atomic_json_dump(path: Path, payload: dict[str, object]) -> None:
+    """Atomically publish one rank's measurement in its destination folder."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path)
+    finally:
+        try:
+            os.unlink(tmp_name)
+        except FileNotFoundError:
+            pass
+
+
+def _measure_quantize_one_layer(
+    cfg: "Config",
+    layer_idx: int,
+    dev: torch.device,
+    quantize_call: Callable[[], _T],
+) -> _T:
+    """Measure exactly one synchronized ``quantize_one_layer`` invocation.
+
+    This helper is called only when ``cfg.perf_measure_layer`` selects the
+    current layer. The ordinary path does not enter it, so a default
+    ``perf_measure_layer=None`` performs no barriers, timing calls, CUDA
+    queries/stat resets, or artifact writes.
+    """
+    rank = parallel_env.get_rank()
+    world = parallel_env.get_world_size()
+    local_rank = int(os.environ.get("LOCAL_RANK", rank))
+    device_index = (
+        dev.index if dev.index is not None else torch.cuda.current_device()
+    )
+    properties = torch.cuda.get_device_properties(device_index)
+    device_name = str(properties.name)
+    device_uuid_value = getattr(properties, "uuid", None)
+    device_uuid = (
+        str(device_uuid_value) if device_uuid_value is not None else None
+    )
+
+    # GPU metadata/context discovery happens above so it cannot contaminate
+    # either the timed interval or the reset peak counters.
+    parallel_env.barrier()
+    torch.cuda.synchronize(dev)
+    torch.cuda.reset_peak_memory_stats(dev)
+    start_allocated = int(torch.cuda.memory_allocated(dev))
+    start_reserved = int(torch.cuda.memory_reserved(dev))
+    start_utc = _utc_now_iso()
+    start_perf_counter_ns = time.perf_counter_ns()
+
+    result = quantize_call()
+
+    torch.cuda.synchronize(dev)
+    end_perf_counter_ns = time.perf_counter_ns()
+    end_utc = _utc_now_iso()
+    end_allocated = int(torch.cuda.memory_allocated(dev))
+    end_reserved = int(torch.cuda.memory_reserved(dev))
+    peak_allocated = int(torch.cuda.max_memory_allocated(dev))
+    peak_reserved = int(torch.cuda.max_memory_reserved(dev))
+    # Keep the post-boundary synchronized as well. It is deliberately outside
+    # elapsed_ns: max(per-rank elapsed_ns) is the distributed critical path,
+    # while a slow rank's wait time must not inflate faster ranks.
+    parallel_env.barrier()
+
+    output_dir = Path(cfg.output_dir).resolve()
+    output_path = (
+        output_dir
+        / cfg.exp
+        / f"perf_measure_layer_{layer_idx}_rank{rank}.json"
+    )
+    payload: dict[str, object] = {
+        "schema_version": 1,
+        "metric_name": "quant_layer_critical_wall",
+        "output_dir": str(output_dir),
+        "exp": cfg.exp,
+        "global_rank": rank,
+        "local_rank": local_rank,
+        "world_size": world,
+        "hostname": socket.gethostname(),
+        "pid": os.getpid(),
+        "layer_idx": layer_idx,
+        "cuda_device_index": device_index,
+        "cuda_device_name": device_name,
+        "cuda_device_uuid": device_uuid,
+        "start_utc": start_utc,
+        "end_utc": end_utc,
+        "start_perf_counter_ns": start_perf_counter_ns,
+        "end_perf_counter_ns": end_perf_counter_ns,
+        "elapsed_ns": end_perf_counter_ns - start_perf_counter_ns,
+        "cuda_start_allocated_bytes": start_allocated,
+        "cuda_end_allocated_bytes": end_allocated,
+        "cuda_peak_allocated_bytes": peak_allocated,
+        "cuda_peak_allocated_delta_bytes": peak_allocated - start_allocated,
+        "cuda_start_reserved_bytes": start_reserved,
+        "cuda_end_reserved_bytes": end_reserved,
+        "cuda_peak_reserved_bytes": peak_reserved,
+        "cuda_peak_reserved_delta_bytes": peak_reserved - start_reserved,
+    }
+    _atomic_json_dump(output_path, payload)
+    return result
 
 
 def _make_quantizer(cfg: "Config"):
@@ -579,15 +705,42 @@ def quantize_all_layers(
                 and layer_idx + 1 < n_layers + 1  # tolerate final-stop runs
             ):
                 next_layer = layers[layer_idx + 1]
-            state = quantize_one_layer(
-                cfg, layer_idx, layers[layer_idx], static, state, dev,
-                num_layers=len(layers), sample_scheduler=sample_scheduler,
-                next_layer=next_layer,
-                next_fp_inps=state.fp_inps if next_layer is not None else None,
-                analyzer=analyzer,
-                layer_manager=layer_manager,
-                trace_writer=trace_writer,
-            )
+            if (
+                cfg.perf_measure_layer is not None
+                and layer_idx == cfg.perf_measure_layer
+            ):
+                # The lambda exists only in the opt-in branch. In particular,
+                # the default-off path below remains a direct call with the
+                # original arguments and execution path.
+                state = _measure_quantize_one_layer(
+                    cfg,
+                    layer_idx,
+                    dev,
+                    lambda: quantize_one_layer(
+                        cfg, layer_idx, layers[layer_idx], static, state, dev,
+                        num_layers=len(layers),
+                        sample_scheduler=sample_scheduler,
+                        next_layer=next_layer,
+                        next_fp_inps=(
+                            state.fp_inps if next_layer is not None else None
+                        ),
+                        analyzer=analyzer,
+                        layer_manager=layer_manager,
+                        trace_writer=trace_writer,
+                    ),
+                )
+            else:
+                state = quantize_one_layer(
+                    cfg, layer_idx, layers[layer_idx], static, state, dev,
+                    num_layers=len(layers), sample_scheduler=sample_scheduler,
+                    next_layer=next_layer,
+                    next_fp_inps=(
+                        state.fp_inps if next_layer is not None else None
+                    ),
+                    analyzer=analyzer,
+                    layer_manager=layer_manager,
+                    trace_writer=trace_writer,
+                )
     finally:
         trace_writer.close()
     if cfg.quant_stop_layer is not None:

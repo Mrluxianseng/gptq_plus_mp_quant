@@ -183,6 +183,10 @@ class Config:
 
     # ----- debug ----------------------------------------------------------
     quant_stop_layer: Optional[int] = None
+    # Optional synchronized wall/memory probe for one transformer block.
+    # ``None`` is a strict no-op: the ordinary quantize_one_layer call remains
+    # direct and performs no timing, CUDA-stat, barrier, or file operations.
+    perf_measure_layer: Optional[int] = None
     # When True, emit NVTX ranges for every major pipeline phase so that
     # `nsys profile -t cuda,nvtx ...` traces can be inspected. Off by
     # default — when off, the wrapper is a nullcontext (no behavior change,
@@ -355,6 +359,18 @@ class Config:
                 f"k_cache_quant_aware_gptq={self.k_cache_quant_aware_gptq}). "
                 "See realq/TODO_CPU_MASTER.md."
             )
+        if (
+            self.perf_measure_layer is not None
+            and (
+                not isinstance(self.perf_measure_layer, int)
+                or isinstance(self.perf_measure_layer, bool)
+                or self.perf_measure_layer < 0
+            )
+        ):
+            raise ValueError(
+                "`perf_measure_layer` must be None or a non-negative integer. "
+                f"Got {self.perf_measure_layer!r}."
+            )
 
     @property
     def activation_aware_quantization_enabled(self) -> bool:
@@ -438,6 +454,7 @@ def parse_cli(argv: list[str] | None = None) -> Config:
         if f.name in {
             "quant_stop_layer",
             "final_layer_backward_bsz",
+            "perf_measure_layer",
         } and isinstance(v, str):
             raw[f.name] = int(v)
     return Config(**raw)
