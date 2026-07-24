@@ -50,6 +50,7 @@ _WEIGHT_PROVENANCE_FIELDS = (
     "w_method",
     "quantizer_inner_fastpath",
     "w_clip_search_impl",
+    "fisher_fp32_cache",
 )
 _BOOL_FIELDS = {
     "rotate",

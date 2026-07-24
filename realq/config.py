@@ -56,6 +56,12 @@ class Config:
     # full quantize). Old code's tensor-mode is not ported (RealQ already
     # vectorises across NUM_GROUPS in the per-group fallback).
     group_parallel_quant: str = "rank"  # one of: none, rank
+    # Opt-in exact performance experiment. Stage the current/slide Fisher
+    # matrices as FP32 once per layer so each refresh loss reuses the same
+    # tensor instead of expanding the persisted BF16 matrix on every call.
+    # Default-off until real-model checkpoint and isolated timing gates pass.
+    fisher_fp32_cache: bool = False
+
     # ----- static end-to-end precompute -----------------------------------
     global_loss_bsz: int = 16
     saliency_clip_percentile: float = 0.99
@@ -305,6 +311,11 @@ class Config:
             raise ValueError(
                 "`quantizer_inner_fastpath` must be bool. Got "
                 f"{self.quantizer_inner_fastpath!r}."
+            )
+        if type(self.fisher_fp32_cache) is not bool:
+            raise ValueError(
+                "`fisher_fp32_cache` must be bool. Got "
+                f"{self.fisher_fp32_cache!r}."
             )
         if not (0.0 < self.saliency_clip_percentile <= 1.0):
             raise ValueError(

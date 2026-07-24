@@ -58,6 +58,24 @@ if TYPE_CHECKING:
 _T = TypeVar("_T")
 
 
+def _stage_fisher_for_refresh(
+    fisher: torch.Tensor,
+    dev: torch.device,
+    *,
+    fp32_cache: bool,
+) -> torch.Tensor:
+    """Move one persisted Fisher matrix to the refresh device.
+
+    The default branch deliberately retains the historical ``fisher.to(dev)``
+    expression and BF16 residency.  The opt-in branch performs the same
+    BF16-to-FP32 value conversion once at the layer boundary that
+    :func:`fisher_mse_loss` otherwise repeats for every backward chunk.
+    """
+    if fp32_cache:
+        return fisher.to(device=dev, dtype=torch.float32)
+    return fisher.to(dev)
+
+
 def _utc_now_iso() -> str:
     """Return an unambiguous UTC timestamp for performance artifacts."""
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -452,7 +470,15 @@ def quantize_one_layer(
         # propagated through later refreshes). Hoisting the alloc here keeps the
         # GPU memory layout deterministic across all per-module quantize calls.
         with nvtx.nvtx_range("layer.fisher_to_gpu"):
-            fisher_dev = static.fisher[layer_idx].to(dev) if block_gd_enabled else None
+            fisher_dev = (
+                _stage_fisher_for_refresh(
+                    static.fisher[layer_idx],
+                    dev,
+                    fp32_cache=cfg.fisher_fp32_cache,
+                )
+                if block_gd_enabled
+                else None
+            )
             # next-layer fisher for slide_window. Hoisted to layer entry so
             # the H2D copy happens ONCE per layer instead of once per module
             # (block_gd reused 6 modules × per-module ``static.fisher[...].to(dev)``
@@ -464,7 +490,11 @@ def quantize_one_layer(
                 and cfg.loss_slide_window
                 and next_layer is not None
             ):
-                next_fisher_dev = static.fisher[layer_idx + 1].to(dev)
+                next_fisher_dev = _stage_fisher_for_refresh(
+                    static.fisher[layer_idx + 1],
+                    dev,
+                    fp32_cache=cfg.fisher_fp32_cache,
+                )
 
         for grp in module_groups.GROUP_ORDER:
             with nvtx.nvtx_range(f"group_{grp}"):
