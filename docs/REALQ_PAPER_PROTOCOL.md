@@ -4,6 +4,12 @@ This file records what can and cannot be reconstructed from `main.tex`.  It is
 an audit record, not a claim that the paper tables are currently reproducible.
 The paper source is intentionally not modified by the implementation audit.
 
+The author-confirmed settings selected on 2026-07-24 for the current
+reverse-cosine A/B experiments are recorded separately in
+[`REALQ_SCHEDULE_ABLATION_MANIFEST.md`](REALQ_SCHEDULE_ABLATION_MANIFEST.md).
+Those settings close choices for the new runs but do not retroactively turn
+previously undisclosed paper-table settings into paper disclosures.
+
 ## Settings explicitly specified by the paper
 
 | Setting | Paper requirement |
