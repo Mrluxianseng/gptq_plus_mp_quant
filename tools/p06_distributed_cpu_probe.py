@@ -1,14 +1,22 @@
-"""Distributed CPU exactness probe for P06 act-order weight stitching.
+"""Distributed CPU/CUDA exactness probe for P06 act-order weight stitching.
 
-Run with CUDA hidden:
+CPU/Gloo is the default and requires CUDA to be hidden:
 
     CUDA_VISIBLE_DEVICES='' torchrun --standalone --nproc_per_node=2 \
         tools/p06_distributed_cpu_probe.py
     CUDA_VISIBLE_DEVICES='' torchrun --standalone --nproc_per_node=4 \
         tools/p06_distributed_cpu_probe.py
 
+CUDA/NCCL is opt-in. The caller must set ``CUBLAS_WORKSPACE_CONFIG`` before
+Python imports torch:
+
+    CUBLAS_WORKSPACE_CONFIG=:4096:8 REALQ_P06_PROBE_DEVICE=cuda \
+      torchrun --standalone --nproc_per_node=4 \
+        tools/p06_distributed_cpu_probe.py
+
 The probe exercises real Fisher-MSE backward, gradient all-reduce, and Adam
-updates. It never touches CUDA.
+updates. Each case runs both legacy->exact and exact->legacy to detect
+allocator/order-sensitive drift.
 """
 
 from __future__ import annotations
@@ -46,7 +54,7 @@ def _raw_equal(left: torch.Tensor, right: torch.Tensor) -> bool:
 
 def _sha256(tensor: torch.Tensor) -> str:
     return hashlib.sha256(
-        tensor.detach().contiguous().numpy().tobytes()
+        tensor.detach().cpu().contiguous().numpy().tobytes()
     ).hexdigest()
 
 
@@ -92,16 +100,23 @@ def _ready_quantizer(
         mse=False,
         weight_groupsize=weight_groupsize,
     )
+    quantizer.to(weight.device)
     # Isolate refresh communication from qparam scale/zero communication.
     quantizer.find_params(weight)
     return quantizer
 
 
-def _run_case(case: _Case, implementation: str) -> _Result:
+def _run_case(
+    case: _Case,
+    implementation: str,
+    device: torch.device,
+) -> _Result:
     rank = dist.get_rank()
     world = dist.get_world_size()
     generator = torch.Generator().manual_seed(case.seed)
-    weight = torch.randn(case.rows, case.columns, generator=generator)
+    weight = torch.randn(
+        case.rows, case.columns, generator=generator
+    ).to(device)
     weight[:, ::2].mul_(0.25)
     weight[:, 1::3].mul_(3.0)
 
@@ -115,33 +130,36 @@ def _run_case(case: _Case, implementation: str) -> _Result:
                 torch.eye(case.columns) * (0.5 + group)
             )
         )
-    full_hessians = torch.stack(full_hessians)
-    act_square = torch.rand(case.columns, generator=generator)
+    full_hessians = torch.stack(full_hessians).to(device)
+    act_square = torch.rand(case.columns, generator=generator).to(device)
 
     samples_per_rank = 2
     global_sample_count = world * samples_per_rank
     global_inputs = torch.randn(
         global_sample_count, 3, case.columns, generator=generator
-    )
+    ).to(device)
     global_targets = torch.randn(
         global_sample_count, 3, case.rows, generator=generator
-    )
+    ).to(device)
     local_slice = slice(
         rank * samples_per_rank,
         (rank + 1) * samples_per_rank,
     )
 
-    layer = _ToyLayer(case.columns, case.rows)
+    layer = _ToyLayer(case.columns, case.rows).to(device)
     layer.proj.weight.data.copy_(weight)
     realq = RealQLayer(
         linear=layer.proj,
+        # RealQLayer deliberately persists saliency on CPU.
         saliency=torch.ones(1, 1, case.num_groups),
         quantizer=_ready_quantizer(weight, case.weight_groupsize),
         num_groups=case.num_groups,
-        dev=torch.device("cpu"),
+        dev=device,
         group_parallel_quant="rank",
     )
-    realq.H = full_hessians.index_select(0, realq.hessian_group_ids)
+    realq.H = full_hessians.index_select(
+        0, realq.hessian_group_ids.to(device)
+    )
     realq.act_square = act_square
     realq._finalized = True
 
@@ -167,7 +185,7 @@ def _run_case(case: _Case, implementation: str) -> _Result:
         module=layer.proj,
         layer_state=layer_state,
         fp_out_for_this_layer=global_targets[local_slice].clone(),
-        fisher=torch.eye(case.rows),
+        fisher=torch.eye(case.rows, device=device),
         ctx=context,
     )
     stitched_inputs: list[torch.Tensor] = []
@@ -206,6 +224,8 @@ def _run_case(case: _Case, implementation: str) -> _Result:
     finally:
         dist.all_gather_into_tensor = original_all_gather
 
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
     return _Result(
         weight=layer.proj.weight.detach().clone(),
         stitched_inputs=stitched_inputs,
@@ -251,30 +271,35 @@ def _expected_collectives(
 
 
 def _assert_results_equal(
-    legacy: _Result,
-    exact: _Result,
+    reference: _Result,
+    candidate: _Result,
     case: _Case,
 ) -> None:
-    assert _raw_equal(exact.weight, legacy.weight)
-    assert exact.adam_step == legacy.adam_step
-    assert len(exact.stitched_inputs) == len(legacy.stitched_inputs)
-    assert len(exact.updates) == len(legacy.updates)
+    assert _raw_equal(candidate.weight, reference.weight)
+    assert candidate.adam_step == reference.adam_step
+    assert len(candidate.stitched_inputs) == len(reference.stitched_inputs)
+    assert len(candidate.updates) == len(reference.updates)
     assert all(
         _raw_equal(left, right)
-        for left, right in zip(exact.stitched_inputs, legacy.stitched_inputs)
+        for left, right in zip(
+            candidate.stitched_inputs,
+            reference.stitched_inputs,
+        )
     )
     assert all(
         _raw_equal(left, right)
-        for left, right in zip(exact.updates, legacy.updates)
+        for left, right in zip(candidate.updates, reference.updates)
     )
-    assert _raw_equal(exact.exp_avg, legacy.exp_avg)
-    assert _raw_equal(exact.exp_avg_sq, legacy.exp_avg_sq)
+    assert _raw_equal(candidate.exp_avg, reference.exp_avg)
+    assert _raw_equal(candidate.exp_avg_sq, reference.exp_avg_sq)
 
     expected_steps = math.ceil(case.columns / case.blocksize) - 1
-    assert exact.adam_step == expected_steps
+    assert candidate.adam_step == expected_steps
 
 
-def _assert_rejection_boundaries() -> dict[str, str]:
+def _assert_rejection_boundaries(
+    device: torch.device,
+) -> dict[str, str]:
     world = dist.get_world_size()
     rank = dist.get_rank()
     errors: dict[str, str] = {}
@@ -285,19 +310,25 @@ def _assert_rejection_boundaries() -> dict[str, str]:
         uneven_rows,
         columns,
         generator=torch.Generator().manual_seed(901),
-    )
-    uneven_layer = nn.Linear(columns, uneven_rows, bias=False)
+    ).to(device)
+    uneven_layer = nn.Linear(
+        columns, uneven_rows, bias=False
+    ).to(device)
     uneven_layer.weight.data.copy_(uneven_weight)
     uneven_realq = RealQLayer(
         uneven_layer,
         torch.ones(1, 1, 1),
         _ready_quantizer(uneven_weight, -1),
         1,
-        torch.device("cpu"),
+        device,
         group_parallel_quant="rank",
     )
-    uneven_realq.H = torch.eye(columns).unsqueeze(0)
-    uneven_realq.act_square = torch.arange(columns, dtype=torch.float32)
+    uneven_realq.H = torch.eye(
+        columns, device=device
+    ).unsqueeze(0)
+    uneven_realq.act_square = torch.arange(
+        columns, dtype=torch.float32, device=device
+    )
     uneven_realq._finalized = True
     try:
         uneven_realq.quantize(
@@ -318,8 +349,10 @@ def _assert_rejection_boundaries() -> dict[str, str]:
         irregular_rows,
         columns,
         generator=torch.Generator().manual_seed(902),
-    )
-    irregular_layer = nn.Linear(columns, irregular_rows, bias=False)
+    ).to(device)
+    irregular_layer = nn.Linear(
+        columns, irregular_rows, bias=False
+    ).to(device)
     irregular_layer.weight.data.copy_(irregular_weight)
     try:
         RealQLayer(
@@ -327,7 +360,7 @@ def _assert_rejection_boundaries() -> dict[str, str]:
             torch.ones(1, 1, 3),
             _ready_quantizer(irregular_weight, -1),
             3,
-            torch.device("cpu"),
+            device,
             group_parallel_quant="rank",
         )
     except ValueError as error:
@@ -344,12 +377,72 @@ def _assert_rejection_boundaries() -> dict[str, str]:
     return errors
 
 
+def _resolve_probe_device() -> tuple[torch.device, str, int | None]:
+    requested = os.environ.get("REALQ_P06_PROBE_DEVICE", "cpu").strip().lower()
+    if requested not in ("cpu", "cuda"):
+        raise ValueError(
+            "REALQ_P06_PROBE_DEVICE must be 'cpu' or 'cuda', got "
+            f"{requested!r}."
+        )
+
+    if requested == "cpu":
+        assert os.environ.get("CUDA_VISIBLE_DEVICES") == "", (
+            "CPU P06 probe requires CUDA_VISIBLE_DEVICES='' and never uses a GPU"
+        )
+        return torch.device("cpu"), "gloo", None
+
+    workspace_config = os.environ.get("CUBLAS_WORKSPACE_CONFIG")
+    if workspace_config not in (":4096:8", ":16:8"):
+        raise RuntimeError(
+            "CUDA P06 probe requires the caller to set "
+            "CUBLAS_WORKSPACE_CONFIG=:4096:8 (or :16:8) before Python starts; "
+            f"got {workspace_config!r}."
+        )
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "REALQ_P06_PROBE_DEVICE=cuda requested but CUDA is unavailable."
+        )
+    try:
+        local_rank = int(os.environ["LOCAL_RANK"])
+    except (KeyError, ValueError) as error:
+        raise RuntimeError(
+            "CUDA P06 probe requires integer LOCAL_RANK from torchrun."
+        ) from error
+    if not 0 <= local_rank < torch.cuda.device_count():
+        raise RuntimeError(
+            f"LOCAL_RANK={local_rank} is outside the visible CUDA device "
+            f"range [0, {torch.cuda.device_count()})."
+        )
+    torch.cuda.set_device(local_rank)
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.use_deterministic_algorithms(True)
+    return torch.device("cuda", local_rank), "nccl", local_rank
+
+
+def _run_implementation_order(
+    case: _Case,
+    implementations: tuple[str, str],
+    device: torch.device,
+) -> dict[str, _Result]:
+    results = {}
+    for implementation in implementations:
+        results[implementation] = _run_case(
+            case,
+            implementation,
+            device,
+        )
+        # Keep every rank on the same implementation boundary. This is
+        # particularly important when the candidate deliberately removes one
+        # NCCL collective from each refresh.
+        dist.barrier()
+    return results
+
+
 def main() -> None:
-    assert os.environ.get("CUDA_VISIBLE_DEVICES") == "", (
-        "P06 probe must run with CUDA_VISIBLE_DEVICES='' and never use a GPU"
-    )
+    device, backend, local_rank = _resolve_probe_device()
     torch.set_num_threads(1)
-    dist.init_process_group("gloo")
+    dist.init_process_group(backend)
     world = dist.get_world_size()
     if world not in (2, 4):
         raise ValueError(f"P06 probe requires world size 2 or 4, got {world}.")
@@ -361,21 +454,52 @@ def main() -> None:
     ]
     summaries = []
     for case in cases:
-        legacy = _run_case(case, LEGACY)
-        dist.barrier()
-        exact = _run_case(case, EXACT)
-        _assert_results_equal(legacy, exact, case)
-        assert legacy.collective_shapes == _expected_collectives(
+        legacy_then_exact = _run_implementation_order(
             case,
-            world=world,
-            implementation=LEGACY,
+            (LEGACY, EXACT),
+            device,
         )
-        assert exact.collective_shapes == _expected_collectives(
+        exact_then_legacy = _run_implementation_order(
             case,
-            world=world,
-            implementation=EXACT,
+            (EXACT, LEGACY),
+            device,
         )
 
+        # Equality must hold within either execution order.
+        _assert_results_equal(
+            legacy_then_exact[LEGACY],
+            legacy_then_exact[EXACT],
+            case,
+        )
+        _assert_results_equal(
+            exact_then_legacy[LEGACY],
+            exact_then_legacy[EXACT],
+            case,
+        )
+        # Each implementation must also be stable across the two allocator /
+        # collective histories.
+        for implementation in (LEGACY, EXACT):
+            _assert_results_equal(
+                legacy_then_exact[implementation],
+                exact_then_legacy[implementation],
+                case,
+            )
+            expected_collectives = _expected_collectives(
+                case,
+                world=world,
+                implementation=implementation,
+            )
+            assert (
+                legacy_then_exact[implementation].collective_shapes
+                == expected_collectives
+            )
+            assert (
+                exact_then_legacy[implementation].collective_shapes
+                == expected_collectives
+            )
+
+        exact = legacy_then_exact[EXACT]
+        legacy = legacy_then_exact[LEGACY]
         digest = _sha256(exact.weight)
         rank_digests = [None] * world
         dist.all_gather_object(rank_digests, digest)
@@ -390,20 +514,33 @@ def main() -> None:
                 "refreshes": exact.adam_step,
                 "legacy_collectives": len(legacy.collective_shapes),
                 "exact_collectives": len(exact.collective_shapes),
+                "execution_orders": [
+                    "legacy_then_exact",
+                    "exact_then_legacy",
+                ],
                 "sha256": digest,
             }
         )
 
-    errors = _assert_rejection_boundaries()
+    errors = _assert_rejection_boundaries(device)
     if dist.get_rank() == 0:
         print(
             json.dumps(
                 {
                     "world_size": world,
                     "backend": dist.get_backend(),
-                    "cuda_visible_devices": os.environ[
+                    "probe_device": os.environ.get(
+                        "REALQ_P06_PROBE_DEVICE",
+                        "cpu",
+                    ),
+                    "local_device": str(device),
+                    "local_rank": local_rank,
+                    "cuda_visible_devices": os.environ.get(
                         "CUDA_VISIBLE_DEVICES"
-                    ],
+                    ),
+                    "cublas_workspace_config": os.environ.get(
+                        "CUBLAS_WORKSPACE_CONFIG"
+                    ),
                     "cases": summaries,
                     "rejections": errors,
                 },
