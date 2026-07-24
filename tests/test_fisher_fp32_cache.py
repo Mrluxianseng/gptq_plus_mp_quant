@@ -211,8 +211,9 @@ def test_fp32_cache_preserves_slide_refresh_adam_state_and_updates_raw_bytes():
         assert torch.equal(
             _raw_bytes(cached_update), _raw_bytes(legacy_update)
         )
-        legacy_weight[:, trailing_start:].sub_(legacy_update)
-        cached_weight[:, trailing_start:].sub_(cached_update)
+        with torch.no_grad():
+            legacy_weight[:, trailing_start:].sub_(legacy_update)
+            cached_weight[:, trailing_start:].sub_(cached_update)
         assert torch.equal(
             _raw_bytes(cached_weight), _raw_bytes(legacy_weight)
         )
