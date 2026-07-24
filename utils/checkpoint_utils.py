@@ -51,6 +51,7 @@ _WEIGHT_PROVENANCE_FIELDS = (
     "quantizer_inner_fastpath",
     "w_clip_search_impl",
     "fisher_fp32_cache",
+    "act_order_stitch_impl",
 )
 _WEIGHT_PROVENANCE_HISTORICAL_DEFAULTS = {
     # Checkpoint format v1 predates these opt-in build switches. Missing
@@ -59,6 +60,7 @@ _WEIGHT_PROVENANCE_HISTORICAL_DEFAULTS = {
     "quantizer_inner_fastpath": False,
     "w_clip_search_impl": "cartesian_legacy",
     "fisher_fp32_cache": False,
+    "act_order_stitch_impl": "full_weight_legacy",
 }
 _BOOL_FIELDS = {
     "rotate",
@@ -210,6 +212,15 @@ def _validate_weight_provenance(provenance: Mapping[str, Any]) -> None:
         raise ValueError(
             "Checkpoint field 'w_clip_search_impl' must be "
             "'cartesian_legacy' or 'symmetric_union_exact'."
+        )
+    if (
+        "act_order_stitch_impl" in provenance
+        and provenance["act_order_stitch_impl"]
+        not in ("full_weight_legacy", "prefix_q_trailing_w_exact")
+    ):
+        raise ValueError(
+            "Checkpoint field 'act_order_stitch_impl' must be "
+            "'full_weight_legacy' or 'prefix_q_trailing_w_exact'."
         )
 
 

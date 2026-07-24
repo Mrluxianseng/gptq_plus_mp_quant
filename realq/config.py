@@ -221,6 +221,12 @@ class Config:
     # Stage current/slide Fisher matrices as FP32 once per layer instead of
     # repeatedly expanding the persisted BF16 matrices in refresh losses.
     fisher_fp32_cache: bool = False
+    # In rank-parallel act-order refreshes, rebuild the complete permuted
+    # weight from the already-gathered quantized prefix and working suffix
+    # instead of issuing a redundant full-weight all-gather.  Keep the
+    # historical collective as the default until distributed CUDA exactness
+    # and timing gates pass.
+    act_order_stitch_impl: str = "full_weight_legacy"
 
     def __post_init__(self) -> None:
         if not self.model_name:
@@ -282,6 +288,15 @@ class Config:
                 "`w_clip_search_impl` must be 'cartesian_legacy' or "
                 "'symmetric_union_exact'. Got "
                 f"{self.w_clip_search_impl!r}."
+            )
+        if self.act_order_stitch_impl not in (
+            "full_weight_legacy",
+            "prefix_q_trailing_w_exact",
+        ):
+            raise ValueError(
+                "`act_order_stitch_impl` must be 'full_weight_legacy' or "
+                "'prefix_q_trailing_w_exact'. Got "
+                f"{self.act_order_stitch_impl!r}."
             )
         if self.num_groups <= 0:
             raise ValueError(

@@ -84,6 +84,7 @@ def test_missing_performance_provenance_restores_historical_build_defaults():
         "quantizer_inner_fastpath",
         "w_clip_search_impl",
         "fisher_fp32_cache",
+        "act_order_stitch_impl",
     ):
         manifest["weight_quantization"].pop(name)
 
@@ -91,11 +92,13 @@ def test_missing_performance_provenance_restores_historical_build_defaults():
         quantizer_inner_fastpath=True,
         w_clip_search_impl="symmetric_union_exact",
         fisher_fp32_cache=True,
+        act_order_stitch_impl="prefix_q_trailing_w_exact",
     )
     assert checkpoint_utils.apply_runtime_manifest(restored_cfg, manifest)
     assert restored_cfg.quantizer_inner_fastpath is False
     assert restored_cfg.w_clip_search_impl == "cartesian_legacy"
     assert restored_cfg.fisher_fp32_cache is False
+    assert restored_cfg.act_order_stitch_impl == "full_weight_legacy"
 
 
 def _rope(q, k):
@@ -357,6 +360,12 @@ def test_checkpoint_rejects_non_boolean_inner_fastpath_provenance(tmp_path):
             "unknown",
             "'w_clip_search_impl' must be 'cartesian_legacy' or "
             "'symmetric_union_exact'",
+        ),
+        (
+            "act_order_stitch_impl",
+            "unknown",
+            "'act_order_stitch_impl' must be 'full_weight_legacy' or "
+            "'prefix_q_trailing_w_exact'",
         ),
     ],
 )

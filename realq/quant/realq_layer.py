@@ -36,6 +36,33 @@ if TYPE_CHECKING:
     from utils.quant_utils import WeightQuantizer  # noqa: F401
 
 
+_ACT_ORDER_STITCH_IMPLEMENTATIONS = frozenset(
+    {"full_weight_legacy", "prefix_q_trailing_w_exact"}
+)
+
+
+def _rebuild_permuted_weight_from_prefix_and_trailing_(
+    destination: torch.Tensor,
+    full_q: torch.Tensor,
+    trailing_w: torch.Tensor,
+    trailing_col_start: int,
+) -> torch.Tensor:
+    """Fill ``destination`` with ``[Q prefix, working-W suffix]``.
+
+    Rank-parallel refresh has already gathered both source regions.  The
+    historical act-order path nevertheless issued another all-gather for the
+    complete working weight, only to overwrite its prefix with ``full_q``
+    before the closure consumed it.  This copy-only reconstruction preserves
+    the destination allocation and every downstream natural-order operation.
+    """
+
+    destination[:, :trailing_col_start].copy_(
+        full_q[:, :trailing_col_start]
+    )
+    destination[:, trailing_col_start:].copy_(trailing_w)
+    return destination
+
+
 class RealQLayer:
     def __init__(
         self,
@@ -278,6 +305,7 @@ class RealQLayer:
         grad_refresh_fn=None,
         group_parallel_quant: str = "none",
         quantizer_inner_fastpath: bool = False,
+        act_order_stitch_impl: str = "full_weight_legacy",
     ) -> None:
         """Run GPTQ on this linear's weight. Mutates ``self.linear.weight``.
 
@@ -302,6 +330,12 @@ class RealQLayer:
         primitive that validates scale/maxq state and all grouped natural
         column coordinates once per block. The default public path is
         unchanged. The private context raises if it becomes stale.
+
+        ``act_order_stitch_impl``: in multi-rank act-order refreshes,
+        ``"prefix_q_trailing_w_exact"`` reconstructs the complete permuted
+        weight from the Q prefix and W suffix that were already gathered,
+        avoiding one redundant full-weight copy collective. The default
+        ``"full_weight_legacy"`` retains the historical path.
         """
         # W16 is the explicit no-weight-quantization mode.  The quantizer has
         # no scale in this mode, so entering the GPTQ column loop would make
@@ -315,6 +349,11 @@ class RealQLayer:
         if w_clip and not self.quantizer.mse:
             raise ValueError(
                 "w_clip=True requires the quantizer to be configured with mse=True."
+            )
+        if act_order_stitch_impl not in _ACT_ORDER_STITCH_IMPLEMENTATIONS:
+            raise ValueError(
+                "act_order_stitch_impl must be 'full_weight_legacy' or "
+                f"'prefix_q_trailing_w_exact'; got {act_order_stitch_impl!r}."
             )
         # rank_mode is the unified "shard rows across ranks + flat (rows, count)
         # inner layout" path. world=1 also takes it so that single-GPU produces
@@ -662,14 +701,26 @@ class RealQLayer:
                                 # adam state we read is exp_avg[:, i2:].
                                 #
                                 # The trailing slice in PERMUTED order maps to
-                                # scattered NATURAL cols, so we can't avoid a
-                                # full W gather here. Fall back to full-W
-                                # gather only on the act_order branch.
+                                # scattered NATURAL cols.  The legacy path
+                                # gathered full W before reordering it.  The
+                                # exact candidate instead fills the same
+                                # allocation from the Q prefix + W suffix
+                                # already gathered above; downstream indexing,
+                                # clone, scatter, closure coordinates, and
+                                # update application remain unchanged.
                                 if rank_mode and world > 1:
                                     full_W = torch.empty_like(W)
-                                    _dist.all_gather_into_tensor(
-                                        full_W, W_local.contiguous(),
-                                    )
+                                    if (
+                                        act_order_stitch_impl
+                                        == "prefix_q_trailing_w_exact"
+                                    ):
+                                        _rebuild_permuted_weight_from_prefix_and_trailing_(
+                                            full_W, full_Q, W_trailing, i2
+                                        )
+                                    else:
+                                        _dist.all_gather_into_tensor(
+                                            full_W, W_local.contiguous(),
+                                        )
                                 else:
                                     full_W = W_local
                                 Q_nat = full_Q[:, invperm]
@@ -864,15 +915,24 @@ class RealQLayer:
                                     W_local_2d[:, i2:].sub_(update[row_sl])
                             else:
                                 # act_order path: closure expects NATURAL-order
-                                # weight covering ALL columns; we cannot avoid a
-                                # full gather of W here because the trailing slice
-                                # in PERMUTED order maps to scattered natural cols.
-                                # Fall back to full-W gather for act_order.
+                                # weight covering all columns. The exact
+                                # candidate reconstructs the same permuted
+                                # [Q-prefix, W-suffix] allocation from data
+                                # already gathered above; legacy retains the
+                                # redundant complete-W collective.
                                 if world > 1:
                                     full_W = torch.empty_like(W)
-                                    _dist.all_gather_into_tensor(
-                                        full_W, W_local_2d.contiguous(),
-                                    )
+                                    if (
+                                        act_order_stitch_impl
+                                        == "prefix_q_trailing_w_exact"
+                                    ):
+                                        _rebuild_permuted_weight_from_prefix_and_trailing_(
+                                            full_W, full_Q, W_trailing, i2
+                                        )
+                                    else:
+                                        _dist.all_gather_into_tensor(
+                                            full_W, W_local_2d.contiguous(),
+                                        )
                                 else:
                                     full_W = W_local_2d
                                 Q_nat = full_Q[:, invperm]

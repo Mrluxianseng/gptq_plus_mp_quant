@@ -640,6 +640,9 @@ def quantize_one_layer(
                                 quantizer_inner_fastpath=(
                                     cfg.quantizer_inner_fastpath
                                 ),
+                                act_order_stitch_impl=(
+                                    cfg.act_order_stitch_impl
+                                ),
                             )
                         realq.free()
                 del realqs
