@@ -110,7 +110,9 @@ python tools/compare_performance_checkpoints.py compare \
 3. 完整 canonical-state SHA256 相同；
 4. 两个 run 都成功，且 commit、case、baseline-id、物理 GPU ID/UUID 顺序
    相同；
-5. 忽略 artifact 路径后，两份 resolved config 的差异恰好等于声明的
+5. world size、model artifact identity、harness/comparator SHA256 和输入
+   source-cache identity 相同且字段完整；
+6. 忽略 artifact 路径后，两份 resolved config 的差异恰好等于声明的
    candidate 字段。
 
 `torch.save` archive SHA256 不要求相同，因为 archive 元数据可能不稳定。
@@ -141,6 +143,12 @@ recompute、cache write、token save 或数据下载日志都会令验证失败�
 最终 source gate 严格要求 commit、tracked/staged bytes、harness、
 comparator 和 model identity 在运行前后不变。untracked churn 只保留在审计
 字段中。
+
+GPU 模式安装了 EXIT cleanup trap。telemetry 和 torchrun 的 `setsid`
+process-group PID 会在启动后立即登记；任何异常 shell 退出都会只终止登记的
+harness-owned process group 并写入 `ABORTED`。已经 `wait`/reap 的 command
+PID 会立即从登记表移除；若进程组尚未来得及建立，正 PID fallback 也必须先
+通过 `/proc/<pid>/status` 证明它仍是 harness shell 的直接子进程。
 
 ## 已知风险
 

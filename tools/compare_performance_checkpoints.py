@@ -66,7 +66,13 @@ def _checkpoint_payload(path: Path) -> dict[str, Any]:
 def _canonical_state_dict(
     state: dict[str, Any],
 ) -> dict[str, tuple[str, torch.Tensor]]:
-    """Normalize the wrapper alias only after proving aliased values equal."""
+    """Fold a wrapper alias only when its plain peer exists and matches.
+
+    ``ActQuantWrapper`` serializes both ``x.weight`` and
+    ``x.module.weight``.  A module can also legitimately have ``module`` in
+    its name without being such an alias, so a unique ``.module.`` key must
+    retain its original identity.
+    """
 
     def byte_equal(left: torch.Tensor, right: torch.Tensor) -> bool:
         if left.shape != right.shape or left.dtype != right.dtype:
@@ -79,7 +85,7 @@ def _canonical_state_dict(
         )
         return torch.equal(left_bytes, right_bytes)
 
-    canonical: dict[str, tuple[str, torch.Tensor]] = {}
+    validated: dict[str, torch.Tensor] = {}
     for raw_key, value in state.items():
         if not isinstance(raw_key, str):
             raise RuntimeError(f"non-string state_dict key: {raw_key!r}")
@@ -87,21 +93,37 @@ def _canonical_state_dict(
             raise RuntimeError(
                 f"state_dict value for {raw_key!r} is not a tensor"
             )
-        key = raw_key.replace(".module.", ".")
-        if key not in canonical:
-            canonical[key] = (raw_key, value)
+        validated[raw_key] = value
+
+    aliases_by_plain: dict[str, list[str]] = {}
+    for wrapped_key, wrapped_value in validated.items():
+        if ".module." not in wrapped_key:
             continue
-        other_key, other_value = canonical[key]
-        if byte_equal(other_value, value):
-            # Prefer the wrapped serialization key.  The canonical key and
-            # bytes are unchanged; retaining the raw key helps audit aliases.
-            preferred = raw_key if ".module." in raw_key else other_key
-            canonical[key] = (preferred, value)
+        plain_key = wrapped_key.replace(".module.", ".")
+        if plain_key not in validated:
             continue
-        raise RuntimeError(
-            "state_dict canonicalization collision with unequal values: "
-            f"{other_key!r} and {raw_key!r} both map to {key!r}"
+        if not byte_equal(validated[plain_key], wrapped_value):
+            raise RuntimeError(
+                "state_dict canonicalization collision with unequal values: "
+                f"{plain_key!r} and {wrapped_key!r} both map to "
+                f"{plain_key!r}"
+            )
+        aliases_by_plain.setdefault(plain_key, []).append(wrapped_key)
+
+    wrapped_aliases = {
+        wrapped
+        for wrapped_keys in aliases_by_plain.values()
+        for wrapped in wrapped_keys
+    }
+    canonical: dict[str, tuple[str, torch.Tensor]] = {}
+    for raw_key, value in validated.items():
+        if raw_key in wrapped_aliases:
+            continue
+        wrapped_keys = aliases_by_plain.get(raw_key)
+        serialized_key = (
+            sorted(wrapped_keys)[0] if wrapped_keys else raw_key
         )
+        canonical[raw_key] = (serialized_key, value)
     return canonical
 
 
@@ -222,6 +244,19 @@ def _run_compatibility(
     right_manifest = right["manifest"]
     left_config = left["config"]
     right_config = right["config"]
+
+    def equal_present(field: str) -> bool:
+        missing = object()
+        left_value = left_manifest.get(field, missing)
+        right_value = right_manifest.get(field, missing)
+        return (
+            left_value is not missing
+            and right_value is not missing
+            and left_value is not None
+            and right_value is not None
+            and left_value == right_value
+        )
+
     declared = _candidate_names(left_manifest) | _candidate_names(right_manifest)
     actual = {
         key: {"left": left_config.get(key), "right": right_config.get(key)}
@@ -230,22 +265,23 @@ def _run_compatibility(
         and left_config.get(key) != right_config.get(key)
     }
     identity_checks = {
-        "baseline_id_equal": (
-            left_manifest.get("baseline_id")
-            == right_manifest.get("baseline_id")
+        "baseline_id_equal": equal_present("baseline_id"),
+        "case_equal": equal_present("case"),
+        "git_commit_equal": equal_present("git_commit"),
+        "physical_gpu_ids_equal": equal_present("physical_gpu_ids"),
+        "physical_gpu_uuids_equal": equal_present(
+            "physical_gpu_uuids_in_rank_order"
         ),
-        "case_equal": left_manifest.get("case") == right_manifest.get("case"),
-        "git_commit_equal": (
-            left_manifest.get("git_commit")
-            == right_manifest.get("git_commit")
+        "world_size_equal": equal_present("world_size"),
+        "model_artifact_identity_equal": equal_present(
+            "model_artifact_identity"
         ),
-        "physical_gpu_ids_equal": (
-            left_manifest.get("physical_gpu_ids")
-            == right_manifest.get("physical_gpu_ids")
+        "harness_sha256_equal": equal_present("harness_sha256"),
+        "checkpoint_compare_tool_sha256_equal": equal_present(
+            "checkpoint_compare_tool_sha256"
         ),
-        "physical_gpu_uuids_equal": (
-            left_manifest.get("physical_gpu_uuids_in_rank_order")
-            == right_manifest.get("physical_gpu_uuids_in_rank_order")
+        "source_cache_identity_equal": equal_present(
+            "source_cache_identity"
         ),
         "both_runs_passed": (
             left_manifest.get("status") == "passed"

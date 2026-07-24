@@ -899,6 +899,18 @@ def sha256(raw: str) -> str:
 
 selected = json.loads(Path(selected_mapping_raw).read_text(encoding="utf-8"))
 source = json.loads(Path(source_raw).read_text(encoding="utf-8"))
+cache = json.loads(Path(cache_raw).read_text(encoding="utf-8"))
+source_cache_identity = [
+    {
+        "kind": pair["kind"],
+        "rank": pair["rank"],
+        "size_bytes": pair["source"]["size_bytes"],
+        "mtime_ns": pair["source"]["mtime_ns"],
+        "mode": pair["source"]["mode"],
+        "sha256": pair["source"]["sha256"],
+    }
+    for pair in cache["pairs"]
+]
 payload = {
     "schema_version": 1,
     "run_id": run_id,
@@ -923,6 +935,7 @@ payload = {
     "model": model,
     "model_artifact_identity": source["model_artifact_identity"],
     "smoke_cache_root": smoke_root,
+    "source_cache_identity": source_cache_identity,
     "source_provenance_path": source_raw,
     "source_provenance_sha256": sha256(source_raw),
     "cache_provenance_path": cache_raw,
@@ -1106,13 +1119,49 @@ PY
 stop_active_processes() {
     local pid
     for pid in "${ACTIVE_PIDS[@]:-}"; do
-        kill -TERM -- "-$pid" 2>/dev/null ||
-            kill -TERM "$pid" 2>/dev/null || true
+        # Every registered child is launched through setsid, so its PID is
+        # also its harness-owned process-group ID. A just-forked setsid child
+        # may not have created that group yet; positive-PID fallback is safe
+        # only while /proc still proves it is our shell's direct child.
+        if ! kill -TERM -- "-$pid" 2>/dev/null; then
+            if registered_pid_is_direct_child "$pid"; then
+                kill -TERM "$pid" 2>/dev/null || true
+            fi
+        fi
     done
     for pid in "${ACTIVE_PIDS[@]:-}"; do
         wait "$pid" 2>/dev/null || true
     done
     ACTIVE_PIDS=()
+}
+
+registered_pid_is_direct_child() {
+    local pid="$1"
+    local key value ignored
+    [[ -r "/proc/$pid/status" ]] || return 1
+    while read -r key value ignored; do
+        if [[ "$key" == "PPid:" ]]; then
+            if [[ "$value" == "$$" ]]; then
+                return 0
+            fi
+            return 1
+        fi
+    done <"/proc/$pid/status"
+    return 1
+}
+
+cleanup_on_exit() {
+    local exit_rc=$?
+    if ((${#ACTIVE_PIDS[@]})); then
+        note "unexpected exit; terminating only harness-owned process groups"
+        stop_active_processes
+        if [[ -n "${RUN_ROOT:-}" && -d "$RUN_ROOT" ]]; then
+            printf 'aborted rc=%s %s\n' \
+                "$exit_rc" "$(date -u +%FT%TZ)" \
+                >"$RUN_ROOT/ABORTED" || true
+        fi
+    fi
+    return "$exit_rc"
 }
 
 on_interrupt() {
@@ -1122,6 +1171,7 @@ on_interrupt() {
     exit 130
 }
 trap on_interrupt INT TERM
+trap cleanup_on_exit EXIT
 
 assert_selected_gpus_idle
 port_available
@@ -1135,6 +1185,7 @@ setsid nvidia-smi --id="$GPU_CSV" \
     >>"$RUN_ROOT/gpu_telemetry.csv" \
     2>"$RUN_ROOT/gpu_telemetry.stderr" &
 telemetry_pid=$!
+ACTIVE_PIDS=("$telemetry_pid")
 
 start_ns="$(date +%s%N)"
 start_utc="$(date -u +%FT%T.%NZ)"
@@ -1154,6 +1205,9 @@ ACTIVE_PIDS=("$command_pid" "$telemetry_pid")
 set +e
 wait "$command_pid"
 command_rc=$?
+# The leader has been reaped. Retain only the still-live telemetry group so
+# the EXIT trap never targets a stale/reusable command PID.
+ACTIVE_PIDS=("$telemetry_pid")
 set -e
 end_ns="$(date +%s%N)"
 end_utc="$(date -u +%FT%T.%NZ)"
