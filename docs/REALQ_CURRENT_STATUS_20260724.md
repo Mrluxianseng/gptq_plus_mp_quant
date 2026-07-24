@@ -603,3 +603,12 @@ checkpoint，并且节点有并发负载，明确不能用于加速结论。下�
    reduce-scatter/multi-group BMM，且证据 provenance 不够严格。
    旧结果降级为预备证据；强化后的 fail-closed gate 正在物理 4–7
    上重跑，完成前不据此提升默认值或宣称 CUDA promotion。
+
+平台健康证据也已补齐。Canoe 的 `job_hang=true` 来自调试入口有意执行
+七天 `sleep`，不是量化进程挂起。13:04--23:22 CST 内唯一节点持续
+`up=1` 且无危险 Pod event；21:50--23:30 内八卡 XID 为 0、最高温度
+56°C、无 OOM/网络丢包，Pod CPU throttle 平均 0.19%、最大 1.09%。
+物理 0--3 在该窗口持续承载用户 workload，而 4--7 只出现短时实验负载。
+因此旧性能数字的主要已知污染仍是同节点并发，而不是过温、XID、OOM
+或 CPU quota；它们继续只算诊断计时。MetaGod 硬件/维修状态因当前身份
+无读权限，明确保留为未验证层。

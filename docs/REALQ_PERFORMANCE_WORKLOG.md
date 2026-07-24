@@ -676,3 +676,37 @@ rejects `python -O`, checks cross-rank updates and Adam moments, and records
 commit/probe/runner/command/log/GPU-mapping hashes.  Its CUDA rerun on physical
 GPUs 4--7 was in progress when this entry was written.  No P03/P04 default
 promotion or speed claim may rely on the superseded artifacts.
+
+### 2026-07-24 - Canoe and node-health evidence for timing validity
+
+The Canoe job `j-7x9o0je4pk` remained `Running` with its only pod
+`Ready`.  Canoe reported `job_hang=true`, but the submitted command
+deliberately ends in `sleep 604800`; this is a debug-node liveness heuristic
+false positive, not evidence that a quantization process hung.
+
+The mandatory dead-node check covered
+`2026-07-24 13:04:01--23:22:00 CST`.  Node `up{}` stayed at one and the pod
+had no `NodeNotReady`, `NodeUnreachable`, eviction, OOM, mount, pressure, or
+other high-risk event.  MetaGod hardware/maintenance history could not be
+queried with the current identity, so the hardware-management layer remains
+explicitly unverified rather than being assumed healthy.
+
+Pod/GPU monitoring over `21:50--23:30 CST`, which contains the diagnostic
+timing and later checkpoint/probe runs, found:
+
+- CPU throttling average `0.001945`, maximum `0.01087`;
+- no pod OOM kill, network drop, or network error;
+- zero XID errors on all eight GPUs;
+- maximum temperature `56 C` on physical 0--3 and `35 C` on physical 4--7;
+- selected physical GPUs 4--7 had only short bursts of work, while physical
+  0--3 averaged roughly 32--35% coarse GPU utilization and reached 100%.
+
+There is therefore no evidence that thermal throttling, XID, OOM, packet
+loss, or CPU quota throttling caused the observed variance.  The changing
+user workload on the same pod/node remains the strongest observed confounder:
+it can perturb shared CPU, storage, memory, and interconnect resources even
+though each timing harness launch owns physical 4--7 exclusively.  These
+monitoring results reinforce, rather than relax, the earlier decision to
+classify the P01/P02 numbers as concurrent diagnostics.  A publishable timing
+family must additionally snapshot the same health signals around every arm
+and require a stable concurrent-process/load state.
