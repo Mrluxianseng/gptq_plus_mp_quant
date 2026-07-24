@@ -1,9 +1,18 @@
 from __future__ import annotations
 
+import copy
+from types import SimpleNamespace
+
 import pytest
 import torch
+import torch.nn as nn
 
 from realq.config import Config, parse_cli
+from realq.refresh.block_gd import (
+    RefreshContext,
+    _SharedSampleScheduler,
+    make_grad_refresh_fn,
+)
 from realq.refresh.fisher_loss import fisher_mse_loss
 from realq.runner.layer_loop import (
     _should_stage_fisher_for_refresh,
@@ -13,6 +22,24 @@ from realq.runner.layer_loop import (
 
 def _raw_bytes(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.detach().cpu().contiguous().reshape(-1).view(torch.uint8)
+
+
+class _ToyLayer(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.proj = nn.Linear(4, 2, bias=False)
+
+    def forward(self, hidden_states, **_kwargs):
+        return (self.proj(hidden_states),)
+
+
+class _ToyNextLayer(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.proj = nn.Linear(2, 2, bias=False)
+
+    def forward(self, hidden_states, **_kwargs):
+        return (self.proj(hidden_states),)
 
 
 def test_fisher_fp32_cache_is_explicit_default_off_and_validated():
@@ -121,3 +148,80 @@ def test_opt_in_staging_preserves_fisher_loss_and_gradient_raw_bytes():
 
     assert torch.equal(_raw_bytes(cached_loss), _raw_bytes(legacy_loss))
     assert torch.equal(_raw_bytes(cached_grad), _raw_bytes(legacy_grad))
+
+
+def test_fp32_cache_preserves_slide_refresh_adam_state_and_updates_raw_bytes():
+    torch.manual_seed(20260724)
+    base_layer = _ToyLayer()
+    base_next = _ToyNextLayer()
+    legacy_layer = copy.deepcopy(base_layer)
+    cached_layer = copy.deepcopy(base_layer)
+    legacy_next = copy.deepcopy(base_next)
+    cached_next = copy.deepcopy(base_next)
+    state = SimpleNamespace(
+        inps=torch.randn(4, 2, 4),
+        attention_mask=None,
+        position_ids=None,
+        position_embeddings=None,
+    )
+    current_target = torch.randn(4, 2, 2)
+    next_target = torch.randn(4, 2, 2)
+    current_fisher = torch.tensor(
+        [[1.0, -0.125], [-0.125, 0.75]],
+        dtype=torch.bfloat16,
+    )
+    next_fisher = torch.tensor(
+        [[0.625, 0.0625], [0.0625, 1.25]],
+        dtype=torch.bfloat16,
+    )
+
+    def build(layer, next_layer, *, cached):
+        context = RefreshContext(
+            module=layer.proj,
+            layer_lr=3e-4,
+            grad_clip=1.0,
+            backward_bsz=2,
+            scheduler=_SharedSampleScheduler(4, 4, seed=19),
+        )
+        refresh = make_grad_refresh_fn(
+            layer=layer,
+            module=layer.proj,
+            layer_state=state,
+            fp_out_for_this_layer=current_target,
+            fisher=current_fisher.float() if cached else current_fisher,
+            ctx=context,
+            next_layer=next_layer,
+            next_fp_out=next_target,
+            next_fisher=next_fisher.float() if cached else next_fisher,
+            slide_alpha_fn=lambda: 0.375,
+        )
+        return context, refresh
+
+    legacy_ctx, legacy_refresh = build(
+        legacy_layer, legacy_next, cached=False
+    )
+    cached_ctx, cached_refresh = build(
+        cached_layer, cached_next, cached=True
+    )
+    legacy_weight = legacy_layer.proj.weight.detach().float().clone()
+    cached_weight = cached_layer.proj.weight.detach().float().clone()
+    for trailing_start in (2, 3):
+        legacy_update = legacy_refresh(legacy_weight, trailing_start)
+        cached_update = cached_refresh(cached_weight, trailing_start)
+        assert torch.equal(
+            _raw_bytes(cached_update), _raw_bytes(legacy_update)
+        )
+        legacy_weight[:, trailing_start:].sub_(legacy_update)
+        cached_weight[:, trailing_start:].sub_(cached_update)
+        assert torch.equal(
+            _raw_bytes(cached_weight), _raw_bytes(legacy_weight)
+        )
+        assert torch.equal(
+            _raw_bytes(cached_ctx.exp_avg),
+            _raw_bytes(legacy_ctx.exp_avg),
+        )
+        assert torch.equal(
+            _raw_bytes(cached_ctx.exp_avg_sq),
+            _raw_bytes(legacy_ctx.exp_avg_sq),
+        )
+        assert cached_ctx.adam_step == legacy_ctx.adam_step
