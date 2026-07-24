@@ -513,6 +513,9 @@ def quantize_one_layer(
                                     trace_layer=layer_idx,
                                     trace_module=name,
                                     blocksize=cfg.blocksize,
+                                    log_column_block_loss=(
+                                        cfg.log_column_block_loss
+                                    ),
                                 )
                                 # slide_alpha closure: returns CURRENT α and advances the
                                 # layer-shared cumulative refresh cursor. Must be called

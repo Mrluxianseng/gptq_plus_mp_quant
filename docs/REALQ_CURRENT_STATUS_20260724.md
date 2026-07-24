@@ -1,6 +1,6 @@
 # REAL-Q 阶段结论与当前状态
 
-更新时间：2026-07-24 20:42 CST
+更新时间：2026-07-24 20:58 CST
 
 ## 一页结论
 
@@ -198,6 +198,45 @@ Qwen3-4B 每 rank 16 的 Stage-0 probe 达到 182,624 MiB 后又申请
 
 五个正式 artifact 均通过主 validator；独立 validator 完成 782 个检查、
 0 failure，并重新计算约 9.4 GB 关键 cache 的 SHA256。
+
+## Column-block backward loss / 学习率诊断
+
+为直接检查论文指标差异是否来自学习率轨迹，`realq` 新增默认关闭的
+日志开关：
+
+```bash
+--log_column_block_loss true
+```
+
+开启后，只有全局 rank 0 会在每次 Block-GD refresh 后输出一行
+`[realq.column_block_loss]`。其中：
+
+- `loss` 是该 column block 的所有 `backward_samples` 在所有 DP rank
+  上按样本数加权后的均值，对应实际参与梯度累积的 backward objective；
+- 普通层的 `objective=fisher_mse`；最终层为 `objective=kl`；
+- loss sliding window 开启时，`loss` 是实际反传的 blended loss，并同时
+  输出 `loss_current`、`loss_next` 和 `slide_alpha`；
+- 同一行输出 `layer`、`module`、`block`、`columns=[start,end)`、
+  `adam_step`、层级 `lr`、Adam bias-correction 后的
+  `adam_step_size=lr/(1-beta1^step)` 和 `global_samples`；
+- `column_space=quant_order` 表明这个区间是 GPTQ 的量化顺序位置；
+  `act_order=true` 时不能把它误读成原始权重的自然列号；
+- 最后一个 column block 后面没有 trailing columns，算法不会为它执行
+  refresh/backward，因此它没有可打印的 backward loss。这不是漏日志。
+
+示意格式：
+
+```text
+[realq.column_block_loss] layer=3 module=mlp.down_proj block=0 columns=[0,128) column_space=quant_order adam_step=1 objective=fisher_mse loss=... loss_current=... loss_next=none slide_alpha=none lr=... adam_step_size=... global_samples=32
+```
+
+日志专用 loss 使用独立 all-reduce，不扩大或改写优化器原有的
+`[gradient | sample_count]` collective buffer；默认 `false` 时不收集
+loss、不增加 collective，也不发生 `.item()` 同步。Fisher、最终层 KL、
+配置解析、DP 空 shard、trace/slide、日志开关前后 Adam/update 逐 bit
+行为的针对性测试为 `14 passed`；当前完整 CPU suite 为
+`203 passed, 5 skipped`。验证显式设置
+`CUDA_VISIBLE_DEVICES=''`，没有占用实验 GPU。
 
 ## 与论文用时表格的现有比较
 

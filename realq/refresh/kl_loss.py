@@ -18,6 +18,7 @@ import torch.nn.functional as F
 from torch.func import functional_call
 
 from realq.refresh.block_gd import (
+    _aggregate_loss_sums_for_logging,
     _aggregate_refresh_sums,
     _functional_weight_name,
 )
@@ -117,7 +118,7 @@ def make_kl_refresh_fn(
                     dtype=torch.float64,
                     device=partial_grad_sum.device,
                 )
-                if ctx.trace_enabled else None
+                if ctx.loss_observation_enabled else None
             )
             # Cast stitched fp32 weight to module dtype ONCE per refresh and
             # reuse the bf16 leaf across all backward batches. ``autograd.grad``
@@ -174,16 +175,25 @@ def make_kl_refresh_fn(
             global_count, global_loss_sums = _aggregate_refresh_sums(
                 partial_grad_sum,
                 partial_count,
-                partial_loss_sums,
+                partial_loss_sums if ctx.trace_enabled else None,
             )
             accum_grad = partial_grad_sum / float(global_count)
+        if ctx.log_column_block_loss and not ctx.trace_enabled:
+            if partial_loss_sums is None:
+                raise RuntimeError(
+                    "column-block loss logging enabled without loss sums"
+                )
+            global_loss_sums = _aggregate_loss_sums_for_logging(
+                partial_loss_sums
+            )
         if global_loss_sums is not None:
-            ctx.record_trace(
+            ctx.record_loss_observation(
                 global_loss_sums=global_loss_sums,
                 global_count=global_count,
                 sample_indices=selected_global,
                 slide_alpha=None,
                 has_next_loss=False,
+                objective="kl",
             )
         with nvtx.nvtx_range("kl_refresh.adam_step"):
             # act_order: re-key natural-order grad → permuted column order so the

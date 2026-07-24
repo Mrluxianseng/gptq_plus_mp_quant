@@ -203,6 +203,13 @@ class Config:
     # ----- derived (auto-filled by __post_init__) -------------------------
     model_name: str = ""
 
+    # Appended after every pre-existing field to preserve Config's positional
+    # constructor ABI. Optional human-readable diagnostic: rank zero logs the
+    # globally averaged objective actually sent to backward after every
+    # refreshed column block, plus its learning-rate and loss-slide metadata.
+    # The final block has no trailing weights and hence no backward objective.
+    log_column_block_loss: bool = False
+
     def __post_init__(self) -> None:
         if not self.model_name:
             # Mirror the old process_args convention: model_name = basename
@@ -271,6 +278,11 @@ class Config:
             raise ValueError(
                 "`group_parallel_quant` must be 'none' or 'rank'. Got "
                 f"{self.group_parallel_quant!r}."
+            )
+        if type(self.log_column_block_loss) is not bool:
+            raise ValueError(
+                "`log_column_block_loss` must be bool. Got "
+                f"{self.log_column_block_loss!r}."
             )
         if not (0.0 < self.saliency_clip_percentile <= 1.0):
             raise ValueError(

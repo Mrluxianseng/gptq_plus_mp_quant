@@ -21,6 +21,7 @@ begins.
 """
 from __future__ import annotations
 
+import logging
 import math
 import random as _random
 from typing import TYPE_CHECKING, Callable
@@ -156,6 +157,7 @@ class RefreshContext:
         trace_layer: int | None = None,
         trace_module: str | None = None,
         blocksize: int | None = None,
+        log_column_block_loss: bool = False,
     ) -> None:
         self.module = module
         self.layer_lr = float(layer_lr)
@@ -166,12 +168,18 @@ class RefreshContext:
         self.trace_layer = trace_layer
         self.trace_module = trace_module
         self.blocksize = blocksize
-        if self.trace_enabled and (
+        self.log_column_block_loss = log_column_block_loss
+        if type(self.log_column_block_loss) is not bool:
+            raise ValueError(
+                "log_column_block_loss must be bool, got "
+                f"{self.log_column_block_loss!r}"
+            )
+        if self.loss_observation_enabled and (
             trace_layer is None or trace_module is None or blocksize is None
         ):
             raise ValueError(
-                "enabled refresh tracing requires trace_layer, trace_module, "
-                "and blocksize"
+                "enabled refresh loss observation requires trace_layer, "
+                "trace_module, and blocksize"
             )
         # Adam state, full-tensor shape; only the trailing column slice is
         # touched per call but keeping the full shape simplifies indexing.
@@ -190,7 +198,11 @@ class RefreshContext:
     def trace_enabled(self) -> bool:
         return self.trace_writer is not None and self.trace_writer.enabled
 
-    def record_trace(
+    @property
+    def loss_observation_enabled(self) -> bool:
+        return self.trace_enabled or self.log_column_block_loss
+
+    def record_loss_observation(
         self,
         *,
         global_loss_sums: torch.Tensor,
@@ -198,14 +210,15 @@ class RefreshContext:
         sample_indices: list[int],
         slide_alpha: float | None,
         has_next_loss: bool,
+        objective: str,
     ) -> None:
-        """Record globally reduced loss statistics for the current Adam step."""
+        """Print and/or trace one globally reduced backward objective."""
 
-        if not self.trace_enabled or not dist_utils.is_main():
+        if not self.loss_observation_enabled or not dist_utils.is_main():
             return
         if global_loss_sums.numel() not in (1, 3):
             raise ValueError(
-                "refresh trace expects [total] or "
+                "refresh loss observation expects [total] or "
                 "[total, current, next] global loss sums"
             )
         block = self.adam_step - 1
@@ -215,29 +228,81 @@ class RefreshContext:
             int(self.module.weight.shape[1]),
         )
         denom = float(global_count)
-        self.trace_writer.record(
-            RefreshStep(
-                layer=int(self.trace_layer),
-                module=str(self.trace_module),
-                block=block,
-                col_start=col_start,
-                col_end=col_end,
-                adam_step=self.adam_step,
-                loss=float(global_loss_sums[0].item()) / denom,
-                loss_current=(
-                    float(global_loss_sums[1].item()) / denom
-                    if global_loss_sums.numel() == 3
-                    else float(global_loss_sums[0].item()) / denom
-                ),
-                loss_next=(
-                    float(global_loss_sums[2].item()) / denom
-                    if has_next_loss and global_loss_sums.numel() == 3
-                    else None
-                ),
-                slide_alpha=slide_alpha,
-                sample_indices=tuple(int(index) for index in sample_indices),
-            )
+        mean_loss = float(global_loss_sums[0].item()) / denom
+        mean_loss_current = (
+            float(global_loss_sums[1].item()) / denom
+            if global_loss_sums.numel() == 3
+            else mean_loss
         )
+        mean_loss_next = (
+            float(global_loss_sums[2].item()) / denom
+            if has_next_loss and global_loss_sums.numel() == 3
+            else None
+        )
+        if self.log_column_block_loss:
+            logging.info(
+                "[realq.column_block_loss] layer=%d module=%s block=%d "
+                "columns=[%d,%d) column_space=quant_order adam_step=%d "
+                "objective=%s loss=%.12g loss_current=%.12g loss_next=%s "
+                "slide_alpha=%s lr=%.12g adam_step_size=%.12g "
+                "global_samples=%d",
+                int(self.trace_layer),
+                str(self.trace_module),
+                block,
+                col_start,
+                col_end,
+                self.adam_step,
+                objective,
+                mean_loss,
+                mean_loss_current,
+                (
+                    f"{mean_loss_next:.12g}"
+                    if mean_loss_next is not None
+                    else "none"
+                ),
+                (
+                    f"{slide_alpha:.12g}"
+                    if slide_alpha is not None
+                    else "none"
+                ),
+                self.layer_lr,
+                self.layer_lr / (1.0 - self.beta1 ** self.adam_step),
+                global_count,
+            )
+        if self.trace_enabled:
+            self.trace_writer.record(
+                RefreshStep(
+                    layer=int(self.trace_layer),
+                    module=str(self.trace_module),
+                    block=block,
+                    col_start=col_start,
+                    col_end=col_end,
+                    adam_step=self.adam_step,
+                    loss=mean_loss,
+                    loss_current=mean_loss_current,
+                    loss_next=mean_loss_next,
+                    slide_alpha=slide_alpha,
+                    sample_indices=tuple(
+                        int(index) for index in sample_indices
+                    ),
+                )
+            )
+
+
+def _aggregate_loss_sums_for_logging(
+    partial_loss_sums: torch.Tensor,
+) -> torch.Tensor:
+    """All-reduce diagnostic loss sums without touching gradient reduction.
+
+    Keeping this collective separate from ``_aggregate_refresh_sums`` means
+    enabling console/file logging cannot change the size (and therefore the
+    collective algorithm) of the optimizer's ``[gradient | count]`` buffer.
+    The loss values are diagnostics only and never feed the Adam update.
+    """
+
+    global_loss_sums = partial_loss_sums.clone()
+    dist_utils.allreduce_sum_(global_loss_sums)
+    return global_loss_sums
 
 
 def _aggregate_refresh_sums(
@@ -440,7 +505,7 @@ def make_grad_refresh_fn(
                     dtype=torch.float64,
                     device=partial_grad_sum.device,
                 )
-                if ctx.trace_enabled else None
+                if ctx.loss_observation_enabled else None
             )
             # Cast the stitched fp32 weight to module dtype ONCE per refresh
             # and pass it to functional_call for every backward batch. Old
@@ -657,11 +722,19 @@ def make_grad_refresh_fn(
             global_count, global_loss_sums = _aggregate_refresh_sums(
                 partial_grad_sum,
                 partial_count,
-                partial_loss_sums,
+                partial_loss_sums if ctx.trace_enabled else None,
             )
             accum_grad = partial_grad_sum / float(global_count)
+        if ctx.log_column_block_loss and not ctx.trace_enabled:
+            if partial_loss_sums is None:
+                raise RuntimeError(
+                    "column-block loss logging enabled without loss sums"
+                )
+            global_loss_sums = _aggregate_loss_sums_for_logging(
+                partial_loss_sums
+            )
         if global_loss_sums is not None:
-            ctx.record_trace(
+            ctx.record_loss_observation(
                 global_loss_sums=global_loss_sums,
                 global_count=global_count,
                 sample_indices=selected_global,
@@ -669,6 +742,7 @@ def make_grad_refresh_fn(
                 has_next_loss=(
                     slide_alpha is not None and slide_alpha < 1.0
                 ),
+                objective="fisher_mse",
             )
         with nvtx.nvtx_range("refresh.adam_step"):
             # act_order: re-key the natural-order grad into PERMUTED column order
