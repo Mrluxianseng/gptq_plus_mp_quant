@@ -66,6 +66,16 @@ _WEIGHT_PROVENANCE_HISTORICAL_DEFAULTS = {
     "w_clip_update_impl": "guarded",
     "w_group_param_layout": "expanded",
 }
+_ARTIFACT_IDENTITY_FIELDS = frozenset(
+    {
+        "source_model",
+        "tokenizer",
+        "rotation",
+        "rotation_seed",
+        "model_config",
+        "parameter_dtypes",
+    }
+)
 _BOOL_FIELDS = {
     "rotate",
     "a_asym",
@@ -85,6 +95,40 @@ _DYNAMIC_QUANT_BUFFER_SUFFIXES = (
     ".k_quantizer.scale",
     ".k_quantizer.zero",
 )
+
+
+def _validate_rotation_seed(value: Any, *, location: str) -> None:
+    if type(value) is not int:
+        raise ValueError(
+            f"{location} field 'rotation_seed' must be int; "
+            "bool, float, and string values are invalid."
+        )
+
+
+def _validate_artifact_manifest(
+    artifact_manifest: Any,
+    *,
+    allow_absent: bool,
+) -> Mapping[str, Any] | None:
+    """Validate the complete identity manifest before it can affect Config."""
+
+    if artifact_manifest is None:
+        if allow_absent:
+            return None
+        raise ValueError("Checkpoint artifact-identity manifest must be a mapping.")
+    if not isinstance(artifact_manifest, Mapping):
+        raise ValueError("Checkpoint artifact-identity manifest must be a mapping.")
+    missing = sorted(_ARTIFACT_IDENTITY_FIELDS - set(artifact_manifest))
+    if missing:
+        raise ValueError(
+            "Checkpoint artifact-identity manifest is incomplete; missing "
+            f"{missing}."
+        )
+    _validate_rotation_seed(
+        artifact_manifest["rotation_seed"],
+        location="Checkpoint artifact-identity",
+    )
+    return artifact_manifest
 
 
 def _model_config_identity(model: torch.nn.Module) -> str:
@@ -128,16 +172,18 @@ def _artifact_manifest(
     from utils.model_utils import rotation_cache_identity
 
     source = str(getattr(config, "model", ""))
-    return {
+    manifest = {
         "source_model": artifact_identity(source),
         "tokenizer": _tokenizer_identity(tokenizer, source),
         "rotation": rotation_cache_identity(config),
-        "rotation_seed": int(getattr(config, "rotation_seed", 0)),
+        "rotation_seed": getattr(config, "rotation_seed", 0),
         "model_config": _model_config_identity(model),
         "parameter_dtypes": sorted(
             {str(parameter.dtype) for parameter in model.parameters()}
         ),
     }
+    _validate_artifact_manifest(manifest, allow_absent=False)
+    return manifest
 
 
 def build_runtime_manifest(
@@ -361,23 +407,11 @@ def load_quantized_checkpoint(
     _validate_runtime_manifest(runtime)
     weight_quantization = payload.get("weight_quantization", {})
     _validate_weight_provenance(weight_quantization)
-    artifact_manifest = payload.get("artifact_identity")
-    if not isinstance(artifact_manifest, Mapping):
-        raise ValueError("Checkpoint artifact-identity manifest must be a mapping.")
-    required_identities = {
-        "source_model",
-        "tokenizer",
-        "rotation",
-        "rotation_seed",
-        "model_config",
-        "parameter_dtypes",
-    }
-    missing_identities = sorted(required_identities - set(artifact_manifest))
-    if missing_identities:
-        raise ValueError(
-            "Checkpoint artifact-identity manifest is incomplete; missing "
-            f"{missing_identities}."
-        )
+    artifact_manifest = _validate_artifact_manifest(
+        payload.get("artifact_identity"),
+        allow_absent=False,
+    )
+    assert artifact_manifest is not None
     return {
         "format": checkpoint_format,
         "format_version": version,
@@ -400,6 +434,10 @@ def apply_runtime_manifest(config: Any, checkpoint: Mapping[str, Any]) -> bool:
     _validate_runtime_manifest(runtime)
     provenance = checkpoint.get("weight_quantization", {})
     _validate_weight_provenance(provenance)
+    identities = _validate_artifact_manifest(
+        checkpoint.get("artifact_identity"),
+        allow_absent=True,
+    )
     for name in _RUNTIME_FIELDS:
         previous = getattr(config, name, None)
         restored = runtime[name]
@@ -426,9 +464,8 @@ def apply_runtime_manifest(config: Any, checkpoint: Mapping[str, Any]) -> bool:
                 name,
                 _WEIGHT_PROVENANCE_HISTORICAL_DEFAULTS[name],
             )
-    identities = checkpoint.get("artifact_identity") or {}
-    if "rotation_seed" in identities and hasattr(config, "rotation_seed"):
-        setattr(config, "rotation_seed", int(identities["rotation_seed"]))
+    if identities is not None and hasattr(config, "rotation_seed"):
+        setattr(config, "rotation_seed", identities["rotation_seed"])
     return True
 
 
@@ -445,16 +482,21 @@ def validate_artifact_identity(
     (source+rotation) and after it (architecture, dtype, tokenizer).  A legacy
     checkpoint has no identities and returns ``False`` for compatibility.
     """
-    identities = checkpoint.get("artifact_identity")
+    identities = _validate_artifact_manifest(
+        checkpoint.get("artifact_identity"),
+        allow_absent=True,
+    )
     if identities is None:
         return False
     from utils.cache_identity import artifact_identity
     from utils.model_utils import rotation_cache_identity
 
+    rotation_seed = getattr(config, "rotation_seed", 0)
+    _validate_rotation_seed(rotation_seed, location="Current configuration")
     actual = {
         "source_model": artifact_identity(getattr(config, "model", "")),
         "rotation": rotation_cache_identity(config),
-        "rotation_seed": int(getattr(config, "rotation_seed", 0)),
+        "rotation_seed": rotation_seed,
     }
     if model is not None:
         actual["model_config"] = _model_config_identity(model)

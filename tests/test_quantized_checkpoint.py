@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from types import SimpleNamespace
 
 import pytest
@@ -59,6 +60,41 @@ def _runtime_cfg(**overrides):
     )
     values.update(overrides)
     return Config(**values)
+
+
+def _fully_divergent_runtime_cfg():
+    cfg = _runtime_cfg(
+        rotate=True,
+        rotation_seed=91,
+        a_bits=8,
+        a_groupsize=-1,
+        a_asym=True,
+        a_clip_ratio=0.7,
+        v_bits=8,
+        v_groupsize=2,
+        v_asym=False,
+        v_clip_ratio=0.7,
+        k_bits=8,
+        k_groupsize=2,
+        k_asym=True,
+        k_clip_ratio=0.7,
+        act_quant_aware_gptq=True,
+        k_cache_quant_aware_gptq=True,
+        w_bits=16,
+        w_groupsize=128,
+        w_asym=True,
+        w_clip=False,
+        quantizer_inner_fastpath=True,
+        w_clip_search_impl="symmetric_union_exact",
+        fisher_fp32_cache=True,
+        act_order_stitch_impl="prefix_q_trailing_w_exact",
+        w_clip_update_impl="where_out",
+        w_group_param_layout="compact",
+    )
+    # The refactored Config has one weight algorithm, but legacy argparse
+    # namespaces still carry w_method and the checkpoint code preserves it.
+    cfg.w_method = "other"
+    return cfg
 
 
 def test_weight_clip_search_backend_roundtrips_as_build_provenance():
@@ -349,31 +385,14 @@ def test_checkpoint_rejects_incomplete_or_invalid_runtime_manifest(tmp_path):
         checkpoint_utils.load_quantized_checkpoint(path)
 
 
-def test_checkpoint_rejects_non_boolean_inner_fastpath_provenance(tmp_path):
-    model = _RuntimeModel()
-    cfg = _runtime_cfg()
-    path = tmp_path / "bad-fastpath-provenance.pt"
-    checkpoint_utils.save_quantized_checkpoint(path, model, cfg)
-    payload = torch.load(path, map_location="cpu", weights_only=True)
-    payload["weight_quantization"]["quantizer_inner_fastpath"] = "false"
-    torch.save(payload, path)
-
-    with pytest.raises(
-        ValueError, match="'quantizer_inner_fastpath' must be bool"
-    ):
-        checkpoint_utils.load_quantized_checkpoint(path)
-
-    target_cfg = _runtime_cfg(a_bits=16, a_clip_ratio=1.0)
-    with pytest.raises(
-        ValueError, match="'quantizer_inner_fastpath' must be bool"
-    ):
-        checkpoint_utils.apply_runtime_manifest(target_cfg, payload)
-    assert target_cfg.a_bits == 16
-
-
 @pytest.mark.parametrize(
     "field,value,error",
     [
+        (
+            "quantizer_inner_fastpath",
+            "false",
+            "'quantizer_inner_fastpath' must be bool",
+        ),
         ("fisher_fp32_cache", "false", "'fisher_fp32_cache' must be bool"),
         (
             "w_clip_search_impl",
@@ -412,17 +431,70 @@ def test_checkpoint_rejects_invalid_performance_provenance(
 
     with pytest.raises(ValueError, match=error):
         checkpoint_utils.load_quantized_checkpoint(path)
-    target_cfg = _runtime_cfg(
-        a_bits=16,
-        a_clip_ratio=1.0,
-        w_clip_update_impl="where_out",
-        w_group_param_layout="compact",
-    )
+    target_cfg = _fully_divergent_runtime_cfg()
+    before = copy.deepcopy(vars(target_cfg))
     with pytest.raises(ValueError, match=error):
         checkpoint_utils.apply_runtime_manifest(target_cfg, payload)
-    assert target_cfg.a_bits == 16
-    assert target_cfg.w_clip_update_impl == "where_out"
-    assert target_cfg.w_group_param_layout == "compact"
+    assert vars(target_cfg) == before
+
+
+@pytest.mark.parametrize(
+    "invalid_seed",
+    ["9", True, 9.0],
+    ids=("string", "bool", "float"),
+)
+def test_checkpoint_rejects_non_integer_rotation_seed_atomically(
+    tmp_path, invalid_seed
+):
+    model = _RuntimeModel()
+    source_cfg = _runtime_cfg(rotation_seed=9)
+    source_cfg.w_method = "gptq_plus"
+    path = tmp_path / f"bad-rotation-seed-{type(invalid_seed).__name__}.pt"
+    checkpoint_utils.save_quantized_checkpoint(path, model, source_cfg)
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    payload["artifact_identity"]["rotation_seed"] = invalid_seed
+    torch.save(payload, path)
+
+    error = r"artifact-identity.*'rotation_seed' must be int"
+    with pytest.raises(ValueError, match=error):
+        checkpoint_utils.load_quantized_checkpoint(path)
+
+    direct_payload = checkpoint_utils.build_runtime_manifest(source_cfg)
+    direct_payload["artifact_identity"] = {
+        "source_model": "source",
+        "tokenizer": "tokenizer",
+        "rotation": "disabled",
+        "rotation_seed": invalid_seed,
+        "model_config": "model-config",
+        "parameter_dtypes": ["torch.float32"],
+    }
+    target_cfg = _fully_divergent_runtime_cfg()
+    assert all(
+        getattr(target_cfg, name) != value
+        for name, value in direct_payload["runtime_quantization"].items()
+    )
+    assert all(
+        getattr(target_cfg, name) != value
+        for name, value in direct_payload["weight_quantization"].items()
+    )
+    before = copy.deepcopy(vars(target_cfg))
+    with pytest.raises(ValueError, match=error):
+        checkpoint_utils.apply_runtime_manifest(target_cfg, direct_payload)
+    assert vars(target_cfg) == before
+
+
+def test_valid_integer_rotation_seed_is_restored(tmp_path):
+    model = _RuntimeModel()
+    source_cfg = _runtime_cfg(rotation_seed=9)
+    path = tmp_path / "valid-rotation-seed.pt"
+    checkpoint_utils.save_quantized_checkpoint(path, model, source_cfg)
+    loaded = checkpoint_utils.load_quantized_checkpoint(path)
+
+    target_cfg = _fully_divergent_runtime_cfg()
+    assert target_cfg.rotation_seed == 91
+    assert checkpoint_utils.apply_runtime_manifest(target_cfg, loaded)
+    assert target_cfg.rotation_seed == 9
+    assert type(target_cfg.rotation_seed) is int
 
 
 def test_artifact_identity_strictly_checks_source_rotation_tokenizer_and_dtype(
