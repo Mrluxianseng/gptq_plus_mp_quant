@@ -447,3 +447,15 @@ def test_w16_allows_nominal_asymmetry_because_it_is_still_a_strict_noop():
     quantizer = _make_quantizer(cfg)
     assert quantizer.bits == 16
     assert not quantizer.sym
+
+
+def test_make_quantizer_plumbs_opt_in_clip_search_backend():
+    cfg = SimpleNamespace(
+        w_asym=False,
+        w_bits=4,
+        w_clip=True,
+        w_groupsize=128,
+        w_clip_search_impl="symmetric_union_exact",
+    )
+    quantizer = _make_quantizer(cfg)
+    assert quantizer.w_clip_search_impl == "symmetric_union_exact"

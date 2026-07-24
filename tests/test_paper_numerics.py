@@ -307,6 +307,7 @@ def test_activation_loss_clip_scope_is_explicit_and_validated():
         ({"w_bits": 1}, "w_bits"),
         ({"w_asym": True}, "w_asym"),
         ({"w_groupsize": 64, "blocksize": 128}, "w_groupsize"),
+        ({"w_clip_search_impl": "unordered"}, "w_clip_search_impl"),
         ({"group_parallel_quant": "tensor"}, "group_parallel_quant"),
         ({"quantizer_inner_fastpath": 1}, "quantizer_inner_fastpath"),
     ],

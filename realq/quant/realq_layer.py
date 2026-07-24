@@ -424,6 +424,7 @@ class RealQLayer:
                     grid=self.quantizer.grid,
                     maxshrink=self.quantizer.maxshrink,
                     weight_groupsize=-1,
+                    w_clip_search_impl=self.quantizer.w_clip_search_impl,
                 )
                 block_quantizer.find_params(weight_block)
                 if rank_mode and world > 1:

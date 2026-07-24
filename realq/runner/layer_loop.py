@@ -198,6 +198,9 @@ def _make_quantizer(cfg: "Config"):
         sym=not cfg.w_asym,
         mse=cfg.w_clip,   # MSE clip search (sub-task 4 turns this on)
         weight_groupsize=cfg.w_groupsize,
+        w_clip_search_impl=getattr(
+            cfg, "w_clip_search_impl", "cartesian_legacy"
+        ),
     )
     return q
 

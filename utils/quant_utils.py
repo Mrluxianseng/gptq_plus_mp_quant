@@ -58,6 +58,162 @@ def sym_quant_dequant(x, scale, maxq):
     return sym_dequant(*sym_quant(x, scale, maxq))
 
 
+_W_CLIP_SEARCH_IMPLEMENTATIONS = frozenset(
+    {"cartesian_legacy", "symmetric_union_exact"}
+)
+
+
+def _symmetric_union_candidates_and_first_keys(
+    xmin, xmax, *, grid, candidate_count
+):
+    """Return symmetric endpoint candidates and their first legacy visits.
+
+    The legacy symmetric MSE search visits every ``(i, j)`` pair in
+    lexicographic order and derives its clipping range as::
+
+        max(abs((1 - i / grid) * xmin), (1 - j / grid) * xmax)
+
+    A maximum is one of its two operands.  Consequently, the complete
+    ``candidate_count ** 2`` range set is covered by the union of the
+    ``candidate_count`` negative and positive endpoints.  ``first_keys``
+    records the earliest legacy pair that produces each endpoint, per
+    row/group lane.  It is later used to preserve the observable first-winner
+    behavior of the legacy strict-``<`` update.
+
+    Each scalar multiplication stays in the same order as the legacy loops.
+    In particular, ``abs`` remains after multiplication so signed zero and
+    floating-point rounding are not silently changed.
+    """
+
+    negative_candidates = torch.stack(
+        [
+            torch.abs((1 - i / grid) * xmin)
+            for i in range(candidate_count)
+        ]
+    )
+    positive_candidates = torch.stack(
+        [
+            (1 - j / grid) * xmax
+            for j in range(candidate_count)
+        ]
+    )
+
+    sentinel = candidate_count * candidate_count
+    key_shape = negative_candidates.shape
+    negative_keys = torch.full(
+        key_shape, sentinel, dtype=torch.long, device=xmin.device
+    )
+    positive_keys = torch.full(
+        key_shape, sentinel, dtype=torch.long, device=xmin.device
+    )
+    key_broadcast_shape = (candidate_count,) + (1,) * xmin.ndim
+    endpoint_indices = torch.arange(
+        candidate_count, dtype=torch.long, device=xmin.device
+    ).reshape(key_broadcast_shape)
+
+    # These are cheap endpoint metadata comparisons, not weight QDQ/error
+    # evaluations.  Avoid an MxMxlane temporary because grouped production
+    # matrices can contain many lanes.
+    for j in range(candidate_count):
+        eligible = positive_candidates[j].unsqueeze(0) <= negative_candidates
+        unassigned = negative_keys == sentinel
+        visit_keys = endpoint_indices * candidate_count + j
+        negative_keys = torch.where(
+            eligible & unassigned, visit_keys, negative_keys
+        )
+    for i in range(candidate_count):
+        eligible = negative_candidates[i].unsqueeze(0) <= positive_candidates
+        unassigned = positive_keys == sentinel
+        visit_keys = i * candidate_count + endpoint_indices
+        positive_keys = torch.where(
+            eligible & unassigned, visit_keys, positive_keys
+        )
+
+    return (
+        torch.cat([negative_candidates, positive_candidates], dim=0),
+        torch.cat([negative_keys, positive_keys], dim=0),
+    )
+
+
+def _select_symmetric_union_scale(
+    x,
+    xmin,
+    xmax,
+    *,
+    maxq,
+    norm,
+    grid,
+    candidate_count,
+    grouped_error_order,
+):
+    """Evaluate 2M symmetric ranges and select the exact legacy winner.
+
+    ``x`` has one final reduction dimension and ``xmin``/``xmax`` contain its
+    lane-wise endpoints.  Selection is lexicographic in
+    ``(error, first_legacy_visit)``.  That is equivalent to the legacy
+    sequential strict-``<`` scan, including duplicate/tied ranges and the
+    case where every candidate error is ``inf`` or ``nan``.
+    """
+
+    candidates, first_keys = _symmetric_union_candidates_and_first_keys(
+        xmin,
+        xmax,
+        grid=grid,
+        candidate_count=candidate_count,
+    )
+    scales = []
+    errors = []
+    for candidate in candidates.unbind(0):
+        scale = candidate.clamp(min=1e-5) / maxq
+        q = sym_quant_dequant(x, scale.unsqueeze(-1), maxq)
+        if grouped_error_order:
+            # Preserve find_params_weight_groupwise's exact expression.
+            err = (q - x).abs().pow(norm).sum(-1)
+        else:
+            # Preserve find_params's mutation/kernel order.
+            q -= x
+            q.abs_()
+            q.pow_(norm)
+            err = torch.sum(q, -1)
+        scales.append(scale)
+        errors.append(err)
+    scales = torch.stack(scales)
+    errors = torch.stack(errors)
+
+    sentinel = candidate_count * candidate_count
+    valid_candidate = first_keys < sentinel
+    # Legacy starts at +inf and updates only for ``err < best``.  Therefore
+    # +inf and NaN are never winners; finite overflow in every candidate keeps
+    # the initial unclipped scale.
+    improving_error = errors < float("inf")
+    eligible_errors = torch.where(
+        valid_candidate & improving_error,
+        errors,
+        torch.full_like(errors, float("inf")),
+    )
+    best_error = eligible_errors.amin(dim=0)
+    tied_for_best = (
+        valid_candidate
+        & improving_error
+        & (errors == best_error.unsqueeze(0))
+    )
+    tie_keys = torch.where(
+        tied_for_best,
+        first_keys,
+        torch.full_like(first_keys, sentinel),
+    )
+    winner = tie_keys.argmin(dim=0)
+    selected = torch.gather(scales, 0, winner.unsqueeze(0)).squeeze(0)
+
+    initial = (
+        torch.maximum(torch.abs(xmin), xmax).clamp(min=1e-5) / maxq
+    )
+    has_winner = best_error < float("inf")
+    result = initial.clone()
+    result[has_winner] = selected[has_winner]
+    return result
+
+
 class STEQuantize(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, scale, maxq):
@@ -448,7 +604,13 @@ class WeightQuantizer(torch.nn.Module):
         grid: int = 50,
         maxshrink: float = 0.5,
         weight_groupsize: int = -1,
+        w_clip_search_impl: str = "cartesian_legacy",
     ) -> None:
+        if w_clip_search_impl not in _W_CLIP_SEARCH_IMPLEMENTATIONS:
+            raise ValueError(
+                "w_clip_search_impl must be 'cartesian_legacy' or "
+                f"'symmetric_union_exact'; got {w_clip_search_impl!r}."
+            )
         self.bits = bits
         self.perchannel = perchannel
         self.sym = sym
@@ -457,6 +619,7 @@ class WeightQuantizer(torch.nn.Module):
         self.grid = grid
         self.maxshrink = maxshrink
         self.weight_groupsize = weight_groupsize
+        self.w_clip_search_impl = w_clip_search_impl
         if sym:
             self.maxq = torch.tensor(2 ** (bits - 1) - 1)
         else:
@@ -475,6 +638,7 @@ class WeightQuantizer(torch.nn.Module):
             )
 
         rows, columns = x.shape
+        use_symmetric_union = self._can_use_symmetric_union(x)
 
         def _params_for_equal_width_groups(grouped_x):
             """Return scale/zero expanded to ``grouped_x``'s last dimension.
@@ -502,7 +666,19 @@ class WeightQuantizer(torch.nn.Module):
                 scale = (xmax - xmin).clamp(min=1e-5) / self.maxq
                 zero = torch.round(-xmin / scale)
 
-            if self.mse:
+            if self.mse and use_symmetric_union:
+                scale = _select_symmetric_union_scale(
+                    grouped_x,
+                    xmin.squeeze(-1),
+                    xmax.squeeze(-1),
+                    maxq=self.maxq,
+                    norm=self.norm,
+                    grid=self.grid,
+                    candidate_count=int(self.maxshrink * self.grid),
+                    grouped_error_order=True,
+                ).unsqueeze(-1)
+                zero = torch.zeros_like(scale)
+            elif self.mse:
                 best = torch.full(
                     grouped_x.shape[:2],
                     float("inf"),
@@ -565,6 +741,41 @@ class WeightQuantizer(torch.nn.Module):
         self.scale = torch.cat(scale_parts, dim=1)
         self.zero = torch.cat(zero_parts, dim=1)
 
+    def _can_use_symmetric_union(self, x) -> bool:
+        """Whether the exact union backend supports this observer input.
+
+        The optimized backend is intentionally conservative.  Symmetry and
+        finite floating-point weights are required by its endpoint proof.
+        Standard GPTQ clipping also has a positive integer grid and
+        ``0 < maxshrink <= 1``; other historical/custom settings remain owned
+        by the byte-preserving Cartesian implementation.
+        """
+
+        if self.w_clip_search_impl != "symmetric_union_exact":
+            return False
+        # RealQLayer always observes ``linear.weight.clone().float()``.  Keep
+        # the optimization on that production dtype: the historical ordinary
+        # row path's ``best`` buffer is float32 and has different (including
+        # erroring) behavior for float64/half inputs, which an opt-in backend
+        # must not accidentally "fix".
+        if not self.mse or not self.sym or x.dtype != torch.float32:
+            return False
+        if (
+            not isinstance(self.grid, int)
+            or isinstance(self.grid, bool)
+            or self.grid <= 0
+            or not isinstance(self.maxshrink, (int, float))
+            or isinstance(self.maxshrink, bool)
+            or not math.isfinite(float(self.maxshrink))
+            or not 0.0 < float(self.maxshrink) <= 1.0
+            or int(self.maxshrink * self.grid) <= 0
+        ):
+            return False
+        # One synchronization per observer is required so non-finite data
+        # follows the exact legacy fallback instead of entering an unproven
+        # domain.
+        return bool(torch.isfinite(x).all())
+
     def find_params(self, x) -> None:
         if self.bits == 16:
             return
@@ -597,7 +808,19 @@ class WeightQuantizer(torch.nn.Module):
             self.scale = (xmax - xmin).clamp(min=1e-5) / self.maxq
             self.zero = torch.round(-xmin / self.scale)
 
-        if self.mse:
+        if self.mse and self._can_use_symmetric_union(x):
+            self.scale = _select_symmetric_union_scale(
+                x,
+                xmin,
+                xmax,
+                maxq=self.maxq,
+                norm=self.norm,
+                grid=self.grid,
+                candidate_count=int(self.maxshrink * self.grid),
+                grouped_error_order=False,
+            )
+            self.zero = torch.zeros_like(self.scale)
+        elif self.mse:
             best = torch.full([x.shape[0]], float("inf"), device=dev)
             for i in range(int(self.maxshrink * self.grid)):
                 for j in range(int(self.maxshrink * self.grid)):

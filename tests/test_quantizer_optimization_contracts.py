@@ -12,6 +12,7 @@ import itertools
 import pytest
 import torch
 
+import utils.quant_utils as quant_utils
 from utils.quant_utils import WeightQuantizer, sym_quant_dequant
 
 
@@ -22,6 +23,7 @@ def _quantizer(
     mse: bool = False,
     grid: int = 8,
     maxshrink: float = 0.5,
+    w_clip_search_impl: str = "cartesian_legacy",
 ) -> WeightQuantizer:
     quantizer = WeightQuantizer()
     quantizer.configure(
@@ -33,6 +35,7 @@ def _quantizer(
         grid=grid,
         maxshrink=maxshrink,
         weight_groupsize=groupsize,
+        w_clip_search_impl=w_clip_search_impl,
     )
     return quantizer
 
@@ -597,25 +600,23 @@ def test_symmetric_union_clip_search_matches_legacy_raw_bytes(
 ):
     for weight in _finite_cases(columns):
         legacy = _quantizer(groupsize=groupsize, mse=True)
+        candidate = _quantizer(
+            groupsize=groupsize,
+            mse=True,
+            w_clip_search_impl="symmetric_union_exact",
+        )
         legacy.find_params(weight)
-        candidate_scale, evaluations = _union_symmetric_find_params_candidate(
-            legacy, weight
-        )
+        candidate.find_params(weight)
 
-        _assert_raw_equal(candidate_scale, legacy.scale)
-        assert evaluations == 2 * int(legacy.maxshrink * legacy.grid)
-        assert evaluations < int(legacy.maxshrink * legacy.grid) ** 2
-
+        _assert_raw_equal(candidate.scale, legacy.scale)
+        _assert_raw_equal(candidate.zero, legacy.zero)
         public_quantized, public_int, public_scale = legacy.fake_quantize(weight)
-        candidate_int = torch.clamp(
-            torch.round(weight / candidate_scale),
-            -(legacy.maxq + 1),
-            legacy.maxq,
+        candidate_quantized, candidate_int, returned_scale = (
+            candidate.fake_quantize(weight)
         )
-        candidate_quantized = (candidate_scale * candidate_int).to(weight.dtype)
         _assert_raw_equal(candidate_quantized, public_quantized)
         _assert_raw_equal(candidate_int, public_int)
-        _assert_raw_equal(candidate_scale, public_scale)
+        _assert_raw_equal(returned_scale, public_scale)
 
 
 @pytest.mark.parametrize("groupsize,columns", [(-1, 29), (128, 257)])
@@ -626,9 +627,15 @@ def test_symmetric_union_clip_search_finite_fuzz_raw_bytes(
     generator = torch.Generator().manual_seed(seed)
     weight = torch.randn(4, columns, generator=generator)
     legacy = _quantizer(groupsize=groupsize, mse=True)
+    candidate = _quantizer(
+        groupsize=groupsize,
+        mse=True,
+        w_clip_search_impl="symmetric_union_exact",
+    )
     legacy.find_params(weight)
-    candidate_scale, _ = _union_symmetric_find_params_candidate(legacy, weight)
-    _assert_raw_equal(candidate_scale, legacy.scale)
+    candidate.find_params(weight)
+    _assert_raw_equal(candidate.scale, legacy.scale)
+    _assert_raw_equal(candidate.zero, legacy.zero)
 
 
 def test_symmetric_union_covers_exact_pair_set_and_first_tie_order():
@@ -659,18 +666,6 @@ def test_symmetric_union_covers_exact_pair_set_and_first_tie_order():
         assert represented == exhaustive
 
 
-def _fallback_dispatch(
-    quantizer: WeightQuantizer, x: torch.Tensor
-) -> tuple[str, torch.Tensor, torch.Tensor]:
-    """Safety dispatch required by P02; legacy owns unsupported domains."""
-
-    if not quantizer.sym or not bool(torch.isfinite(x).all()):
-        quantizer.find_params(x)
-        return "legacy", quantizer.scale, quantizer.zero
-    scale, _ = _union_symmetric_find_params_candidate(quantizer, x)
-    return "union", scale, torch.zeros_like(scale)
-
-
 @pytest.mark.parametrize("groupsize,columns", [(-1, 9), (128, 129)])
 @pytest.mark.parametrize(
     "nonfinite",
@@ -682,13 +677,17 @@ def test_symmetric_union_nonfinite_input_falls_back_to_legacy_raw_bytes(
     weight = torch.linspace(-2.0, 3.0, steps=2 * columns).reshape(2, columns)
     weight[0, -1] = nonfinite
     expected = _quantizer(groupsize=groupsize, sym=True, mse=True)
-    actual = _quantizer(groupsize=groupsize, sym=True, mse=True)
+    actual = _quantizer(
+        groupsize=groupsize,
+        sym=True,
+        mse=True,
+        w_clip_search_impl="symmetric_union_exact",
+    )
     expected.find_params(weight)
+    actual.find_params(weight)
 
-    backend, scale, zero = _fallback_dispatch(actual, weight)
-    assert backend == "legacy"
-    _assert_raw_equal(scale, expected.scale)
-    _assert_raw_equal(zero, expected.zero)
+    _assert_raw_equal(actual.scale, expected.scale)
+    _assert_raw_equal(actual.zero, expected.zero)
 
 
 @pytest.mark.parametrize("groupsize,columns", [(-1, 9), (128, 129)])
@@ -697,17 +696,151 @@ def test_symmetric_union_asymmetric_mode_falls_back_to_legacy_raw_bytes(
 ):
     weight = torch.linspace(-2.0, 3.0, steps=3 * columns).reshape(3, columns)
     expected = _quantizer(groupsize=groupsize, sym=False, mse=True)
-    actual = _quantizer(groupsize=groupsize, sym=False, mse=True)
+    actual = _quantizer(
+        groupsize=groupsize,
+        sym=False,
+        mse=True,
+        w_clip_search_impl="symmetric_union_exact",
+    )
     expected.find_params(weight)
+    actual.find_params(weight)
 
-    backend, scale, zero = _fallback_dispatch(actual, weight)
-    assert backend == "legacy"
-    _assert_raw_equal(scale, expected.scale)
-    _assert_raw_equal(zero, expected.zero)
+    _assert_raw_equal(actual.scale, expected.scale)
+    _assert_raw_equal(actual.zero, expected.zero)
 
 
-def test_default_symmetric_union_reduces_error_evaluations_625_to_50():
-    grid, maxshrink = 50, 0.5
-    legacy_evaluations = int(grid * maxshrink) ** 2
-    union_evaluations = 2 * int(grid * maxshrink)
-    assert (legacy_evaluations, union_evaluations) == (625, 50)
+def test_symmetric_union_nonfinite_dispatch_executes_cartesian_loop(monkeypatch):
+    calls = 0
+    original = quant_utils.sym_quant_dequant
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(quant_utils, "sym_quant_dequant", counted)
+    weight = torch.tensor([[float("nan"), -1.0, 2.0]])
+    quantizer = _quantizer(
+        groupsize=-1,
+        mse=True,
+        grid=8,
+        maxshrink=0.5,
+        w_clip_search_impl="symmetric_union_exact",
+    )
+    quantizer.find_params(weight)
+    assert calls == int(quantizer.grid * quantizer.maxshrink) ** 2
+
+
+def test_symmetric_union_unsupported_search_shape_falls_back_raw_bytes(
+    monkeypatch,
+):
+    calls = 0
+    original = quant_utils.sym_quant_dequant
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(quant_utils, "sym_quant_dequant", counted)
+    weight = torch.linspace(-3.0, 2.0, steps=34).reshape(2, 17)
+    legacy = _quantizer(
+        groupsize=-1, mse=True, grid=8, maxshrink=1.25
+    )
+    candidate = _quantizer(
+        groupsize=-1,
+        mse=True,
+        grid=8,
+        maxshrink=1.25,
+        w_clip_search_impl="symmetric_union_exact",
+    )
+    legacy.find_params(weight)
+    legacy_calls = calls
+    calls = 0
+    candidate.find_params(weight)
+    candidate_calls = calls
+    expected_calls = int(8 * 1.25) ** 2
+    assert (legacy_calls, candidate_calls) == (expected_calls, expected_calls)
+    _assert_raw_equal(candidate.scale, legacy.scale)
+    _assert_raw_equal(candidate.zero, legacy.zero)
+
+
+def test_symmetric_union_unsupported_row_dtype_preserves_legacy_error():
+    weight = torch.randn(2, 9, dtype=torch.float64)
+    for implementation in (
+        "cartesian_legacy",
+        "symmetric_union_exact",
+    ):
+        quantizer = _quantizer(
+            groupsize=-1,
+            mse=True,
+            w_clip_search_impl=implementation,
+        )
+        with pytest.raises(
+            RuntimeError,
+            match="source and destination dtypes match",
+        ):
+            quantizer.find_params(weight)
+
+
+def test_symmetric_union_reduces_actual_qdq_error_evaluations_625_to_50(
+    monkeypatch,
+):
+    calls = 0
+    original = quant_utils.sym_quant_dequant
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(quant_utils, "sym_quant_dequant", counted)
+    weight = torch.randn(4, 257, generator=torch.Generator().manual_seed(17))
+
+    default = _quantizer(
+        groupsize=-1, mse=True, grid=50, maxshrink=0.5
+    )
+    assert default.w_clip_search_impl == "cartesian_legacy"
+    default.find_params(weight)
+    legacy_calls = calls
+
+    calls = 0
+    union = _quantizer(
+        groupsize=-1,
+        mse=True,
+        grid=50,
+        maxshrink=0.5,
+        w_clip_search_impl="symmetric_union_exact",
+    )
+    union.find_params(weight)
+    union_calls = calls
+
+    assert (legacy_calls, union_calls) == (625, 50)
+    _assert_raw_equal(union.scale, default.scale)
+    _assert_raw_equal(union.zero, default.zero)
+
+
+def test_symmetric_union_group128_short_tail_is_two_exact_50_eval_batches(
+    monkeypatch,
+):
+    calls = 0
+    original = quant_utils.sym_quant_dequant
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(quant_utils, "sym_quant_dequant", counted)
+    weight = torch.randn(3, 257, generator=torch.Generator().manual_seed(19))
+    union = _quantizer(
+        groupsize=128,
+        mse=True,
+        grid=50,
+        maxshrink=0.5,
+        w_clip_search_impl="symmetric_union_exact",
+    )
+    union.find_params(weight)
+    # Full groups are vectorized together; the unequal one-column tail is a
+    # second batch.  Each batch is 50 QDQ/error evaluations instead of 625.
+    assert calls == 100

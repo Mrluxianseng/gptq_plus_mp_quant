@@ -39,6 +39,9 @@ class Config:
     w_groupsize: int = -1     # -1 = per-row
     w_asym: bool = False
     w_clip: bool = True       # MSE-based clip search in find_params
+    # Opt-in exact reduction for symmetric finite weight clipping.  The
+    # default preserves the historical Cartesian scan.
+    w_clip_search_impl: str = "cartesian_legacy"
 
     # ----- RealQ algorithm -------------------------------------------------
     num_groups: int = 4       # Hessian groups per linear (output-row sharing)
@@ -267,6 +270,15 @@ class Config:
                     f"Got w_groupsize={self.w_groupsize}, "
                     f"blocksize={self.blocksize}."
                 )
+        if self.w_clip_search_impl not in (
+            "cartesian_legacy",
+            "symmetric_union_exact",
+        ):
+            raise ValueError(
+                "`w_clip_search_impl` must be 'cartesian_legacy' or "
+                "'symmetric_union_exact'. Got "
+                f"{self.w_clip_search_impl!r}."
+            )
         if self.num_groups <= 0:
             raise ValueError(
                 f"`num_groups` must be positive. Got {self.num_groups}."
