@@ -254,6 +254,7 @@ def test_activation_aware_uses_reported_constant_lr_but_fp16_flag_is_noop():
 
 def test_paper_defaults_and_conditional_akv_clip_presets():
     fp = Config()
+    assert fp.quantizer_inner_fastpath is False
     assert fp.grad_hessian_topk <= 0
     assert fp.kl_topk <= 0
     assert fp.saliency_clip_percentile == pytest.approx(0.99)
@@ -284,6 +285,9 @@ def test_paper_defaults_and_conditional_akv_clip_presets():
     assert explicit.a_clip_ratio == pytest.approx(1.0)
     assert explicit.final_layer_grad_clip == pytest.approx(5e-4)
     assert fp.final_layer_backward_bsz == fp.backward_bsz == 32
+    assert parse_cli(
+        ["--quantizer_inner_fastpath", "true"]
+    ).quantizer_inner_fastpath is True
 
 
 def test_activation_loss_clip_scope_is_explicit_and_validated():
@@ -304,6 +308,7 @@ def test_activation_loss_clip_scope_is_explicit_and_validated():
         ({"w_asym": True}, "w_asym"),
         ({"w_groupsize": 64, "blocksize": 128}, "w_groupsize"),
         ({"group_parallel_quant": "tensor"}, "group_parallel_quant"),
+        ({"quantizer_inner_fastpath": 1}, "quantizer_inner_fastpath"),
     ],
 )
 def test_refactored_weight_config_rejects_unsupported_modes(

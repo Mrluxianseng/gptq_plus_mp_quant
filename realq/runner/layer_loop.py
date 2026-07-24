@@ -564,6 +564,9 @@ def quantize_one_layer(
                                 w_clip=cfg.w_clip,
                                 grad_refresh_fn=grad_refresh_fn,
                                 group_parallel_quant=cfg.group_parallel_quant,
+                                quantizer_inner_fastpath=(
+                                    cfg.quantizer_inner_fastpath
+                                ),
                             )
                         realq.free()
                 del realqs

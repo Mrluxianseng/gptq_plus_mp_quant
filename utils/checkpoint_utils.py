@@ -48,6 +48,7 @@ _WEIGHT_PROVENANCE_FIELDS = (
     "w_asym",
     "w_clip",
     "w_method",
+    "quantizer_inner_fastpath",
 )
 _BOOL_FIELDS = {
     "rotate",

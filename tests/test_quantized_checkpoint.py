@@ -104,7 +104,7 @@ def test_checkpoint_is_weights_only_safe_and_restores_exact_a_v_runtime(
 ):
     torch.manual_seed(7)
     source = _RuntimeModel()
-    cfg = _runtime_cfg()
+    cfg = _runtime_cfg(quantizer_inner_fastpath=True)
     configure_activation_quantizers_for_gptq(cfg, source)
     x = torch.tensor([[[1.0, -2.0, 3.5, -4.0]]])
     expected = source(x)
@@ -133,6 +133,7 @@ def test_checkpoint_is_weights_only_safe_and_restores_exact_a_v_runtime(
         act_quant_aware_gptq=True,
         k_cache_quant_aware_gptq=False,
         w_bits=16,
+        quantizer_inner_fastpath=False,
     )
     assert checkpoint_utils.apply_runtime_manifest(restored_cfg, loaded)
     assert restored_cfg.a_bits == 4
@@ -141,6 +142,8 @@ def test_checkpoint_is_weights_only_safe_and_restores_exact_a_v_runtime(
     assert restored_cfg.v_asym is True
     assert restored_cfg.act_quant_aware_gptq is False
     assert restored_cfg.w_bits == 4
+    assert raw["weight_quantization"]["quantizer_inner_fastpath"] is True
+    assert restored_cfg.quantizer_inner_fastpath is True
 
     target = _RuntimeModel()
     configure_activation_quantizers_for_gptq(restored_cfg, target)

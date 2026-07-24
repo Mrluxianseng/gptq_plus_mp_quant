@@ -1,11 +1,8 @@
-"""Raw-byte contracts for prospective quantizer hot-path optimizations.
+"""Raw-byte contracts for quantizer hot-path optimizations.
 
-These tests intentionally keep the candidate implementations local to the test
-module.  They let us prove the algebra and the observable tie-breaking contract
-before changing :mod:`utils.quant_utils` while the formal baseline source is
-frozen.  When the production fast paths are added, the local candidate calls
-should be replaced by the corresponding private methods/configured backends so
-the same cases become direct implementation regressions.
+The trusted inner fake-quant tests exercise the production private methods
+directly. Later sections intentionally retain local prospective implementations
+until their corresponding optimization switches are promoted.
 """
 
 from __future__ import annotations
@@ -50,51 +47,44 @@ def _assert_raw_equal(actual: torch.Tensor, expected: torch.Tensor) -> None:
     assert torch.equal(actual_bytes, expected_bytes)
 
 
-def _trusted_fake_quant_candidate(
-    quantizer: WeightQuantizer,
-    x: torch.Tensor,
-    preselected_scale: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Candidate for a *prevalidated* inner-loop fake-quant primitive.
-
-    The caller remains responsible for all public API work: checking
-    ``ready()/bits``, moving scale to the input device, slicing output rows,
-    and mapping act-order columns back to natural group coordinates.  Keeping
-    the exact division -> round -> clamp -> multiply order (and the tensor
-    ``maxq`` operand) is part of the raw-byte contract.
-    """
-
-    quantized_int = torch.clamp(
-        torch.round(x / preselected_scale),
-        -(quantizer.maxq + 1),
-        quantizer.maxq,
-    )
-    return (
-        (preselected_scale * quantized_int).to(x.dtype),
-        quantized_int,
-        preselected_scale,
-    )
-
-
-def _public_preselected_scale(
+def _assert_inner_columns_match_public_raw_bytes(
     quantizer: WeightQuantizer,
     x: torch.Tensor,
     *,
     st_idx: int | None = None,
     end_idx: int | None = None,
-    col_idx: torch.Tensor | int | None = None,
-) -> torch.Tensor:
-    """Repeat only the public scale-selection prelude used by the call site."""
+    natural_columns: torch.Tensor | None = None,
+):
+    """Exercise the production private primitive one REAL-Q column at a time."""
 
-    scale = quantizer.scale.to(x.device)
-    if st_idx is not None and end_idx is not None:
-        scale = scale[st_idx:end_idx]
-    if quantizer.weight_groupsize > 0 and col_idx is not None:
-        natural_columns = torch.as_tensor(
-            col_idx, dtype=torch.long, device=scale.device
-        ).reshape(-1)
-        scale = scale.index_select(-1, natural_columns)
-    return scale
+    prepared = quantizer._prepare_fake_quantize_inner(
+        input_rows=x.shape[0],
+        column_count=x.shape[1],
+        device=x.device,
+        dtype=x.dtype,
+        st_idx=st_idx,
+        end_idx=end_idx,
+        col_idx=natural_columns,
+    )
+    for column_offset in range(x.shape[1]):
+        x_column = x[:, column_offset : column_offset + 1]
+        natural_column = (
+            int(natural_columns[column_offset])
+            if natural_columns is not None
+            else column_offset
+        )
+        public = quantizer.fake_quantize(
+            x_column,
+            st_idx=st_idx,
+            end_idx=end_idx,
+            col_idx=natural_column,
+        )
+        fast = quantizer._fake_quantize_prevalidated(
+            x_column, prepared, column_offset
+        )
+        for actual, expected in zip(fast, public):
+            _assert_raw_equal(actual, expected)
+    return prepared
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
@@ -111,14 +101,7 @@ def test_trusted_fake_quant_row_mode_is_raw_byte_identical_on_edge_values(dtype)
     )
     x = quantizer.scale * multipliers
 
-    public = quantizer.fake_quantize(x)
-    candidate = _trusted_fake_quant_candidate(
-        quantizer,
-        x,
-        _public_preselected_scale(quantizer, x),
-    )
-    for actual, expected in zip(candidate, public):
-        _assert_raw_equal(actual, expected)
+    _assert_inner_columns_match_public_raw_bytes(quantizer, x)
 
 
 def test_trusted_fake_quant_preserves_row_slice_contract_raw_bytes():
@@ -131,14 +114,9 @@ def test_trusted_fake_quant_preserves_row_slice_contract_raw_bytes():
         ]
     )
 
-    public = quantizer.fake_quantize(x, st_idx=1, end_idx=3)
-    candidate = _trusted_fake_quant_candidate(
-        quantizer,
-        x,
-        _public_preselected_scale(quantizer, x, st_idx=1, end_idx=3),
+    _assert_inner_columns_match_public_raw_bytes(
+        quantizer, x, st_idx=1, end_idx=3
     )
-    for actual, expected in zip(candidate, public):
-        _assert_raw_equal(actual, expected)
 
 
 def test_trusted_fake_quant_group128_act_order_and_short_tail_raw_bytes():
@@ -157,42 +135,51 @@ def test_trusted_fake_quant_group128_act_order_and_short_tail_raw_bytes():
     row_start, row_end = 1, 3
     x = weight[row_start:row_end].index_select(-1, natural_columns)
 
-    public = quantizer.fake_quantize(
+    _assert_inner_columns_match_public_raw_bytes(
+        quantizer,
         x,
         st_idx=row_start,
         end_idx=row_end,
-        col_idx=natural_columns,
+        natural_columns=natural_columns,
     )
-    candidate = _trusted_fake_quant_candidate(
-        quantizer,
-        x,
-        _public_preselected_scale(
-            quantizer,
-            x,
-            st_idx=row_start,
-            end_idx=row_end,
-            col_idx=natural_columns,
-        ),
-    )
-    for actual, expected in zip(candidate, public):
-        _assert_raw_equal(actual, expected)
 
     # Counterexample for an unsafe hoist: treating the permuted loop position
     # as the natural column silently takes every scale from group 0.  The
     # deliberately different group ranges make that observably wrong.
-    wrong_scale = _public_preselected_scale(
-        quantizer,
-        x,
+    wrong_columns = torch.arange(natural_columns.numel())
+    wrong_prepared = quantizer._prepare_fake_quantize_inner(
+        input_rows=x.shape[0],
+        column_count=x.shape[1],
+        device=x.device,
+        dtype=x.dtype,
         st_idx=row_start,
         end_idx=row_end,
-        col_idx=torch.arange(natural_columns.numel()),
+        col_idx=wrong_columns,
     )
-    wrong_quantized, _, _ = _trusted_fake_quant_candidate(
-        quantizer, x, wrong_scale
+    wrong_quantized = torch.cat(
+        [
+            quantizer._fake_quantize_prevalidated(
+                x[:, offset : offset + 1], wrong_prepared, offset
+            )[0]
+            for offset in range(x.shape[1])
+        ],
+        dim=1,
+    )
+    correct_quantized = torch.cat(
+        [
+            quantizer.fake_quantize(
+                x[:, offset : offset + 1],
+                st_idx=row_start,
+                end_idx=row_end,
+                col_idx=natural_columns[offset],
+            )[0]
+            for offset in range(x.shape[1])
+        ],
+        dim=1,
     )
     assert not torch.equal(
         wrong_quantized.contiguous().view(torch.uint8),
-        public[0].contiguous().view(torch.uint8),
+        correct_quantized.contiguous().view(torch.uint8),
     )
 
 
@@ -206,14 +193,99 @@ def test_trusted_fake_quant_finite_fuzz_is_raw_byte_identical(
     quantizer = _quantizer(groupsize=groupsize)
     quantizer.find_params(weight)
 
-    public = quantizer.fake_quantize(weight)
-    candidate = _trusted_fake_quant_candidate(
+    natural_columns = (
+        torch.arange(columns) if groupsize > 0 else None
+    )
+    _assert_inner_columns_match_public_raw_bytes(
         quantizer,
         weight,
-        _public_preselected_scale(quantizer, weight),
+        natural_columns=natural_columns,
     )
-    for actual, expected in zip(candidate, public):
-        _assert_raw_equal(actual, expected)
+
+
+def test_trusted_fake_quant_rejects_replaced_or_mutated_scale_as_stale():
+    quantizer = _quantizer(groupsize=-1)
+    weight = torch.randn(3, 5, generator=torch.Generator().manual_seed(41))
+    quantizer.find_params(weight)
+    prepared = quantizer._prepare_fake_quantize_inner(
+        input_rows=3,
+        column_count=5,
+        device=weight.device,
+        dtype=weight.dtype,
+    )
+    quantizer.scale.add_(0.125)
+    with pytest.raises(RuntimeError, match="Stale prevalidated"):
+        quantizer._fake_quantize_prevalidated(weight[:, :1], prepared, 0)
+
+    quantizer.find_params(weight)
+    prepared = quantizer._prepare_fake_quantize_inner(
+        input_rows=3,
+        column_count=5,
+        device=weight.device,
+        dtype=weight.dtype,
+    )
+    quantizer.scale = quantizer.scale.clone()
+    with pytest.raises(RuntimeError, match="Stale prevalidated"):
+        quantizer._fake_quantize_prevalidated(weight[:, :1], prepared, 0)
+
+
+def test_trusted_fake_quant_rejects_mutated_maxq_or_quantizer_metadata():
+    quantizer = _quantizer(groupsize=-1)
+    weight = torch.randn(3, 2, generator=torch.Generator().manual_seed(42))
+    quantizer.find_params(weight)
+    prepared = quantizer._prepare_fake_quantize_inner(
+        input_rows=3,
+        column_count=2,
+        device=weight.device,
+        dtype=weight.dtype,
+    )
+    quantizer.maxq.add_(1)
+    with pytest.raises(RuntimeError, match="Stale prevalidated"):
+        quantizer._fake_quantize_prevalidated(weight[:, :1], prepared, 0)
+
+    quantizer.maxq.sub_(1)
+    prepared = quantizer._prepare_fake_quantize_inner(
+        input_rows=3,
+        column_count=2,
+        device=weight.device,
+        dtype=weight.dtype,
+    )
+    quantizer.bits = 3
+    with pytest.raises(RuntimeError, match="Stale prevalidated"):
+        quantizer._fake_quantize_prevalidated(weight[:, :1], prepared, 0)
+
+
+def test_trusted_fake_quant_rejects_invalid_natural_column_contracts():
+    weight = torch.randn(
+        3, 257, generator=torch.Generator().manual_seed(43)
+    )
+    quantizer = _quantizer(groupsize=128)
+    quantizer.find_params(weight)
+    common = dict(
+        input_rows=3,
+        column_count=3,
+        device=weight.device,
+        dtype=weight.dtype,
+    )
+
+    with pytest.raises(ValueError, match="requires one natural col_idx"):
+        quantizer._prepare_fake_quantize_inner(**common)
+    with pytest.raises(ValueError, match="one natural column index"):
+        quantizer._prepare_fake_quantize_inner(
+            **common, col_idx=torch.tensor([0, 1])
+        )
+    with pytest.raises(IndexError, match="outside"):
+        quantizer._prepare_fake_quantize_inner(
+            **common, col_idx=torch.tensor([0, 128, 257])
+        )
+    with pytest.raises(IndexError, match="outside"):
+        quantizer._prepare_fake_quantize_inner(
+            **common, col_idx=torch.tensor([-1, 0, 1])
+        )
+    with pytest.raises(TypeError, match="integer natural"):
+        quantizer._prepare_fake_quantize_inner(
+            **common, col_idx=torch.tensor([0.0, 1.0, 2.0])
+        )
 
 
 def _symmetric_union_candidates_and_first_keys(
@@ -518,12 +590,15 @@ def test_symmetric_union_clip_search_matches_legacy_raw_bytes(
         assert evaluations < int(legacy.maxshrink * legacy.grid) ** 2
 
         public_quantized, public_int, public_scale = legacy.fake_quantize(weight)
-        candidate_quantized, candidate_int, returned_scale = (
-            _trusted_fake_quant_candidate(legacy, weight, candidate_scale)
+        candidate_int = torch.clamp(
+            torch.round(weight / candidate_scale),
+            -(legacy.maxq + 1),
+            legacy.maxq,
         )
+        candidate_quantized = (candidate_scale * candidate_int).to(weight.dtype)
         _assert_raw_equal(candidate_quantized, public_quantized)
         _assert_raw_equal(candidate_int, public_int)
-        _assert_raw_equal(returned_scale, public_scale)
+        _assert_raw_equal(candidate_scale, public_scale)
 
 
 @pytest.mark.parametrize("groupsize,columns", [(-1, 29), (128, 257)])

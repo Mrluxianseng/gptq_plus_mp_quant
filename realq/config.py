@@ -53,6 +53,12 @@ class Config:
     # full quantize). Old code's tensor-mode is not ported (RealQ already
     # vectorises across NUM_GROUPS in the per-group fallback).
     group_parallel_quant: str = "rank"  # one of: none, rank
+    # Opt-in performance experiment: prevalidate WeightQuantizer state and
+    # grouped natural-column coordinates once per GPTQ block, then use the
+    # private exact-arithmetic inner primitive. Default-off until full-model
+    # raw-byte A/B promotion is complete. A stale context raises instead of
+    # silently using changed scale/maxq state.
+    quantizer_inner_fastpath: bool = False
 
     # ----- static end-to-end precompute -----------------------------------
     global_loss_bsz: int = 16
@@ -283,6 +289,11 @@ class Config:
             raise ValueError(
                 "`log_column_block_loss` must be bool. Got "
                 f"{self.log_column_block_loss!r}."
+            )
+        if type(self.quantizer_inner_fastpath) is not bool:
+            raise ValueError(
+                "`quantizer_inner_fastpath` must be bool. Got "
+                f"{self.quantizer_inner_fastpath!r}."
             )
         if not (0.0 < self.saliency_clip_percentile <= 1.0):
             raise ValueError(

@@ -277,6 +277,7 @@ class RealQLayer:
         w_clip: bool = False,
         grad_refresh_fn=None,
         group_parallel_quant: str = "none",
+        quantizer_inner_fastpath: bool = False,
     ) -> None:
         """Run GPTQ on this linear's weight. Mutates ``self.linear.weight``.
 
@@ -296,6 +297,11 @@ class RealQLayer:
         rank (correct but redundant). ``act_order`` is supported in rank mode:
         its globally reduced ``act_square`` produces the same permutation on
         every rank, and natural-column qparams are computed before permutation.
+
+        ``quantizer_inner_fastpath``: opt into a private WeightQuantizer
+        primitive that validates scale/maxq state and all grouped natural
+        column coordinates once per block. The default public path is
+        unchanged. The private context raises if it becomes stale.
         """
         # W16 is the explicit no-weight-quantization mode.  The quantizer has
         # no scale in this mode, so entering the GPTQ column loop would make
@@ -527,6 +533,28 @@ class RealQLayer:
                         if dynamic_weight_groups
                         else self.quantizer
                     )
+                    inner_fastpath = None
+                    if quantizer_inner_fastpath:
+                        natural_columns = None
+                        if block_quantizer.weight_groupsize > 0:
+                            natural_columns = (
+                                perm[i1:i2]
+                                if perm is not None
+                                else torch.arange(
+                                    i1, i2, device=W1_local.device
+                                )
+                            )
+                        inner_fastpath = (
+                            block_quantizer._prepare_fake_quantize_inner(
+                                input_rows=W1_local.shape[0],
+                                column_count=count,
+                                device=W1_local.device,
+                                dtype=W1_local.dtype,
+                                st_idx=row_sl.start,
+                                end_idx=row_sl.stop,
+                                col_idx=natural_columns,
+                            )
+                        )
                     Q1_local = torch.zeros_like(W1_local)
                     Err1_local = torch.zeros_like(W1_local)
                     Hinv1 = Hinv_single[i1:i2, i1:i2]
@@ -537,12 +565,23 @@ class RealQLayer:
                             w_col = w.unsqueeze(1)
                             # Slice scale/zero to local rows so fake_quantize sees
                             # the per-row params for the rows we own.
-                            q_fake, _, _ = block_quantizer.fake_quantize(
-                                w_col,
-                                st_idx=row_sl.start,
-                                end_idx=row_sl.stop,
-                                col_idx=perm[i1 + i] if perm is not None else i1 + i,
-                            )
+                            if inner_fastpath is None:
+                                q_fake, _, _ = block_quantizer.fake_quantize(
+                                    w_col,
+                                    st_idx=row_sl.start,
+                                    end_idx=row_sl.stop,
+                                    col_idx=(
+                                        perm[i1 + i]
+                                        if perm is not None
+                                        else i1 + i
+                                    ),
+                                )
+                            else:
+                                q_fake, _, _ = (
+                                    block_quantizer._fake_quantize_prevalidated(
+                                        w_col, inner_fastpath, i
+                                    )
+                                )
                             q = q_fake.flatten()
                             Q1_local[:, i] = q
                             err = (w - q) / d
@@ -706,6 +745,26 @@ class RealQLayer:
                         if dynamic_weight_groups
                         else self.quantizer
                     )
+                    inner_fastpath = None
+                    if quantizer_inner_fastpath:
+                        natural_columns = None
+                        if block_quantizer.weight_groupsize > 0:
+                            natural_columns = (
+                                perm[i1:i2]
+                                if perm is not None
+                                else torch.arange(i1, i2, device=W1.device)
+                            )
+                        inner_fastpath = (
+                            block_quantizer._prepare_fake_quantize_inner(
+                                input_rows=G_l * R_l,
+                                column_count=count,
+                                device=W1.device,
+                                dtype=W1.dtype,
+                                st_idx=row_sl.start,
+                                end_idx=row_sl.stop,
+                                col_idx=natural_columns,
+                            )
+                        )
                     Q1 = torch.zeros_like(W1)
                     Err1 = torch.zeros_like(W1)
                     Hinv1 = Hinv_per_group[:, i1:i2, i1:i2]        # (G_l, count, count)
@@ -719,12 +778,23 @@ class RealQLayer:
                             # order because local groups are contiguous in
                             # row space.
                             w_col_flat = w_col.reshape(-1, 1)
-                            q_fake, _, _ = block_quantizer.fake_quantize(
-                                w_col_flat,
-                                st_idx=row_sl.start,
-                                end_idx=row_sl.stop,
-                                col_idx=perm[i1 + i] if perm is not None else i1 + i,
-                            )
+                            if inner_fastpath is None:
+                                q_fake, _, _ = block_quantizer.fake_quantize(
+                                    w_col_flat,
+                                    st_idx=row_sl.start,
+                                    end_idx=row_sl.stop,
+                                    col_idx=(
+                                        perm[i1 + i]
+                                        if perm is not None
+                                        else i1 + i
+                                    ),
+                                )
+                            else:
+                                q_fake, _, _ = (
+                                    block_quantizer._fake_quantize_prevalidated(
+                                        w_col_flat, inner_fastpath, i
+                                    )
+                                )
                             q_col = q_fake.reshape(G_l, R_l)
                             Q1[:, :, i] = q_col
                             d = Hinv1[:, i, i].unsqueeze(1)        # (G_l, 1) — broadcast across R_l
@@ -837,6 +907,24 @@ class RealQLayer:
                         if dynamic_weight_groups
                         else self.quantizer
                     )
+                    inner_fastpath = None
+                    if quantizer_inner_fastpath:
+                        natural_columns = None
+                        if block_quantizer.weight_groupsize > 0:
+                            natural_columns = (
+                                perm[i1:i2]
+                                if perm is not None
+                                else torch.arange(i1, i2, device=W1.device)
+                            )
+                        inner_fastpath = (
+                            block_quantizer._prepare_fake_quantize_inner(
+                                input_rows=W1.shape[0],
+                                column_count=count,
+                                device=W1.device,
+                                dtype=W1.dtype,
+                                col_idx=natural_columns,
+                            )
+                        )
                     Q1 = torch.zeros_like(W1)
                     Err1 = torch.zeros_like(W1)
                     W1_g = W1.view(self.num_groups, rpg, count)
@@ -845,10 +933,21 @@ class RealQLayer:
                     with nvtx.nvtx_range("block.inner_cols"):
                         for i in range(count):
                             w_col = W1[:, i].unsqueeze(1)
-                            q_fake, _, _ = block_quantizer.fake_quantize(
-                                w_col,
-                                col_idx=perm[i1 + i] if perm is not None else i1 + i,
-                            )
+                            if inner_fastpath is None:
+                                q_fake, _, _ = block_quantizer.fake_quantize(
+                                    w_col,
+                                    col_idx=(
+                                        perm[i1 + i]
+                                        if perm is not None
+                                        else i1 + i
+                                    ),
+                                )
+                            else:
+                                q_fake, _, _ = (
+                                    block_quantizer._fake_quantize_prevalidated(
+                                        w_col, inner_fastpath, i
+                                    )
+                                )
                             q_col = q_fake.flatten()
                             Q1[:, i] = q_col
                             d_g = Hinv1_g[:, i, i]

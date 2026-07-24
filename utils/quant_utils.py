@@ -343,6 +343,69 @@ class ActQuantWrapper(torch.nn.Module):
         return x
 
 
+class _PrevalidatedWeightFakeQuant:
+    """Opaque state for :meth:`WeightQuantizer._fake_quantize_prevalidated`.
+
+    REAL-Q quantizes one weight column at a time.  The public
+    :meth:`WeightQuantizer.fake_quantize` entry point deliberately validates
+    readiness, row slicing, and natural-column coordinates on every call.
+    Repeating those tensor-wide checks in the inner GPTQ loop is expensive,
+    especially because turning a CUDA boolean into a Python branch
+    synchronizes the stream.
+
+    This private context moves the checks to the enclosing block boundary.
+    It also snapshots every quantizer object that can affect the arithmetic.
+    The hot-path method checks the cheap Python/Tensor version metadata before
+    each use and raises if anything is stale; it must never silently execute
+    with parameters different from those that were prevalidated.
+    """
+
+    __slots__ = (
+        "owner",
+        "source_scale",
+        "source_scale_version",
+        "source_maxq",
+        "source_maxq_version",
+        "prepared_scale",
+        "prepared_scale_version",
+        "bits",
+        "weight_groupsize",
+        "input_rows",
+        "column_count",
+        "device",
+        "dtype",
+        "grouped",
+    )
+
+    def __init__(
+        self,
+        *,
+        owner,
+        source_scale,
+        source_maxq,
+        prepared_scale,
+        input_rows,
+        column_count,
+        device,
+        dtype,
+        grouped,
+    ) -> None:
+        self.owner = owner
+        self.source_scale = source_scale
+        self.source_scale_version = source_scale._version
+        self.source_maxq = source_maxq
+        self.source_maxq_version = source_maxq._version
+        self.prepared_scale = prepared_scale
+        self.prepared_scale_version = prepared_scale._version
+        self.bits = owner.bits
+        self.weight_groupsize = owner.weight_groupsize
+        self.input_rows = input_rows
+        self.column_count = column_count
+        self.device = device
+        self.dtype = dtype
+        self.grouped = grouped
+
+
 class WeightQuantizer(torch.nn.Module):
     """From GPTQ Repo"""
 
@@ -595,6 +658,209 @@ class WeightQuantizer(torch.nn.Module):
             return (scale * q).to(x_dtype), q, scale
         else:
             return None, None, None
+
+    def _prepare_fake_quantize_inner(
+        self,
+        *,
+        input_rows,
+        column_count,
+        device,
+        dtype,
+        st_idx=None,
+        end_idx=None,
+        col_idx=None,
+    ):
+        """Prevalidate one REAL-Q block's private column-wise fast path.
+
+        This is intentionally narrower than :meth:`fake_quantize`: it accepts
+        only the ``(rows, 1)`` symmetric weight-column layout used by
+        :class:`realq.quant.realq_layer.RealQLayer`.  Public callers must keep
+        using :meth:`fake_quantize`.
+
+        Grouped parameters are stored in natural (pre-act-order) column
+        coordinates.  ``col_idx`` therefore names every natural column in the
+        block, in the exact order in which the inner loop will consume them.
+        The complete mapping is bounds-checked once here.  Selected scales are
+        transposed into a contiguous ``(columns, rows, 1)`` layout so each hot
+        iteration sees the same contiguous ``(rows, 1)`` operand as the public
+        scalar ``index_select`` path.
+        """
+
+        if (
+            not isinstance(input_rows, int)
+            or isinstance(input_rows, bool)
+            or input_rows <= 0
+        ):
+            raise ValueError(
+                f"input_rows must be a positive integer; got {input_rows!r}."
+            )
+        if (
+            not isinstance(column_count, int)
+            or isinstance(column_count, bool)
+            or column_count <= 0
+        ):
+            raise ValueError(
+                "column_count must be a positive integer; "
+                f"got {column_count!r}."
+            )
+        if (st_idx is None) != (end_idx is None):
+            raise ValueError(
+                "st_idx and end_idx must either both be provided or both be None."
+            )
+        if not hasattr(self, "bits") or self.bits >= 16:
+            raise RuntimeError(
+                "The prevalidated weight fast path requires an enabled "
+                "quantizer with bits < 16."
+            )
+        if not self.ready():
+            raise RuntimeError(
+                "The prevalidated weight fast path requires ready scale "
+                "parameters."
+            )
+
+        device = torch.device(device)
+        source_scale = self.scale
+        source_maxq = self.maxq
+        scale = source_scale.to(device)
+        if st_idx is not None and end_idx is not None:
+            scale = scale[st_idx:end_idx]
+        if scale.dim() != 2 or scale.shape[0] != input_rows:
+            raise ValueError(
+                "The prevalidated weight fast path requires a 2-D scale with "
+                "one row per input row after slicing; got "
+                f"scale.shape={tuple(scale.shape)}, input_rows={input_rows}."
+            )
+        if source_maxq.device != device:
+            raise ValueError(
+                "maxq must already be on the input device, matching the public "
+                "fake_quantize arithmetic; got "
+                f"maxq.device={source_maxq.device}, input device={device}."
+            )
+
+        grouped = self.weight_groupsize > 0
+        if grouped:
+            if col_idx is None:
+                raise ValueError(
+                    "Grouped prevalidated fake quantization requires one "
+                    "natural col_idx per inner-loop column."
+                )
+            raw_col_idx = torch.as_tensor(col_idx, device=scale.device).reshape(-1)
+            integer_dtypes = {
+                torch.uint8,
+                torch.int8,
+                torch.int16,
+                torch.int32,
+                torch.int64,
+            }
+            if raw_col_idx.dtype not in integer_dtypes:
+                raise TypeError(
+                    "Grouped prevalidated col_idx must contain integer natural "
+                    f"column coordinates; got dtype={raw_col_idx.dtype}."
+                )
+            natural_columns = raw_col_idx.to(dtype=torch.long)
+            if natural_columns.numel() != column_count:
+                raise ValueError(
+                    "col_idx must provide one natural column index per inner "
+                    f"iteration; got {natural_columns.numel()} indices for "
+                    f"column_count={column_count}."
+                )
+            if torch.any(natural_columns < 0) or torch.any(
+                natural_columns >= scale.shape[-1]
+            ):
+                raise IndexError(
+                    f"col_idx is outside [0, {scale.shape[-1]}) for grouped "
+                    "weight quantization."
+                )
+            selected = scale.index_select(-1, natural_columns)
+            prepared_scale = selected.transpose(0, 1).contiguous().unsqueeze(-1)
+        else:
+            # The public column path broadcasts one per-row scale over a
+            # (rows, 1) input.  Refuse broader broadcasting here: it is not a
+            # RealQLayer hot-loop shape and could hide a stale/wrong observer.
+            if scale.shape[-1] != 1:
+                raise ValueError(
+                    "Per-row prevalidated fake quantization requires "
+                    f"scale.shape=(rows, 1); got {tuple(scale.shape)}."
+                )
+            prepared_scale = scale
+
+        return _PrevalidatedWeightFakeQuant(
+            owner=self,
+            source_scale=source_scale,
+            source_maxq=source_maxq,
+            prepared_scale=prepared_scale,
+            input_rows=input_rows,
+            column_count=column_count,
+            device=device,
+            dtype=dtype,
+            grouped=grouped,
+        )
+
+    def _fake_quantize_prevalidated(self, x, prepared, column_offset):
+        """Fake-quantize one weight column using a validated block context.
+
+        Arithmetic intentionally stays byte-for-byte in the public method's
+        order: divide, round, clamp with the *tensor* ``maxq`` operand,
+        multiply, then cast back to the input dtype.
+        """
+
+        if not isinstance(prepared, _PrevalidatedWeightFakeQuant):
+            raise TypeError(
+                "prepared must come from _prepare_fake_quantize_inner()."
+            )
+        if prepared.owner is not self:
+            raise RuntimeError(
+                "The prevalidated fake-quant context belongs to another quantizer."
+            )
+        if (
+            self.scale is not prepared.source_scale
+            or self.scale._version != prepared.source_scale_version
+            or self.maxq is not prepared.source_maxq
+            or self.maxq._version != prepared.source_maxq_version
+            or self.bits != prepared.bits
+            or self.weight_groupsize != prepared.weight_groupsize
+            or prepared.prepared_scale._version
+            != prepared.prepared_scale_version
+        ):
+            raise RuntimeError(
+                "Stale prevalidated fake-quant context: scale, maxq, bits, or "
+                "weight_groupsize changed after block-boundary validation."
+            )
+        if (
+            not isinstance(column_offset, int)
+            or isinstance(column_offset, bool)
+            or not 0 <= column_offset < prepared.column_count
+        ):
+            raise IndexError(
+                "column_offset is outside the prevalidated block: "
+                f"{column_offset!r} not in [0, {prepared.column_count})."
+            )
+        if (
+            x.dim() != 2
+            or tuple(x.shape) != (prepared.input_rows, 1)
+            or x.device != prepared.device
+            or x.dtype != prepared.dtype
+        ):
+            raise ValueError(
+                "Input no longer matches the prevalidated REAL-Q column "
+                "contract; expected "
+                f"shape=({prepared.input_rows}, 1), device={prepared.device}, "
+                f"dtype={prepared.dtype}, got shape={tuple(x.shape)}, "
+                f"device={x.device}, dtype={x.dtype}."
+            )
+
+        scale = (
+            prepared.prepared_scale[column_offset]
+            if prepared.grouped
+            else prepared.prepared_scale
+        )
+        x_dtype = x.dtype
+        q = torch.clamp(
+            torch.round(x / scale),
+            -(self.maxq + 1),
+            self.maxq,
+        )
+        return (scale * q).to(x_dtype), q, scale
 
     def enabled(self):
         return self.maxq > 0

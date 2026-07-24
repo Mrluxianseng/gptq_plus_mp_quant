@@ -127,6 +127,7 @@ def _run_realq(
     act_order: bool,
     hessian: torch.Tensor | None = None,
     blocksize: int = 128,
+    quantizer_inner_fastpath: bool = False,
 ) -> torch.Tensor:
     linear = nn.Linear(weight.shape[1], weight.shape[0], bias=False)
     linear.weight.data.copy_(weight)
@@ -152,6 +153,7 @@ def _run_realq(
         act_order=act_order,
         w_clip=False,
         group_parallel_quant=group_parallel_quant,
+        quantizer_inner_fastpath=quantizer_inner_fastpath,
     )
     return linear.weight.detach().clone()
 
@@ -175,6 +177,48 @@ def test_group128_realq_all_row_group_paths_match_natural_group_rtn(
         act_order=act_order,
     )
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "groupsize,num_groups,group_parallel_quant,act_order,columns",
+    [
+        (-1, 1, "rank", False, 17),
+        (128, 1, "rank", False, 129),
+        (128, 1, "rank", True, 129),
+        (128, 2, "rank", True, 129),
+        (128, 2, "none", True, 129),
+    ],
+)
+def test_quantizer_inner_fastpath_is_raw_byte_identical_end_to_end(
+    groupsize,
+    num_groups,
+    group_parallel_quant,
+    act_order,
+    columns,
+):
+    weight = _structured_weight(rows=4, columns=columns)
+    baseline = _run_realq(
+        weight,
+        groupsize=groupsize,
+        num_groups=num_groups,
+        group_parallel_quant=group_parallel_quant,
+        act_order=act_order,
+        blocksize=min(128, columns),
+        quantizer_inner_fastpath=False,
+    )
+    fast = _run_realq(
+        weight,
+        groupsize=groupsize,
+        num_groups=num_groups,
+        group_parallel_quant=group_parallel_quant,
+        act_order=act_order,
+        blocksize=min(128, columns),
+        quantizer_inner_fastpath=True,
+    )
+    assert torch.equal(
+        fast.contiguous().view(torch.uint8),
+        baseline.contiguous().view(torch.uint8),
+    )
 
 
 def _legacy_dynamic_group_reference(
