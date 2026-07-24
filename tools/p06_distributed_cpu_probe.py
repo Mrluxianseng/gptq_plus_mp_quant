@@ -139,6 +139,7 @@ class _Result:
     exp_avg_sq: torch.Tensor
     adam_step: int
     collective_shapes: list[tuple[tuple[int, ...], tuple[int, ...]]]
+    peak_memory_bytes: int
 
 
 def _ready_quantizer(
@@ -166,6 +167,9 @@ def _run_case(
 ) -> _Result:
     rank = dist.get_rank()
     world = dist.get_world_size()
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+        torch.cuda.reset_peak_memory_stats(device)
     generator = torch.Generator().manual_seed(case.seed)
     weight = torch.randn(
         case.rows, case.columns, generator=generator
@@ -279,6 +283,9 @@ def _run_case(
 
     if device.type == "cuda":
         torch.cuda.synchronize(device)
+        peak_memory_bytes = torch.cuda.max_memory_allocated(device)
+    else:
+        peak_memory_bytes = 0
     return _Result(
         weight=layer.proj.weight.detach().clone(),
         stitched_inputs=stitched_inputs,
@@ -287,6 +294,7 @@ def _run_case(
         exp_avg_sq=context.exp_avg_sq.clone(),
         adam_step=context.adam_step,
         collective_shapes=collective_shapes,
+        peak_memory_bytes=peak_memory_bytes,
     )
 
 
@@ -569,6 +577,7 @@ def main() -> None:
         _Case(8, 8, 4, 4, -1, 8300 + world),
     ]
     summaries = []
+    local_peak_memory_bytes = 0
     for case in cases:
         legacy_then_exact = _run_implementation_order(
             case,
@@ -622,6 +631,16 @@ def main() -> None:
 
         exact = legacy_then_exact[EXACT]
         legacy = legacy_then_exact[LEGACY]
+        case_peak_memory_bytes = max(
+            result.peak_memory_bytes
+            for result in (
+                *legacy_then_exact.values(),
+                *exact_then_legacy.values(),
+            )
+        )
+        local_peak_memory_bytes = max(
+            local_peak_memory_bytes, case_peak_memory_bytes
+        )
         replica_digests = _replica_digests(exact)
         rank_digests = [None] * world
         dist.all_gather_object(rank_digests, replica_digests)
@@ -645,11 +664,33 @@ def main() -> None:
                     "legacy_then_exact",
                     "exact_then_legacy",
                 ],
+                "peak_memory_bytes": case_peak_memory_bytes,
                 "sha256": digest,
             }
         )
 
     errors = _require_rejection_boundaries(device)
+    if device.type == "cuda":
+        properties = torch.cuda.get_device_properties(device)
+        local_device_info = {
+            "rank": dist.get_rank(),
+            "local_rank": local_rank,
+            "name": properties.name,
+            "uuid": str(getattr(properties, "uuid", "unavailable")),
+            "total_memory_bytes": properties.total_memory,
+            "peak_memory_bytes": local_peak_memory_bytes,
+        }
+    else:
+        local_device_info = {
+            "rank": dist.get_rank(),
+            "local_rank": None,
+            "name": "cpu",
+            "uuid": "unavailable",
+            "total_memory_bytes": None,
+            "peak_memory_bytes": 0,
+        }
+    device_infos = [None] * world
+    dist.all_gather_object(device_infos, local_device_info)
     if dist.get_rank() == 0:
         print(
             json.dumps(
@@ -663,6 +704,7 @@ def main() -> None:
                     ),
                     "local_device": str(device),
                     "local_rank": local_rank,
+                    "devices": device_infos,
                     "cuda_visible_devices": os.environ.get(
                         "CUDA_VISIBLE_DEVICES"
                     ),
