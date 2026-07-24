@@ -264,4 +264,49 @@ failed candidates remain in the table.
 - Correctness wave 2: group A/A repeat on the same GPUs 0--3 and
   `group_akv_aware` on GPUs 4--7.
 - Estimated checkpoint storage is 30--35 GB for four full-model artifacts.
-- No performance result has yet been populated.
+- The first attempted root,
+  `j-7x9o0je4pk_20260724T121230Z_cb5c469794a4`, was deliberately marked
+  `INTERRUPTED` after detecting a separately launched user process. It is
+  invalid for every correctness or timing claim; no user process was killed.
+
+### 2026-07-24 - pre-optimization correctness baseline
+
+Successful immutable root:
+
+```text
+/minimax-avatar-new/zhangqian/realq/experiment_data/perf_stage1_debugging_zhangqian/j-7x9o0je4pk_20260724T121554Z_cb5c469794a4
+```
+
+The root passed with return code zero at source commit
+`cb5c469794a4e187a85c2ce44beb3b05e8685909`. The tracked diff remained
+empty before and after, the input cache tree was unchanged, all four cases
+hit both token and collective static caches, and no fetch, cache write,
+recompute, fallback, traceback, child failure, or CUDA OOM marker occurred.
+The source model identity was
+`64b5baa184e0fb3676b4d52c6b662a1a20ebf8e1e51ffb495e7d47b60063130d`.
+
+| Case | GPUs | Process wall (s) | Sampled per-GPU peak (MiB) | Checkpoint bytes | Canonical state SHA256 |
+|---|---|---:|---|---:|---|
+| `pre_group128` | 0--3 | 127.881826043 | 17556, 19132, 19362, 19362 | 8,823,945,165 | `9587755d521e46b3e65b2139864dab6985674ceda219475c24b0606841cfb595` |
+| `pre_group128_repeat` | 0--3 | 121.324124515 | 17556, 17980, 18044, 17618 | 8,823,945,165 | `9587755d521e46b3e65b2139864dab6985674ceda219475c24b0606841cfb595` |
+| `pre_row` | 4--7 | 125.003221112 | 11838, 11520, 11776, 11776 | 8,823,945,165 | `7b2a5f84bcfe9214a81321c5fe9a7749f72ea8ef2c20312b36f401a9f9379d84` |
+| `pre_aware_a4k4v4` | 4--7 | 151.707985236 | 18348, 19170, 19746, 19426 | 8,823,952,077 | `2ba29a821d09549685c2bae5cae0b24131432df591a19bda5b3dc14f05e6361c` |
+
+These process-wall values were collected from concurrent correctness waves
+and are diagnostic only. They are explicitly ineligible for a speedup claim.
+Primary timing starts only after synchronized layer-boundary instrumentation
+lands and uses isolated warm-up plus three repetitions.
+
+The group-128 A/A comparison on the same physical GPUs passed exactly:
+
+- 435 canonical tensor keys and 399 weight keys compared;
+- no missing, extra, or mismatched key;
+- canonical state SHA256 equal and maximum absolute difference exactly zero;
+- archive SHA256 differed, as expected for containers with metadata:
+  `2dd9a8544c9938cb3003aee81cd98135e9540566342e7438edea18f1dfb54518`
+  versus
+  `dfc4a25e2455256f4a27d08ae9cebbe0dd8263535adb0ff123e1650251961bb2`.
+
+This baseline establishes E0 and E3 oracles for the first structural
+optimization candidates. It does not yet satisfy the isolated timing
+protocol or E4.
