@@ -112,6 +112,17 @@ def parse_gen():
         ),
     )
     parser.add_argument(
+        "--a_loss_clip_scope",
+        choices=("global_refresh", "local_backward_chunk"),
+        default="local_backward_chunk",
+        help=(
+            "Percentile population for activation-delta loss clipping. "
+            "global_refresh uses one exact cross-rank threshold per refresh; "
+            "local_backward_chunk preserves the historical "
+            "per-rank/per-backward-chunk paper-code behavior."
+        ),
+    )
+    parser.add_argument(
         "--k_clip_ratio",
         type=float,
         default=None,
@@ -970,6 +981,15 @@ def parse_gen():
         raise ValueError(f"`backward_bsz` must be positive or -1. Got {args.backward_bsz}.")
     if not (0.0 < args.a_loss_ratio <= 1.0):
         raise ValueError(f"`a_loss_ratio` must be in (0, 1]. Got {args.a_loss_ratio}.")
+    if args.a_loss_clip_scope not in (
+        "global_refresh",
+        "local_backward_chunk",
+    ):
+        raise ValueError(
+            "`a_loss_clip_scope` must be 'global_refresh' or "
+            "'local_backward_chunk'. "
+            f"Got {args.a_loss_clip_scope!r}."
+        )
     quant_aware_methods = {"gptaq", "gptq_guided", "gptq_plus"}
     if getattr(args, "act_quant_aware_gptq", False):
         if args.w_method not in quant_aware_methods:

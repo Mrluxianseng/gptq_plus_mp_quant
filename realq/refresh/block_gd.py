@@ -328,6 +328,10 @@ def make_grad_refresh_fn(
     # ratio < 1.0 caps the top (1 - ratio) fraction of |delta|; see
     # :func:`realq.refresh.fisher_loss._scale_delta_by_abs_quantile`.
     a_loss_ratio: float = 1.0,
+    # ``global_refresh`` is world/chunk invariant but requires a graph-free
+    # prepass and distributed exact percentile. ``local_backward_chunk`` is
+    # the historical paper-code behavior and computes P95 in each loss call.
+    a_loss_clip_scope: str = "local_backward_chunk",
 ) -> Callable[..., torch.Tensor]:
     """Build the per-block refresh closure for one linear.
 
@@ -357,6 +361,15 @@ def make_grad_refresh_fn(
     pi = layer_state.position_ids
     pe = layer_state.position_embeddings
     weight_name = _functional_weight_name(layer, module)
+    if a_loss_clip_scope not in (
+        "global_refresh",
+        "local_backward_chunk",
+    ):
+        raise ValueError(
+            "a_loss_clip_scope must be 'global_refresh' or "
+            "'local_backward_chunk', "
+            f"got {a_loss_clip_scope!r}."
+        )
 
     def refresh(
         stitched_weight_fp32: torch.Tensor,
@@ -441,14 +454,19 @@ def make_grad_refresh_fn(
             override_dtype = module.weight.data.dtype
             override_weight = stitched_weight_fp32.to(override_dtype).requires_grad_(True)
 
-        # ``a_loss_ratio`` is defined over the complete GLOBAL sample set for
-        # this refresh. A rank-/chunk-local P95 changes the objective with
-        # world size and partitioning. Run a graph-free prepass, gather only
-        # |delta| values, and broadcast one exact cap used by every backward
-        # accumulation chunk.
+        # In ``global_refresh`` mode, ``a_loss_ratio`` is defined over the
+        # complete GLOBAL sample set for this refresh. Run a graph-free
+        # prepass, gather |delta| values, and broadcast one exact cap used by
+        # every backward accumulation chunk. ``local_backward_chunk``
+        # deliberately skips this block: fisher_mse_loss receives
+        # threshold=None below and reproduces the historical rank-/chunk-local
+        # percentile in-line.
         a_loss_threshold = None
         next_a_loss_threshold = None
-        if a_loss_ratio < 1.0:
+        if (
+            a_loss_ratio < 1.0
+            and a_loss_clip_scope == "global_refresh"
+        ):
             local_abs_delta: list[torch.Tensor] = []
             local_abs_next_delta: list[torch.Tensor] = []
             with torch.no_grad(), nvtx.nvtx_range(

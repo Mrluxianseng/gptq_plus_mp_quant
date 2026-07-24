@@ -11,7 +11,7 @@ from typing import Any, Iterable
 from utils import dist_utils
 
 
-TRACE_SCHEMA_VERSION = 2
+TRACE_SCHEMA_VERSION = 3
 
 # Keep trace metadata intentionally limited to knobs that exist with the same
 # meaning in both the legacy and refactored implementations.  Implementation-
@@ -50,6 +50,7 @@ REFRESH_TRACE_CONFIG_KEYS = (
     "final_layer_backward_bsz",
     "bsz",
     "a_loss_ratio",
+    "a_loss_clip_scope",
     "loss_slide_window",
     "a_bits",
     "a_groupsize",
@@ -365,7 +366,6 @@ def default_refresh_trace_config(config: Any) -> dict[str, Any]:
                 model_utils.rotation_cache_identity(config)
             ),
             "world_size": dist_utils.get_world_size(),
-            "a_loss_clip_scope": "global_refresh",
             "saliency_clip_scope": "global_calibration",
         }
     )

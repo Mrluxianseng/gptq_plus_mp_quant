@@ -28,6 +28,7 @@ non-schedule hyperparameter.
 | `w_clip` | `true` | Enable the MSE search for the symmetric weight fake-quantization range. |
 | `grad_hessian_topk` | `-1` | Use the full vocabulary for the categorical Fisher-label gradient. |
 | `kl_topk` | `-1` | Use full-vocabulary KL in the final transformer block and evaluation. |
+| `a_loss_clip_scope` | `local_backward_chunk` | Preserve the historical paper-code P95 population: each rank/backward chunk computes its own threshold in-line. The paper specifies P95 but not its axes; `global_refresh` remains available as an explicit partition-invariant mode but is not the paper timing path. |
 | `eval_seq_len` | `2048` | Chunk the held-out WikiText-2 test tokens into 2048-token sequences. |
 | Calibration / rotation / refresh seeds | `1 / 0 / 0` | Keep the current REAL-Q split seed domains and explicitly pin every run. |
 | Fisher categorical-label base seed | source-fixed `0` | Deterministic per-global-sample label draws; not a CLI field. |
@@ -41,6 +42,18 @@ legacy-compatible; the schedule arms intentionally compare the historical
 formula with the corrected/current behavior. They do not remove the
 discrepancies with the paper wording documented in
 `REALQ_PAPER_PROTOCOL.md`.
+
+The activation-loss clip requires a separate provenance distinction. The
+paper states only the ratio `0.95`; it does not disclose the percentile axes.
+The historical implementation that generated the paper-era behavior flattened
+each rank's current backward chunk and computed P95 inside the loss. The
+audit's newer `global_refresh` mode instead performs a no-grad current/next
+forward prepass and an exact distributed percentile so the objective is
+independent of world size and chunking. It is mathematically cleaner but is a
+different algorithm and a materially different performance path. Paper-gap
+metric and timing arms therefore lock `local_backward_chunk`; any
+`global_refresh` result must be reported as a distinct current-semantics
+experiment.
 
 ## Hardware-tuned systems profile
 
@@ -64,6 +77,34 @@ the paper's 2048 and 256 samples respectively, processed in repeated batches
 with the same peak shape (plus one smaller 4B tail batch). The rejected 4B
 local-16 probe and the accepted local-12 probe are retained under
 `../experiment_data/batch_probe_20260724/`.
+
+## Rejected global-refresh timing probe
+
+Before the percentile population was made explicit, two Qwen3-4B arms were
+started concurrently with the then-default exact `global_refresh` P95. Both
+were stopped after layer 0 because this path is neither the historical paper
+algorithm nor compatible with the requested ten-hour experiment budget:
+
+| Arm | Layer-0 interval (UTC) | Layer-0 time |
+|---|---|---:|
+| current paper sine schedule | 07:19:35--07:39:46 | 20 min 11 s |
+| historical cos-squared schedule | 07:19:37--07:39:51 | 20 min 14 s |
+
+The 1.9-second difference is only about 0.16%, confirming that the
+reverse-cosine formula is not the runtime cause. Qwen3-4B has 201
+trailing-column refreshes per ordinary transformer layer. With 32 samples of
+length 2048 and hidden width 2560, each exact P95 sees 167,772,160 FP32
+elements (640 MiB); sliding activates approximately 401 current/next P95
+computations per layer, plus the corresponding no-grad forward prepasses.
+Mechanical layer-0 extrapolation is roughly 12.1 hours for Stage 1, versus the
+paper's 72-minute Stage-0-plus-Stage-1 total.
+
+The interrupted logs and stale reservation locks remain under
+`schedule_ablation_formal_20260724` as failure evidence. They are not metrics
+and must not be resumed or compared with the paper table. Fair runtime
+measurement restarts from a new source-bound warm manifest, uses
+`local_backward_chunk`, and runs one four-GPU arm at a time so the other
+four GPUs do not introduce host/NVLink contention.
 
 ## Fail-closed execution contract
 

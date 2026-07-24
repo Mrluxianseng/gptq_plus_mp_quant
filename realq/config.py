@@ -96,6 +96,14 @@ class Config:
     # the ``_activation_clip_threshold`` torch.quantile/topk fallback.
     # Default 1.0 = disabled (delta passes through).
     a_loss_ratio: float = 1.0
+    # The paper specifies P95 clipping but not the percentile population.
+    # ``global_refresh`` computes one exact threshold over every selected
+    # sample/token/channel in a refresh, across ranks and accumulation chunks.
+    # ``local_backward_chunk`` preserves the historical paper-code behavior:
+    # every rank/backward chunk computes its own threshold in-line, with no
+    # prepass. It is the default because the paper tables predate the newer
+    # partition-invariant implementation.
+    a_loss_clip_scope: str = "local_backward_chunk"
 
     # ----- batch / memory -------------------------------------------------
     bsz: int = 64
@@ -199,6 +207,15 @@ class Config:
         if not (0.0 < self.a_loss_ratio <= 1.0):
             raise ValueError(
                 f"`a_loss_ratio` must be in (0, 1]. Got {self.a_loss_ratio}."
+            )
+        if self.a_loss_clip_scope not in (
+            "global_refresh",
+            "local_backward_chunk",
+        ):
+            raise ValueError(
+                "`a_loss_clip_scope` must be 'global_refresh' or "
+                "'local_backward_chunk'. Got "
+                f"{self.a_loss_clip_scope!r}."
             )
         if (
             not isinstance(self.w_bits, int)

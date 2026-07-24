@@ -2958,6 +2958,14 @@ def quantize_and_measure(args, analyzer, trainloader, dev, target_layers, measur
 # ---------------------------------------------------------------------------
 
 def main(args):
+    if args.a_loss_clip_scope != "local_backward_chunk":
+        raise ValueError(
+            "analyze_grad_cosine currently supports only "
+            "--a_loss_clip_scope=local_backward_chunk. Its diagnostic loss "
+            "batches do not implement the production cross-rank "
+            "global_refresh prepass, so accepting that mode would silently "
+            "measure a different objective."
+        )
     configure_reproducibility(args.refresh_seed, deterministic=True)
     if "LOCAL_RANK" in os.environ and torch.cuda.is_available():
         torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))

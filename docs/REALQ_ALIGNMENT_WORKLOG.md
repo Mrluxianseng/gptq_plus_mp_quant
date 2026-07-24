@@ -132,7 +132,7 @@ different questions:
 | K-cache quantization | Post-RoPE K fake quant, aware/unaware | Same | High-level per-token K is consistent; exact post-RoPE site and independent aware switch are not specified |
 | Query/Q quantization | Not implemented | Not implemented | Not claimed by the paper; Q is rotation-only |
 | A/K/V range clip | Symmetric quantization with explicit clip ratios | Same, conditional low-bit default 0.9 | Stated symmetric/per-token ratios match; signed integer range and rounding rule are not disclosed |
-| Activation-loss clip | A separate detached P95 over every activation-error element of each current/next loss component in one refresh, globally across ranks and refresh micro-batches | Same value, gradient, scope, and legacy activation arithmetic order | Matches detached P95; paper does not define these axes |
+| Activation-loss clip | Explicit `local_backward_chunk` historical mode and `global_refresh` partition-invariant mode; current/next components remain separate and detached | Same modes, values, gradients, and activation arithmetic order | Matches detached P95; paper does not define the percentile population, so paper-gap runs lock the historical local mode |
 | Per-row weights | Correct | Correct | Yes for W4A16 |
 | Grouped weights | Correct group-128/act-order/short tail | Repaired to match all tested legacy paths | Group-128 operator is consistent; W2/W3 full-pipeline runs were not performed |
 | Final KL | Full-vocabulary fp32 KL | Same | Yes |
@@ -193,8 +193,25 @@ and one final-layer full-vocabulary KL case.
   the paper's constant LR.
 - Made full-vocabulary Fisher and final/evaluation KL the defaults and moved
   distribution math to fp32.
-- Corrected global P99 saliency clipping and global-refresh P95 activation-loss
-  clipping so neither depends on micro-batch or rank partitioning.
+- Corrected global P99 saliency clipping and initially added a
+  partition-invariant global-refresh P95 activation-loss path.
+- A paper-runtime cross-check then established that the paper did not specify
+  global P95 axes and that every pre-audit implementation used
+  rank/backward-chunk-local P95 without a prepass. Added
+  `a_loss_clip_scope={local_backward_chunk,global_refresh}` to both
+  implementations, made the historical mode the default and paper-gap
+  manifest setting, retained global mode as an explicit alternative, and
+  included the scope in trace provenance (schema 3).
+- Focused post-change matrix
+  (`../experiment_data/p95_scope_alignment_20260724/matrix_v2/matrix_report.json`):
+  real Hugging Face three-layer Llama fixture, W4 per-row, rotate, slide, and
+  `a_loss_ratio=0.95` with explicit `local_backward_chunk`. Two legacy and two
+  refactored runs produced four passing comparisons over 27 refreshes each;
+  every loss relative difference and final tensor-state absolute difference
+  was exactly zero, and checkpoint manifests matched. The report binds the
+  tested dirty source to diff SHA256
+  `6903d98caf6b9a20c058d9e2c6ff3a1611991a27b2c14289b8272801906e9db1`;
+  the coherent commit that follows supersedes that working-tree identity.
 - Repaired refactored group-128 parameter shapes, short-tail handling,
   act-order natural-column mapping, rank-group synchronization, and batched
   Hessian inversion arithmetic.

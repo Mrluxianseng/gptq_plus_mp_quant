@@ -61,13 +61,18 @@ not state:
 - `lm-eval` version, task-config revisions, and evaluation batch size;
 - the exact legacy loss-slide indexing and terminal-layer policy.
 
-For clarity, the audited implementation resolves the unspecified percentile
-axes as follows:
+For clarity, the audited implementation exposes the unspecified
+activation-loss percentile population rather than silently choosing one:
 
-- activation-loss P95 is computed separately for the current and next
-  loss-slide components, over every absolute activation-error element
-  (selected refresh sample, token, hidden channel) in one block refresh,
-  globally across ranks and all gradient-accumulation chunks;
+- `a_loss_clip_scope=local_backward_chunk` (the default and historical
+  paper-code path) computes current/next thresholds independently inside
+  each rank's backward chunk after flattening its
+  `(sample, token, hidden channel)` elements;
+- `a_loss_clip_scope=global_refresh` (the newer partition-invariant path)
+  computes current/next thresholds independently over all selected
+  `(sample, token, hidden channel)` elements in one refresh, globally across
+  ranks and all gradient-accumulation chunks. It requires an additional
+  no-grad forward prepass and is not the paper runtime path;
 - saliency P99 is computed separately for each linear module, over its complete
   `(calibration sample, token, saliency group)` tensor, globally across ranks
   and independent of static-precompute micro-batch partitioning.
@@ -89,6 +94,7 @@ reproduction entry point.
 | Gradient clip | Not disclosed | 1.0 / 1.0 | `5e-5` / `5e-4` |
 | Learning rate | Per model/setting table | one convenience default `3e-4` | sweep-specific values |
 | Small-Qwen activation-loss P95 | 0.95 for Qwen3-0.6B/1.7B/4B | `Config` / template 1.0 unless explicitly overridden | sweep 1.0 unless explicitly overridden |
+| Activation-loss P95 population | Not disclosed | `local_backward_chunk` by default; explicit `global_refresh` alternative | Historical local backward-chunk behavior |
 | Weight grouping | W4A16 per-row; W2/W3 and W*x*A4KV4 group 128 | template now selects this from bit widths; `Config` alone defaults per-row | sweep defaults per-row unless overridden |
 | Eval datasets | Held-out WikiText-2 plus ten tasks | KL/PPL defaults to WikiText-2 and `lm_eval=False`; template does not enable tasks | parser defaults multiple KL/PPL datasets but task scoring still requires its enable flag |
 

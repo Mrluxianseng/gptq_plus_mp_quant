@@ -98,6 +98,10 @@ _COMMON_CASE_CONFIG = {
     "backward_bsz": 128,
     "final_layer_backward_bsz": 32,
     "bsz": 64,
+    # The paper does not disclose the P95 population. Its historical code and
+    # reported runtime use rank-/backward-chunk-local clipping without an
+    # extra prepass; lock that scope for paper-gap timing and metric A/B.
+    "a_loss_clip_scope": "local_backward_chunk",
     "fsdp": False,
     "fsdp_cpu_offload": False,
     "fsdp_max_shard_size": "5GB",

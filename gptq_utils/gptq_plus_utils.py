@@ -6356,6 +6356,7 @@ def collect_true_weight_gradient(
     layer_recorder=None,
     sink_size=0,
     a_loss_ratio=1.0,
+    a_loss_clip_scope="local_backward_chunk",
 ):
     """Compute the refresh gradient as a per-rank partial sum + count.
 
@@ -6504,14 +6505,26 @@ def collect_true_weight_gradient(
     if refresh_mb is not None and refresh_mb > 0 and _lm_head_loss:
         _step = min(bsz, int(refresh_mb))
 
-    # The paper's activation-loss clipping is one P95 over the complete GLOBAL
-    # sample set selected for this refresh, not one P95 per rank or internal
-    # accumulation chunk. Every rank participates even when global shuffle
+    # The paper specifies P95 clipping but not its population. The explicit
+    # global mode below uses one threshold over the complete selected refresh
+    # sample set; the historical/default local mode leaves both thresholds
+    # None so compute_refresh_loss calculates one P95 per rank/backward chunk.
+    # Every rank participates in the global prepass even when global shuffle
     # assigns it zero samples.
+    if a_loss_clip_scope not in (
+        "global_refresh",
+        "local_backward_chunk",
+    ):
+        raise ValueError(
+            "a_loss_clip_scope must be 'global_refresh' or "
+            "'local_backward_chunk', "
+            f"got {a_loss_clip_scope!r}."
+        )
     a_loss_threshold = None
     next_a_loss_threshold = None
     if (
         a_loss_ratio < 1.0
+        and a_loss_clip_scope == "global_refresh"
         and (
             is_fisher_backed_loss(refresh_loss_type)
             or is_hidden_mse_loss(refresh_loss_type)
@@ -7206,6 +7219,7 @@ def run_pre_quant_gd(
     layer_recorder=None,
     sink_size=0,
     a_loss_ratio=1.0,
+    a_loss_clip_scope="local_backward_chunk",
 ):
     if num_steps <= 0 or not module_names:
         return
@@ -7267,6 +7281,7 @@ def run_pre_quant_gd(
                                 layer_recorder=layer_recorder,
                                 sink_size=sink_size,
                                 a_loss_ratio=a_loss_ratio,
+                                a_loss_clip_scope=a_loss_clip_scope,
                             )
                         )
                     # DP aggregation — packed into one allreduce (grad tensor +
@@ -8763,6 +8778,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             layer_recorder=layer_recorder,
                             sink_size=sink_size,
                             a_loss_ratio=args.a_loss_ratio,
+                            a_loss_clip_scope=args.a_loss_clip_scope,
                         )
 
             # Compute slide-window refresh span over the whole transformer block,
@@ -9251,6 +9267,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                                 layer_recorder=layer_recorder,
                                 sink_size=sink_size,
                                 a_loss_ratio=args.a_loss_ratio,
+                                a_loss_clip_scope=args.a_loss_clip_scope,
                             )
                         )
                         # DP aggregation. When world_size > 1 we pack the grad sum

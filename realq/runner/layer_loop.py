@@ -419,6 +419,7 @@ def quantize_one_layer(
                                             else None
                                         ),
                                         a_loss_ratio=cfg.a_loss_ratio,
+                                        a_loss_clip_scope=cfg.a_loss_clip_scope,
                                     )
                         with nvtx.nvtx_range("module.quantize"):
                             realq.quantize(

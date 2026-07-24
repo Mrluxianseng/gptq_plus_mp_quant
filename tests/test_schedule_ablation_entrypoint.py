@@ -261,6 +261,7 @@ def test_launcher_mechanically_expands_locked_case(
     assert cfg.hessian_accum_bsz == 256
     assert cfg.grad_clip == 1.0
     assert cfg.final_layer_grad_clip is None
+    assert cfg.a_loss_clip_scope == "local_backward_chunk"
     assert cfg.exit_after_precompute is warm
     assert experiment.allow_create_rotation_fingerprint is warm
     assert experiment.require_precomputed_caches is (not warm)

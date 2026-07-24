@@ -258,6 +258,7 @@ def test_paper_defaults_and_conditional_akv_clip_presets():
     assert fp.kl_topk <= 0
     assert fp.saliency_clip_percentile == pytest.approx(0.99)
     assert fp.a_loss_ratio == pytest.approx(1.0)
+    assert fp.a_loss_clip_scope == "local_backward_chunk"
     assert (fp.a_clip_ratio, fp.k_clip_ratio, fp.v_clip_ratio) == (
         1.0,
         1.0,
@@ -283,6 +284,17 @@ def test_paper_defaults_and_conditional_akv_clip_presets():
     assert explicit.a_clip_ratio == pytest.approx(1.0)
     assert explicit.final_layer_grad_clip == pytest.approx(5e-4)
     assert fp.final_layer_backward_bsz == fp.backward_bsz == 32
+
+
+def test_activation_loss_clip_scope_is_explicit_and_validated():
+    assert parse_cli(
+        ["--a_loss_clip_scope", "global_refresh"]
+    ).a_loss_clip_scope == "global_refresh"
+    assert Config(
+        a_loss_clip_scope="local_backward_chunk"
+    ).a_loss_clip_scope == "local_backward_chunk"
+    with pytest.raises(ValueError, match="a_loss_clip_scope"):
+        Config(a_loss_clip_scope="per_token")
 
 
 @pytest.mark.parametrize(
@@ -438,6 +450,38 @@ def test_activation_loss_clip_matches_legacy_bf16_value_and_gradient():
         fisher,
         a_loss_ratio=0.95,
         a_loss_threshold=threshold,
+    )
+    old_grad = torch.autograd.grad(old_loss, q_old)[0]
+    new_grad = torch.autograd.grad(new_loss, q_new)[0]
+
+    assert torch.equal(old_loss, new_loss)
+    assert torch.equal(old_grad, new_grad)
+
+
+def test_historical_local_a_loss_clip_matches_without_shared_threshold():
+    torch.manual_seed(19)
+    fp_out = torch.randn(3, 4, 8, dtype=torch.bfloat16)
+    q_old = (
+        fp_out.float() + 0.2 * torch.randn_like(fp_out.float())
+    ).to(torch.bfloat16).requires_grad_()
+    q_new = q_old.detach().clone().requires_grad_()
+    base = torch.randn(8, 8)
+    fisher = base @ base.T
+
+    old_loss = compute_refresh_loss(
+        "fisher_diag_mse",
+        q_old,
+        fp_out,
+        None,
+        -1,
+        layer_output_fisher=fisher,
+        a_loss_ratio=0.95,
+    )
+    new_loss = fisher_mse_loss(
+        q_new,
+        fp_out,
+        fisher,
+        a_loss_ratio=0.95,
     )
     old_grad = torch.autograd.grad(old_loss, q_old)[0]
     new_grad = torch.autograd.grad(new_loss, q_new)[0]

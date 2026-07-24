@@ -186,6 +186,7 @@ DEFAULTS: dict[str, Any] = {
     "rotate": False,
     "loss_slide_window": False,
     "a_loss_ratio": 1.0,
+    "a_loss_clip_scope": "local_backward_chunk",
     "a_bits": 16,
     "k_bits": 16,
     "v_bits": 16,
@@ -267,6 +268,7 @@ def _common_old(
         "--alignment_run_id", run_id,
         "--save_qmodel_path", str(run_dir / "model.pt"),
         "--a_loss_ratio", str(case["a_loss_ratio"]),
+        "--a_loss_clip_scope", str(case["a_loss_clip_scope"]),
         "--a_bits", str(case["a_bits"]),
         "--k_bits", str(case["k_bits"]),
         "--v_bits", str(case["v_bits"]),
@@ -339,6 +341,7 @@ def _common_new(
         "--grad_lr_layer_schedule", "cosine",
         "--grad_lr_layer_base_ratio", "0.01",
         "--a_loss_ratio", str(case["a_loss_ratio"]),
+        "--a_loss_clip_scope", str(case["a_loss_clip_scope"]),
         "--loss_slide_window", _flag_value(case["loss_slide_window"]),
         "--rotate", _flag_value(case["rotate"]),
         "--skip_eval", "true",
@@ -553,7 +556,7 @@ def _capture_provenance(
     def git_output(*command: str) -> str:
         try:
             return subprocess.check_output(
-                ["git", *command],
+                ["git", "-c", f"safe.directory={workspace}", *command],
                 cwd=workspace,
                 text=True,
                 stderr=subprocess.STDOUT,

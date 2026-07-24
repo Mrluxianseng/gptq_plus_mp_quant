@@ -245,6 +245,95 @@ def test_block_gd_update_is_bias_corrected_adam_on_trailing_columns():
     )
 
 
+def test_local_backward_chunk_clip_skips_global_percentile_prepass(
+    monkeypatch,
+):
+    torch.manual_seed(41)
+    layer = _ToyLayer()
+    state = SimpleNamespace(
+        inps=torch.randn(2, 2, 4),
+        attention_mask=None,
+        position_ids=None,
+        position_embeddings=None,
+    )
+    ctx = RefreshContext(
+        module=layer.proj,
+        layer_lr=1e-3,
+        grad_clip=1.0,
+        backward_bsz=1,
+        scheduler=_SharedSampleScheduler(2, 2, seed=0),
+    )
+
+    def fail_global_percentile(*_args, **_kwargs):
+        raise AssertionError("local scope must not run a global P95 prepass")
+
+    monkeypatch.setattr(
+        "realq.refresh.block_gd.global_percentile",
+        fail_global_percentile,
+    )
+    refresh = make_grad_refresh_fn(
+        layer=layer,
+        module=layer.proj,
+        layer_state=state,
+        fp_out_for_this_layer=torch.zeros(2, 2, 2),
+        fisher=torch.eye(2),
+        ctx=ctx,
+        a_loss_ratio=0.95,
+        a_loss_clip_scope="local_backward_chunk",
+    )
+    assert refresh(
+        layer.proj.weight.detach().float().clone(), 2
+    ) is not None
+
+
+def test_global_refresh_clip_runs_one_shared_percentile_prepass(
+    monkeypatch,
+):
+    import realq.refresh.block_gd as block_gd
+
+    torch.manual_seed(43)
+    layer = _ToyLayer()
+    state = SimpleNamespace(
+        inps=torch.randn(2, 2, 4),
+        attention_mask=None,
+        position_ids=None,
+        position_embeddings=None,
+    )
+    ctx = RefreshContext(
+        module=layer.proj,
+        layer_lr=1e-3,
+        grad_clip=1.0,
+        backward_bsz=1,
+        scheduler=_SharedSampleScheduler(2, 2, seed=0),
+    )
+    original = block_gd.global_percentile
+    calls = []
+
+    def record_global_percentile(values, ratio):
+        calls.append((values.numel(), ratio))
+        return original(values, ratio)
+
+    monkeypatch.setattr(
+        block_gd,
+        "global_percentile",
+        record_global_percentile,
+    )
+    refresh = make_grad_refresh_fn(
+        layer=layer,
+        module=layer.proj,
+        layer_state=state,
+        fp_out_for_this_layer=torch.zeros(2, 2, 2),
+        fisher=torch.eye(2),
+        ctx=ctx,
+        a_loss_ratio=0.95,
+        a_loss_clip_scope="global_refresh",
+    )
+    assert refresh(
+        layer.proj.weight.detach().float().clone(), 2
+    ) is not None
+    assert calls == [(8, 0.95)]
+
+
 def test_fisher_refresh_records_explicit_first_and_blended_slide_steps(tmp_path):
     torch.manual_seed(1)
     layer = _ToyLayer()
