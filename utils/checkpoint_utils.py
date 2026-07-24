@@ -52,6 +52,14 @@ _WEIGHT_PROVENANCE_FIELDS = (
     "w_clip_search_impl",
     "fisher_fp32_cache",
 )
+_WEIGHT_PROVENANCE_HISTORICAL_DEFAULTS = {
+    # Checkpoint format v1 predates these opt-in build switches. Missing
+    # fields therefore mean the historical implementation, not whatever
+    # value happened to be present on the caller's evaluation Config.
+    "quantizer_inner_fastpath": False,
+    "w_clip_search_impl": "cartesian_legacy",
+    "fisher_fp32_cache": False,
+}
 _BOOL_FIELDS = {
     "rotate",
     "a_asym",
@@ -191,12 +199,17 @@ def _validate_weight_provenance(provenance: Mapping[str, Any]) -> None:
         raise ValueError(
             "Checkpoint weight-quantization provenance must be a mapping."
         )
+    for name in ("quantizer_inner_fastpath", "fisher_fp32_cache"):
+        if name in provenance and type(provenance[name]) is not bool:
+            raise ValueError(f"Checkpoint field {name!r} must be bool.")
     if (
-        "quantizer_inner_fastpath" in provenance
-        and type(provenance["quantizer_inner_fastpath"]) is not bool
+        "w_clip_search_impl" in provenance
+        and provenance["w_clip_search_impl"]
+        not in ("cartesian_legacy", "symmetric_union_exact")
     ):
         raise ValueError(
-            "Checkpoint field 'quantizer_inner_fastpath' must be bool."
+            "Checkpoint field 'w_clip_search_impl' must be "
+            "'cartesian_legacy' or 'symmetric_union_exact'."
         )
 
 
@@ -373,6 +386,15 @@ def apply_runtime_manifest(config: Any, checkpoint: Mapping[str, Any]) -> bool:
     for name in _WEIGHT_PROVENANCE_FIELDS:
         if name in provenance and hasattr(config, name):
             setattr(config, name, provenance[name])
+        elif (
+            name in _WEIGHT_PROVENANCE_HISTORICAL_DEFAULTS
+            and hasattr(config, name)
+        ):
+            setattr(
+                config,
+                name,
+                _WEIGHT_PROVENANCE_HISTORICAL_DEFAULTS[name],
+            )
     identities = checkpoint.get("artifact_identity") or {}
     if "rotation_seed" in identities and hasattr(config, "rotation_seed"):
         setattr(config, "rotation_seed", int(identities["rotation_seed"]))

@@ -39,9 +39,6 @@ class Config:
     w_groupsize: int = -1     # -1 = per-row
     w_asym: bool = False
     w_clip: bool = True       # MSE-based clip search in find_params
-    # Opt-in exact reduction for symmetric finite weight clipping.  The
-    # default preserves the historical Cartesian scan.
-    w_clip_search_impl: str = "cartesian_legacy"
 
     # ----- RealQ algorithm -------------------------------------------------
     num_groups: int = 4       # Hessian groups per linear (output-row sharing)
@@ -56,11 +53,6 @@ class Config:
     # full quantize). Old code's tensor-mode is not ported (RealQ already
     # vectorises across NUM_GROUPS in the per-group fallback).
     group_parallel_quant: str = "rank"  # one of: none, rank
-    # Opt-in exact performance experiment. Stage the current/slide Fisher
-    # matrices as FP32 once per layer so each refresh loss reuses the same
-    # tensor instead of expanding the persisted BF16 matrix on every call.
-    # Default-off until real-model checkpoint and isolated timing gates pass.
-    fisher_fp32_cache: bool = False
 
     # ----- static end-to-end precompute -----------------------------------
     global_loss_bsz: int = 16
@@ -210,19 +202,25 @@ class Config:
 
     # ----- derived (auto-filled by __post_init__) -------------------------
     model_name: str = ""
-    # Opt-in performance experiment: prevalidate WeightQuantizer state and
-    # grouped natural-column coordinates once per GPTQ block, then use the
-    # private exact-arithmetic inner primitive. Keep this newly added field
-    # last so existing positional Config construction retains its field ABI.
-    # The production runner uses keyword arguments/CLI flags.
-    quantizer_inner_fastpath: bool = False
-
     # Appended after every pre-existing field to preserve Config's positional
     # constructor ABI. Optional human-readable diagnostic: rank zero logs the
     # globally averaged objective actually sent to backward after every
     # refreshed column block, plus its learning-rate and loss-slide metadata.
     # The final block has no trailing weights and hence no backward objective.
     log_column_block_loss: bool = False
+
+    # Performance experiment knobs are appended after the pre-existing
+    # dataclass fields so positional Config construction keeps its ABI. Each
+    # experiment is explicit and default-off pending real-model promotion.
+    # Prevalidate WeightQuantizer state and grouped natural-column coordinates
+    # once per GPTQ block, then use the private exact-arithmetic primitive.
+    quantizer_inner_fastpath: bool = False
+    # Reduce finite symmetric weight-clip candidates from the historical
+    # Cartesian scan to the exact endpoint union.
+    w_clip_search_impl: str = "cartesian_legacy"
+    # Stage current/slide Fisher matrices as FP32 once per layer instead of
+    # repeatedly expanding the persisted BF16 matrices in refresh losses.
+    fisher_fp32_cache: bool = False
 
     def __post_init__(self) -> None:
         if not self.model_name:

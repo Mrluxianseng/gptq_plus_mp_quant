@@ -77,6 +77,27 @@ def test_weight_clip_search_backend_roundtrips_as_build_provenance():
     assert restored_cfg.w_clip_search_impl == "symmetric_union_exact"
 
 
+def test_missing_performance_provenance_restores_historical_build_defaults():
+    source_cfg = _runtime_cfg()
+    manifest = checkpoint_utils.build_runtime_manifest(source_cfg)
+    for name in (
+        "quantizer_inner_fastpath",
+        "w_clip_search_impl",
+        "fisher_fp32_cache",
+    ):
+        manifest["weight_quantization"].pop(name)
+
+    restored_cfg = _runtime_cfg(
+        quantizer_inner_fastpath=True,
+        w_clip_search_impl="symmetric_union_exact",
+        fisher_fp32_cache=True,
+    )
+    assert checkpoint_utils.apply_runtime_manifest(restored_cfg, manifest)
+    assert restored_cfg.quantizer_inner_fastpath is False
+    assert restored_cfg.w_clip_search_impl == "cartesian_legacy"
+    assert restored_cfg.fisher_fp32_cache is False
+
+
 def _rope(q, k):
     return q + 0.25, k - 0.5
 
@@ -323,6 +344,37 @@ def test_checkpoint_rejects_non_boolean_inner_fastpath_provenance(tmp_path):
     with pytest.raises(
         ValueError, match="'quantizer_inner_fastpath' must be bool"
     ):
+        checkpoint_utils.apply_runtime_manifest(target_cfg, payload)
+    assert target_cfg.a_bits == 16
+
+
+@pytest.mark.parametrize(
+    "field,value,error",
+    [
+        ("fisher_fp32_cache", "false", "'fisher_fp32_cache' must be bool"),
+        (
+            "w_clip_search_impl",
+            "unknown",
+            "'w_clip_search_impl' must be 'cartesian_legacy' or "
+            "'symmetric_union_exact'",
+        ),
+    ],
+)
+def test_checkpoint_rejects_invalid_performance_provenance(
+    tmp_path, field, value, error
+):
+    model = _RuntimeModel()
+    cfg = _runtime_cfg()
+    path = tmp_path / f"bad-{field}-provenance.pt"
+    checkpoint_utils.save_quantized_checkpoint(path, model, cfg)
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    payload["weight_quantization"][field] = value
+    torch.save(payload, path)
+
+    with pytest.raises(ValueError, match=error):
+        checkpoint_utils.load_quantized_checkpoint(path)
+    target_cfg = _runtime_cfg(a_bits=16, a_clip_ratio=1.0)
+    with pytest.raises(ValueError, match=error):
         checkpoint_utils.apply_runtime_manifest(target_cfg, payload)
     assert target_cfg.a_bits == 16
 
