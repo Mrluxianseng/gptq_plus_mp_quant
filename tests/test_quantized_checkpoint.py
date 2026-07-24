@@ -61,6 +61,22 @@ def _runtime_cfg(**overrides):
     return Config(**values)
 
 
+def test_weight_clip_search_backend_roundtrips_as_build_provenance():
+    source_cfg = _runtime_cfg(
+        w_clip_search_impl="symmetric_union_exact",
+    )
+    manifest = checkpoint_utils.build_runtime_manifest(source_cfg)
+    assert manifest["weight_quantization"]["w_clip_search_impl"] == (
+        "symmetric_union_exact"
+    )
+
+    restored_cfg = _runtime_cfg(
+        w_clip_search_impl="cartesian_legacy",
+    )
+    assert checkpoint_utils.apply_runtime_manifest(restored_cfg, manifest)
+    assert restored_cfg.w_clip_search_impl == "symmetric_union_exact"
+
+
 def _rope(q, k):
     return q + 0.25, k - 0.5
 
