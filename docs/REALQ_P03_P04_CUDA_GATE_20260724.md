@@ -1,8 +1,16 @@
 # REAL-Q P03/P04 CUDA exactness gate (2026-07-24)
 
+> **Superseded evidence notice (2026-07-24):** the first-pass logs described
+> below are retained for audit history but are not admissible correctness
+> evidence. They manually injected a one-group Hessian, did not exercise the
+> production `NUM_GROUPS=4` sharded-Hessian/multi-group-bmm branch, used Python
+> `assert` for some gates, and lacked a fail-closed source/GPU manifest. A
+> hardened rerun will be recorded in this document after it completes. Do not
+> use the first-pass verdict or hashes to enable an optimization.
+
 ## Verdict
 
-P03 (`w_clip_update_impl=where_out`) and P04
+Historical first-pass result only: P03 (`w_clip_update_impl=where_out`) and P04
 (`w_group_param_layout=compact`) passed every synthetic CUDA gate described
 below on the integrated source `dfa3dbef2270c67361d11e9de40e5024c774c07d`.
 Every mathematical output was compared as contiguous raw bytes; no tolerance
@@ -11,7 +19,8 @@ was used.
 The tests found no numerical difference in the exercised production domain.
 P04 deliberately changes grouped-qparam storage and the first two NCCL
 all-gather shapes. It does not change the number of collectives, the expanded
-qparams, integer `Q`, returned scales, Fisher-MSE refresh inputs, Adam updates
+qparams, observer-level integer `Q`, returned scales, Fisher-MSE refresh
+inputs, Adam updates
 or moments, or final weights.
 
 This is an exactness gate, not a full-model quality or timing result. The
@@ -60,6 +69,9 @@ The matrix includes:
 - asymmetric P02 fallback to Cartesian;
 - NaN/Inf P02 fallback to Cartesian.
 
+The P02 fixture used `grid=4`. It establishes equality for that fixture only;
+it is not a proof of candidate-count reduction or a performance result.
+
 ### P04 observer and coordinate composition
 
 Expanded and compact layouts were checked for:
@@ -86,9 +98,8 @@ World size one exercised both `group_parallel_quant=none` and `rank`:
 - all combinations of P01 off/on, P02 Cartesian/union, P03 guarded/where-out,
   and, where applicable, P04 expanded/compact.
 
-This produced 80 candidate comparisons. Each candidate was compared with a
-fresh legacy result, and a final legacy repeat checked allocator/order
-stability.
+This produced 80 candidate comparisons. One legacy baseline was reused within
+each case/mode, and a final legacy repeat checked allocator/order stability.
 
 DP2 and DP4 used real NCCL row sharding. Each world size tested:
 
@@ -105,6 +116,12 @@ DP2 and DP4 used real NCCL row sharding. Each world size tested:
 - a final legacy repeat after all candidates.
 
 All comparisons passed raw-byte exactly.
+
+Integer `Q` was checked at the observer boundary only. End-to-end distributed
+checks compared expanded qparams, fake-dequantized final weights, refresh
+inputs/updates, and Adam moments; they did not extract an integer-Q tensor.
+Hashes from different DP world sizes use different seeded fixtures and are not
+evidence of world-size invariance.
 
 ## Results
 
@@ -182,7 +199,7 @@ torchrun --standalone --nproc_per_node=4 \
   tools/p06_distributed_cpu_probe.py
 ```
 
-Raw logs are retained outside the source worktree:
+Superseded raw logs retained outside the source worktree:
 
 - `/minimax-avatar-new/zhangqian/realq/experiment_data/p03_p04_cuda_gate_20260724/world1.log`
 - `/minimax-avatar-new/zhangqian/realq/experiment_data/p03_p04_cuda_gate_20260724/world2.log`

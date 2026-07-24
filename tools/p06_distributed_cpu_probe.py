@@ -27,8 +27,16 @@ import hashlib
 import json
 import math
 import os
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
+
+if sys.flags.optimize != 0 or not __debug__:
+    raise RuntimeError(
+        "P06 correctness probe refuses optimized Python at startup: "
+        f"sys.flags.optimize={sys.flags.optimize}, __debug__={__debug__}"
+    )
 
 import torch
 import torch.distributed as dist
@@ -47,6 +55,15 @@ LEGACY = "full_weight_legacy"
 EXACT = "prefix_q_trailing_w_exact"
 
 
+class ProbeFailure(RuntimeError):
+    """A correctness or provenance contract failed."""
+
+
+def _require(condition: bool, message: str) -> None:
+    if not condition:
+        raise ProbeFailure(message)
+
+
 def _raw_equal(left: torch.Tensor, right: torch.Tensor) -> bool:
     return torch.equal(
         left.detach().contiguous().view(torch.uint8),
@@ -58,6 +75,40 @@ def _sha256(tensor: torch.Tensor) -> str:
     return hashlib.sha256(
         tensor.detach().cpu().contiguous().numpy().tobytes()
     ).hexdigest()
+
+
+def _probe_provenance(*, require_binding: bool) -> dict[str, object]:
+    _require(
+        sys.flags.optimize == 0 and __debug__,
+        "P06 probe refuses optimized Python: "
+        f"sys.flags.optimize={sys.flags.optimize}, __debug__={__debug__}",
+    )
+    probe_path = Path(__file__).resolve()
+    probe_sha256 = hashlib.sha256(probe_path.read_bytes()).hexdigest()
+    expected_sha256 = os.environ.get("REALQ_PROBE_EXPECTED_SHA256")
+    expected_commit = os.environ.get("REALQ_PROBE_EXPECTED_GIT_COMMIT")
+    if require_binding:
+        _require(
+            expected_sha256 == probe_sha256,
+            "REALQ_PROBE_EXPECTED_SHA256 must bind this exact P06 probe: "
+            f"expected={expected_sha256!r}, actual={probe_sha256}",
+        )
+        _require(
+            expected_commit is not None
+            and len(expected_commit) == 40
+            and all(
+                character in "0123456789abcdef"
+                for character in expected_commit
+            ),
+            "REALQ_PROBE_EXPECTED_GIT_COMMIT must be lowercase 40-hex",
+        )
+    return {
+        "probe_path": str(probe_path),
+        "probe_sha256": probe_sha256,
+        "expected_git_commit": expected_commit,
+        "python_optimize": sys.flags.optimize,
+        "python_debug": __debug__,
+    }
 
 
 class _ToyLayer(nn.Module):
@@ -272,34 +323,61 @@ def _expected_collectives(
     return expected
 
 
-def _assert_results_equal(
+def _require_results_equal(
     reference: _Result,
     candidate: _Result,
     case: _Case,
 ) -> None:
-    assert _raw_equal(candidate.weight, reference.weight)
-    assert candidate.adam_step == reference.adam_step
-    assert len(candidate.stitched_inputs) == len(reference.stitched_inputs)
-    assert len(candidate.updates) == len(reference.updates)
-    assert all(
-        _raw_equal(left, right)
-        for left, right in zip(
-            candidate.stitched_inputs,
-            reference.stitched_inputs,
-        )
+    _require(
+        _raw_equal(candidate.weight, reference.weight),
+        "P06 final weights differ",
     )
-    assert all(
-        _raw_equal(left, right)
-        for left, right in zip(candidate.updates, reference.updates)
+    _require(
+        candidate.adam_step == reference.adam_step,
+        "P06 Adam steps differ",
     )
-    assert _raw_equal(candidate.exp_avg, reference.exp_avg)
-    assert _raw_equal(candidate.exp_avg_sq, reference.exp_avg_sq)
+    _require(
+        len(candidate.stitched_inputs) == len(reference.stitched_inputs),
+        "P06 stitched-input counts differ",
+    )
+    _require(
+        len(candidate.updates) == len(reference.updates),
+        "P06 update counts differ",
+    )
+    _require(
+        all(
+            _raw_equal(left, right)
+            for left, right in zip(
+                candidate.stitched_inputs,
+                reference.stitched_inputs,
+            )
+        ),
+        "P06 stitched inputs differ",
+    )
+    _require(
+        all(
+            _raw_equal(left, right)
+            for left, right in zip(candidate.updates, reference.updates)
+        ),
+        "P06 updates differ",
+    )
+    _require(
+        _raw_equal(candidate.exp_avg, reference.exp_avg),
+        "P06 exp_avg differs",
+    )
+    _require(
+        _raw_equal(candidate.exp_avg_sq, reference.exp_avg_sq),
+        "P06 exp_avg_sq differs",
+    )
 
     expected_steps = math.ceil(case.columns / case.blocksize) - 1
-    assert candidate.adam_step == expected_steps
+    _require(
+        candidate.adam_step == expected_steps,
+        f"P06 Adam step {candidate.adam_step} != {expected_steps}",
+    )
 
 
-def _assert_rejection_boundaries(
+def _require_rejection_boundaries(
     device: torch.device,
 ) -> dict[str, str]:
     world = dist.get_world_size()
@@ -343,7 +421,7 @@ def _assert_rejection_boundaries(
     except ValueError as error:
         errors["uneven_rows"] = str(error)
     else:
-        raise AssertionError("uneven output rows unexpectedly accepted")
+        raise ProbeFailure("uneven output rows unexpectedly accepted")
 
     # Three groups are irregular against both tested world sizes (2 and 4).
     irregular_rows = 12
@@ -368,14 +446,17 @@ def _assert_rejection_boundaries(
     except ValueError as error:
         errors["irregular_groups"] = str(error)
     else:
-        raise AssertionError(
+        raise ProbeFailure(
             f"irregular world/group relation unexpectedly accepted: "
             f"world={world}, groups=3, rank={rank}"
         )
 
     gathered = [None] * world
     dist.all_gather_object(gathered, errors)
-    assert all(item == errors for item in gathered)
+    _require(
+        all(item == errors for item in gathered),
+        f"P06 rejection messages differ across ranks: {gathered}",
+    )
     return errors
 
 
@@ -388,8 +469,10 @@ def _resolve_probe_device() -> tuple[torch.device, str, int | None]:
         )
 
     if requested == "cpu":
-        assert os.environ.get("CUDA_VISIBLE_DEVICES") == "", (
-            "CPU P06 probe requires CUDA_VISIBLE_DEVICES='' and never uses a GPU"
+        _require(
+            os.environ.get("CUDA_VISIBLE_DEVICES") == "",
+            "CPU P06 probe requires CUDA_VISIBLE_DEVICES='' and never "
+            "uses a GPU",
         )
         return torch.device("cpu"), "gloo", None
 
@@ -422,6 +505,17 @@ def _resolve_probe_device() -> tuple[torch.device, str, int | None]:
     return torch.device("cuda", local_rank), "nccl", local_rank
 
 
+def _barrier(device: torch.device) -> None:
+    if device.type == "cuda":
+        _require(
+            device.index is not None,
+            f"P06 CUDA barrier received invalid device {device}",
+        )
+        dist.barrier(device_ids=[device.index])
+    else:
+        dist.barrier()
+
+
 def _run_implementation_order(
     case: _Case,
     implementations: tuple[str, str],
@@ -437,14 +531,34 @@ def _run_implementation_order(
         # Keep every rank on the same implementation boundary. This is
         # particularly important when the candidate deliberately removes one
         # NCCL collective from each refresh.
-        dist.barrier()
+        _barrier(device)
     return results
 
 
+def _replica_digests(result: _Result) -> dict[str, object]:
+    return {
+        "weight": _sha256(result.weight),
+        "stitched_inputs": [
+            _sha256(item) for item in result.stitched_inputs
+        ],
+        "updates": [_sha256(item) for item in result.updates],
+        "exp_avg": _sha256(result.exp_avg),
+        "exp_avg_sq": _sha256(result.exp_avg_sq),
+    }
+
+
 def main() -> None:
+    _require(
+        sys.flags.optimize == 0 and __debug__,
+        "P06 probe refuses optimized Python before device initialization",
+    )
     device, backend, local_rank = _resolve_probe_device()
+    provenance = _probe_provenance(require_binding=backend == "nccl")
     torch.set_num_threads(1)
-    dist.init_process_group(backend)
+    if device.type == "cuda":
+        dist.init_process_group(backend, device_id=device)
+    else:
+        dist.init_process_group(backend)
     world = dist.get_world_size()
     if world not in (2, 4):
         raise ValueError(f"P06 probe requires world size 2 or 4, got {world}.")
@@ -468,12 +582,12 @@ def main() -> None:
         )
 
         # Equality must hold within either execution order.
-        _assert_results_equal(
+        _require_results_equal(
             legacy_then_exact[LEGACY],
             legacy_then_exact[EXACT],
             case,
         )
-        _assert_results_equal(
+        _require_results_equal(
             exact_then_legacy[LEGACY],
             exact_then_legacy[EXACT],
             case,
@@ -481,7 +595,7 @@ def main() -> None:
         # Each implementation must also be stable across the two allocator /
         # collective histories.
         for implementation in (LEGACY, EXACT):
-            _assert_results_equal(
+            _require_results_equal(
                 legacy_then_exact[implementation],
                 exact_then_legacy[implementation],
                 case,
@@ -491,21 +605,32 @@ def main() -> None:
                 world=world,
                 implementation=implementation,
             )
-            assert (
+            _require(
                 legacy_then_exact[implementation].collective_shapes
-                == expected_collectives
+                == expected_collectives,
+                "P06 collective trace differs in legacy->exact order: "
+                f"{legacy_then_exact[implementation].collective_shapes} "
+                f"!= {expected_collectives}",
             )
-            assert (
+            _require(
                 exact_then_legacy[implementation].collective_shapes
-                == expected_collectives
+                == expected_collectives,
+                "P06 collective trace differs in exact->legacy order: "
+                f"{exact_then_legacy[implementation].collective_shapes} "
+                f"!= {expected_collectives}",
             )
 
         exact = legacy_then_exact[EXACT]
         legacy = legacy_then_exact[LEGACY]
-        digest = _sha256(exact.weight)
+        replica_digests = _replica_digests(exact)
         rank_digests = [None] * world
-        dist.all_gather_object(rank_digests, digest)
-        assert all(item == digest for item in rank_digests)
+        dist.all_gather_object(rank_digests, replica_digests)
+        _require(
+            all(item == replica_digests for item in rank_digests),
+            "P06 ranks diverged in stitched inputs, updates, moments, or "
+            f"weights: {rank_digests}",
+        )
+        digest = str(replica_digests["weight"])
         summaries.append(
             {
                 "rows": case.rows,
@@ -524,13 +649,14 @@ def main() -> None:
             }
         )
 
-    errors = _assert_rejection_boundaries(device)
+    errors = _require_rejection_boundaries(device)
     if dist.get_rank() == 0:
         print(
             json.dumps(
                 {
                     "world_size": world,
                     "backend": dist.get_backend(),
+                    **provenance,
                     "probe_device": os.environ.get(
                         "REALQ_P06_PROBE_DEVICE",
                         "cpu",
