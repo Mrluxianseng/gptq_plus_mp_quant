@@ -1558,10 +1558,16 @@ source_fields = (
     "tracked_diff_bytes",
     "staged_diff_sha256",
     "staged_diff_bytes",
-    "status_porcelain_v1",
     "script_sha256",
 )
 source_unchanged = all(before[field] == after[field] for field in source_fields)
+# Untracked files are retained in both provenance snapshots for audit, but
+# they are not executable source and may legitimately change when the user
+# runs a disjoint experiment in the shared checkout's output directory.
+# Tracked/staged bytes, commit, and the harness itself remain hard gates.
+untracked_status_unchanged = (
+    before["status_porcelain_v1"] == after["status_porcelain_v1"]
+)
 source_clean = (
     before["tracked_diff_bytes"] == 0
     and before["staged_diff_bytes"] == 0
@@ -1720,6 +1726,9 @@ summary = {
         "all_run_validations_passed": passed_runs,
         "source_clean": source_clean,
         "source_unchanged": source_unchanged,
+        "untracked_status_unchanged_audit_only": (
+            untracked_status_unchanged
+        ),
         "cache_unchanged": cache_unchanged,
     },
     "eligible_for_isolated_timing_comparison": passed,
@@ -1735,6 +1744,9 @@ manifest.update(
         "requested_return_code": requested_rc,
         "source_unchanged": source_unchanged,
         "source_clean": source_clean,
+        "untracked_status_unchanged_audit_only": (
+            untracked_status_unchanged
+        ),
         "cache_unchanged": cache_unchanged,
         "summary_path": str(root / "summary.json"),
         "eligible_for_isolated_timing_comparison": passed,
