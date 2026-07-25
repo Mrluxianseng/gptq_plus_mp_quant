@@ -584,21 +584,33 @@ class GPTQPlus:
         return base + beta_view * (current_weight - ref_weight)
 
     @staticmethod
-    def _make_grad_optimizer_state(weight_sub, grad_optimizer):
-        if grad_optimizer not in {"sgd", "adam"}:
-            raise ValueError(f"Unsupported `grad_optimizer={grad_optimizer}`. Expected one of: sgd, adam.")
+    def _make_grad_optimizer_state(weight_sub, grad_optimizer, curvature_full=None):
+        if grad_optimizer not in {"sgd", "adam", "h_adam"}:
+            raise ValueError(f"Unsupported `grad_optimizer={grad_optimizer}`. Expected one of: sgd, adam, h_adam.")
         state = {"type": grad_optimizer, "step": 0}
         if grad_optimizer == "adam":
             state["exp_avg"] = torch.zeros_like(weight_sub)
             state["exp_avg_sq"] = torch.zeros_like(weight_sub)
+        elif grad_optimizer == "h_adam":
+            # H-Adam: keep the first moment (exp_avg) but replace Adam's statistical
+            # second moment with the precomputed KFAC curvature diagonal. For the
+            # GPTQ layer-wise objective the weight Hessian is I ⊗ H, so the exact
+            # diagonal curvature is diag(H) broadcast across output rows;
+            # `curvature_full` is that [1, columns] tensor (mean-normalised + damped).
+            # Dropping exp_avg_sq also halves the optimizer-state memory vs. adam.
+            if curvature_full is None:
+                raise ValueError("h_adam requires `curvature_full` (KFAC curvature diagonal).")
+            state["exp_avg"] = torch.zeros_like(weight_sub)
+            state["curvature"] = curvature_full
         return state
 
     @staticmethod
     def _clear_grad_optimizer_state(opt_state, col_start, col_end):
         if opt_state is None or col_end <= col_start:
             return
-        if opt_state["type"] == "adam":
+        if opt_state["type"] in ("adam", "h_adam"):
             opt_state["exp_avg"][:, col_start:col_end].zero_()
+        if opt_state["type"] == "adam":
             opt_state["exp_avg_sq"][:, col_start:col_end].zero_()
 
     @staticmethod
@@ -622,10 +634,20 @@ class GPTQPlus:
 
         opt_state["step"] += 1
         exp_avg = opt_state["exp_avg"][:, col_start:]
-        exp_avg_sq = opt_state["exp_avg_sq"][:, col_start:]
         exp_avg.mul_(adam_beta1).add_(grad_slice, alpha=1 - adam_beta1)
-        exp_avg_sq.mul_(adam_beta2).addcmul_(grad_slice, grad_slice, value=1 - adam_beta2)
         bias_correction1 = 1 - adam_beta1 ** opt_state["step"]
+
+        if opt_state["type"] == "h_adam":
+            # H-Adam: precondition with the precomputed KFAC curvature diagonal
+            # (diag(GPTQ Hessian), mean-normalised + damped) instead of Adam's
+            # exp_avg_sq. `curvature` is [1, columns] and broadcasts across rows;
+            # slice the same tail [:, col_start:] as exp_avg. No exp_avg_sq and no
+            # bias_correction2 — the curvature is exact, not an EMA estimate.
+            denom = opt_state["curvature"][:, col_start:].sqrt() + adam_eps
+            return (lr / bias_correction1) * (exp_avg / denom)
+
+        exp_avg_sq = opt_state["exp_avg_sq"][:, col_start:]
+        exp_avg_sq.mul_(adam_beta2).addcmul_(grad_slice, grad_slice, value=1 - adam_beta2)
         bias_correction2 = 1 - adam_beta2 ** opt_state["step"]
         denom = exp_avg_sq.sqrt() / math.sqrt(bias_correction2)
         denom.add_(adam_eps)
@@ -899,6 +921,7 @@ class GPTQPlus:
         gradient_refresh_fn=None,
         grad_lr=1e-3,
         grad_optimizer="sgd",
+        curvature_damping=0.1,
         grad_reg_strategy="none",
         grad_reg_lambda=0.0,
         grad_gate_floor=0.1,
@@ -1026,6 +1049,15 @@ class GPTQPlus:
                             gradients_sub = gradients_sub[:, perm]
                             invperm = torch.argsort(perm)
 
+                    # H-Adam KFAC input factor: capture the (dead-fixed, actorder-
+                    # permuted) Hessian diagonal now — before Hinv computation — so
+                    # it aligns with W_sub's column order. diag(H) is the exact
+                    # layer-wise weight curvature (weight Hessian = I ⊗ H).
+                    h_sub_diag = (
+                        torch.diagonal(H_sub).clone()
+                        if (block_gd_mode and grad_optimizer == "h_adam") else None
+                    )
+
                     if need_hessian_reg:
                         with profile_recorder.section("fasterquant.subgroup.H_sub_clone") if profile_recorder else _NULL_CONTEXT:
                             hessian_reg = H_sub.clone()
@@ -1109,7 +1141,14 @@ class GPTQPlus:
                             "hessian_reg": hessian_reg,
                             "gate_scale": gate_scale,
                             "gate_zero": gate_zero,
-                            "grad_optimizer_state": self._make_grad_optimizer_state(W_sub, grad_optimizer) if block_gd_mode else None,
+                            "grad_optimizer_state": self._make_grad_optimizer_state(
+                                W_sub,
+                                grad_optimizer,
+                                curvature_full=(
+                                    build_kfac_curvature_diag(W_sub, h_sub_diag, None, damping=curvature_damping)
+                                    if grad_optimizer == "h_adam" else None
+                                ),
+                            ) if block_gd_mode else None,
                             "groups": groups,
                             "perm": perm,
                             "invperm": invperm,
@@ -7446,6 +7485,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             ) if args.g_update_mode in {"block_backward", "block_gd"} else None,
                             grad_lr=effective_grad_lr,
                             grad_optimizer=effective_grad_optimizer,
+                            curvature_damping=getattr(args, "h_adam_curvature_damping", 0.1),
                             grad_reg_strategy=effective_grad_reg_strategy,
                             grad_reg_lambda=args.grad_reg_lambda,
                             grad_gate_floor=args.grad_gate_floor,

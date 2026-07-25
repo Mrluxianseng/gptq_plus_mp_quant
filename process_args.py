@@ -164,14 +164,16 @@ def parse_gen():
         "--grad_optimizer",
         type=str,
         default="sgd",
-        choices=["sgd", "adam"],
-        help="Optimizer used for the block-wise first-order update after each refresh.",
+        choices=["sgd", "adam", "h_adam"],
+        help="Optimizer used for the block-wise first-order update after each refresh. "
+             "`h_adam` preconditions with diag(GPTQ Hessian) — the exact layer-wise "
+             "weight curvature — instead of Adam's exp_avg_sq.",
     )
     parser.add_argument(
         "--final_layer_grad_optimizer",
         type=str,
         default=None,
-        choices=["sgd", "adam"],
+        choices=["sgd", "adam", "h_adam"],
         help="Optional override for the block-wise first-order optimizer used only in the final transformer layer.",
     )
     parser.add_argument(
