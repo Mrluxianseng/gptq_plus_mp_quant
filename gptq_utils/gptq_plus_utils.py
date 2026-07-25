@@ -4413,6 +4413,7 @@ def apply_dense_optimizer_step(
     param,
     grad,
     lr,
+    curvature_diag,
     optimizer,
     opt_state=None,
     grad_clip=1.0,
@@ -4431,8 +4432,41 @@ def apply_dense_optimizer_step(
         param.sub_(update.to(param.dtype))
         return update, opt_state
 
-    if optimizer != "adam":
-        raise ValueError(f"Unsupported optimizer `{optimizer}`. Expected one of: sgd, adam.")
+    if optimizer not in('adam', 'h_adam'):
+        raise ValueError(f"Unsupported optimizer `{optimizer}`. Expected one of: sgd, adam, h_adam.")
+
+    if optimizer == 'h_adam':
+        if curvature_diag is None:
+            raise ValueError(f"h_adam requires 'curvature_diag'(Fisher/Hessian diagonal).")
+        # NOTE: the update below must run on EVERY step, not only when the state
+        # is freshly allocated. Keeping it inside `if opt_state is None:` (as an
+        # earlier draft did) made step >= 2 fall through to the vanilla-Adam
+        # branch, which then KeyError'd on the missing `exp_avg_sq`.
+        if opt_state is None:
+            opt_state = {
+                'step': 0,
+                'exp_avg': torch.zeros_like(param, dtype=torch.float32),
+            }
+        opt_state['step'] += 1
+        exp_avg = opt_state['exp_avg']
+        grad_step = grad_step.float()
+        exp_avg.mul_(adam_beta1).add_(grad_step, alpha=1 - adam_beta1)
+        bias_correction1 = 1 - adam_beta1 ** opt_state['step']
+
+        # H-Adam: replace Adam's statistically-estimated 2nd moment (exp_avg_sq)
+        # with the precomputed KFAC curvature diagonal
+        #   curvature[i, j] ≈ E[g_i^2] · E[x_j^2]  (output-Fisher ⊗ input-Hessian).
+        # `curvature_diag` is pre-normalised to ~unit mean (see
+        # build_kfac_curvature_diag) so `lr` keeps the same scale as vanilla
+        # Adam; it may be [out, in] or a broadcastable [1, in]. Dropping
+        # exp_avg_sq also halves the optimizer-state memory vs. Adam.
+        denom = curvature_diag.to(device=exp_avg.device, dtype=torch.float32).sqrt() + adam_eps
+        step_size = lr / bias_correction1
+        update = step_size * (exp_avg / denom)
+        param.sub_(update.to(param.dtype))
+        return update, opt_state
+
+    #     ------------原有adam分支------------
 
     if opt_state is None:
         opt_state = {
@@ -4454,6 +4488,117 @@ def apply_dense_optimizer_step(
     update = step_size * (exp_avg / denom)
     param.sub_(update.to(param.dtype))
     return update, opt_state
+
+
+@torch.no_grad()
+def collect_module_input_second_moment(
+    *,
+    layer,
+    modules,
+    inps,
+    attention_mask,
+    position_ids,
+    position_embeddings,
+    dev,
+    bsz,
+):
+    """One forward pass over the calibration inputs that accumulates, per module,
+    the per-input-channel activation energy  sum_tokens x_j^2  (the diagonal of
+    the input Gram matrix E[x x^T]).
+
+    This is the KFAC "input factor" diag(A). At pre-quant-GD time the GPTQ input
+    Hessian (`GPTQPlus.H` / `GPTQPlus.act_square`) has NOT been built yet — the
+    GPTQPlus instances are created only later in the quant loop — so we recompute
+    this cheap diagonal directly from a hooked forward pass. The result is
+    summed across DP ranks so every rank derives an identical curvature and the
+    weights stay bit-for-bit in sync under data parallelism.
+
+    Returns { module_name: FloatTensor[in_features] } (unnormalised sum, on dev).
+    Normalisation is deferred to `build_kfac_curvature_diag` (mean-normalised).
+    """
+    sums = {name: None for name, _ in modules}
+
+    def _make_hook(name):
+        def _hook(_module, inp, _out):
+            x = inp[0]
+            x = x.reshape(-1, x.shape[-1]).float()
+            sq = (x * x).sum(dim=0)
+            if sums[name] is None:
+                sums[name] = sq
+            else:
+                sums[name].add_(sq)
+        return _hook
+
+    handles = [module.register_forward_hook(_make_hook(name)) for name, module in modules]
+    try:
+        for j in range(0, inps.shape[0], bsz):
+            batch = inps[j:j + bsz].to(dev)
+            bs = batch.shape[0]
+            batch_attention_mask = (
+                attention_mask.expand(bs, -1, -1, -1) if attention_mask is not None else None
+            )
+            batch_position_ids = position_ids.expand(bs, -1)
+            batch_position_embeddings = (
+                position_embeddings[0].expand(bs, -1, -1),
+                position_embeddings[1].expand(bs, -1, -1),
+            )
+            layer(
+                batch,
+                attention_mask=batch_attention_mask,
+                position_ids=batch_position_ids,
+                position_embeddings=batch_position_embeddings,
+            )
+    finally:
+        for h in handles:
+            h.remove()
+
+    if dist_utils.get_world_size() > 1:
+        for name in sums:
+            if sums[name] is not None:
+                dist_utils.allreduce_sum_(sums[name])
+    return sums
+
+
+def build_kfac_curvature_diag(weight, input_sq, output_fisher, damping=0.1):
+    """Assemble the per-weight KFAC curvature diagonal used by H-Adam.
+
+        curvature[i, j] ≈ E[g_i^2] · E[x_j^2]
+                        = diag(output_fisher)[i] · input_sq[j]
+
+    This is the diagonal of the Kronecker-factored Fisher  A ⊗ B, with
+    A = E[x x^T] (input factor, `input_sq`) and B = E[g g^T] (output factor,
+    `output_fisher`). `weight` is [out, in]; `input_sq` is [in]; `output_fisher`
+    is the (H, H) block-output Fisher (or None).
+
+    The output factor is only dimensionally valid for modules whose output IS
+    the residual stream (o_proj / down_proj, i.e. out == H). For q/k/v/gate/up
+    the module output dim != H, so we fall back to the input-only diagonal
+    broadcast across output rows (returned as a [1, in] broadcastable tensor).
+
+    Both factors are normalised to unit mean, so the assembled curvature has
+    mean ≈ 1 and `lr` keeps the same scale as vanilla Adam. A relative damping
+    term keeps the sqrt-denominator finite on near-zero channels (this is also
+    the natural hook for the quant-grid-aware damping of doc 方向4).
+    """
+    out_features, in_features = weight.shape
+    a = input_sq.to(dtype=torch.float32).clamp_min(0.0)
+    a = a / a.mean().clamp_min(1e-12)  # [in], mean ≈ 1
+
+    use_output_factor = (
+        output_fisher is not None
+        and output_fisher.dim() == 2
+        and output_fisher.shape[0] == out_features
+    )
+    if use_output_factor:
+        b = torch.diagonal(output_fisher.to(dtype=torch.float32, device=a.device)).clamp_min(0.0)
+        b = b / b.mean().clamp_min(1e-12)  # [out], mean ≈ 1
+        curvature = torch.outer(b, a)  # [out, in], mean ≈ 1  (full KFAC diagonal)
+    else:
+        curvature = a.view(1, in_features)  # broadcastable input-only fallback
+
+    if damping and damping > 0:
+        curvature = curvature + float(damping)
+    return curvature
 
 
 def collect_layer_output_fisher_only(
@@ -5328,6 +5473,7 @@ def run_pre_quant_gd(
     layer_recorder=None,
     sink_size=0,
     a_loss_ratio=1.0,
+    curvature_damping=0.1,
 ):
     if num_steps <= 0 or not module_names:
         return
@@ -5348,6 +5494,46 @@ def run_pre_quant_gd(
                     "exp_avg": torch.zeros_like(module.weight.data, dtype=torch.float32),
                     "exp_avg_sq": torch.zeros_like(module.weight.data, dtype=torch.float32),
                 }
+
+        elif grad_optimizer == 'h_adam':
+            for module_name, module in modules:
+                optimizer_states[module_name] = {
+                    "step": 0,
+                    "exp_avg": torch.zeros_like(module.weight.data, dtype=torch.float32),
+                }
+
+        # H-Adam preconditioner: precompute the per-weight KFAC curvature diagonal
+        #   curvature[i, j] ≈ diag(output_fisher)[i] · E[x_j^2]
+        # once per layer. The input factor E[x^2] is captured from a single hooked
+        # forward pass (the GPTQ input Hessian is not available this early in the
+        # pipeline); the output factor is the already-plumbed layer-output Fisher.
+        curvature_diag_by_module = {}
+        if grad_optimizer == 'h_adam':
+            with layer_recorder.section("layer.pre_quant_gd.kfac_curvature") if layer_recorder else _NULL_CONTEXT:
+                input_sq_by_module = collect_module_input_second_moment(
+                    layer=layer,
+                    modules=modules,
+                    inps=inps,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    position_embeddings=position_embeddings,
+                    dev=dev,
+                    bsz=backward_bsz,
+                )
+                for module_name, module in modules:
+                    input_sq = input_sq_by_module.get(module_name)
+                    if input_sq is None:
+                        raise RuntimeError(
+                            f"h_adam: failed to capture input activations for module `{module_name}` "
+                            f"(no forward hook fired)."
+                        )
+                    output_fisher = layer_output_fisher_by_module.get(module_name)
+                    curvature_diag_by_module[module_name] = build_kfac_curvature_diag(
+                        module.weight.data,
+                        input_sq,
+                        output_fisher,
+                        damping=curvature_damping,
+                    )
 
     world = dist_utils.get_world_size()
     for step_idx in range(num_steps):
@@ -5423,6 +5609,7 @@ def run_pre_quant_gd(
                             module.weight.data,
                             grad,
                             lr=grad_lr,
+                            curvature_diag=curvature_diag_by_module.get(module_name),
                             optimizer=grad_optimizer,
                             opt_state=optimizer_states.get(module_name),
                             grad_clip=grad_clip,
@@ -5449,33 +5636,99 @@ def run_pre_quant_gd(
             format_log_value(grad_lr, digits=6),
         )
 
+def _mp_module_score(sal, metric, topk_ratio=0.1):
+    """Compute a scalar sensitivity score for one module's saliency tensor."""
+    flat = sal.float().reshape(-1)
+    if metric == "fisher_mean":
+        return flat.mean().item()
+    elif metric == "fisher_max":
+        return flat.max().item()
+    elif metric == "fisher_topk":
+        k = max(1, int(topk_ratio * flat.numel()))
+        return flat.topk(k).values.mean().item()
+    elif metric == "random":
+        return float(torch.rand(1).item())
+    else:
+        raise ValueError(f"Unknown mp_saliency_metric: {metric!r}. "
+                         f"Choose from: fisher_mean, fisher_max, fisher_topk, random.")
+
+
 def compute_mp_bit_map(args, static_saliency_by_layer):
+    """
+    Build a (layer_idx, module_name) → bits mapping for mixed-precision quantization.
+
+    Supports three saliency metrics (--mp_saliency_metric):
+      fisher_mean  – mean of per-token squared gradient (default, original behaviour)
+      fisher_max   – max of per-token squared gradient (captures peak sensitivity)
+      fisher_topk  – mean of top-k% tokens by squared gradient (--mp_topk_ratio)
+      random       – random scores (ablation baseline: does ordering matter?)
+
+    Supports three allocation granularities (--mp_granularity):
+      module  – per-module bit assignment (finest, default)
+      layer   – all modules in a transformer layer share the same bits
+      type    – all modules of the same role (e.g. q_proj, mlp.down_proj) share bits
+    """
     if not getattr(args, "mixed_precision", False):
         return {}
-    scores= {}
+
+    metric = getattr(args, "mp_saliency_metric", "fisher_mean")
+    granularity = getattr(args, "mp_granularity", "module")
+    topk_ratio = getattr(args, "mp_topk_ratio", 0.1)
+
+    # --- Step 1: per-module raw scores ---
+    raw_scores = {}
     for layer_idx, layer_saliency in enumerate(static_saliency_by_layer):
         if layer_saliency is None:
             continue
         for module_name, sal in layer_saliency.items():
-            scores[(layer_idx, module_name)] = sal.float().mean().item()
-    ratio =  (args.mp_target_avg_bits - args.mp_low_bits)/(args.mp_high_bits - args.mp_low_bits)
+            raw_scores[(layer_idx, module_name)] = _mp_module_score(sal, metric, topk_ratio)
 
-    sorted_items = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-    n_hign = int(len(sorted_items) * ratio)
+    if not raw_scores:
+        logging.warning("compute_mp_bit_map: no saliency data found; returning empty bit_map.")
+        return {}
+
+    # --- Step 2: aggregate scores by granularity ---
+    if granularity == "module":
+        agg_scores = dict(raw_scores)
+
+    elif granularity == "layer":
+        layer_sum, layer_cnt = {}, {}
+        for (li, mn), score in raw_scores.items():
+            layer_sum[li] = layer_sum.get(li, 0.0) + score
+            layer_cnt[li] = layer_cnt.get(li, 0) + 1
+        layer_avg = {li: layer_sum[li] / layer_cnt[li] for li in layer_sum}
+        agg_scores = {(li, mn): layer_avg[li] for (li, mn) in raw_scores}
+
+    elif granularity == "type":
+        # Module type = last component of the dotted name (e.g. "q_proj" from "self_attn.q_proj")
+        type_sum, type_cnt = {}, {}
+        for (li, mn), score in raw_scores.items():
+            mtype = mn.split(".")[-1]
+            type_sum[mtype] = type_sum.get(mtype, 0.0) + score
+            type_cnt[mtype] = type_cnt.get(mtype, 0) + 1
+        type_avg = {mt: type_sum[mt] / type_cnt[mt] for mt in type_sum}
+        agg_scores = {(li, mn): type_avg[mn.split(".")[-1]] for (li, mn) in raw_scores}
+
+    else:
+        raise ValueError(f"Unknown mp_granularity: {granularity!r}. "
+                         f"Choose from: module, layer, type.")
+
+    # --- Step 3: sort and assign high/low bits ---
+    ratio = (args.mp_target_avg_bits - args.mp_low_bits) / (args.mp_high_bits - args.mp_low_bits)
+    sorted_items = sorted(agg_scores.items(), key=lambda x: x[1], reverse=True)
+    n_high = int(len(sorted_items) * ratio)
 
     bit_map = {}
-    for idx, ((layer_idx, module_name), score) in enumerate(sorted_items):
-        if idx < n_hign:
-            bit_map[(layer_idx, module_name)] = args.mp_high_bits
-        else:
-            bit_map[(layer_idx, module_name)] = args.mp_low_bits
+    for idx, ((layer_idx, module_name), _) in enumerate(sorted_items):
+        bit_map[(layer_idx, module_name)] = args.mp_high_bits if idx < n_high else args.mp_low_bits
 
     logging.info(
-        "Mixed precision: %d modules total, %d@%dbit, %d@%dbit, avg=%.2f bits",
+        "Mixed precision [metric=%s, granularity=%s]: %d modules, %d@%dbit + %d@%dbit = avg %.2f bits",
+        metric, granularity,
         len(bit_map),
-        n_hign, args.mp_high_bits,
-        len(bit_map)-n_hign, args.mp_low_bits,
-        args.mp_target_avg_bits
+        n_high, args.mp_high_bits,
+        len(bit_map) - n_high, args.mp_low_bits,
+        args.mp_target_avg_bits,
     )
     return bit_map
 
@@ -6522,6 +6775,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             layer_recorder=layer_recorder,
                             sink_size=sink_size,
                             a_loss_ratio=args.a_loss_ratio,
+                            curvature_damping=getattr(args, "h_adam_curvature_damping", 0.1),
                         )
 
             # Compute slide-window refresh span over the whole transformer block,

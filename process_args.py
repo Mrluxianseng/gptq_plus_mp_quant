@@ -15,6 +15,37 @@ def parse_gen():
     parser.add_argument("--mp_target_avg_bits", type=float, default=3.5, help="Target average bits")
     parser.add_argument("--mp_high_bits", type=int, default=4, help="the higher weight bits")
     parser.add_argument("--mp_low_bits", type=int, default=3, help="the lower weight bits")
+    parser.add_argument(
+        "--mp_saliency_metric",
+        type=str,
+        default="fisher_mean",
+        choices=["fisher_mean", "fisher_max", "fisher_topk", "random"],
+        help=(
+            "Metric used to score each module's sensitivity for mixed-precision bit allocation. "
+            "'fisher_mean': mean of per-token squared gradient (default). "
+            "'fisher_max': max of per-token squared gradient (peak sensitivity). "
+            "'fisher_topk': mean of top-k%% most sensitive tokens (see --mp_topk_ratio). "
+            "'random': random scores; ablation baseline to test whether saliency ordering matters."
+        ),
+    )
+    parser.add_argument(
+        "--mp_granularity",
+        type=str,
+        default="module",
+        choices=["module", "layer", "type"],
+        help=(
+            "Granularity of mixed-precision bit allocation. "
+            "'module': each linear module gets an independent bit width (finest, default). "
+            "'layer': all modules within a transformer layer share the same bits. "
+            "'type': all modules of the same role (e.g. q_proj, mlp.down_proj) share bits across layers."
+        ),
+    )
+    parser.add_argument(
+        "--mp_topk_ratio",
+        type=float,
+        default=0.1,
+        help="Fraction of tokens kept by the fisher_topk saliency metric (default 0.1 = top 10%%).",
+    )
     parser.add_argument("--model", type=str, required=True, help="The model to quantize")
     parser.add_argument("--exp", type=str, required=True, help="Exp name")
     parser.add_argument("--seed", type=int, default=42,
@@ -334,15 +365,26 @@ def parse_gen():
         "--pre_grad_optimizer",
         type=str,
         default="sgd",
-        choices=["sgd", "adam"],
-        help="Optimizer used for the pre-quantization gradient descent phase.",
+        choices=["sgd", "adam", "h_adam"],
+        help="Optimizer used for the pre-quantization gradient descent phase. "
+             "`h_adam` preconditions with the KFAC curvature diagonal "
+             "(output-Fisher ⊗ input-Hessian) instead of Adam's exp_avg_sq.",
     )
     parser.add_argument(
         "--pre_final_layer_grad_optimizer",
         type=str,
         default=None,
-        choices=["sgd", "adam"],
+        choices=["sgd", "adam", "h_adam"],
         help="Optional override for the pre-quantization optimizer used only in the final transformer layer.",
+    )
+    parser.add_argument(
+        "--h_adam_curvature_damping",
+        type=float,
+        default=0.1,
+        help="Relative damping added to the (mean-normalised) H-Adam KFAC "
+             "curvature diagonal before the sqrt-preconditioner. Larger values "
+             "make H-Adam behave closer to plain SGD/Adam on near-zero-curvature "
+             "channels. Only used when a pre-grad optimizer is `h_adam`.",
     )
     parser.add_argument(
         "--proj_lr_scale",
@@ -794,6 +836,10 @@ def parse_gen():
         raise ValueError(f"`backward_bsz` must be positive or -1. Got {args.backward_bsz}.")
     if not (0.0 < args.a_loss_ratio <= 1.0):
         raise ValueError(f"`a_loss_ratio` must be in (0, 1]. Got {args.a_loss_ratio}.")
+    if args.h_adam_curvature_damping < 0:
+        raise ValueError(
+            f"`h_adam_curvature_damping` must be non-negative. Got {args.h_adam_curvature_damping}."
+        )
     if getattr(args, "act_quant_aware_gptq", False):
         if args.w_method != "gptq_plus":
             raise ValueError("--act_quant_aware_gptq is currently implemented only for --w_method=gptq_plus.")

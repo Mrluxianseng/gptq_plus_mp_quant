@@ -105,6 +105,9 @@ PRE_GRAD_LR=${PRE_GRAD_LR:-0.00003}
 PRE_FINAL_LAYER_GRAD_LR=${PRE_FINAL_LAYER_GRAD_LR:-0.3}
 PRE_GRAD_OPTIMIZER=${PRE_GRAD_OPTIMIZER:-adam}
 PRE_FINAL_LAYER_GRAD_OPTIMIZER=${PRE_FINAL_LAYER_GRAD_OPTIMIZER:-sgd}
+# H-Adam KFAC-curvature damping (only used when a pre-grad optimizer is h_adam).
+# Empty -> fall back to the process_args default (0.1).
+H_ADAM_CURVATURE_DAMPING=${H_ADAM_CURVATURE_DAMPING:-}
 #--grad_reg_strategy {none,l2,hessian,quant_error_gate,quant_error_gate_optimized}
 GRAD_REG_STRATEGY=${GRAD_REG_STRATEGY:-none}
 GRAD_REG_LAMBDA=${GRAD_REG_LAMBDA:-50.0}
@@ -213,6 +216,11 @@ fi
 FINAL_LAYER_GRAD_CLIP_ARGS=()
 if [[ -n "${FINAL_LAYER_GRAD_CLIP}" && "${FINAL_LAYER_GRAD_CLIP}" != "none" ]]; then
     FINAL_LAYER_GRAD_CLIP_ARGS=(--final_layer_grad_clip "${FINAL_LAYER_GRAD_CLIP}")
+fi
+
+H_ADAM_CURVATURE_DAMPING_ARGS=()
+if [[ -n "${H_ADAM_CURVATURE_DAMPING}" ]]; then
+    H_ADAM_CURVATURE_DAMPING_ARGS=(--h_adam_curvature_damping "${H_ADAM_CURVATURE_DAMPING}")
 fi
 
 PRE_FINAL_LAYER_GRAD_OPTIMIZER_ARGS=()
@@ -584,6 +592,7 @@ for grad_lr in "${GRAD_LRS[@]}"; do
         --pre_gd_steps "${PRE_GD_STEPS}" \
         --pre_grad_lr "${PRE_GRAD_LR}" \
         --pre_grad_optimizer "${PRE_GRAD_OPTIMIZER}" \
+        "${H_ADAM_CURVATURE_DAMPING_ARGS[@]}" \
         "${PRE_FINAL_LAYER_GRAD_LR_ARGS[@]}" \
         "${PRE_FINAL_LAYER_GRAD_OPTIMIZER_ARGS[@]}" \
         "${PRE_CLIP_ARGS[@]}" \
