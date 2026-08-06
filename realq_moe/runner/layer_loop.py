@@ -23,7 +23,7 @@ import os
 import socket
 import tempfile
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, TypeVar
@@ -32,31 +32,164 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 
-from realq.alignment import RefreshTraceWriter, default_refresh_trace_config
-from realq.parallel import env as parallel_env
-from realq.parallel.cpu_master import CpuMasterLayerManager
-from realq.quant.realq_layer import RealQLayer
-from realq.refresh.block_gd import (
-    BlockRefreshState,
+from realq_moe import model_adapter
+from realq_moe.alignment import RefreshTraceWriter, default_refresh_trace_config
+from realq_moe.parallel import env as parallel_env
+from realq_moe.parallel.cpu_master import CpuMasterLayerManager
+from realq_moe.quant.realq_layer import RealQLayer
+from realq_moe.refresh.block_gd import (
     RefreshContext,
     _SharedSampleScheduler,
     layer_lr_for_schedule,
     make_grad_refresh_fn,
 )
-from realq.refresh.kl_loss import make_kl_refresh_fn
-from realq.runner import module_groups, streams
-from realq.utils import memory as mem_utils
-from realq.utils import nvtx
+from realq_moe.refresh.kl_loss import make_kl_refresh_fn
+from realq_moe.runner import module_groups, streams
+from realq_moe.utils import memory as mem_utils
+from realq_moe.utils import nvtx
 from gptq_utils.quant_aware_utils import disable_fp_path_quant
 from utils import dist_utils, quant_utils
 
 if TYPE_CHECKING:
-    from realq.config import Config
-    from realq.precompute import StaticStats
+    from realq_moe.config import Config
+    from realq_moe.precompute import StaticStats
     from utils.model_utils import ModelAnalyzer
 
 
 _T = TypeVar("_T")
+
+
+def _assert_module_cuda(
+    module: nn.Module,
+    dev: torch.device,
+    *,
+    label: str,
+) -> None:
+    expected_index = (
+        dev.index if dev.index is not None else torch.cuda.current_device()
+    )
+    for tensor_name, tensor in (
+        list(module.named_parameters(recurse=True))
+        + list(module.named_buffers(recurse=True))
+    ):
+        if tensor.device.type != "cuda" or tensor.device.index != expected_index:
+            raise RuntimeError(
+                f"{label}.{tensor_name} must remain on cuda:{expected_index}; "
+                f"got {tensor.device}."
+            )
+
+
+def _assert_layer_inputs_cuda(
+    state: streams.LayerInputs,
+    dev: torch.device,
+) -> None:
+    expected_index = (
+        dev.index if dev.index is not None else torch.cuda.current_device()
+    )
+    tensors = {
+        "inps": state.inps,
+        "fp_inps": state.fp_inps,
+        "attention_mask": state.attention_mask,
+        "position_ids": state.position_ids,
+    }
+    if state.position_embeddings is not None:
+        tensors["position_embeddings[0]"] = state.position_embeddings[0]
+        tensors["position_embeddings[1]"] = state.position_embeddings[1]
+    for name, tensor in tensors.items():
+        if tensor is None:
+            continue
+        if tensor.device.type != "cuda" or tensor.device.index != expected_index:
+            raise RuntimeError(
+                "GPU-resident MoE layer stream requires "
+                f"{name} on cuda:{expected_index}; got {tensor.device}."
+            )
+
+
+def _release_consumed_moe_static_layer(
+    static: "StaticStats",
+    layer_idx: int,
+    dev: torch.device,
+) -> None:
+    """Drop a GPU-resident Stage-0 layer after its only consumer returns.
+
+    Routed saliency is assignment-sized: on Qwen3-30B-A3B, the three expert
+    projections alone retain roughly 192 MiB per transformer layer. Keeping
+    already-consumed layers through the final full-vocabulary KL refresh
+    wastes several GiB without preserving any future input. Replace each
+    consumed entry with an empty CUDA sentinel so this remains deletion,
+    never CPU offload, while list indices for later layers stay stable.
+    """
+
+    field_lengths = {
+        "saliency": len(static.saliency),
+        "fisher": len(static.fisher),
+        "routes": len(static.routes),
+        "expert_global_assignment_counts": len(
+            static.expert_global_assignment_counts
+        ),
+        "expert_global_coverage": len(static.expert_global_coverage),
+    }
+    invalid = {
+        name: length
+        for name, length in field_lengths.items()
+        if layer_idx < 0 or layer_idx >= length
+    }
+    if invalid:
+        raise RuntimeError(
+            "cannot release consumed MoE Stage-0 layer "
+            f"{layer_idx}; invalid field lengths={invalid}."
+        )
+
+    fisher_dtype = static.fisher[layer_idx].dtype
+    count_dtype = static.expert_global_assignment_counts[layer_idx].dtype
+    static.saliency[layer_idx] = {}
+    static.fisher[layer_idx] = torch.empty(
+        0, device=dev, dtype=fisher_dtype
+    )
+    static.routes[layer_idx] = {}
+    static.expert_global_assignment_counts[layer_idx] = torch.empty(
+        0, device=dev, dtype=count_dtype
+    )
+    static.expert_global_coverage[layer_idx] = {}
+    logging.info(
+        "[realq_moe.static_release] layer_idx=%d device=%s",
+        layer_idx,
+        dev,
+    )
+
+
+def _assert_tensor_tree_cuda(
+    value,
+    dev: torch.device,
+    *,
+    label: str,
+) -> int:
+    expected_index = (
+        dev.index if dev.index is not None else torch.cuda.current_device()
+    )
+    if torch.is_tensor(value):
+        if value.device.type != "cuda" or value.device.index != expected_index:
+            raise RuntimeError(
+                f"{label} must remain on cuda:{expected_index}; got "
+                f"{value.device}."
+            )
+        return 1
+    count = 0
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            count += _assert_tensor_tree_cuda(
+                child,
+                dev,
+                label=f"{label}[{key!r}]",
+            )
+    elif isinstance(value, (list, tuple)):
+        for index, child in enumerate(value):
+            count += _assert_tensor_tree_cuda(
+                child,
+                dev,
+                label=f"{label}[{index}]",
+            )
+    return count
 
 
 def _stage_fisher_for_refresh(
@@ -142,6 +275,8 @@ def _measure_quantize_one_layer(
     layer_idx: int,
     dev: torch.device,
     quantize_call: Callable[[], _T],
+    *,
+    teacher_route_coverage: dict[str, torch.Tensor] | None = None,
 ) -> _T:
     """Measure exactly one synchronized ``quantize_one_layer`` invocation.
 
@@ -198,7 +333,7 @@ def _measure_quantize_one_layer(
         / f"perf_measure_layer_{layer_idx}_rank{rank}.json"
     )
     payload: dict[str, object] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "metric_name": "quant_layer_critical_wall",
         "output_dir": str(output_dir),
         "exp": cfg.exp,
@@ -224,7 +359,48 @@ def _measure_quantize_one_layer(
         "cuda_end_reserved_bytes": end_reserved,
         "cuda_peak_reserved_bytes": peak_reserved,
         "cuda_peak_reserved_delta_bytes": peak_reserved - start_reserved,
+        "quant_parallel": {
+            "world_size": world,
+            "group_parallel_quant": cfg.group_parallel_quant,
+            "moe_expert_execution": (
+                "single_gpu_joint_column_blocks"
+                if world == 1 and cfg.moe_joint_column_block
+                else "distributed_unvalidated"
+            ),
+        },
+        "performance_options": {
+            "quantizer_inner_fastpath": cfg.quantizer_inner_fastpath,
+            "prepared_clamp_bound_cache": (
+                cfg.prepared_clamp_bound_cache
+            ),
+            "triton_column_block": cfg.triton_column_block,
+            "w_clip_search_impl": cfg.w_clip_search_impl,
+            "fisher_fp32_cache": cfg.fisher_fp32_cache,
+            "act_order_stitch_impl": cfg.act_order_stitch_impl,
+            "w_clip_update_impl": cfg.w_clip_update_impl,
+            "w_group_param_layout": cfg.w_group_param_layout,
+        },
+        "moe_lifecycle": {
+            "route_pack_impl": cfg.moe_route_pack_impl,
+            "expert_chunk_assignments": cfg.moe_expert_chunk_assignments,
+            "projection_order": list(model_adapter.EXPERT_PROJECTION_ORDER),
+            "gpu_resident": cfg.moe_gpu_resident,
+            "joint_column_block": cfg.moe_joint_column_block,
+            "expert_loss_scope": (
+                "full_slide"
+                if cfg.moe_expert_loss_slide_window
+                else "current_layer"
+            ),
+            "expert_loss_slide_window": cfg.moe_expert_loss_slide_window,
+        },
     }
+    if teacher_route_coverage:
+        payload["teacher_route_coverage"] = {
+            # JSON telemetry necessarily becomes host scalars; do not create a
+            # persistent CPU tensor/offload buffer for it.
+            field: tensor.detach().tolist()
+            for field, tensor in teacher_route_coverage.items()
+        }
     _atomic_json_dump(output_path, payload)
     return result
 
@@ -331,19 +507,6 @@ def _replay_fp_layer(
         return streams.replay_layer(layer, state, bsz=bsz, inps=inps)
 
 
-def _all_quantizable_modules(
-    layer: nn.Module,
-) -> list[tuple[str, nn.Module]]:
-    """Return the exact sequential linear order for a transformer block."""
-
-    ordered: list[tuple[str, nn.Module]] = []
-    for group_name in module_groups.GROUP_ORDER:
-        ordered.extend(
-            module_groups.get_group_modules(layer, group_name).items()
-        )
-    return ordered
-
-
 @torch.no_grad()
 def quantize_one_layer(
     cfg: "Config",
@@ -359,7 +522,6 @@ def quantize_one_layer(
     analyzer: "ModelAnalyzer | None" = None,
     layer_manager: "CpuMasterLayerManager | None" = None,
     trace_writer: "RefreshTraceWriter | None" = None,
-    block_refresh_states: dict[int, BlockRefreshState] | None = None,
 ) -> streams.LayerInputs:
     """Quantise one transformer layer, return updated input state for the
     next layer (= output of this layer with all-quantised weights).
@@ -375,10 +537,37 @@ def quantize_one_layer(
     ``layer_manager.enabled=False`` ⇒ identical to plain ``.to`` calls.
     """
     with nvtx.nvtx_range(f"layer_{layer_idx}"):
+        sparse_moe_layer = model_adapter.is_sparse_moe_layer(layer)
+        moe_gpu_resident = (
+            sparse_moe_layer
+            and bool(getattr(cfg, "moe_gpu_resident", False))
+        )
+        cfg.validate_moe_runtime_contract(sparse_moe=sparse_moe_layer)
+        if moe_gpu_resident and parallel_env.get_world_size() != 1:
+            raise ValueError(
+                "The first joint/GPU-resident Qwen3-MoE runner requires "
+                "world_size=1."
+            )
+        active_group_order = (
+            model_adapter.ATTENTION_GROUP_ORDER
+            if sparse_moe_layer
+            else module_groups.GROUP_ORDER
+        )
         use_manager = layer_manager is not None and layer_manager.enabled
+        if moe_gpu_resident and use_manager:
+            raise RuntimeError(
+                "GPU-resident MoE quantization rejects CpuMasterLayerManager."
+            )
         with nvtx.nvtx_range("layer.materialize"):
             if use_manager:
                 layer = layer_manager.materialize_layer(layer_idx)
+            elif moe_gpu_resident:
+                _assert_module_cuda(
+                    layer,
+                    dev,
+                    label=f"layer[{layer_idx}]",
+                )
+                _assert_layer_inputs_cuda(state, dev)
             else:
                 layer.to(dev)
         saliency_for_layer = static.saliency[layer_idx]
@@ -417,6 +606,12 @@ def quantize_one_layer(
             with nvtx.nvtx_range("layer.next_fp_replay"):
                 if use_manager:
                     next_layer = layer_manager.materialize_layer(layer_idx + 1)
+                elif moe_gpu_resident:
+                    _assert_module_cuda(
+                        next_layer,
+                        dev,
+                        label=f"layer[{layer_idx + 1}]",
+                    )
                 else:
                     next_layer.to(dev)
                 # bsz=1: match old GPTQ+ ``slide_fp_inps_next`` per-sample loop
@@ -476,49 +671,60 @@ def quantize_one_layer(
                     layer_manager.materialize_runtime_modules(
                         [analyzer.get_layernorm_before_head(), analyzer.get_lm_head()]
                     )
+                elif moe_gpu_resident:
+                    _assert_module_cuda(
+                        analyzer.get_layernorm_before_head(),
+                        dev,
+                        label="final_norm",
+                    )
+                    _assert_module_cuda(
+                        analyzer.get_lm_head(),
+                        dev,
+                        label="lm_head",
+                    )
                 else:
                     analyzer.get_layernorm_before_head().to(dev)
                     analyzer.get_lm_head().to(dev)
-
-        block_state = None
-        next_block_state = None
-        if block_gd_enabled:
-            if block_refresh_states is None:
-                block_refresh_states = {}
-            current_named_modules = _all_quantizable_modules(layer)
-            block_state = block_refresh_states.get(layer_idx)
-            if block_state is None:
-                block_state = BlockRefreshState(
-                    layer, current_named_modules
-                )
-                block_refresh_states[layer_idx] = block_state
-            else:
-                block_state.rebind(layer, current_named_modules)
-            if cfg.loss_slide_window and next_layer is not None:
-                next_named_modules = _all_quantizable_modules(next_layer)
-                next_block_state = block_refresh_states.get(layer_idx + 1)
-                if next_block_state is None:
-                    next_block_state = BlockRefreshState(
-                        next_layer, next_named_modules
-                    )
-                    block_refresh_states[layer_idx + 1] = next_block_state
-                else:
-                    next_block_state.rebind(
-                        next_layer, next_named_modules
-                    )
 
         # Slide α schedule: at the FIRST refresh in the layer α=1, at the LAST
         # α=0. Total refreshes in the layer = sum over modules of
         # (cols/blocksize - 1).
         slide_total_refreshes = 0
         if cfg.loss_slide_window and next_layer is not None:
-            for grp in module_groups.GROUP_ORDER:
+            for grp in active_group_order:
                 mods = module_groups.get_group_modules(layer, grp)
                 for _, mod in mods.items():
                     cols = mod.weight.shape[1]
                     n_blocks = (cols + cfg.blocksize - 1) // cfg.blocksize
                     slide_total_refreshes += max(n_blocks - 1, 0)
+            if sparse_moe_layer and cfg.moe_expert_loss_slide_window:
+                # Joint expert orchestration advances once per projection
+                # column boundary, not once per expert. Experts within one
+                # projection share shape, so expert 0 is the canonical count.
+                for projection in model_adapter.EXPERT_PROJECTION_ORDER:
+                    module = model_adapter.resolve_linear(
+                        layer,
+                        model_adapter.expert_projection_path(0, projection),
+                    )
+                    cols = module.weight.shape[1]
+                    n_blocks = (
+                        cols + cfg.blocksize - 1
+                    ) // cfg.blocksize
+                    slide_total_refreshes += max(n_blocks - 1, 0)
         slide_cursor = {"n": 0}  # advances by 1 per refresh CALL across all modules
+
+        def _alpha_advance(
+            _cursor=slide_cursor,
+            _total=slide_total_refreshes,
+        ):
+            n = _cursor["n"]
+            alpha = (
+                1.0 - n / max(_total - 1, 1)
+                if _total > 1
+                else 1.0
+            )
+            _cursor["n"] = n + 1
+            return alpha
 
         if block_gd_enabled:
             # functional_call inside the refresh closure carries the override
@@ -582,7 +788,7 @@ def quantize_one_layer(
                     fp32_cache=cfg.fisher_fp32_cache,
                 )
 
-        for grp in module_groups.GROUP_ORDER:
+        for grp in active_group_order:
             with nvtx.nvtx_range(f"group_{grp}"):
                 modules = module_groups.get_group_modules(layer, grp)
                 # Build one RealQLayer per module in this group, sharing the layer's
@@ -636,22 +842,10 @@ def quantize_one_layer(
                                         cfg.log_column_block_loss
                                     ),
                                 )
-                                # slide_alpha closure: returns CURRENT α and advances the
-                                # layer-shared cumulative refresh cursor. Must be called
-                                # exactly once per refresh; tying the cursor advance to the
-                                # alpha read keeps the count honest.
-                                def _alpha_advance(_cursor=slide_cursor, _total=slide_total_refreshes):
-                                    n = _cursor["n"]
-                                    alpha = 1.0 - n / max(_total - 1, 1) if _total > 1 else 1.0
-                                    _cursor["n"] = n + 1
-                                    return alpha
-
                                 if use_kl_refresh:
                                     grad_refresh_fn = make_kl_refresh_fn(
                                         layer=layer,
                                         module=realq.linear,
-                                        module_name=name,
-                                        block_state=block_state,
                                         layer_state=state,
                                         fp_out_for_this_layer=fp_outs,
                                         analyzer=analyzer,
@@ -662,18 +856,11 @@ def quantize_one_layer(
                                     grad_refresh_fn = make_grad_refresh_fn(
                                         layer=layer,
                                         module=realq.linear,
-                                        module_name=name,
-                                        block_state=block_state,
                                         layer_state=state,
                                         fp_out_for_this_layer=fp_outs,
                                         fisher=fisher_dev,
                                         ctx=ctx,
                                         next_layer=next_layer if cfg.loss_slide_window else None,
-                                        next_block_state=(
-                                            next_block_state
-                                            if cfg.loss_slide_window
-                                            else None
-                                        ),
                                         next_fp_out=next_fp_outs if cfg.loss_slide_window else None,
                                         next_fisher=next_fisher_dev,
                                         slide_alpha_fn=(
@@ -684,11 +871,6 @@ def quantize_one_layer(
                                         a_loss_ratio=cfg.a_loss_ratio,
                                         a_loss_clip_scope=cfg.a_loss_clip_scope,
                                     )
-                        initial_weight_fp32 = (
-                            block_state.begin_quantization(name)
-                            if block_state is not None
-                            else None
-                        )
                         with nvtx.nvtx_range("module.quantize"):
                             realq.quantize(
                                 blocksize=cfg.blocksize,
@@ -696,7 +878,6 @@ def quantize_one_layer(
                                 act_order=cfg.act_order,
                                 w_clip=cfg.w_clip,
                                 grad_refresh_fn=grad_refresh_fn,
-                                initial_weight_fp32=initial_weight_fp32,
                                 group_parallel_quant=cfg.group_parallel_quant,
                                 quantizer_inner_fastpath=(
                                     cfg.quantizer_inner_fastpath
@@ -711,18 +892,90 @@ def quantize_one_layer(
                                     cfg.triton_column_block
                                 ),
                             )
-                        if block_state is not None:
-                            block_state.finish_quantization(name)
                         realq.free()
                 del realqs
+
+        if sparse_moe_layer:
+            # The attention groups above deliberately execute the inherited
+            # dense path.  Drop their last closure/Adam references before the
+            # long expert loop so the MoE peak reflects one expert projection,
+            # not a stale o_proj optimizer state.
+            grad_refresh_fn = None
+            ctx = None
+            realq = None
+
+            # Dense legacy/serial reference releases the next-layer staging
+            # before its long expert loop.  The accepted MoE runtime instead
+            # keeps the complete model, next layer, Fisher and FP target on
+            # CUDA; the joint stepper consumes these resident objects once it
+            # is wired into moe_layer_loop.
+            if next_layer is not None and not moe_gpu_resident:
+                if use_manager:
+                    layer_manager.release_layer(
+                        layer_idx + 1,
+                        next_layer,
+                        orig_device=torch.device("cpu"),
+                    )
+                else:
+                    next_layer.cpu()
+                next_layer = None
+                next_fisher_dev = None
+                next_fp_outs = None
+                mem_utils.cleanup_memory()
+
+            from realq_moe.runner.moe_layer_loop import (
+                quantize_sparse_experts,
+            )
+
+            expert_slide_enabled = (
+                block_gd_enabled
+                and cfg.loss_slide_window
+                and cfg.moe_expert_loss_slide_window
+                and next_layer is not None
+            )
+            quantize_sparse_experts(
+                cfg=cfg,
+                layer_idx=layer_idx,
+                layer=layer,
+                static=static,
+                state=state,
+                fp_outs=fp_outs,
+                fisher=fisher_dev,
+                layer_lr=layer_lr,
+                grad_clip=effective_grad_clip,
+                refresh_bsz_local=refresh_bsz_local,
+                sample_scheduler=sample_scheduler,
+                block_gd_enabled=block_gd_enabled,
+                use_kl_refresh=use_kl_refresh,
+                analyzer=analyzer,
+                trace_writer=trace_writer,
+                dev=dev,
+                next_layer=(
+                    next_layer
+                    if expert_slide_enabled
+                    else None
+                ),
+                next_fp_outs=(
+                    next_fp_outs
+                    if expert_slide_enabled
+                    else None
+                ),
+                next_fisher=(
+                    next_fisher_dev
+                    if expert_slide_enabled
+                    else None
+                ),
+                slide_alpha_fn=(
+                    _alpha_advance
+                    if expert_slide_enabled
+                    else None
+                ),
+            )
 
         if block_gd_enabled:
             for p in layer.parameters():
                 p.requires_grad_(False)
                 p.grad = None
-            block_state.assert_complete()
-            block_state.release()
-            block_refresh_states.pop(layer_idx, None)
         if cfg.fisher_fp32_cache:
             # The final loop locals otherwise retain the last refresh closure,
             # which in turn retains both FP32 Fisher matrices through the
@@ -743,60 +996,136 @@ def quantize_one_layer(
         with nvtx.nvtx_range("layer.final_replay"):
             new_inps = streams.replay_layer(layer, state, bsz=1)
         with nvtx.nvtx_range("layer.teardown"):
-            if use_manager:
-                layer_manager.release_layer(layer_idx, layer, orig_device=torch.device("cpu"))
+            if moe_gpu_resident:
+                _assert_module_cuda(
+                    layer,
+                    dev,
+                    label=f"layer[{layer_idx}]",
+                )
+                if next_layer is not None:
+                    _assert_module_cuda(
+                        next_layer,
+                        dev,
+                        label=f"layer[{layer_idx + 1}]",
+                    )
+                if use_kl_refresh:
+                    _assert_module_cuda(
+                        analyzer.get_layernorm_before_head(),
+                        dev,
+                        label="final_norm",
+                    )
+                    _assert_module_cuda(
+                        analyzer.get_lm_head(),
+                        dev,
+                        label="lm_head",
+                    )
             else:
-                layer.cpu()
-            if next_layer is not None and cfg.loss_slide_window:
-                # Free the next-layer GPU copy; it'll be re-streamed when its turn
-                # comes (and quantised at that point — the FP forward we did up
-                # there was on un-mutated weights).
                 if use_manager:
                     layer_manager.release_layer(
-                        layer_idx + 1, next_layer, orig_device=torch.device("cpu"),
+                        layer_idx,
+                        layer,
+                        orig_device=torch.device("cpu"),
                     )
                 else:
-                    next_layer.cpu()
-            if use_kl_refresh:
-                if use_manager:
-                    layer_manager.release_runtime_modules(
-                        [analyzer.get_layernorm_before_head(), analyzer.get_lm_head()],
-                        torch.device("cpu"),
-                    )
-                else:
-                    analyzer.get_layernorm_before_head().cpu()
-                    analyzer.get_lm_head().cpu()
-            mem_utils.cleanup_memory()
-        return streams.LayerInputs(
+                    layer.cpu()
+                if next_layer is not None and cfg.loss_slide_window:
+                    # Dense legacy re-streams this layer when its turn comes.
+                    if use_manager:
+                        layer_manager.release_layer(
+                            layer_idx + 1,
+                            next_layer,
+                            orig_device=torch.device("cpu"),
+                        )
+                    else:
+                        next_layer.cpu()
+                if use_kl_refresh:
+                    if use_manager:
+                        layer_manager.release_runtime_modules(
+                            [
+                                analyzer.get_layernorm_before_head(),
+                                analyzer.get_lm_head(),
+                            ],
+                            torch.device("cpu"),
+                        )
+                    else:
+                        analyzer.get_layernorm_before_head().cpu()
+                        analyzer.get_lm_head().cpu()
+                mem_utils.cleanup_memory()
+        next_state = streams.LayerInputs(
             inps=new_inps,
             fp_inps=fp_outs,
             attention_mask=state.attention_mask,
             position_ids=state.position_ids,
             position_embeddings=state.position_embeddings,
         )
+        if moe_gpu_resident:
+            _assert_layer_inputs_cuda(next_state, dev)
+        return next_state
 
 
 def quantize_all_layers(
     cfg: "Config",
     analyzer: "ModelAnalyzer",
     static: "StaticStats",
-    trainloader: list[torch.Tensor],
+    trainloader: list[torch.Tensor] | torch.Tensor,
 ) -> None:
     """Drive the full layer-by-layer GPTQ loop. Mutates the model in place."""
     rank = parallel_env.get_rank()
     world = parallel_env.get_world_size()
     dev = torch.device(f"cuda:{torch.cuda.current_device()}")
 
-    sl = dist_utils.shard_slice(len(trainloader), rank=rank, world=world)
-    rank_samples = [trainloader[i] for i in range(sl.start, sl.stop)]
-
     layers = analyzer.get_layers()
-    # Build the cpu_master layer manager. enabled=False ⇒ falls through to
-    # plain .to(dev)/.cpu() so the legacy fsdp=True path is unaffected.
-    layer_manager = CpuMasterLayerManager(analyzer, dev, layers)
+    sparse_moe = any(
+        model_adapter.is_sparse_moe_layer(layer) for layer in layers
+    )
+    cfg.validate_moe_runtime_contract(sparse_moe=sparse_moe)
+    gpu_resident_moe = sparse_moe and cfg.moe_gpu_resident
+    if gpu_resident_moe and world != 1:
+        raise ValueError(
+            "The first joint/GPU-resident Qwen3-MoE runner requires "
+            "world_size=1."
+        )
+    if gpu_resident_moe:
+        for family_name in ("saliency", "fisher", "routes"):
+            tensor_count = _assert_tensor_tree_cuda(
+                getattr(static, family_name),
+                dev,
+                label=f"static.{family_name}",
+            )
+            if tensor_count == 0:
+                raise RuntimeError(
+                    f"GPU-resident Stage-0 produced no {family_name} tensors."
+                )
+
+    sl = dist_utils.shard_slice(len(trainloader), rank=rank, world=world)
+    if gpu_resident_moe:
+        if torch.is_tensor(trainloader):
+            rank_samples = trainloader[sl].reshape(sl.stop - sl.start, -1)
+        else:
+            rank_samples = torch.stack(
+                [
+                    trainloader[i].reshape(-1)
+                    for i in range(sl.start, sl.stop)
+                ],
+                dim=0,
+            )
+        # capture_layer0_inputs performs the sole rank-local H2D upload and
+        # slices that CUDA tensor without a per-sample transfer.
+        _assert_module_cuda(analyzer.model, dev, label="analyzer.model")
+        layer_manager = None
+    else:
+        rank_samples = [
+            trainloader[i] for i in range(sl.start, sl.stop)
+        ]
+        # Dense legacy keeps the copied cpu-master/.to(dev)/.cpu() lifecycle.
+        layer_manager = CpuMasterLayerManager(analyzer, dev, layers)
 
     state = streams.capture_layer0_inputs(
-        analyzer, rank_samples, dev, layer_manager=layer_manager,
+        analyzer,
+        rank_samples,
+        dev,
+        layer_manager=layer_manager,
+        gpu_resident=gpu_resident_moe,
     )
 
     # capture may have refreshed layers[0] (Catcher unwrap + manager release),
@@ -814,7 +1143,6 @@ def quantize_all_layers(
                 "global_loss": True,
                 "grad_refresh_loss": "fisher_diag_mse",
                 "g_update_mode": "block_gd",
-                "weight_update_scope": "full_transformer_block",
                 "grad_optimizer": "adam",
                 "final_layer_grad_optimizer": "adam",
                 "analytical_first_order_enabled": False,
@@ -855,11 +1183,10 @@ def quantize_all_layers(
 
     trace_writer = RefreshTraceWriter(
         cfg.alignment_trace_path,
-        implementation="realq",
+        implementation="realq_moe",
         run_id=cfg.alignment_run_id,
         config=alignment_trace_config,
     )
-    block_refresh_states: dict[int, BlockRefreshState] = {}
     try:
         for layer_idx in tqdm(
             range(n_layers),
@@ -900,7 +1227,11 @@ def quantize_all_layers(
                         analyzer=analyzer,
                         layer_manager=layer_manager,
                         trace_writer=trace_writer,
-                        block_refresh_states=block_refresh_states,
+                    ),
+                    teacher_route_coverage=(
+                        static.expert_global_coverage[layer_idx]
+                        if static.expert_global_coverage
+                        else None
                     ),
                 )
             else:
@@ -914,12 +1245,12 @@ def quantize_all_layers(
                     analyzer=analyzer,
                     layer_manager=layer_manager,
                     trace_writer=trace_writer,
-                    block_refresh_states=block_refresh_states,
+                )
+            if gpu_resident_moe:
+                _release_consumed_moe_static_layer(
+                    static, layer_idx, dev
                 )
     finally:
-        for pending_state in block_refresh_states.values():
-            pending_state.release()
-        block_refresh_states.clear()
         trace_writer.close()
     if cfg.quant_stop_layer is not None:
         logging.info(

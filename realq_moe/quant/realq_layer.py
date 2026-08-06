@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn as nn
 
-from realq.quant.hessian import (
+from realq_moe.quant.hessian import (
     cholesky_inverse_batched_with_damp,
     cholesky_inverse_with_damp,
 )
@@ -31,7 +31,7 @@ from realq.quant.triton_column_block import (
     prepared_scale_matrix,
     quantize_column_block,
 )
-from realq.utils import nvtx
+from realq_moe.utils import nvtx
 from utils import dist_utils
 
 LOSS_GRAD_SCALE = 1000.0  # must match precompute.static_e2e.LOSS_GRAD_SCALE.
@@ -86,8 +86,9 @@ class RealQLayer:
                 f"out_features ({self.rows}) must be divisible by num_groups ({num_groups})."
             )
         self.rows_per_group = self.rows // num_groups
-        # Saliency stays on CPU; sliced + moved to GPU in add_batch on demand.
-        self.saliency_cpu = saliency.float()
+        # The speed-first MoE runtime keeps Stage-0 statistics on their CUDA
+        # device.  ``.float()`` changes only dtype when already resident.
+        self.saliency = saliency.float()
         self.quantizer = quantizer
         # Rank shard setup. Mirrors gptq_plus's `hessian_group_shard` path:
         # under group_parallel_quant="rank" with NUM_GROUPS>1 each rank owns a
@@ -177,7 +178,7 @@ class RealQLayer:
                 (), device=dev, dtype=self.H.dtype,
             ).expand(self.columns, self.columns)
         self.act_square = torch.zeros((self.columns,), device=dev)
-        self.index = 0          # local sample cursor into saliency_cpu
+        self.index = 0          # local sample cursor into saliency
         self.token_count = 0    # local token count (sum of B*T per add_batch)
         self._finalized = False
 
@@ -220,7 +221,7 @@ class RealQLayer:
         """Accumulate one batch of inputs into the per-rank Hessian.
 
         ``inp`` shape: ``(B, T, in_features)`` or ``(B*T, in_features)``.
-        Saliency is sliced from ``saliency_cpu[index:index+B]`` so callers must
+        Saliency is sliced from ``saliency[index:index+B]`` so callers must
         feed batches in the same order they were laid down during precompute.
         """
         if self._finalized:
@@ -229,7 +230,7 @@ class RealQLayer:
             inp = inp.unsqueeze(0)
         assert inp.dim() == 3, f"expected 2/3D input, got {inp.dim()}"
         B = inp.shape[0]
-        sal = self.saliency_cpu[self.index : self.index + B].to(self.dev)
+        sal = self.saliency[self.index : self.index + B].to(self.dev)
         self.index += B
         # Match old code's sink-strip path: if saliency was clipped (sink
         # tokens dropped), trim the activation prefix to align T. Sub-task 3
@@ -307,7 +308,6 @@ class RealQLayer:
         act_order: bool = False,
         w_clip: bool = False,
         grad_refresh_fn=None,
-        initial_weight_fp32: torch.Tensor | None = None,
         group_parallel_quant: str = "none",
         quantizer_inner_fastpath: bool = False,
         act_order_stitch_impl: str = "full_weight_legacy",
@@ -324,16 +324,7 @@ class RealQLayer:
         :func:`realq.runner.layer_loop._make_quantizer`); the flag is here only
         to refuse misuse when the quantizer wasn't configured for it.
 
-        ``grad_refresh_fn``: see ``realq.refresh.block_gd`` docstring. Factory
-        closures declare ``_realq_update_layout`` as either
-        ``"full_natural"`` (full-block REAL-Q) or
-        ``"trailing_quant_order"`` (legacy public callback); unmarked custom
-        callbacks retain the legacy trailing contract.
-
-        ``initial_weight_fp32``: FP32 master accumulated while this linear was
-        still a future unquantized weight in full-block Block-GD. Ownership is
-        transferred to this method and the tensor becomes the GPTQ working
-        weight.
+        ``grad_refresh_fn``: see ``realq.refresh.block_gd`` docstring.
 
         ``group_parallel_quant``: ``"rank"`` shards the per-row find_params
         + per-row inner block update across DP ranks, with an all-gather at
@@ -387,25 +378,6 @@ class RealQLayer:
             )
         if type(triton_column_block) is not bool:
             raise ValueError("triton_column_block must be bool.")
-        refresh_update_layout = (
-            getattr(
-                grad_refresh_fn,
-                "_realq_update_layout",
-                "trailing_quant_order",
-            )
-            if grad_refresh_fn is not None
-            else None
-        )
-        if refresh_update_layout not in (
-            None,
-            "trailing_quant_order",
-            "full_natural",
-        ):
-            raise ValueError(
-                "unknown grad refresh update layout "
-                f"{refresh_update_layout!r}."
-            )
-        full_refresh_update = refresh_update_layout == "full_natural"
 
         self.quantizer_inner_fastpath_audit = {
             "requested": quantizer_inner_fastpath,
@@ -448,7 +420,7 @@ class RealQLayer:
             ] += 1
             if not inner_fastpath_fallback_logged:
                 logging.warning(
-                    "[realq] P01 unavailable; using legacy column path: %s",
+                    "[realq_moe] P01 unavailable; using legacy column path: %s",
                     key,
                 )
                 inner_fastpath_fallback_logged = True
@@ -477,28 +449,7 @@ class RealQLayer:
                 "rank mode + NUM_GROUPS>1 requires hessian_group_sharded=True; "
                 "pass group_parallel_quant='rank' to RealQLayer.__init__."
             )
-        if initial_weight_fp32 is None:
-            W = self.linear.weight.data.clone().float()
-        else:
-            if tuple(initial_weight_fp32.shape) != (
-                self.rows,
-                self.columns,
-            ):
-                raise ValueError(
-                    "initial_weight_fp32 shape mismatch: expected "
-                    f"{(self.rows, self.columns)}, got "
-                    f"{tuple(initial_weight_fp32.shape)}"
-                )
-            if (
-                initial_weight_fp32.dtype != torch.float32
-                or initial_weight_fp32.device != self.dev
-            ):
-                raise ValueError(
-                    "initial_weight_fp32 must be FP32 on the quantization "
-                    f"device {self.dev}; got dtype={initial_weight_fp32.dtype} "
-                    f"device={initial_weight_fp32.device}"
-                )
-            W = initial_weight_fp32
+        W = self.linear.weight.data.clone().float()
         dynamic_weight_groups = (
             self.quantizer.weight_groupsize > 0 and not act_order
         )
@@ -532,7 +483,7 @@ class RealQLayer:
             world = dist_utils.get_world_size()
             rank = dist_utils.get_rank()
             if rank_mode:
-                from realq.parallel.group_quant import row_slice_for_rank
+                from realq_moe.parallel.group_quant import row_slice_for_rank
                 row_sl = row_slice_for_rank(rank, world, self.rows)
             else:
                 row_sl = slice(0, self.rows)
@@ -743,8 +694,6 @@ class RealQLayer:
                                 w = W1_local[:, i]
                                 d = Hinv1[i, i]
                                 w_col = w.unsqueeze(1)
-                                # Slice scale/zero to local rows so
-                                # fake_quantize sees only the rows we own.
                                 if inner_fastpath is None:
                                     q_fake, _, _ = (
                                         block_quantizer.fake_quantize(
@@ -830,12 +779,7 @@ class RealQLayer:
                                 stitched_fp32[:, i2:] = W_trailing
                                 update = grad_refresh_fn(stitched_fp32, i2)
                                 if update is not None:
-                                    update_local = (
-                                        update[row_sl, i2:]
-                                        if full_refresh_update
-                                        else update[row_sl]
-                                    )
-                                    W_local[:, i2:].sub_(update_local)
+                                    W_local[:, i2:].sub_(update[row_sl])
                             else:
                                 # act_order: the autograd forward sees a
                                 # NATURAL-order weight (columns in original
@@ -877,17 +821,11 @@ class RealQLayer:
                                 quant_nat_cols = perm[:i2]
                                 stitched_nat = W_nat.clone()
                                 stitched_nat[:, quant_nat_cols] = Q_nat[:, quant_nat_cols]
-                                # Persistent Adam state stays in NATURAL
-                                # coordinates. The closure returns a full
-                                # natural-order update with zeros in locked
-                                # columns; permute once for the working suffix.
-                                full_update = (
-                                    grad_refresh_fn(
-                                        stitched_nat, i2, perm=perm
-                                    )
-                                    if full_refresh_update
-                                    else grad_refresh_fn(stitched_nat, 0)
-                                )
+                                # Closure operates in NATURAL coord (i.e.
+                                # trailing_col_start=0 means update covers ALL
+                                # natural columns). We then permute back to
+                                # PERMUTED, slice trailing, apply to W_local.
+                                full_update = grad_refresh_fn(stitched_nat, 0)
                                 if full_update is not None:
                                     update_permuted = full_update[:, perm]
                                     W_local[:, i2:].sub_(update_permuted[row_sl, i2:])
@@ -1083,12 +1021,7 @@ class RealQLayer:
                                 stitched_fp32[:, i2:] = W_trailing
                                 update = grad_refresh_fn(stitched_fp32, i2)
                                 if update is not None:
-                                    update_local = (
-                                        update[row_sl, i2:]
-                                        if full_refresh_update
-                                        else update[row_sl]
-                                    )
-                                    W_local_2d[:, i2:].sub_(update_local)
+                                    W_local_2d[:, i2:].sub_(update[row_sl])
                             else:
                                 # act_order path: closure expects NATURAL-order
                                 # weight covering all columns. The exact
@@ -1121,14 +1054,7 @@ class RealQLayer:
                                 # rationale; mirrors old GPTQPlus permuted-state Adam).
                                 update = grad_refresh_fn(stitched_nat, i2, perm=perm)
                                 if update is not None:
-                                    if full_refresh_update:
-                                        update_permuted = update[:, perm]
-                                        update_local = update_permuted[
-                                            row_sl, i2:
-                                        ]
-                                    else:
-                                        update_local = update[row_sl]
-                                    W_local_2d[:, i2:].sub_(update_local)
+                                    W_local_2d[:, i2:].sub_(update[row_sl])
 
             # All-gather final Q_local_2d into the (rows, columns) Q replica
             # so the module.weight write below sees the same Q on every rank.
@@ -1240,12 +1166,7 @@ class RealQLayer:
                                 stitched_fp32[:, :i2] = Q[:, :i2]
                                 update = grad_refresh_fn(stitched_fp32, i2)
                                 if update is not None:
-                                    update_trailing = (
-                                        update[:, i2:]
-                                        if full_refresh_update
-                                        else update
-                                    )
-                                    W[:, i2:].sub_(update_trailing)
+                                    W[:, i2:].sub_(update)
                             else:
                                 Q_nat = Q[:, invperm]
                                 W_nat = W[:, invperm]
@@ -1256,12 +1177,7 @@ class RealQLayer:
                                 # coord (see block_gd.py rationale).
                                 update = grad_refresh_fn(stitched_nat, i2, perm=perm)
                                 if update is not None:
-                                    update_trailing = (
-                                        update[:, perm][:, i2:]
-                                        if full_refresh_update
-                                        else update
-                                    )
-                                    W[:, i2:].sub_(update_trailing)
+                                    W[:, i2:].sub_(update)
 
         if invperm is not None:
             with nvtx.nvtx_range("quant.invperm"):
@@ -1273,4 +1189,4 @@ class RealQLayer:
         """Release GPU buffers; call once a layer is fully quantised."""
         self.H = None
         self.act_square = None
-        self.saliency_cpu = None
+        self.saliency = None

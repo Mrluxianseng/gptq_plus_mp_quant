@@ -198,7 +198,7 @@ class Config:
     allow_unsafe_legacy_checkpoint: bool = False
     save_qmodel_path: Optional[str] = None
     output_dir: str = "./output"
-    exp: str = "realq"
+    exp: str = "realq_moe"
 
     # ----- derived (auto-filled by __post_init__) -------------------------
     model_name: str = ""
@@ -209,10 +209,9 @@ class Config:
     # The final block has no trailing weights and hence no backward objective.
     log_column_block_loss: bool = False
 
-    # Performance knobs are appended after the pre-existing dataclass fields
-    # so positional Config construction keeps its ABI. P01--P06/P10 use their
-    # optimized implementations by default; every legacy implementation
-    # remains selectable for rollback.
+    # Inherited performance knobs now default to the optimized single-GPU
+    # implementations. MoE-specialized kernels may consume them directly or
+    # supersede their inner-loop work with the joint Triton path.
     # Prevalidate WeightQuantizer state and grouped natural-column coordinates
     # once per GPTQ block, then use the private exact-arithmetic primitive.
     quantizer_inner_fastpath: bool = True
@@ -249,52 +248,13 @@ class Config:
     # to make base and instruct checkpoints consume the identical saved token
     # tensor even though their derived ``model_name`` values differ.
     tokens_cache_file: Optional[str] = None
-    # P10: evaluate the invariant tensor lower clamp bound once per prepared
-    # P01 block rather than once per quantized column.
     prepared_clamp_bound_cache: bool = True
-    # Fuse the sequential quantize + in-block GPTQ compensation loop into one
-    # autotuned Triton program. The cross-block Err@Hinv compensation remains
-    # a separate one-shot GEMM/BMM.
     triton_column_block: bool = True
 
-    # ----- generation-based inference evaluation -------------------------
-    reasoning_eval: bool = False
-    reasoning_tasks: list[str] = field(
-        default_factory=lambda: [
-            "gsm8k",
-            "math_500",
-            "humaneval_plus",
-            "livecodebench_lite",
-        ]
-    )
-    reasoning_data_dir: str = "./datasets/reasoning_eval"
-    reasoning_output_dir: Optional[str] = None
-    reasoning_batch_size: int = 1
-    reasoning_limit: int = -1
-    reasoning_max_new_tokens: int = 4096
-    reasoning_num_samples: int = 1
-    reasoning_apply_chat_template: bool = True
-    reasoning_enable_thinking: bool = True
-    reasoning_do_sample: bool = True
-    reasoning_temperature: float = 0.6
-    reasoning_top_p: float = 0.95
-    reasoning_top_k: int = 20
-    reasoning_seed: int = 1234
-    reasoning_resume: bool = True
-    reasoning_protocol: str = "realq_zero_shot_v1"
-    reasoning_system_prompt: str = (
-        "You are a careful reasoning assistant. Follow the requested output "
-        "format exactly."
-    )
-    reasoning_lcb_release: str = "release_v6"
-    reasoning_lcb_source_dir: str = (
-        "./datasets/reasoning_eval/vendor/LiveCodeBench"
-    )
-    # Allows generation evaluation without first materializing WikiText KL/PPL
-    # references. ``skip_eval`` still disables every evaluator.
-    skip_kl_ppl_eval: bool = False
-
     # ----- Qwen3-MoE policy / lifecycle ----------------------------------
+    # Appended after every inherited REAL-Q field so dense Config positional
+    # construction keeps the copied ABI.  These controls are architecture
+    # specific; none enables a general dense-kernel optimisation.
     moe_route_pack_impl: str = "stable_csr_reference"
     moe_expert_chunk_assignments: int = 4096
     moe_min_expert_assignments: int = 1
@@ -302,9 +262,21 @@ class Config:
     moe_min_expert_unique_samples: int = 1
     moe_fail_on_teacher_cold: bool = True
     moe_fail_on_student_cold: bool = True
+    # A globally unassigned expert has no routed statistic from which to
+    # construct a Hessian.  The accepted deterministic fallback is direct
+    # grouped RTN; positive-but-insufficient coverage still fails closed.
     moe_zero_route_fallback: str = "rtn"
+    # Accepted speed-first runtime contract for the all-sparse Qwen3-MoE
+    # target.  Dense analyzers ignore these MoE-only controls and retain the
+    # copied REAL-Q lifecycle.
     moe_gpu_resident: bool = True
+    # Freeze the orchestration target even while the joint projection stepper
+    # is developed behind the isolated MoE runner.  A false value must never
+    # silently select the serial contribution path in a formal MoE run.
     moe_joint_column_block: bool = True
+    # The joint projection stepper amortizes next-layer replay across all
+    # experts at one shared column boundary, so expert full-slide is the
+    # accepted primary arm rather than a serial per-expert replay.
     moe_expert_loss_slide_window: bool = True
 
     def __post_init__(self) -> None:
@@ -327,37 +299,6 @@ class Config:
                 "`require_reference_cache_hit` must be bool. Got "
                 f"{self.require_reference_cache_hit!r}."
             )
-        if not self.reasoning_tasks:
-            raise ValueError("`reasoning_tasks` must not be empty.")
-        if self.reasoning_batch_size <= 0:
-            raise ValueError("`reasoning_batch_size` must be positive.")
-        if self.reasoning_limit == 0 or self.reasoning_limit < -1:
-            raise ValueError(
-                "`reasoning_limit` must be -1 or a positive integer."
-            )
-        if self.reasoning_max_new_tokens <= 0:
-            raise ValueError("`reasoning_max_new_tokens` must be positive.")
-        if self.reasoning_num_samples <= 0:
-            raise ValueError("`reasoning_num_samples` must be positive.")
-        if self.reasoning_protocol != "realq_zero_shot_v1":
-            raise ValueError(
-                "`reasoning_protocol` must be 'realq_zero_shot_v1'."
-            )
-        if self.reasoning_do_sample and self.reasoning_temperature <= 0:
-            raise ValueError(
-                "`reasoning_temperature` must be positive when sampling."
-            )
-        if not 0.0 < self.reasoning_top_p <= 1.0:
-            raise ValueError("`reasoning_top_p` must be in (0, 1].")
-        if self.reasoning_top_k < 0:
-            raise ValueError("`reasoning_top_k` must be non-negative.")
-        if self.reasoning_lcb_release == "release_latest":
-            raise ValueError(
-                "`reasoning_lcb_release=release_latest` is not reproducible; "
-                "pin an explicit LiveCodeBench release."
-            )
-        if type(self.skip_kl_ppl_eval) is not bool:
-            raise ValueError("`skip_kl_ppl_eval` must be bool.")
         if not (0.0 < self.a_loss_ratio <= 1.0):
             raise ValueError(
                 f"`a_loss_ratio` must be in (0, 1]. Got {self.a_loss_ratio}."
@@ -395,27 +336,16 @@ class Config:
                     "`w_asym=True` is unsupported: REAL-Q's weight fake-quant "
                     "path does not preserve asymmetric zero-points."
                 )
-            if self.w_groupsize != -1:
-                if self.blocksize % self.w_groupsize != 0:
-                    raise ValueError(
-                        "`blocksize` must be an integer multiple of "
-                        "`w_groupsize` for grouped weight quantization. "
-                        f"Got w_groupsize={self.w_groupsize}, "
-                        f"blocksize={self.blocksize}."
-                    )
-                if (
-                    not self.act_order
-                    and self.w_groupsize != self.blocksize
-                ):
-                    raise ValueError(
-                        "`w_groupsize != blocksize` is supported only with "
-                        "`act_order=True`, where natural-column group "
-                        "parameters are observed statically before the "
-                        "permutation. Dynamic non-act-order groups still "
-                        "require equality to preserve legacy observer timing. "
-                        f"Got w_groupsize={self.w_groupsize}, "
-                        f"blocksize={self.blocksize}."
-                    )
+            if (
+                self.w_groupsize != -1
+                and self.w_groupsize != self.blocksize
+            ):
+                raise ValueError(
+                    "`w_groupsize` must be -1 or equal to `blocksize`, "
+                    "matching legacy GPTQ+ dynamic/static group semantics. "
+                    f"Got w_groupsize={self.w_groupsize}, "
+                    f"blocksize={self.blocksize}."
+                )
         if self.w_clip_search_impl not in (
             "cartesian_legacy",
             "symmetric_union_exact",
@@ -554,17 +484,19 @@ class Config:
         if not self.moe_gpu_resident:
             raise ValueError(
                 "The accepted Qwen3-MoE policy requires "
-                "`moe_gpu_resident=True`."
+                "`moe_gpu_resident=True`; CPU/offload execution is an oracle "
+                "only, not a formal runtime."
             )
         if not self.moe_joint_column_block:
             raise ValueError(
                 "The accepted Qwen3-MoE policy requires "
-                "`moe_joint_column_block=True`."
+                "`moe_joint_column_block=True`; serial expert refresh is an "
+                "oracle only."
             )
         if not self.moe_expert_loss_slide_window:
             raise ValueError(
-                "The accepted Qwen3-MoE joint policy requires "
-                "`moe_expert_loss_slide_window=True`."
+                "The accepted Qwen3-MoE joint policy requires full-slide "
+                "expert refresh; set `moe_expert_loss_slide_window=True`."
             )
         if not (0.0 < self.saliency_clip_percentile <= 1.0):
             raise ValueError(
@@ -667,10 +599,24 @@ class Config:
             )
 
     def validate_moe_runtime_contract(self, *, sparse_moe: bool) -> None:
-        """Fail closed on unsupported offload/distributed sparse runtimes."""
+        """Fail closed on host-offload lifecycles for a sparse MoE analyzer.
+
+        Config construction cannot inspect the checkpoint architecture, so
+        dense D0/D1 runs retain the inherited ``cpu_master``/FSDP behavior.
+        Pipeline and runner call this method immediately after discovering an
+        all-sparse analyzer and before any Stage-0/Stage-1 orchestration.
+        """
 
         if not sparse_moe:
             return
+        if not self.moe_gpu_resident:
+            raise ValueError(
+                "Sparse REAL-Q MoE requires `moe_gpu_resident=True`."
+            )
+        if not self.moe_joint_column_block:
+            raise ValueError(
+                "Sparse REAL-Q MoE requires `moe_joint_column_block=True`."
+            )
         if not self.loss_slide_window:
             raise ValueError(
                 "Sparse REAL-Q MoE full-slide refresh requires "
@@ -682,6 +628,9 @@ class Config:
         if self.fsdp_cpu_offload:
             incompatible.append("fsdp_cpu_offload=True")
         if self.fsdp:
+            # The copied FSDP lifecycle always saves after Stage-0 and calls
+            # reload_on_cpu before Stage-1.  Reject it until a genuinely
+            # GPU-resident unshard/quant path exists.
             incompatible.append("fsdp=True (post-Stage-0 reload_on_cpu)")
         if incompatible:
             raise ValueError(
@@ -740,7 +689,7 @@ def _build_parser() -> argparse.ArgumentParser:
             p.add_argument(flag, action="store_true", default=False)
         elif f.type is bool or isinstance(default, bool):
             p.add_argument(flag, type=_str2bool, default=default)
-        elif f.name in {"eval_datasets", "reasoning_tasks"}:
+        elif f.name == "eval_datasets":
             p.add_argument(flag, type=str, nargs="+", default=default)
         elif default is None:
             # Optional[str] / Optional[int]: leave default None, accept str

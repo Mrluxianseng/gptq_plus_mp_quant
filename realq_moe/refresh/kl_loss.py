@@ -14,24 +14,21 @@ from typing import TYPE_CHECKING, Callable
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.func import functional_call
 
-from realq.refresh.block_gd import (
-    BlockRefreshState,
-    _aggregate_block_refresh_sums,
+from realq_moe.refresh.block_gd import (
     _aggregate_loss_sums_for_logging,
     _aggregate_refresh_sums,
-    _apply_block_adam,
     _functional_weight_name,
-    _refresh_batch_kwargs,
 )
-from realq.utils import nvtx
+from realq_moe.utils import nvtx
 from utils import dist_utils
 from utils.loss_utils import tokenwise_kl_from_logits
 
 if TYPE_CHECKING:
-    from realq.refresh.block_gd import RefreshContext
-    from realq.runner.streams import LayerInputs
+    from realq_moe.refresh.block_gd import RefreshContext
+    from realq_moe.runner.streams import LayerInputs
     from utils.model_utils import ModelAnalyzer
 
 
@@ -62,7 +59,7 @@ def kl_topk_loss(
     return tokenwise_kl_from_logits(logits, logits_fp).mean()
 
 
-def _make_single_linear_kl_refresh_fn_legacy(
+def make_kl_refresh_fn(
     *,
     layer: "nn.Module",
     module: "nn.Module",
@@ -100,7 +97,6 @@ def _make_single_linear_kl_refresh_fn_legacy(
         # counter advances uniformly across ranks).
         with nvtx.nvtx_range("kl_refresh.setup"):
             ctx.adam_step += 1
-            ctx.refresh_step += 1
             selected_global = ctx.next_indices()
             rank = dist_utils.get_rank()
             n_local = inps.shape[0]
@@ -221,199 +217,4 @@ def _make_single_linear_kl_refresh_fn_legacy(
             update = step_size * (ea / denom)
             return update
 
-    refresh._realq_update_layout = "trailing_quant_order"
-    return refresh
-
-
-def make_kl_refresh_fn(
-    *,
-    layer: nn.Module,
-    module: nn.Module,
-    module_name: str | None = None,
-    block_state: BlockRefreshState | None = None,
-    layer_state: "LayerInputs",
-    fp_out_for_this_layer: torch.Tensor,
-    analyzer: "ModelAnalyzer",
-    kl_topk: int,
-    ctx: "RefreshContext",
-) -> Callable[..., torch.Tensor]:
-    """Build full-block KL refresh with legacy single-linear compatibility."""
-
-    if module_name is None or block_state is None:
-        if module_name is not None or block_state is not None:
-            raise ValueError(
-                "module_name and block_state must be supplied together."
-            )
-        return _make_single_linear_kl_refresh_fn_legacy(
-            layer=layer,
-            module=module,
-            layer_state=layer_state,
-            fp_out_for_this_layer=fp_out_for_this_layer,
-            analyzer=analyzer,
-            kl_topk=kl_topk,
-            ctx=ctx,
-        )
-
-    inps = layer_state.inps
-    am = layer_state.attention_mask
-    pi = layer_state.position_ids
-    pe = layer_state.position_embeddings
-
-    def refresh(
-        stitched_weight_fp32: torch.Tensor,
-        trailing_col_start: int,
-        perm: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        with nvtx.nvtx_range("kl_refresh.setup"):
-            backward_invocation_id = (
-                ctx.allocate_backward_invocation_id()
-            )
-            selected_global = ctx.next_indices()
-            rank = dist_utils.get_rank()
-            n_local = inps.shape[0]
-            rank_start = rank * n_local
-            rank_end = rank_start + n_local
-            selected = [
-                global_index - rank_start
-                for global_index in selected_global
-                if rank_start <= global_index < rank_end
-            ]
-            overrides, active = block_state.make_overrides(
-                current_name=module_name,
-                current_weight_fp32=stitched_weight_fp32,
-                trailing_col_start=trailing_col_start,
-                perm=perm,
-                trace_scope="current_block",
-            )
-            leaves = [entry.leaf for entry in active]
-            partial_grad_sums = [
-                torch.zeros_like(entry.state.exp_avg)
-                for entry in active
-            ]
-            partial_used = [False] * len(active)
-            partial_count = 0
-            backward_chunk_sizes: list[int] = []
-            partial_loss_sums = (
-                torch.zeros(
-                    1,
-                    dtype=torch.float64,
-                    device=stitched_weight_fp32.device,
-                )
-                if ctx.loss_observation_enabled
-                else None
-            )
-            ctx.refresh_step += 1
-            ctx.adam_step = block_state.expected_next_step(module_name)
-
-        for iter_idx, start in enumerate(
-            range(0, len(selected), ctx.backward_bsz)
-        ):
-            with nvtx.nvtx_range(f"kl_refresh.iter_{iter_idx}"):
-                batch_idx = selected[start : start + ctx.backward_bsz]
-                batch_size = len(batch_idx)
-                backward_chunk_sizes.append(batch_size)
-                sample_idx = torch.tensor(
-                    batch_idx, dtype=torch.long, device=inps.device
-                )
-                x = inps.index_select(0, sample_idx)
-                fp_target_hidden = fp_out_for_this_layer.index_select(
-                    0, sample_idx
-                ).to(x.device)
-                kw = _refresh_batch_kwargs(
-                    batch_size=batch_size,
-                    attention_mask=am,
-                    position_ids=pi,
-                    position_embeddings=pe,
-                )
-                with torch.enable_grad():
-                    with nvtx.nvtx_range("kl_refresh.forward"):
-                        out = functional_call(
-                            layer,
-                            overrides,
-                            (x,),
-                            kw,
-                            strict=False,
-                        )
-                        q_hidden = (
-                            out[0] if isinstance(out, tuple) else out
-                        )
-                    with nvtx.nvtx_range("kl_refresh.loss"):
-                        loss = kl_topk_loss(
-                            q_hidden,
-                            fp_target_hidden,
-                            analyzer,
-                            kl_topk,
-                        )
-                    with nvtx.nvtx_range("kl_refresh.backward"):
-                        batch_grads = torch.autograd.grad(
-                            loss,
-                            leaves,
-                            retain_graph=False,
-                            allow_unused=True,
-                        )
-                with nvtx.nvtx_range("kl_refresh.accumulate"):
-                    for index, batch_grad in enumerate(batch_grads):
-                        if batch_grad is None:
-                            continue
-                        partial_grad_sums[index].add_(
-                            batch_grad.detach().float(),
-                            alpha=float(batch_size),
-                        )
-                        partial_used[index] = True
-                    partial_count += batch_size
-                    if partial_loss_sums is not None:
-                        partial_loss_sums[0].add_(
-                            loss.detach().float(),
-                            alpha=float(batch_size),
-                        )
-
-        with nvtx.nvtx_range("kl_refresh.grad_allreduce"):
-            (
-                global_count,
-                global_used,
-                global_loss_sums,
-            ) = _aggregate_block_refresh_sums(
-                partial_grad_sums,
-                partial_used,
-                partial_count,
-                partial_loss_sums if ctx.trace_enabled else None,
-            )
-        if ctx.log_column_block_loss and not ctx.trace_enabled:
-            if partial_loss_sums is None:
-                raise RuntimeError(
-                    "column-block loss logging enabled without loss sums"
-                )
-            global_loss_sums = _aggregate_loss_sums_for_logging(
-                partial_loss_sums
-            )
-        with nvtx.nvtx_range("kl_refresh.adam_step"):
-            update, active_weight_audits = _apply_block_adam(
-                active,
-                partial_grad_sums,
-                global_used,
-                global_count,
-                lr=ctx.layer_lr,
-                grad_clip=ctx.grad_clip,
-            )
-        if global_loss_sums is not None:
-            ctx.record_loss_observation(
-                global_loss_sums=global_loss_sums,
-                global_count=global_count,
-                sample_indices=selected_global,
-                slide_alpha=None,
-                has_next_loss=False,
-                objective="kl_full_block",
-                backward_invocation_id=backward_invocation_id,
-                backward_chunk_sizes=tuple(backward_chunk_sizes),
-                active_weight_audits=active_weight_audits,
-            )
-        if block_state._states[module_name].step != ctx.adam_step:
-            raise RuntimeError(
-                f"current Adam step drift for {module_name}: "
-                f"state={block_state._states[module_name].step}, "
-                f"diagnostic={ctx.adam_step}"
-            )
-        return update
-
-    refresh._realq_update_layout = "full_natural"
     return refresh

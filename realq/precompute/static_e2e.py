@@ -238,7 +238,9 @@ def run(cfg: "Config", analyzer: "ModelAnalyzer") -> StaticStats:
 
     # 2. Calibration data, sharded per rank.
     with nvtx.nvtx_range("precompute.load_data"):
-        tokens_save_path = cfg.tokens_cache_file
+        # Keep compatibility with lightweight/legacy config objects that
+        # predate the explicit shared calibration artifact field.
+        tokens_save_path = getattr(cfg, "tokens_cache_file", None)
         if tokens_save_path is None and cfg.tokens_cache_path:
             # data_utils.get_tokens expects a file path; build one keyed by the
             # arguments that change tokenisation output.

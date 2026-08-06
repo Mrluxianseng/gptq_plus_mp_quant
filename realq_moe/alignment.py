@@ -11,8 +11,7 @@ from typing import Any, Iterable
 from utils import dist_utils
 
 
-TRACE_SCHEMA_VERSION = 4
-SUPPORTED_TRACE_SCHEMA_VERSIONS = (3, TRACE_SCHEMA_VERSION)
+TRACE_SCHEMA_VERSION = 3
 
 # Keep trace metadata intentionally limited to knobs that exist with the same
 # meaning in both the legacy and refactored implementations.  Implementation-
@@ -74,26 +73,6 @@ REFRESH_TRACE_CONFIG_KEYS = (
 
 
 @dataclass(frozen=True)
-class ActiveWeightAudit:
-    """Runtime evidence for one leaf participating in a Block-GD backward."""
-
-    scope: str
-    name: str
-    parameter_name: str
-    is_current: bool
-    used: bool
-    active_column_count: int
-    source_storage_id: str
-    storage_id_after: str | None
-    optimizer_step_before: int
-    optimizer_step_after: int
-    update_applied: bool
-    update_l2: float
-    source_l2_before: float
-    source_l2_after: float | None
-
-
-@dataclass(frozen=True)
 class RefreshStep:
     """One block-GD loss observation.
 
@@ -112,12 +91,6 @@ class RefreshStep:
     loss_next: float | None = None
     slide_alpha: float | None = None
     sample_indices: tuple[int, ...] = ()
-    objective: str | None = None
-    backward_invocation_id: int | None = None
-    backward_chunk_sizes: tuple[int, ...] = ()
-    backward_bsz: int | None = None
-    global_count: int | None = None
-    active_weights: tuple[ActiveWeightAudit, ...] = ()
 
     @property
     def identity(self) -> tuple[int, str, int, int, int, int]:
@@ -146,7 +119,6 @@ class RefreshTraceWriter:
         self.implementation = implementation
         self.run_id = run_id
         self._handle = None
-        self._backward_invocation_count = 0
         if path is None or not dist_utils.is_main():
             return
         parent = os.path.dirname(os.path.abspath(path))
@@ -183,12 +155,6 @@ class RefreshTraceWriter:
     def record(self, step: RefreshStep) -> None:
         payload = asdict(step)
         payload["sample_indices"] = list(step.sample_indices)
-        payload["backward_chunk_sizes"] = list(
-            step.backward_chunk_sizes
-        )
-        payload["active_weights"] = [
-            asdict(item) for item in step.active_weights
-        ]
         payload.update(
             {
                 "record_type": "refresh_step",
@@ -198,12 +164,6 @@ class RefreshTraceWriter:
             }
         )
         self._write(payload)
-
-    def allocate_backward_invocation_id(self) -> int:
-        """Return a unique run-local ID at the actual backward call site."""
-
-        self._backward_invocation_count += 1
-        return self._backward_invocation_count
 
     def close(self) -> None:
         if self._handle is not None:
@@ -231,9 +191,7 @@ def load_refresh_trace(path: str) -> tuple[dict[str, Any], dict[tuple, RefreshSt
             if not line.strip():
                 continue
             payload = json.loads(line)
-            if payload.get("schema_version") not in (
-                SUPPORTED_TRACE_SCHEMA_VERSIONS
-            ):
+            if payload.get("schema_version") != TRACE_SCHEMA_VERSION:
                 raise ValueError(
                     f"{path}:{line_number}: unsupported trace schema "
                     f"{payload.get('schema_version')!r}"
@@ -260,51 +218,6 @@ def load_refresh_trace(path: str) -> tuple[dict[str, Any], dict[tuple, RefreshSt
                 loss_next=_optional_float(payload.get("loss_next")),
                 slide_alpha=_optional_float(payload.get("slide_alpha")),
                 sample_indices=tuple(int(x) for x in payload.get("sample_indices", ())),
-                objective=_optional_str(payload.get("objective")),
-                backward_invocation_id=_optional_int(
-                    payload.get("backward_invocation_id")
-                ),
-                backward_chunk_sizes=tuple(
-                    int(x)
-                    for x in payload.get("backward_chunk_sizes", ())
-                ),
-                backward_bsz=_optional_int(
-                    payload.get("backward_bsz")
-                ),
-                global_count=_optional_int(payload.get("global_count")),
-                active_weights=tuple(
-                    ActiveWeightAudit(
-                        scope=str(item["scope"]),
-                        name=str(item["name"]),
-                        parameter_name=str(item["parameter_name"]),
-                        is_current=bool(item["is_current"]),
-                        used=bool(item["used"]),
-                        active_column_count=int(
-                            item["active_column_count"]
-                        ),
-                        source_storage_id=str(
-                            item["source_storage_id"]
-                        ),
-                        storage_id_after=_optional_str(
-                            item.get("storage_id_after")
-                        ),
-                        optimizer_step_before=int(
-                            item["optimizer_step_before"]
-                        ),
-                        optimizer_step_after=int(
-                            item["optimizer_step_after"]
-                        ),
-                        update_applied=bool(item["update_applied"]),
-                        update_l2=float(item["update_l2"]),
-                        source_l2_before=float(
-                            item["source_l2_before"]
-                        ),
-                        source_l2_after=_optional_float(
-                            item.get("source_l2_after")
-                        ),
-                    )
-                    for item in payload.get("active_weights", ())
-                ),
             )
             if step.identity in steps:
                 raise ValueError(f"{path}: duplicate step identity {step.identity!r}")
@@ -316,14 +229,6 @@ def load_refresh_trace(path: str) -> tuple[dict[str, Any], dict[tuple, RefreshSt
 
 def _optional_float(value: Any) -> float | None:
     return None if value is None else float(value)
-
-
-def _optional_int(value: Any) -> int | None:
-    return None if value is None else int(value)
-
-
-def _optional_str(value: Any) -> str | None:
-    return None if value is None else str(value)
 
 
 def compare_refresh_traces(

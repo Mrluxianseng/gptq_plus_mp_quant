@@ -13,19 +13,23 @@
 """
 from __future__ import annotations
 
+import copy
 import logging
 import os
+from collections import OrderedDict
+from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from transformers import AutoConfig
 
-from realq import akv, fsdp as realq_fsdp, precompute, runner
-from realq.benchmarks import run_reasoning_eval
-from realq.parallel import env as parallel_env
-from realq.utils import memory as mem_utils
-from realq.utils import nvtx
+from realq_moe import akv, fsdp as realq_fsdp, model_adapter, precompute, runner
+from realq_moe.parallel import env as parallel_env
+from realq_moe.utils import memory as mem_utils
+from realq_moe.utils import nvtx
+from utils.loss_utils import tokenwise_kl_from_logits
 from utils import (
     checkpoint_utils,
     data_utils,
@@ -37,33 +41,217 @@ from utils import (
 )
 
 if TYPE_CHECKING:
-    from realq.config import Config
+    from realq_moe.config import Config
+
+
+def _is_sparse_moe_analyzer(analyzer: model_utils.ModelAnalyzer) -> bool:
+    return any(
+        model_adapter.is_sparse_moe_layer(layer)
+        for layer in analyzer.get_layers()
+    )
 
 
 def _model_source_declares_sparse_moe(model_source: object) -> bool:
-    """Detect the supported sparse architecture before loading weights."""
+    """Probe architecture without loading weights for cpu-master fail-closed."""
 
     if isinstance(model_source, str):
-        try:
-            config = AutoConfig.from_pretrained(
-                model_source,
-                trust_remote_code=True,
-            )
-        except OSError:
-            # This is a best-effort early dispatcher. Invalid placeholders,
-            # mocked analyzers, and temporarily unavailable remote configs
-            # must retain the ordinary loader's historical error/patch point.
-            return False
+        config = AutoConfig.from_pretrained(
+            model_source,
+            trust_remote_code=True,
+        )
     else:
         config = getattr(model_source, "config", None)
         if config is None:
             return False
     architectures = tuple(getattr(config, "architectures", ()) or ())
-    return "Qwen3MoeForCausalLM" in architectures
+    return any(
+        architecture in model_adapter.SUPPORTED_MOE_ARCHITECTURES
+        for architecture in architectures
+    )
+
+
+def _assert_module_cuda(
+    module: torch.nn.Module,
+    dev: torch.device,
+    *,
+    label: str,
+) -> None:
+    expected_index = (
+        dev.index if dev.index is not None else torch.cuda.current_device()
+    )
+    for tensor_name, tensor in (
+        list(module.named_parameters(recurse=True))
+        + list(module.named_buffers(recurse=True))
+    ):
+        if tensor.device.type != "cuda" or tensor.device.index != expected_index:
+            raise RuntimeError(
+                f"{label}.{tensor_name} must remain on cuda:{expected_index}; "
+                f"got {tensor.device}."
+            )
+
+
+def _iter_tensor_leaves(value):
+    if torch.is_tensor(value):
+        yield value
+        return
+    if isinstance(value, Mapping):
+        for child in value.values():
+            yield from _iter_tensor_leaves(child)
+        return
+    if isinstance(value, (list, tuple)):
+        for child in value:
+            yield from _iter_tensor_leaves(child)
+
+
+def _assert_static_stats_cuda(
+    static,
+    dev: torch.device,
+) -> None:
+    expected_index = (
+        dev.index if dev.index is not None else torch.cuda.current_device()
+    )
+    for family_name in ("saliency", "fisher", "routes"):
+        family = getattr(static, family_name)
+        tensor_count = 0
+        for tensor in _iter_tensor_leaves(family):
+            tensor_count += 1
+            if (
+                tensor.device.type != "cuda"
+                or tensor.device.index != expected_index
+            ):
+                raise RuntimeError(
+                    "Sparse REAL-Q MoE Stage-0/Stage-1 contract requires "
+                    f"{family_name} tensors on cuda:{expected_index}; "
+                    f"got {tensor.device}."
+                )
+        if tensor_count == 0:
+            raise RuntimeError(
+                f"Sparse REAL-Q MoE Stage-0 produced no {family_name} tensors."
+            )
+
+
+def _activate_moe_gpu_resident_runtime(
+    cfg: "Config",
+    analyzer: model_utils.ModelAnalyzer,
+    *,
+    upload_model: bool = True,
+) -> bool:
+    """Validate the sparse contract and optionally establish CUDA residency.
+
+    The source checkpoint and copied rotation implementation are CPU-backed.
+    With evaluation enabled we must upload once before rotation to capture the
+    immutable FP target, then re-establish residency after rotation.  With
+    evaluation skipped, ``upload_model=False`` avoids that unnecessary first
+    whole-model transfer and the post-rotation call performs the sole upload.
+    """
+
+    sparse_moe = _is_sparse_moe_analyzer(analyzer)
+    cfg.validate_moe_runtime_contract(sparse_moe=sparse_moe)
+    if not sparse_moe:
+        return False
+    if parallel_env.get_world_size() != 1:
+        raise ValueError(
+            "The first joint/GPU-resident Qwen3-MoE runtime requires "
+            "world_size=1."
+        )
+    dev = torch.device(f"cuda:{torch.cuda.current_device()}")
+    # ModelAnalyzer captures a state_dict at load time. Nothing in the runtime
+    # consumes it; retaining those tensor aliases would keep the source
+    # checkpoint storage alive when the module is later transferred.
+    analyzer.state_dict = None
+    if not upload_model:
+        return True
+    analyzer.model.to(dev)
+    analyzer.model.eval()
+    _assert_module_cuda(analyzer.model, dev, label="analyzer.model")
+    return True
+
+
+def _extract_last_hidden(outputs) -> torch.Tensor:
+    hidden = getattr(outputs, "last_hidden_state", None)
+    if hidden is None:
+        hidden = outputs[0] if isinstance(outputs, tuple) else None
+    if not torch.is_tensor(hidden):
+        raise RuntimeError(
+            "GPU-resident MoE eval expected base-model last_hidden_state."
+        )
+    return hidden
+
+
+@torch.no_grad()
+def _capture_gpu_hidden_states(
+    analyzer: model_utils.ModelAnalyzer,
+    input_ids: torch.Tensor,
+) -> torch.Tensor:
+    """Capture post-final-norm hidden states without layer CPU streaming."""
+
+    if input_ids.device.type != "cuda":
+        raise RuntimeError("GPU-resident eval input_ids must be CUDA tensors.")
+    base_model = getattr(analyzer.model, "model", None)
+    if base_model is None:
+        raise RuntimeError("Qwen3-MoE model is missing its base `model` module.")
+    hidden_out = None
+    for sample_idx in range(int(input_ids.shape[0])):
+        outputs = base_model(
+            input_ids=input_ids[sample_idx : sample_idx + 1],
+            use_cache=False,
+        )
+        hidden = _extract_last_hidden(outputs)
+        if hidden_out is None:
+            hidden_out = torch.empty(
+                (
+                    int(input_ids.shape[0]),
+                    int(hidden.shape[1]),
+                    int(hidden.shape[2]),
+                ),
+                device=hidden.device,
+                dtype=hidden.dtype,
+            )
+        hidden_out[sample_idx : sample_idx + 1].copy_(hidden)
+        del outputs, hidden
+    if hidden_out is None:
+        raise RuntimeError("GPU-resident eval received zero samples.")
+    return hidden_out
+
+
+def _setup_moe_gpu_eval(
+    cfg: "Config",
+    analyzer: model_utils.ModelAnalyzer,
+):
+    """Build immutable FP eval targets entirely on the resident GPU."""
+
+    dev = torch.device(f"cuda:{torch.cuda.current_device()}")
+    test_tokens, ref_hidden = {}, {}
+    for dataset in cfg.eval_datasets:
+        loader = data_utils.get_loaders(
+            dataset,
+            split="test",
+            tokenizer=analyzer.tokenizer,
+            seq_len=cfg.eval_seq_len,
+            num_samples=cfg.nsamples,
+        )
+        input_ids = loader.input_ids
+        nsamples = int(input_ids.numel()) // int(cfg.eval_seq_len)
+        tokens = (
+            input_ids[:, : nsamples * cfg.eval_seq_len]
+            .reshape(nsamples, cfg.eval_seq_len)
+            .to(dev)
+        )
+        test_tokens[dataset] = tokens
+        ref_hidden[dataset] = _capture_gpu_hidden_states(analyzer, tokens)
+    orig_lm_head = copy.deepcopy(analyzer.get_lm_head()).to(dev)
+    orig_lm_head.eval()
+    _assert_module_cuda(orig_lm_head, dev, label="orig_lm_head")
+    return test_tokens, ref_hidden, orig_lm_head
 
 
 def _setup_eval(cfg: "Config", analyzer: model_utils.ModelAnalyzer):
     """Cache fp reference logits per dataset before any weight modification."""
+    if (
+        cfg.moe_gpu_resident
+        and _is_sparse_moe_analyzer(analyzer)
+    ):
+        return _setup_moe_gpu_eval(cfg, analyzer)
     test_loaders, ref_logits = {}, {}
     orig_lm_head = None
     for ds in cfg.eval_datasets:
@@ -98,6 +286,7 @@ def _maybe_rotate(cfg: "Config", analyzer: model_utils.ModelAnalyzer) -> None:
                 if data.data_ptr() != p.data.data_ptr():
                     p.data = data
         rotation_utils.add_activation_quant_wrappers_for_rotation(analyzer)
+        model_adapter.repair_moe_down_rotation_wrappers(analyzer)
         # Mark the model so akv.install_actquant_wrappers stays a no-op.
         analyzer.model._realq_actquant_wrappers_installed = True
     else:
@@ -119,65 +308,181 @@ def _prepare_loaded_runtime_wrappers(
     """
     if cfg.rotate:
         rotation_utils.add_activation_quant_wrappers_for_rotation(analyzer)
+        model_adapter.repair_moe_down_rotation_wrappers(analyzer)
         analyzer.model._realq_actquant_wrappers_installed = True
     else:
         akv.install_actquant_wrappers(analyzer)
+
+
+@torch.no_grad()
+def _moe_gpu_kl_ppl_eval(
+    cfg: "Config",
+    analyzer: model_utils.ModelAnalyzer,
+    orig_lm_head: torch.nn.Module,
+    test_tokens: dict[str, torch.Tensor],
+    ref_hidden: dict[str, torch.Tensor],
+) -> None:
+    """Evaluate sparse MoE without invoking eval_utils' CPU layer streamer."""
+
+    dev = torch.device(f"cuda:{torch.cuda.current_device()}")
+    _assert_module_cuda(analyzer.model, dev, label="analyzer.model")
+    _assert_module_cuda(orig_lm_head, dev, label="orig_lm_head")
+    base_model = getattr(analyzer.model, "model", None)
+    if base_model is None:
+        raise RuntimeError("Qwen3-MoE model is missing its base `model` module.")
+    lm_head = analyzer.get_lm_head()
+    head_chunk_tokens = max(1, int(cfg.blocksize))
+    metric_vals: "OrderedDict[str, str]" = OrderedDict()
+
+    for dataset in cfg.eval_datasets:
+        input_ids = test_tokens[dataset]
+        reference = ref_hidden[dataset]
+        if input_ids.device.type != "cuda" or reference.device.type != "cuda":
+            raise RuntimeError(
+                f"GPU-resident eval tensors for {dataset} left CUDA."
+            )
+        nll_sum = torch.zeros((), dtype=torch.float32, device=dev)
+        kl_sum = torch.zeros((), dtype=torch.float32, device=dev)
+        nll_count = 0
+        kl_count = 0
+        seq_len = int(input_ids.shape[1])
+
+        for sample_idx in range(int(input_ids.shape[0])):
+            outputs = base_model(
+                input_ids=input_ids[sample_idx : sample_idx + 1],
+                use_cache=False,
+            )
+            student_hidden = _extract_last_hidden(outputs)
+            teacher_hidden = reference[sample_idx : sample_idx + 1]
+            for start in range(0, seq_len, head_chunk_tokens):
+                end = min(start + head_chunk_tokens, seq_len)
+                student_logits = lm_head(
+                    student_hidden[:, start:end]
+                ).float()
+                teacher_logits = orig_lm_head(
+                    teacher_hidden[:, start:end]
+                ).float()
+
+                # Causal NLL excludes the final position.  Compute before any
+                # diagnostic top-k KL projection so PPL remains full-vocab.
+                nll_end = min(end, seq_len - 1)
+                nll_width = max(0, nll_end - start)
+                if nll_width:
+                    labels = input_ids[
+                        sample_idx : sample_idx + 1,
+                        start + 1 : nll_end + 1,
+                    ]
+                    nll_sum.add_(
+                        F.cross_entropy(
+                            student_logits[:, :nll_width].transpose(1, 2),
+                            labels,
+                            reduction="sum",
+                        ).float()
+                    )
+                    nll_count += int(labels.numel())
+
+                if cfg.kl_topk > 0:
+                    teacher_for_kl, indices = teacher_logits.topk(
+                        int(cfg.kl_topk),
+                        dim=-1,
+                        sorted=False,
+                    )
+                    student_for_kl = student_logits.gather(-1, indices)
+                else:
+                    teacher_for_kl = teacher_logits
+                    student_for_kl = student_logits
+                token_kl = tokenwise_kl_from_logits(
+                    student_for_kl,
+                    teacher_for_kl,
+                )
+                kl_sum.add_(token_kl.sum())
+                kl_count += int(token_kl.numel())
+                del (
+                    student_logits,
+                    teacher_logits,
+                    teacher_for_kl,
+                    student_for_kl,
+                    token_kl,
+                )
+            del outputs, student_hidden
+
+        if nll_count == 0 or kl_count == 0:
+            raise RuntimeError(
+                f"GPU-resident eval for {dataset} produced no tokens."
+            )
+        ppl = float(torch.exp(nll_sum / nll_count).item())
+        kl_loss = float((kl_sum / kl_count).item())
+        if kl_loss < -1e-7:
+            raise RuntimeError(
+                "Full-vocabulary fp32 KL became materially negative "
+                f"({kl_loss:.3e}) for {dataset}."
+            )
+        kl_loss = max(0.0, kl_loss)
+        metric_vals[f"KL-{dataset}"] = f"{kl_loss:.2e}"
+        metric_vals[f"PPL-{dataset}"] = f"{ppl:.2f}"
+        logging.info(
+            "Exact GPU-resident KL&PPL on %s: %.17g, %.17g",
+            dataset,
+            kl_loss,
+            ppl,
+        )
+    eval_utils.pretty_print_results(metric_vals)
 
 
 def _run_lm_eval_if_requested(
     cfg: "Config",
     analyzer: model_utils.ModelAnalyzer,
 ) -> bool:
-    """Run rank-0 lm-eval and/or reasoning evaluation after quantization.
+    """Run rank-0 lm_eval after releasing the torchrun process group.
 
-    Returns ``True`` when a generation evaluator was requested and the caller
-    must return
+    Returns ``True`` when lm_eval was requested and the caller must return
     immediately.  All ranks execute the pre-destroy barrier and destroy their
-    process group; only the original rank 0 dispatches the full CPU model over
-    the now-available visible GPUs and drives QA evaluation.  This mirrors the
-    legacy ``ptq.py`` lifecycle and avoids keeping nonzero ranks in a NCCL
-    barrier while rank 0's Accelerate model uses their GPUs.
+    process group. Dense legacy runs dispatch the full CPU model over visible
+    GPUs. The accepted sparse MoE path is already single-GPU/CUDA-resident and
+    passes that model directly to lm-eval without CPU dispatch.
     """
-    requested = (
-        getattr(cfg, "lm_eval", False)
-        or getattr(cfg, "reasoning_eval", False)
-    )
-    if not (requested and not cfg.skip_eval):
+    if not (getattr(cfg, "lm_eval", False) and not cfg.skip_eval):
         return False
 
-    run_eval = parallel_env.is_main()
+    run_lm_eval = parallel_env.is_main()
     if parallel_env.is_dist_available_and_initialized():
         parallel_env.barrier()
         dist.destroy_process_group()
-    if run_eval:
-        dist_utils.distribute_model(analyzer.model)
-        if getattr(cfg, "lm_eval", False):
-            with nvtx.nvtx_range("ptq.eval_lm_eval"):
-                eval_utils.qa_eval(
-                    analyzer.model,
-                    analyzer.tokenizer,
-                    cfg.lm_eval_batch_size,
-                )
-        if getattr(cfg, "reasoning_eval", False):
-            with nvtx.nvtx_range("ptq.eval_reasoning"):
-                run_reasoning_eval(
-                    analyzer.model,
-                    analyzer.tokenizer,
-                    cfg,
-                )
+    if run_lm_eval:
+        gpu_resident_moe = (
+            cfg.moe_gpu_resident
+            and _is_sparse_moe_analyzer(analyzer)
+        )
+        if gpu_resident_moe:
+            dev = torch.device(f"cuda:{torch.cuda.current_device()}")
+            _assert_module_cuda(
+                analyzer.model,
+                dev,
+                label="analyzer.model",
+            )
+        else:
+            dist_utils.distribute_model(analyzer.model)
+        with nvtx.nvtx_range("ptq.eval_lm_eval"):
+            eval_utils.qa_eval(
+                analyzer.model,
+                analyzer.tokenizer,
+                cfg.lm_eval_batch_size,
+            )
+        if gpu_resident_moe:
+            _assert_module_cuda(
+                analyzer.model,
+                dev,
+                label="analyzer.model.after_lm_eval",
+            )
     return True
 
 
 def run(cfg: "Config") -> None:
     """End-to-end RealQ pipeline."""
-    if _model_source_declares_sparse_moe(cfg.model):
-        # Keep the dense core on its latest full-block/Triton path while the
-        # sparse package owns its deliberately different ragged statistics,
-        # all-expert Jacobi refresh, and fully GPU-resident lifecycle.
-        from realq_moe.pipeline import run as run_moe
-
-        return run_moe(cfg)
     if cfg.cpu_master:
+        cfg.validate_moe_runtime_contract(
+            sparse_moe=_model_source_declares_sparse_moe(cfg.model)
+        )
         return _run_cpu_master(cfg)
 
     loaded_checkpoint = None
@@ -191,6 +496,7 @@ def run(cfg: "Config") -> None:
 
     with nvtx.nvtx_range("ptq.load_model"):
         analyzer = model_utils.ModelAnalyzer(cfg.model, cfg.seq_len)
+        model_adapter.validate_analyzer(analyzer)
     if loaded_checkpoint is not None:
         checkpoint_utils.validate_artifact_identity(
             cfg,
@@ -198,11 +504,16 @@ def run(cfg: "Config") -> None:
             model=analyzer.model,
             tokenizer=analyzer.tokenizer,
         )
+    gpu_resident_moe = _activate_moe_gpu_resident_runtime(
+        cfg,
+        analyzer,
+        upload_model=not cfg.skip_eval,
+    )
 
     # 1. Reference logits (must be captured BEFORE rotate — KL eval compares
     # quantised lm_head against the unrotated lm_head).
     test_loaders = ref_logits = orig_lm_head = None
-    if not cfg.skip_eval and not cfg.skip_kl_ppl_eval:
+    if not cfg.skip_eval:
         with nvtx.nvtx_range("ptq.ref_logits"):
             test_loaders, ref_logits, orig_lm_head = _setup_eval(cfg, analyzer)
 
@@ -212,6 +523,12 @@ def run(cfg: "Config") -> None:
             _maybe_rotate(cfg, analyzer)
         else:
             _prepare_loaded_runtime_wrappers(cfg, analyzer)
+    if gpu_resident_moe:
+        # The inherited rotation kernels deliberately write transformed
+        # weights back to CPU.  Rotation is pre-Stage-0 setup; from this point
+        # through capture, quantization and evaluation the entire sparse model
+        # is required to remain on this GPU.
+        _activate_moe_gpu_resident_runtime(cfg, analyzer)
 
     # A quantized artifact already contains the final fake-quantized weights.
     # Prepare the same wrapper topology, restore the weights, then reconstruct
@@ -227,16 +544,28 @@ def run(cfg: "Config") -> None:
         with nvtx.nvtx_range("ptq.akv_restore"):
             akv.setup_aware_pre_quant(analyzer, cfg)
             akv.setup_unaware_post_quant(analyzer, cfg)
+        if gpu_resident_moe:
+            dev = torch.device(f"cuda:{torch.cuda.current_device()}")
+            _assert_module_cuda(analyzer.model, dev, label="analyzer.model")
         if cfg.save_qmodel_path and parallel_env.is_main():
             checkpoint_utils.save_quantized_checkpoint(
                 cfg.save_qmodel_path, analyzer.model, cfg, analyzer.tokenizer
             )
-        if not cfg.skip_eval and not cfg.skip_kl_ppl_eval:
+        if not cfg.skip_eval:
             with nvtx.nvtx_range("ptq.eval_kl_ppl"):
-                analyzer.model.cpu()
-                eval_utils.kl_ppl_eval(
-                    cfg, analyzer, orig_lm_head, test_loaders, ref_logits
-                )
+                if gpu_resident_moe:
+                    _moe_gpu_kl_ppl_eval(
+                        cfg,
+                        analyzer,
+                        orig_lm_head,
+                        test_loaders,
+                        ref_logits,
+                    )
+                else:
+                    analyzer.model.cpu()
+                    eval_utils.kl_ppl_eval(
+                        cfg, analyzer, orig_lm_head, test_loaders, ref_logits
+                    )
         if _run_lm_eval_if_requested(cfg, analyzer):
             return
         if parallel_env.is_dist_available_and_initialized():
@@ -255,6 +584,10 @@ def run(cfg: "Config") -> None:
     # 3. Static precompute (saliency + Fisher).
     with nvtx.nvtx_range("ptq.precompute"):
         static = precompute.run(cfg, analyzer)
+    if gpu_resident_moe:
+        dev = torch.device(f"cuda:{torch.cuda.current_device()}")
+        _assert_module_cuda(analyzer.model, dev, label="analyzer.model")
+        _assert_static_stats_cuda(static, dev)
     logging.info(
         "[realq] precompute done: %d layers, saliency[0] modules=%s, fisher[0].shape=%s",
         len(static.fisher),
@@ -273,6 +606,7 @@ def run(cfg: "Config") -> None:
         with nvtx.nvtx_range("ptq.fsdp_unwrap"):
             ckpt_dir = realq_fsdp.save_post_precompute_checkpoint(analyzer, cfg)
             analyzer = realq_fsdp.reload_on_cpu(analyzer, ckpt_dir)
+            model_adapter.validate_analyzer(analyzer)
             # Reinstall ActQuantWrapper sites on the freshly-loaded model — the
             # checkpoint stored only the inner Linear weights without wrappers.
             # Re-applying the rotation wrappers (which install had_K on down_proj
@@ -284,6 +618,7 @@ def run(cfg: "Config") -> None:
             # only sets the had_K buffers; weight values stay as-is.
             if cfg.rotate:
                 rotation_utils.add_activation_quant_wrappers_for_rotation(analyzer)
+                model_adapter.repair_moe_down_rotation_wrappers(analyzer)
             else:
                 akv.install_actquant_wrappers(analyzer)
             akv.setup_aware_pre_quant(analyzer, cfg)
@@ -330,10 +665,25 @@ def run(cfg: "Config") -> None:
             )
 
     # 6. Eval (PPL/KL)
-    if not cfg.skip_eval and not cfg.skip_kl_ppl_eval:
+    if not cfg.skip_eval:
         with nvtx.nvtx_range("ptq.eval_kl_ppl"):
-            analyzer.model.cpu()
-            eval_utils.kl_ppl_eval(cfg, analyzer, orig_lm_head, test_loaders, ref_logits)
+            if gpu_resident_moe:
+                _moe_gpu_kl_ppl_eval(
+                    cfg,
+                    analyzer,
+                    orig_lm_head,
+                    test_loaders,
+                    ref_logits,
+                )
+            else:
+                analyzer.model.cpu()
+                eval_utils.kl_ppl_eval(
+                    cfg,
+                    analyzer,
+                    orig_lm_head,
+                    test_loaders,
+                    ref_logits,
+                )
 
     # 7. Optional lm_eval QA tasks.  Release the torchrun process group before
     # rank 0 dispatches the model over all visible GPUs.
@@ -364,17 +714,21 @@ def _run_cpu_master(cfg: "Config") -> None:
     Phase F   eval rank0-only with barriers; lm_eval barriers + destroy
               process group, rank>0 returns. Mirrors ptq.py:55-206.
     """
+    cfg.validate_moe_runtime_contract(
+        sparse_moe=_model_source_declares_sparse_moe(cfg.model)
+    )
     # Phase A — rotate cache (rank0 only, plus Phase B-needed checkpoint path).
     checkpoint_path, _is_rotated = realq_fsdp.prepare_rotated_checkpoint(cfg)
 
     # Phase A.5 — ref logits (rank 0 only; CPU peak still 1×M because Phase A
     # already freed its analyzer).
     test_loaders = ref_logits = orig_lm_head = None
-    if not cfg.skip_eval and not cfg.skip_kl_ppl_eval:
+    if not cfg.skip_eval:
         if parallel_env.is_main():
             analyzer_eval = model_utils.ModelAnalyzer(
                 checkpoint_path, cfg.seq_len, tokenizer_source=checkpoint_path,
             )
+            model_adapter.validate_analyzer(analyzer_eval)
             # Set the OLD attribute name so eval_utils.get_ref_logits computes
             # the same cache tag as the legacy path (utils/eval_utils.py:115).
             analyzer_eval.model._gptqplus_prepared_checkpoint_path = checkpoint_path
@@ -395,11 +749,13 @@ def _run_cpu_master(cfg: "Config") -> None:
 
     # Phase B — meta init + sharded broadcast load.
     analyzer = realq_fsdp.load_meta_for_precompute(cfg, checkpoint_path)
+    model_adapter.validate_analyzer(analyzer)
     # Wrappers installed AFTER broadcast load (the loader matches keys against
     # vanilla state_dict; wrapping introduces ``.module.`` infix that would
     # turn into unmatched keys).
     if cfg.rotate:
         rotation_utils.add_activation_quant_wrappers_for_rotation(analyzer)
+        model_adapter.repair_moe_down_rotation_wrappers(analyzer)
     else:
         akv.install_actquant_wrappers(analyzer)
     # Sync the realq-side flag so akv.setup_aware_pre_quant's
@@ -426,8 +782,10 @@ def _run_cpu_master(cfg: "Config") -> None:
     del analyzer
     mem_utils.cleanup_memory()
     analyzer = realq_fsdp.rebuild_asymmetric_for_quant(cfg, checkpoint_path)
+    model_adapter.validate_analyzer(analyzer)
     if cfg.rotate:
         rotation_utils.add_activation_quant_wrappers_for_rotation(analyzer)
+        model_adapter.repair_moe_down_rotation_wrappers(analyzer)
     else:
         akv.install_actquant_wrappers(analyzer)
     # Same flag-sync as Phase B (see comment there).
@@ -462,7 +820,7 @@ def _run_cpu_master(cfg: "Config") -> None:
     # is already CPU-resident after Phase E (manager released every block back
     # to CPU), and rank>0's model is meta — calling .cpu() on a meta module
     # would raise NotImplementedError from _apply.
-    if not cfg.skip_eval and not cfg.skip_kl_ppl_eval:
+    if not cfg.skip_eval:
         if parallel_env.is_main():
             eval_utils.kl_ppl_eval(cfg, analyzer, orig_lm_head, test_loaders, ref_logits)
         else:
