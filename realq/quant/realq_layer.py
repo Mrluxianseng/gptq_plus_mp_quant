@@ -27,6 +27,10 @@ from realq.quant.hessian import (
     cholesky_inverse_batched_with_damp,
     cholesky_inverse_with_damp,
 )
+from realq.quant.triton_column_block import (
+    prepared_scale_matrix,
+    quantize_column_block,
+)
 from realq.utils import nvtx
 from utils import dist_utils
 
@@ -306,6 +310,8 @@ class RealQLayer:
         group_parallel_quant: str = "none",
         quantizer_inner_fastpath: bool = False,
         act_order_stitch_impl: str = "full_weight_legacy",
+        prepared_clamp_bound_cache: bool = False,
+        triton_column_block: bool = False,
     ) -> None:
         """Run GPTQ on this linear's weight. Mutates ``self.linear.weight``.
 
@@ -336,6 +342,11 @@ class RealQLayer:
         weight from the Q prefix and W suffix that were already gathered,
         avoiding one redundant full-weight copy collective. The default
         ``"full_weight_legacy"`` retains the historical path.
+
+        ``prepared_clamp_bound_cache`` enables P10 inside the P01 fallback
+        path. ``triton_column_block`` fuses the sequential quantize +
+        in-block compensation loop for supported single-GPU CUDA blocks; the
+        existing outer compensation BMM remains unchanged.
         """
         # W16 is the explicit no-weight-quantization mode.  The quantizer has
         # no scale in this mode, so entering the GPTQ column loop would make
@@ -355,6 +366,64 @@ class RealQLayer:
                 "act_order_stitch_impl must be 'full_weight_legacy' or "
                 f"'prefix_q_trailing_w_exact'; got {act_order_stitch_impl!r}."
             )
+        if type(quantizer_inner_fastpath) is not bool:
+            raise ValueError("quantizer_inner_fastpath must be bool.")
+        if type(prepared_clamp_bound_cache) is not bool:
+            raise ValueError("prepared_clamp_bound_cache must be bool.")
+        if prepared_clamp_bound_cache and not quantizer_inner_fastpath:
+            raise ValueError(
+                "prepared_clamp_bound_cache=True requires "
+                "quantizer_inner_fastpath=True."
+            )
+        if type(triton_column_block) is not bool:
+            raise ValueError("triton_column_block must be bool.")
+
+        self.quantizer_inner_fastpath_audit = {
+            "requested": quantizer_inner_fastpath,
+            "prepared_clamp_bound_cache_requested": (
+                prepared_clamp_bound_cache
+            ),
+            "prepared_blocks": 0,
+            "cached_bound_blocks": 0,
+            "triton_blocks": 0,
+            "legacy_fallback_blocks": 0,
+            "fallback_reasons": {},
+        }
+        inner_fastpath_fallback_logged = False
+
+        def prepare_inner_fastpath(block_quantizer, **kwargs):
+            nonlocal inner_fastpath_fallback_logged
+            prepared = block_quantizer._try_prepare_fake_quantize_inner(
+                cache_clamp_bound=prepared_clamp_bound_cache,
+                **kwargs,
+            )
+            if prepared is not None:
+                self.quantizer_inner_fastpath_audit["prepared_blocks"] += 1
+                if prepared.cache_clamp_bound:
+                    self.quantizer_inner_fastpath_audit[
+                        "cached_bound_blocks"
+                    ] += 1
+                return prepared
+            reason = block_quantizer._inner_fastpath_fallback_reason
+            if not isinstance(reason, dict):
+                raise RuntimeError(
+                    "P01 returned a fallback without an auditable reason."
+                )
+            key = f"{reason['code']}:{reason['tensor']}"
+            reasons = self.quantizer_inner_fastpath_audit[
+                "fallback_reasons"
+            ]
+            reasons[key] = reasons.get(key, 0) + 1
+            self.quantizer_inner_fastpath_audit[
+                "legacy_fallback_blocks"
+            ] += 1
+            if not inner_fastpath_fallback_logged:
+                logging.warning(
+                    "[realq] P01 unavailable; using legacy column path: %s",
+                    key,
+                )
+                inner_fastpath_fallback_logged = True
+            return None
         # rank_mode is the unified "shard rows across ranks + flat (rows, count)
         # inner layout" path. world=1 also takes it so that single-GPU produces
         # bit-equal results to multi-GPU (and to the legacy code's
@@ -590,49 +659,68 @@ class RealQLayer:
                                     i1, i2, device=W1_local.device
                                 )
                             )
-                        inner_fastpath = (
-                            block_quantizer._prepare_fake_quantize_inner(
-                                input_rows=W1_local.shape[0],
-                                column_count=count,
-                                device=W1_local.device,
-                                dtype=W1_local.dtype,
-                                st_idx=row_sl.start,
-                                end_idx=row_sl.stop,
-                                col_idx=natural_columns,
-                            )
+                        inner_fastpath = prepare_inner_fastpath(
+                            block_quantizer,
+                            input_rows=W1_local.shape[0],
+                            column_count=count,
+                            device=W1_local.device,
+                            dtype=W1_local.dtype,
+                            st_idx=row_sl.start,
+                            end_idx=row_sl.stop,
+                            col_idx=natural_columns,
                         )
                     Q1_local = torch.zeros_like(W1_local)
                     Err1_local = torch.zeros_like(W1_local)
                     Hinv1 = Hinv_single[i1:i2, i1:i2]
                     with nvtx.nvtx_range("block.inner_cols"):
-                        for i in range(count):
-                            w = W1_local[:, i]
-                            d = Hinv1[i, i]
-                            w_col = w.unsqueeze(1)
-                            # Slice scale/zero to local rows so fake_quantize sees
-                            # the per-row params for the rows we own.
-                            if inner_fastpath is None:
-                                q_fake, _, _ = block_quantizer.fake_quantize(
-                                    w_col,
-                                    st_idx=row_sl.start,
-                                    end_idx=row_sl.stop,
-                                    col_idx=(
-                                        perm[i1 + i]
-                                        if perm is not None
-                                        else i1 + i
-                                    ),
-                                )
-                            else:
-                                q_fake, _, _ = (
-                                    block_quantizer._fake_quantize_prevalidated(
-                                        w_col, inner_fastpath, i
+                        if (
+                            triton_column_block
+                            and world == 1
+                            and inner_fastpath is not None
+                        ):
+                            Q1_local, Err1_local = quantize_column_block(
+                                W1_local,
+                                prepared_scale_matrix(inner_fastpath),
+                                Hinv1.unsqueeze(0),
+                                block_quantizer.maxq,
+                                rows_per_group=W1_local.shape[0],
+                            )
+                            self.quantizer_inner_fastpath_audit[
+                                "triton_blocks"
+                            ] += 1
+                        else:
+                            for i in range(count):
+                                w = W1_local[:, i]
+                                d = Hinv1[i, i]
+                                w_col = w.unsqueeze(1)
+                                # Slice scale/zero to local rows so
+                                # fake_quantize sees only the rows we own.
+                                if inner_fastpath is None:
+                                    q_fake, _, _ = (
+                                        block_quantizer.fake_quantize(
+                                            w_col,
+                                            st_idx=row_sl.start,
+                                            end_idx=row_sl.stop,
+                                            col_idx=(
+                                                perm[i1 + i]
+                                                if perm is not None
+                                                else i1 + i
+                                            ),
+                                        )
                                     )
+                                else:
+                                    q_fake, _, _ = (
+                                        block_quantizer._fake_quantize_prevalidated(
+                                            w_col, inner_fastpath, i
+                                        )
+                                    )
+                                q = q_fake.flatten()
+                                Q1_local[:, i] = q
+                                err = (w - q) / d
+                                W1_local[:, i:] -= err.unsqueeze(1).matmul(
+                                    Hinv1[i, i:].unsqueeze(0)
                                 )
-                            q = q_fake.flatten()
-                            Q1_local[:, i] = q
-                            err = (w - q) / d
-                            W1_local[:, i:] -= err.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
-                            Err1_local[:, i] = err
+                                Err1_local[:, i] = err
                     Q_local[:, i1:i2] = Q1_local
                     with nvtx.nvtx_range("block.outer_compensate"):
                         W_local[:, i2:] -= Err1_local.matmul(Hinv_single[i1:i2, i2:])
@@ -812,62 +900,78 @@ class RealQLayer:
                                 if perm is not None
                                 else torch.arange(i1, i2, device=W1.device)
                             )
-                        inner_fastpath = (
-                            block_quantizer._prepare_fake_quantize_inner(
-                                input_rows=G_l * R_l,
-                                column_count=count,
-                                device=W1.device,
-                                dtype=W1.dtype,
-                                st_idx=row_sl.start,
-                                end_idx=row_sl.stop,
-                                col_idx=natural_columns,
-                            )
+                        inner_fastpath = prepare_inner_fastpath(
+                            block_quantizer,
+                            input_rows=G_l * R_l,
+                            column_count=count,
+                            device=W1.device,
+                            dtype=W1.dtype,
+                            st_idx=row_sl.start,
+                            end_idx=row_sl.stop,
+                            col_idx=natural_columns,
                         )
                     Q1 = torch.zeros_like(W1)
                     Err1 = torch.zeros_like(W1)
                     Hinv1 = Hinv_per_group[:, i1:i2, i1:i2]        # (G_l, count, count)
 
                     with nvtx.nvtx_range("block.inner_cols"):
-                        for i in range(count):
-                            w_col = W1[:, :, i]                    # (G_l, R_l)
-                            # fake_quantize expects (n_local, 1) in natural
-                            # row order; reshape (G_l, R_l) → (G_l*R_l, 1)
-                            # preserves the [local_row_start, local_row_end)
-                            # order because local groups are contiguous in
-                            # row space.
-                            w_col_flat = w_col.reshape(-1, 1)
-                            if inner_fastpath is None:
-                                q_fake, _, _ = block_quantizer.fake_quantize(
-                                    w_col_flat,
-                                    st_idx=row_sl.start,
-                                    end_idx=row_sl.stop,
-                                    col_idx=(
-                                        perm[i1 + i]
-                                        if perm is not None
-                                        else i1 + i
-                                    ),
-                                )
-                            else:
-                                q_fake, _, _ = (
-                                    block_quantizer._fake_quantize_prevalidated(
-                                        w_col_flat, inner_fastpath, i
-                                    )
-                                )
-                            q_col = q_fake.reshape(G_l, R_l)
-                            Q1[:, :, i] = q_col
-                            d = Hinv1[:, i, i].unsqueeze(1)        # (G_l, 1) — broadcast across R_l
-                            err = (w_col - q_col) / d              # (G_l, R_l)
-                            Err1[:, :, i] = err
-                            # In-block compensation: every remaining col
-                            # [i, count) gets err * Hinv_row[:, i, i:]
-                            # subtracted, broadcast across R_l rows of each
-                            # group.
-                            #   err.unsqueeze(-1):              (G_l, R_l, 1)
-                            #   Hinv1[:, i, i:].unsqueeze(1):   (G_l, 1, count - i)
-                            # → broadcast to                     (G_l, R_l, count - i)
-                            W1[:, :, i:].sub_(
-                                err.unsqueeze(-1) * Hinv1[:, i, i:].unsqueeze(1)
+                        if (
+                            triton_column_block
+                            and world == 1
+                            and inner_fastpath is not None
+                        ):
+                            q_flat, err_flat = quantize_column_block(
+                                W1.reshape(G_l * R_l, count),
+                                prepared_scale_matrix(inner_fastpath),
+                                Hinv1,
+                                block_quantizer.maxq,
+                                rows_per_group=R_l,
                             )
+                            Q1 = q_flat.view(G_l, R_l, count)
+                            Err1 = err_flat.view(G_l, R_l, count)
+                            self.quantizer_inner_fastpath_audit[
+                                "triton_blocks"
+                            ] += 1
+                        else:
+                            for i in range(count):
+                                w_col = W1[:, :, i]                # (G_l, R_l)
+                                # fake_quantize expects (n_local, 1) in natural
+                                # row order; reshape (G_l, R_l) →
+                                # (G_l*R_l, 1) preserves the local contiguous
+                                # row order.
+                                w_col_flat = w_col.reshape(-1, 1)
+                                if inner_fastpath is None:
+                                    q_fake, _, _ = (
+                                        block_quantizer.fake_quantize(
+                                            w_col_flat,
+                                            st_idx=row_sl.start,
+                                            end_idx=row_sl.stop,
+                                            col_idx=(
+                                                perm[i1 + i]
+                                                if perm is not None
+                                                else i1 + i
+                                            ),
+                                        )
+                                    )
+                                else:
+                                    q_fake, _, _ = (
+                                        block_quantizer._fake_quantize_prevalidated(
+                                            w_col_flat,
+                                            inner_fastpath,
+                                            i,
+                                        )
+                                    )
+                                q_col = q_fake.reshape(G_l, R_l)
+                                Q1[:, :, i] = q_col
+                                d = Hinv1[:, i, i].unsqueeze(1)
+                                err = (w_col - q_col) / d
+                                Err1[:, :, i] = err
+                                # In-block compensation broadcasts one Hinv
+                                # suffix row across the R_l weight rows.
+                                W1[:, :, i:].sub_(
+                                    err.unsqueeze(-1)
+                                    * Hinv1[:, i, i:].unsqueeze(1)
+                                )
 
                     Q_local[:, :, i1:i2] = Q1
 
@@ -983,14 +1087,13 @@ class RealQLayer:
                                 if perm is not None
                                 else torch.arange(i1, i2, device=W1.device)
                             )
-                        inner_fastpath = (
-                            block_quantizer._prepare_fake_quantize_inner(
-                                input_rows=W1.shape[0],
-                                column_count=count,
-                                device=W1.device,
-                                dtype=W1.dtype,
-                                col_idx=natural_columns,
-                            )
+                        inner_fastpath = prepare_inner_fastpath(
+                            block_quantizer,
+                            input_rows=W1.shape[0],
+                            column_count=count,
+                            device=W1.device,
+                            dtype=W1.dtype,
+                            col_idx=natural_columns,
                         )
                     Q1 = torch.zeros_like(W1)
                     Err1 = torch.zeros_like(W1)
@@ -998,33 +1101,57 @@ class RealQLayer:
                     Err1_g = Err1.view(self.num_groups, rpg, count)
                     Hinv1_g = Hinv_per_group[:, i1:i2, i1:i2]
                     with nvtx.nvtx_range("block.inner_cols"):
-                        for i in range(count):
-                            w_col = W1[:, i].unsqueeze(1)
-                            if inner_fastpath is None:
-                                q_fake, _, _ = block_quantizer.fake_quantize(
-                                    w_col,
-                                    col_idx=(
-                                        perm[i1 + i]
-                                        if perm is not None
-                                        else i1 + i
-                                    ),
-                                )
-                            else:
-                                q_fake, _, _ = (
-                                    block_quantizer._fake_quantize_prevalidated(
-                                        w_col, inner_fastpath, i
+                        if (
+                            triton_column_block
+                            and world == 1
+                            and inner_fastpath is not None
+                        ):
+                            Q1, Err1 = quantize_column_block(
+                                W1,
+                                prepared_scale_matrix(inner_fastpath),
+                                Hinv1_g,
+                                block_quantizer.maxq,
+                                rows_per_group=rpg,
+                            )
+                            Err1_g = Err1.view(
+                                self.num_groups, rpg, count
+                            )
+                            self.quantizer_inner_fastpath_audit[
+                                "triton_blocks"
+                            ] += 1
+                        else:
+                            for i in range(count):
+                                w_col = W1[:, i].unsqueeze(1)
+                                if inner_fastpath is None:
+                                    q_fake, _, _ = (
+                                        block_quantizer.fake_quantize(
+                                            w_col,
+                                            col_idx=(
+                                                perm[i1 + i]
+                                                if perm is not None
+                                                else i1 + i
+                                            ),
+                                        )
                                     )
+                                else:
+                                    q_fake, _, _ = (
+                                        block_quantizer._fake_quantize_prevalidated(
+                                            w_col, inner_fastpath, i
+                                        )
+                                    )
+                                q_col = q_fake.flatten()
+                                Q1[:, i] = q_col
+                                d_g = Hinv1_g[:, i, i]
+                                d_per_row = d_g.repeat_interleave(rpg)
+                                err = (W1[:, i] - q_col) / d_per_row
+                                Err1[:, i] = err
+                                err_g = err.view(self.num_groups, rpg)
+                                hinv_row_g = Hinv1_g[:, i, i:]
+                                update_g = (
+                                    err_g.unsqueeze(-1)
+                                    * hinv_row_g.unsqueeze(1)
                                 )
-                            q_col = q_fake.flatten()
-                            Q1[:, i] = q_col
-                            d_g = Hinv1_g[:, i, i]
-                            d_per_row = d_g.repeat_interleave(rpg)
-                            err = (W1[:, i] - q_col) / d_per_row
-                            Err1[:, i] = err
-                            err_g = err.view(self.num_groups, rpg)
-                            hinv_row_g = Hinv1_g[:, i, i:]
-                            update_g = err_g.unsqueeze(-1) * hinv_row_g.unsqueeze(1)
-                            W1_g[:, :, i:].sub_(update_g)
+                                W1_g[:, :, i:].sub_(update_g)
                     Q[:, i1:i2] = Q1
                     if i2 < self.columns:
                         with nvtx.nvtx_range("block.outer_compensate"):

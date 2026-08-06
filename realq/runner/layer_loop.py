@@ -647,6 +647,12 @@ def quantize_one_layer(
                                 act_order_stitch_impl=(
                                     cfg.act_order_stitch_impl
                                 ),
+                                prepared_clamp_bound_cache=(
+                                    cfg.prepared_clamp_bound_cache
+                                ),
+                                triton_column_block=(
+                                    cfg.triton_column_block
+                                ),
                             )
                         realq.free()
                 del realqs

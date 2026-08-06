@@ -197,6 +197,14 @@ def run(cfg: "Config", analyzer: "ModelAnalyzer") -> StaticStats:
                     "[realq.precompute] cache hit (rank %d): %s",
                     rank, cache_mod.cache_path(cfg.static_cache_path, key, world, rank),
                 )
+                # The distributed rotation broadcast materialises every
+                # parameter on the local CUDA device.  A cache miss reaches
+                # the normal teardown below, which moves the non-FSDP model
+                # back to CPU before layer-streamed quantisation; an early
+                # cache hit must leave the model in the same state.
+                if not getattr(cfg, "fsdp", False):
+                    analyzer.model.cpu()
+                    mem_utils.cleanup_memory()
                 return StaticStats(saliency=cached["saliency"], fisher=cached["fisher"])
             if local_hit:
                 logging.warning(
@@ -213,11 +221,25 @@ def run(cfg: "Config", analyzer: "ModelAnalyzer") -> StaticStats:
             # A rank-local hit can be very large.  Once consensus rejects the
             # early return, release it before allocating Stage-0 activations.
             cached = None
+            if getattr(cfg, "require_static_cache_hit", False):
+                expected_path = cache_mod.cache_path(
+                    cfg.static_cache_path,
+                    key,
+                    world,
+                    rank,
+                )
+                raise RuntimeError(
+                    "[realq.precompute] required static cache hit was not "
+                    f"available on every rank; rank={rank}, "
+                    f"expected={expected_path}. Run the dedicated "
+                    "realq_static precompute producer successfully before "
+                    "launching sweep consumers."
+                )
 
     # 2. Calibration data, sharded per rank.
     with nvtx.nvtx_range("precompute.load_data"):
-        tokens_save_path = None
-        if cfg.tokens_cache_path:
+        tokens_save_path = cfg.tokens_cache_file
+        if tokens_save_path is None and cfg.tokens_cache_path:
             # data_utils.get_tokens expects a file path; build one keyed by the
             # arguments that change tokenisation output.
             import os as _os

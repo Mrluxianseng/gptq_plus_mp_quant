@@ -254,8 +254,8 @@ def run(cfg: "Config") -> None:
     # 4. Quantise.
     # Reuse the same calibration tokens that drove precompute (same key, so
     # `data_utils.get_tokens` hits the on-disk cache).
-    tokens_save_path = None
-    if cfg.tokens_cache_path:
+    tokens_save_path = cfg.tokens_cache_file
+    if tokens_save_path is None and cfg.tokens_cache_path:
         tokens_save_path = os.path.join(
             cfg.tokens_cache_path,
             f"{cfg.model_name}_{cfg.dataset}_train_n{cfg.nsamples}_sl{cfg.seq_len}_seed{cfg.seed}.pt",
@@ -391,8 +391,8 @@ def _run_cpu_master(cfg: "Config") -> None:
     akv.setup_aware_pre_quant(analyzer, cfg)
 
     # Phase E — quant.
-    tokens_save_path = None
-    if cfg.tokens_cache_path:
+    tokens_save_path = cfg.tokens_cache_file
+    if tokens_save_path is None and cfg.tokens_cache_path:
         tokens_save_path = os.path.join(
             cfg.tokens_cache_path,
             f"{cfg.model_name}_{cfg.dataset}_train_n{cfg.nsamples}_sl{cfg.seq_len}_seed{cfg.seed}.pt",

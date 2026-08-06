@@ -209,40 +209,74 @@ class Config:
     # The final block has no trailing weights and hence no backward objective.
     log_column_block_loss: bool = False
 
-    # Performance experiment knobs are appended after the pre-existing
-    # dataclass fields so positional Config construction keeps its ABI. Each
-    # experiment is explicit and default-off pending real-model promotion.
+    # Performance knobs are appended after the pre-existing dataclass fields
+    # so positional Config construction keeps its ABI. P01--P06/P10 use their
+    # optimized implementations by default; every legacy implementation
+    # remains selectable for rollback.
     # Prevalidate WeightQuantizer state and grouped natural-column coordinates
     # once per GPTQ block, then use the private exact-arithmetic primitive.
-    quantizer_inner_fastpath: bool = False
+    quantizer_inner_fastpath: bool = True
     # Reduce finite symmetric weight-clip candidates from the historical
     # Cartesian scan to the exact endpoint union.
-    w_clip_search_impl: str = "cartesian_legacy"
+    w_clip_search_impl: str = "symmetric_union_exact"
     # Stage current/slide Fisher matrices as FP32 once per layer instead of
     # repeatedly expanding the persisted BF16 matrices in refresh losses.
-    fisher_fp32_cache: bool = False
+    fisher_fp32_cache: bool = True
     # In rank-parallel act-order refreshes, rebuild the complete permuted
     # weight from the already-gathered quantized prefix and working suffix
     # instead of issuing a redundant full-weight all-gather.  Keep the
     # historical collective as the default until distributed CUDA exactness
     # and timing gates pass.
-    act_order_stitch_impl: str = "full_weight_legacy"
+    act_order_stitch_impl: str = "prefix_q_trailing_w_exact"
     # Replace the per-candidate CUDA-tensor Python guard in the exact
     # Cartesian weight-clip search with fixed-shape ``torch.where(..., out=)``
     # updates.  The optimized implementation is restricted to the production
     # FP32/no-grad observer domain; every other input follows the historical
     # guarded implementation exactly.
-    w_clip_update_impl: str = "guarded"
+    w_clip_update_impl: str = "where_out"
     # Store grouped weight scale/zero either once per natural column
     # (historical) or once per natural group. Compact is an opt-in exact
     # candidate until the CUDA E0--E4 gates are complete.
-    w_group_param_layout: str = "expanded"
+    w_group_param_layout: str = "compact"
+    # Campaign consumers set this after a dedicated cache producer succeeds.
+    # Appended to preserve Config's positional constructor ABI. A miss then
+    # fails instead of silently recomputing Stage 0 concurrently.
+    require_static_cache_hit: bool = False
+    # The dedicated producer also materialises FP WikiText-2 reference
+    # hidden states. Sweep consumers refuse to regenerate them concurrently.
+    require_reference_cache_hit: bool = False
+    # Optional exact calibration artifact.  Controlled comparisons use this
+    # to make base and instruct checkpoints consume the identical saved token
+    # tensor even though their derived ``model_name`` values differ.
+    tokens_cache_file: Optional[str] = None
+    # P10: evaluate the invariant tensor lower clamp bound once per prepared
+    # P01 block rather than once per quantized column.
+    prepared_clamp_bound_cache: bool = True
+    # Fuse the sequential quantize + in-block GPTQ compensation loop into one
+    # autotuned Triton program. The cross-block Err@Hinv compensation remains
+    # a separate one-shot GEMM/BMM.
+    triton_column_block: bool = True
 
     def __post_init__(self) -> None:
         if not self.model_name:
             # Mirror the old process_args convention: model_name = basename
             # of the model path, used as a cache-key fragment by eval_utils.
             self.model_name = os.path.basename(self.model.rstrip("/")) or "model"
+        if type(self.require_static_cache_hit) is not bool:
+            raise ValueError(
+                "`require_static_cache_hit` must be bool. Got "
+                f"{self.require_static_cache_hit!r}."
+            )
+        if self.require_static_cache_hit and not self.static_cache_path:
+            raise ValueError(
+                "`require_static_cache_hit=True` requires "
+                "`static_cache_path`."
+            )
+        if type(self.require_reference_cache_hit) is not bool:
+            raise ValueError(
+                "`require_reference_cache_hit` must be bool. Got "
+                f"{self.require_reference_cache_hit!r}."
+            )
         if not (0.0 < self.a_loss_ratio <= 1.0):
             raise ValueError(
                 f"`a_loss_ratio` must be in (0, 1]. Got {self.a_loss_ratio}."
@@ -280,16 +314,27 @@ class Config:
                     "`w_asym=True` is unsupported: REAL-Q's weight fake-quant "
                     "path does not preserve asymmetric zero-points."
                 )
-            if (
-                self.w_groupsize != -1
-                and self.w_groupsize != self.blocksize
-            ):
-                raise ValueError(
-                    "`w_groupsize` must be -1 or equal to `blocksize`, "
-                    "matching legacy GPTQ+ dynamic/static group semantics. "
-                    f"Got w_groupsize={self.w_groupsize}, "
-                    f"blocksize={self.blocksize}."
-                )
+            if self.w_groupsize != -1:
+                if self.blocksize % self.w_groupsize != 0:
+                    raise ValueError(
+                        "`blocksize` must be an integer multiple of "
+                        "`w_groupsize` for grouped weight quantization. "
+                        f"Got w_groupsize={self.w_groupsize}, "
+                        f"blocksize={self.blocksize}."
+                    )
+                if (
+                    not self.act_order
+                    and self.w_groupsize != self.blocksize
+                ):
+                    raise ValueError(
+                        "`w_groupsize != blocksize` is supported only with "
+                        "`act_order=True`, where natural-column group "
+                        "parameters are observed statically before the "
+                        "permutation. Dynamic non-act-order groups still "
+                        "require equality to preserve legacy observer timing. "
+                        f"Got w_groupsize={self.w_groupsize}, "
+                        f"blocksize={self.blocksize}."
+                    )
         if self.w_clip_search_impl not in (
             "cartesian_legacy",
             "symmetric_union_exact",
@@ -344,6 +389,24 @@ class Config:
             raise ValueError(
                 "`quantizer_inner_fastpath` must be bool. Got "
                 f"{self.quantizer_inner_fastpath!r}."
+            )
+        if type(self.prepared_clamp_bound_cache) is not bool:
+            raise ValueError(
+                "`prepared_clamp_bound_cache` must be bool. Got "
+                f"{self.prepared_clamp_bound_cache!r}."
+            )
+        if (
+            self.prepared_clamp_bound_cache
+            and not self.quantizer_inner_fastpath
+        ):
+            raise ValueError(
+                "`prepared_clamp_bound_cache=True` requires "
+                "`quantizer_inner_fastpath=True`."
+            )
+        if type(self.triton_column_block) is not bool:
+            raise ValueError(
+                "`triton_column_block` must be bool. Got "
+                f"{self.triton_column_block!r}."
             )
         if type(self.fisher_fp32_cache) is not bool:
             raise ValueError(
