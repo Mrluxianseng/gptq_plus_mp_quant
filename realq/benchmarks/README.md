@@ -1,14 +1,14 @@
 # RealQ Benchmark
 
-`realq/` 是从当前工作树的 `realq/` 完整复制出的独立包。原
-`realq/` 没有被本次接入修改；副本保留相同的量化、checkpoint、KL/PPL
-和 lm-eval 流程，并在“量化完成或加载量化 checkpoint 之后”增加生成式
-推理评测。
+本目录是主线 `realq` 包的生成式推理评测子模块。它不复制量化内核，
+而是在“量化完成或加载量化 checkpoint 之后”直接消费同一个主线模型和
+`realq.config.Config`，因此 Block-GD、MoE 分流、checkpoint、KL/PPL、
+lm-eval 和性能开关使用同一份运行时配置。
 
 详细操作见
-[REALQ_BENCHMARK_TUTORIAL.md](../docs/REALQ_BENCHMARK_TUTORIAL.md)，完整
+[REALQ_BENCHMARK_TUTORIAL.md](../../docs/REALQ_BENCHMARK_TUTORIAL.md)，完整
 实施与测试流水账见
-[REALQ_BENCHMARK_IMPLEMENTATION_20260726.md](../docs/REALQ_BENCHMARK_IMPLEMENTATION_20260726.md)。
+[REALQ_BENCHMARK_IMPLEMENTATION_20260726.md](../../docs/REALQ_BENCHMARK_IMPLEMENTATION_20260726.md)。
 
 ## 支持范围
 
@@ -106,10 +106,8 @@ reasoning_eval/
     └── scores.json
 ```
 
-## 当前 Qwen3 model zoo
+## 模型要求
 
-当前 `modelzoo/Qwen3/` 中实际存在 `Qwen3-4B`、`Qwen3-8B` 和
-`Qwen3-32B`，没有 1B。三者都是经过 post-training、带完整 chat template
-和 thinking/non-thinking 开关的 Qwen3 chat/instruct 模型；它们的 README
-同时把各自的 `Qwen3-*-Base` 标为基础模型。因此这里不能把目录名没有
-`-Instruct` 误判为 base 模型。
+评测入口不绑定某个固定 model-zoo 清单；`cfg.model` 或已加载量化
+checkpoint 对应的 tokenizer 必须可从本地离线读取。chat/instruct 模型应
+提供有效 chat template；不要仅根据目录名是否带 `-Instruct` 判断模型类型。
