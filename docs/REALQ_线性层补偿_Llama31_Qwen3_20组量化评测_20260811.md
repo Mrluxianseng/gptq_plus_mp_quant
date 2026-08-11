@@ -251,3 +251,4 @@
 - 2026-08-11 22:26：Qwen3-32B KV4 最后一项 SIQA 完成，子进程 rc=0、单组审计与原子 marker 均通过；正式 KL/PPL/QA Avg=`0.25566542/8.2580/68.71`。至此质量评测=`20/20`、QA 单项=`200/200`、failure=`0`，两机 GPU 全部释放。
 - 2026-08-11 22:27：质量 fail-closed 总审计 rc=0，计数=`20 runs / 20 PPL / 200 QA`，quality audit fingerprint=`0ecc1f4b3528d83698cbcfeea96b81f69a745c3a447e4d7c3dc8ee690d950a88`；主表与十项 QA 明细均从该审计 JSON 回填。
 - 2026-08-11 22:29：主表 20 行的 KL/PPL/QA Avg 与十项 QA 明细 20 行均逐字段对比审计 JSON，无差异、无占位符；相关门禁测试=`32 passed`，`git diff --check` 通过。
+- 2026-08-11 22:36：确认两机 16 卡均为 `0 MiB/0%` 且无 CUDA 进程后，执行 `mmctl jobs abort j-tc64iczh8w` 与 `mmctl jobs abort j-jd9dtz5a1h`，两条命令均成功；控制面复核两条 debug/sleep job 均为 `Aborted/retry=0`。共享盘 checkpoint、日志、generation、正式审计与质量审计产物均保留。
