@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 from torch.func import functional_call
 
+from realq.config import parse_cli
 from realq.alignment import RefreshTraceWriter
 from realq.refresh.block_gd import (
     BlockRefreshState,
@@ -98,6 +99,42 @@ def _context(module: nn.Module) -> RefreshContext:
             seed=0,
         ),
     )
+
+
+def test_full_block_refresh_defaults_to_legacy_single_linear_scope() -> None:
+    assert parse_cli([]).full_block_refresh is False
+    assert (
+        parse_cli(["--full_block_refresh", "true"]).full_block_refresh
+        is True
+    )
+
+
+def test_legacy_single_linear_refresh_does_not_update_future_linear() -> None:
+    torch.manual_seed(3)
+    block = _ToyBlock(seed=5)
+    x = torch.randn(2, 3, 4)
+    with torch.no_grad():
+        fp_out = block(x)[0].clone()
+    future_before = block.second.weight.detach().clone()
+
+    refresh = make_grad_refresh_fn(
+        layer=block,
+        module=block.first,
+        layer_state=_layer_inputs(x),
+        fp_out_for_this_layer=fp_out,
+        fisher=torch.eye(4),
+        ctx=_context(block.first),
+    )
+    update = refresh(
+        block.first.weight.detach().float().clone() + 0.1,
+        trailing_col_start=2,
+    )
+
+    assert refresh._realq_update_layout == "trailing_quant_order"
+    assert update is not None
+    assert update.shape == (4, 2)
+    assert torch.count_nonzero(update) > 0
+    assert torch.equal(block.second.weight, future_before)
 
 
 def test_full_block_trace_records_actual_backward_and_master_updates(

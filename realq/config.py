@@ -307,11 +307,24 @@ class Config:
     moe_joint_column_block: bool = True
     moe_expert_loss_slide_window: bool = True
 
+    # REAL-Q Plus extends every refresh from the current linear's unquantized
+    # suffix to all not-yet-quantized linears in the current Transformer
+    # block (and, for an active sliding arm, the next block).  Appended to
+    # preserve Config's positional constructor ABI.  The default is the
+    # paper/original single-linear refresh scope; REAL-Q Plus campaigns must
+    # opt into the expanded Transformer-block update explicitly.
+    full_block_refresh: bool = False
+
     def __post_init__(self) -> None:
         if not self.model_name:
             # Mirror the old process_args convention: model_name = basename
             # of the model path, used as a cache-key fragment by eval_utils.
             self.model_name = os.path.basename(self.model.rstrip("/")) or "model"
+        if type(self.full_block_refresh) is not bool:
+            raise ValueError(
+                "`full_block_refresh` must be bool. Got "
+                f"{self.full_block_refresh!r}."
+            )
         if type(self.require_static_cache_hit) is not bool:
             raise ValueError(
                 "`require_static_cache_hit` must be bool. Got "

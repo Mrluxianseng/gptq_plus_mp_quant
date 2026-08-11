@@ -482,7 +482,7 @@ def quantize_one_layer(
 
         block_state = None
         next_block_state = None
-        if block_gd_enabled:
+        if block_gd_enabled and cfg.full_block_refresh:
             if block_refresh_states is None:
                 block_refresh_states = {}
             current_named_modules = _all_quantizable_modules(layer)
@@ -650,8 +650,16 @@ def quantize_one_layer(
                                     grad_refresh_fn = make_kl_refresh_fn(
                                         layer=layer,
                                         module=realq.linear,
-                                        module_name=name,
-                                        block_state=block_state,
+                                        module_name=(
+                                            name
+                                            if cfg.full_block_refresh
+                                            else None
+                                        ),
+                                        block_state=(
+                                            block_state
+                                            if cfg.full_block_refresh
+                                            else None
+                                        ),
                                         layer_state=state,
                                         fp_out_for_this_layer=fp_outs,
                                         analyzer=analyzer,
@@ -662,8 +670,16 @@ def quantize_one_layer(
                                     grad_refresh_fn = make_grad_refresh_fn(
                                         layer=layer,
                                         module=realq.linear,
-                                        module_name=name,
-                                        block_state=block_state,
+                                        module_name=(
+                                            name
+                                            if cfg.full_block_refresh
+                                            else None
+                                        ),
+                                        block_state=(
+                                            block_state
+                                            if cfg.full_block_refresh
+                                            else None
+                                        ),
                                         layer_state=state,
                                         fp_out_for_this_layer=fp_outs,
                                         fisher=fisher_dev,
@@ -671,7 +687,10 @@ def quantize_one_layer(
                                         next_layer=next_layer if cfg.loss_slide_window else None,
                                         next_block_state=(
                                             next_block_state
-                                            if cfg.loss_slide_window
+                                            if (
+                                                cfg.full_block_refresh
+                                                and cfg.loss_slide_window
+                                            )
                                             else None
                                         ),
                                         next_fp_out=next_fp_outs if cfg.loss_slide_window else None,
@@ -720,9 +739,14 @@ def quantize_one_layer(
             for p in layer.parameters():
                 p.requires_grad_(False)
                 p.grad = None
-            block_state.assert_complete()
-            block_state.release()
-            block_refresh_states.pop(layer_idx, None)
+            if cfg.full_block_refresh:
+                if block_state is None or block_refresh_states is None:
+                    raise RuntimeError(
+                        "full-block refresh completed without block state"
+                    )
+                block_state.assert_complete()
+                block_state.release()
+                block_refresh_states.pop(layer_idx, None)
         if cfg.fisher_fp32_cache:
             # The final loop locals otherwise retain the last refresh closure,
             # which in turn retains both FP32 Fisher matrices through the
@@ -814,7 +838,11 @@ def quantize_all_layers(
                 "global_loss": True,
                 "grad_refresh_loss": "fisher_diag_mse",
                 "g_update_mode": "block_gd",
-                "weight_update_scope": "full_transformer_block",
+                "weight_update_scope": (
+                    "full_transformer_block"
+                    if cfg.full_block_refresh
+                    else "current_linear_trailing_columns"
+                ),
                 "grad_optimizer": "adam",
                 "final_layer_grad_optimizer": "adam",
                 "analytical_first_order_enabled": False,
