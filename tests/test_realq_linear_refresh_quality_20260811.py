@@ -57,5 +57,5 @@ def test_quality_identity_is_campaign_specific_and_audit_is_not_stale():
         "6c749049865856fcda739d07e16bbcab84ddb8349e618d83b9f0f7449ae060e1"
     )
     assert q.EXPECTED_FINAL_AUDIT_FINGERPRINT == (
-        "TBD_AFTER_LINEAR_REFRESH_FINAL_AUDIT"
+        "9ff8b504bc75c03ee755f0dd3cf6bb09424b14f004b5b330775826570e3d291d"
     )
