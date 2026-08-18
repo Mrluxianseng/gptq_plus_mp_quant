@@ -21,7 +21,7 @@ import torch
 import torch.distributed as dist
 from transformers import AutoConfig
 
-from realq import akv, fsdp as realq_fsdp, precompute, runner
+from realq import akv, attention, fsdp as realq_fsdp, precompute, runner
 from realq.benchmarks import run_reasoning_eval
 from realq.parallel import env as parallel_env
 from realq.utils import memory as mem_utils
@@ -171,6 +171,11 @@ def _run_lm_eval_if_requested(
 def run(cfg: "Config") -> None:
     """End-to-end RealQ pipeline."""
     if _model_source_declares_sparse_moe(cfg.model):
+        if cfg.attention_backend != "sdpa":
+            raise ValueError(
+                "attention_backend='flash_attention_4' is currently "
+                "supported only by the dense RealQ pipeline."
+            )
         # Keep the dense core on its latest full-block/Triton path while the
         # sparse package owns its deliberately different ragged statistics,
         # all-expert Jacobi refresh, and fully GPU-resident lifecycle.
@@ -191,6 +196,7 @@ def run(cfg: "Config") -> None:
 
     with nvtx.nvtx_range("ptq.load_model"):
         analyzer = model_utils.ModelAnalyzer(cfg.model, cfg.seq_len)
+    attention.configure_attention_backend(analyzer.model, cfg.attention_backend)
     if loaded_checkpoint is not None:
         checkpoint_utils.validate_artifact_identity(
             cfg,
@@ -273,6 +279,9 @@ def run(cfg: "Config") -> None:
         with nvtx.nvtx_range("ptq.fsdp_unwrap"):
             ckpt_dir = realq_fsdp.save_post_precompute_checkpoint(analyzer, cfg)
             analyzer = realq_fsdp.reload_on_cpu(analyzer, ckpt_dir)
+            attention.configure_attention_backend(
+                analyzer.model, cfg.attention_backend
+            )
             # Reinstall ActQuantWrapper sites on the freshly-loaded model — the
             # checkpoint stored only the inner Linear weights without wrappers.
             # Re-applying the rotation wrappers (which install had_K on down_proj
@@ -375,6 +384,9 @@ def _run_cpu_master(cfg: "Config") -> None:
             analyzer_eval = model_utils.ModelAnalyzer(
                 checkpoint_path, cfg.seq_len, tokenizer_source=checkpoint_path,
             )
+            attention.configure_attention_backend(
+                analyzer_eval.model, cfg.attention_backend
+            )
             # Set the OLD attribute name so eval_utils.get_ref_logits computes
             # the same cache tag as the legacy path (utils/eval_utils.py:115).
             analyzer_eval.model._gptqplus_prepared_checkpoint_path = checkpoint_path
@@ -395,6 +407,7 @@ def _run_cpu_master(cfg: "Config") -> None:
 
     # Phase B — meta init + sharded broadcast load.
     analyzer = realq_fsdp.load_meta_for_precompute(cfg, checkpoint_path)
+    attention.configure_attention_backend(analyzer.model, cfg.attention_backend)
     # Wrappers installed AFTER broadcast load (the loader matches keys against
     # vanilla state_dict; wrapping introduces ``.module.`` infix that would
     # turn into unmatched keys).
@@ -426,6 +439,7 @@ def _run_cpu_master(cfg: "Config") -> None:
     del analyzer
     mem_utils.cleanup_memory()
     analyzer = realq_fsdp.rebuild_asymmetric_for_quant(cfg, checkpoint_path)
+    attention.configure_attention_backend(analyzer.model, cfg.attention_backend)
     if cfg.rotate:
         rotation_utils.add_activation_quant_wrappers_for_rotation(analyzer)
     else:

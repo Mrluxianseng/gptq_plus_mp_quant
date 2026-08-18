@@ -143,8 +143,13 @@ def _run_realq(
     w_clip_search_impl: str = "cartesian_legacy",
     w_clip_update_impl: str = "guarded",
     w_group_param_layout: str = "expanded",
+    prepared_clamp_bound_cache: bool = False,
+    triton_column_block: bool = False,
 ) -> torch.Tensor:
-    linear = nn.Linear(weight.shape[1], weight.shape[0], bias=False)
+    device = weight.device
+    linear = nn.Linear(
+        weight.shape[1], weight.shape[0], bias=False, device=device
+    )
     linear.weight.data.copy_(weight)
     quantizer = _quantizer(
         groupsize=groupsize,
@@ -155,18 +160,24 @@ def _run_realq(
     )
     realq = RealQLayer(
         linear=linear,
-        saliency=torch.ones(1, 1, num_groups),
+        saliency=torch.ones(1, 1, num_groups, device=device),
         quantizer=quantizer,
         num_groups=num_groups,
-        dev=torch.device("cpu"),
+        dev=device,
         group_parallel_quant=group_parallel_quant,
     )
     # A diagonal Hessian removes cross-column compensation, isolating the
     # quantizer/group-coordinate contract in all RealQLayer execution paths.
     if hessian is None:
-        hessian = torch.eye(weight.shape[1])
-    realq.H = hessian.unsqueeze(0).repeat(num_groups, 1, 1)
-    realq.act_square = torch.arange(weight.shape[1], dtype=torch.float32)
+        hessian = torch.eye(weight.shape[1], device=device)
+    realq.H = (
+        hessian.unsqueeze(0).repeat(num_groups, 1, 1)
+        if hessian.dim() == 2
+        else hessian.clone()
+    )
+    realq.act_square = torch.arange(
+        weight.shape[1], dtype=torch.float32, device=device
+    )
     realq._finalized = True
     realq.quantize(
         blocksize=blocksize,
@@ -175,8 +186,54 @@ def _run_realq(
         w_clip=w_clip,
         group_parallel_quant=group_parallel_quant,
         quantizer_inner_fastpath=quantizer_inner_fastpath,
+        prepared_clamp_bound_cache=prepared_clamp_bound_cache,
+        triton_column_block=triton_column_block,
     )
     return linear.weight.detach().clone()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="requires CUDA Triton",
+)
+def test_triton_column_blocks_match_full_dense_realq_with_outer_compensation():
+    torch.manual_seed(20260728)
+    device = torch.device("cuda")
+    rows, columns, num_groups = 64, 259, 4
+    weight = torch.randn(rows, columns, device=device)
+    factor = torch.randn(num_groups, columns, columns, device=device)
+    hessian = (
+        factor @ factor.transpose(-1, -2)
+        + torch.eye(columns, device=device).unsqueeze(0) * 0.5
+    )
+
+    common = dict(
+        groupsize=128,
+        num_groups=num_groups,
+        group_parallel_quant="none",
+        act_order=True,
+        hessian=hessian,
+        blocksize=128,
+        quantizer_inner_fastpath=True,
+        w_clip=True,
+        w_clip_search_impl="symmetric_union_exact",
+        w_clip_update_impl="where_out",
+        w_group_param_layout="compact",
+        prepared_clamp_bound_cache=True,
+    )
+    expected = _run_realq(
+        weight,
+        triton_column_block=False,
+        **common,
+    )
+    actual = _run_realq(
+        weight,
+        triton_column_block=True,
+        **common,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(actual, expected)
 
 
 @pytest.mark.parametrize("num_groups", [1, 2])
@@ -463,6 +520,30 @@ def test_dynamic_group_size_must_match_blocksize():
             act_order=False,
             blocksize=64,
         )
+
+
+@pytest.mark.parametrize("num_groups", [1, 2])
+@pytest.mark.parametrize("group_parallel_quant", ["none", "rank"])
+@pytest.mark.parametrize("quantizer_inner_fastpath", [False, True])
+def test_act_order_group128_supports_four_groups_per_block(
+    num_groups, group_parallel_quant, quantizer_inner_fastpath
+):
+    weight = _structured_weight(rows=4, columns=513)
+    reference_quantizer = _quantizer(groupsize=128)
+    reference_quantizer.find_params(weight)
+    expected, _, _ = reference_quantizer.fake_quantize(weight)
+
+    actual = _run_realq(
+        weight,
+        groupsize=128,
+        num_groups=num_groups,
+        group_parallel_quant=group_parallel_quant,
+        act_order=True,
+        blocksize=512,
+        quantizer_inner_fastpath=quantizer_inner_fastpath,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(

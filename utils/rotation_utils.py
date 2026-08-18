@@ -2,10 +2,18 @@ import functools
 import typing
 import torch
 import math
+import types
+import weakref
 from tqdm import tqdm
 
-from utils import memory_utils, model_utils, hadamard_utils, quant_utils, \
-                  monkeypatch
+from utils import (
+    hadamard_utils,
+    memory_utils,
+    model_utils,
+    monkeypatch,
+    quant_utils,
+    triton_qwen3_fusions,
+)
 
 
 @torch.inference_mode()
@@ -112,7 +120,9 @@ def rotate_ov_proj(analyzer: model_utils.ModelAnalyzer, layer, R2=None):
 def rotate_model(args, analyzer: model_utils.ModelAnalyzer):
     if args.optimized_rotation_path is not None:
         R_cpk = args.optimized_rotation_path
-        R1 = torch.load(R_cpk)["R1"].cuda().to(torch.float64)
+        R1 = torch.load(R_cpk)["R1"].to(
+            device="cuda", dtype=torch.float64
+        )
         rotation_gen = None
     else:
         # Rotation is an algorithmic artifact, not part of calibration
@@ -133,7 +143,9 @@ def rotate_model(args, analyzer: model_utils.ModelAnalyzer):
     for idx, layer in enumerate(tqdm(layers, unit="layer", desc="Rotating")):
         if args.optimized_rotation_path is not None:
             key = f"model.layers.{idx}.self_attn.R2"
-            R2 = torch.load(R_cpk)[key].cuda().to(torch.float64)
+            R2 = torch.load(R_cpk)[key].to(
+                device="cuda", dtype=torch.float64
+            )
         else:
             R2 = get_orthogonal_matrix(
                 analyzer.head_dim,
@@ -176,8 +188,22 @@ def prepare_model_for_rotated_quantization(args, analyzer: model_utils.ModelAnal
         quant_utils.add_actquant(analyzer)
 
 
+def _deferred_qk_rmsnorm_forward(_module, hidden_states):
+    """Leave Q/K unnormalised until the fused post-projection RoPE site."""
+
+    return hidden_states
+
+
 class QKRotationWrapper(torch.nn.Module):
-    def __init__(self, func, head_dim, *args, **kwargs):
+    def __init__(
+        self,
+        func,
+        head_dim,
+        *args,
+        q_norm=None,
+        k_norm=None,
+        **kwargs,
+    ):
         super().__init__()
         if not hadamard_utils.is_pow2(head_dim):
             raise ValueError(
@@ -196,8 +222,48 @@ class QKRotationWrapper(torch.nn.Module):
         self.k_sym = False
         self.k_clip_ratio = 1.0
         self.k_quant_enabled = False
+        # Weak references avoid registering q_norm/k_norm a second time below
+        # this wrapper, which would duplicate state_dict paths.
+        object.__setattr__(self, "_q_norm_ref", None)
+        object.__setattr__(self, "_k_norm_ref", None)
         if kwargs:
             self.configure_k_quant(**kwargs)
+        if q_norm is not None or k_norm is not None:
+            self.configure_qk_norm_fusion(q_norm=q_norm, k_norm=k_norm)
+
+    def configure_qk_norm_fusion(self, *, q_norm, k_norm) -> None:
+        if q_norm is None or k_norm is None:
+            raise ValueError("Q/K RMSNorm fusion requires both norm modules.")
+        for label, norm in (("q_norm", q_norm), ("k_norm", k_norm)):
+            weight = getattr(norm, "weight", None)
+            if weight is None or tuple(weight.shape) != (self.head_dim,):
+                raise ValueError(
+                    f"{label}.weight must have shape ({self.head_dim},)."
+                )
+            if not hasattr(norm, "variance_epsilon"):
+                raise ValueError(f"{label} does not expose variance_epsilon.")
+            if not hasattr(norm, "_realq_unfused_forward"):
+                # REAL-Q never optimises RMSNorm parameters during Block-GD;
+                # freezing makes that existing contract explicit and lets the
+                # custom backward omit an otherwise expensive dweight reduce.
+                norm.weight.requires_grad_(False)
+                norm._realq_unfused_forward = norm.forward
+                norm.forward = types.MethodType(
+                    _deferred_qk_rmsnorm_forward, norm
+                )
+        object.__setattr__(self, "_q_norm_ref", weakref.ref(q_norm))
+        object.__setattr__(self, "_k_norm_ref", weakref.ref(k_norm))
+
+    def _deferred_norms(self):
+        q_ref = object.__getattribute__(self, "_q_norm_ref")
+        k_ref = object.__getattribute__(self, "_k_norm_ref")
+        if q_ref is None or k_ref is None:
+            return None, None
+        q_norm = q_ref()
+        k_norm = k_ref()
+        if q_norm is None or k_norm is None:
+            raise RuntimeError("Deferred Q/K RMSNorm module was released.")
+        return q_norm, k_norm
 
     def configure_k_quant(
         self,
@@ -236,10 +302,60 @@ class QKRotationWrapper(torch.nn.Module):
         self.k_quant_enabled = bool(k_quant_enabled)
 
     def forward(self, *args, **kwargs):
-        q, k = self.func(*args, **kwargs)
+        q_norm, k_norm = self._deferred_norms()
+        if q_norm is None:
+            q, k = self.func(*args, **kwargs)
+        else:
+            if len(args) < 2:
+                raise ValueError("RoPE wrapper requires positional Q and K inputs.")
+            q, k = args[:2]
+            cos = args[2] if len(args) > 2 else kwargs.get("cos")
+            sin = args[3] if len(args) > 3 else kwargs.get("sin")
+            unsqueeze_dim = (
+                args[5]
+                if len(args) > 5
+                else kwargs.get("unsqueeze_dim", 1)
+            )
+            if (
+                cos is not None
+                and sin is not None
+                and triton_qwen3_fusions.can_fuse_qk_rmsnorm_rope(
+                    q,
+                    k,
+                    q_norm.weight,
+                    k_norm.weight,
+                    cos,
+                    sin,
+                    unsqueeze_dim=unsqueeze_dim,
+                )
+            ):
+                q, k = triton_qwen3_fusions.fused_qk_rmsnorm_rope(
+                    q,
+                    k,
+                    q_norm.weight,
+                    k_norm.weight,
+                    cos,
+                    sin,
+                    q_eps=float(q_norm.variance_epsilon),
+                    k_eps=float(k_norm.variance_epsilon),
+                )
+            else:
+                # CPU, unsupported layouts and non-default RoPE broadcasting
+                # retain the original eager equation exactly.
+                q = q_norm._realq_unfused_forward(q)
+                k = k_norm._realq_unfused_forward(k)
+                forwarded_args = (q, k, *args[2:])
+                q, k = self.func(*forwarded_args, **kwargs)
         dtype = q.dtype
-        q = (hadamard_utils.HadamardTransform.apply(q.float()) / math.sqrt(q.shape[-1])).to(dtype)
-        k = (hadamard_utils.HadamardTransform.apply(k.float()) / math.sqrt(k.shape[-1])).to(dtype)
+        # FP32 input/output casts are precision-critical here: the Q/K online
+        # rotation was defined in FP32.  FHT fuses the normalization multiply
+        # into its CUDA store; only the final deployed-dtype cast remains.
+        q = hadamard_utils.scaled_hadamard_transform(
+            q.float(), scale=1.0 / math.sqrt(q.shape[-1])
+        ).to(dtype)
+        k = hadamard_utils.scaled_hadamard_transform(
+            k.float(), scale=1.0 / math.sqrt(k.shape[-1])
+        ).to(dtype)
         if not self.k_quant_enabled or self.k_bits >= 16:
             return q, k
 
@@ -252,7 +368,6 @@ class QKRotationWrapper(torch.nn.Module):
                 self.k_quantizer(token_wise_k)
                 .reshape((bsz, seq_len, num_heads, head_dim))
                 .transpose(1, 2)
-                .to(q)
             )
         else:  # head-wise quantization
             per_head_k = k.view(-1, head_dim)
@@ -260,7 +375,6 @@ class QKRotationWrapper(torch.nn.Module):
             k = (
                 self.k_quantizer(per_head_k)
                 .reshape((bsz, num_heads, seq_len, head_dim))
-                .to(q)
             )
 
         self.k_quantizer.free()
@@ -272,6 +386,8 @@ def add_qk_rotation_wrapper_after_function_call_in_forward(
     module,
     function_name,
     *args,
+    q_norm=None,
+    k_norm=None,
     **kwargs,
 ):
     """
@@ -289,13 +405,23 @@ def add_qk_rotation_wrapper_after_function_call_in_forward(
             )
         if args or kwargs:
             wrapper.configure_k_quant(*args, **kwargs)
+        if q_norm is not None or k_norm is not None:
+            wrapper.configure_qk_norm_fusion(
+                q_norm=q_norm, k_norm=k_norm
+            )
         return wrapper
 
     wrapper = monkeypatch.add_wrapper_after_function_call_in_method(
         module,
         "forward",
         function_name,
-        lambda original_func: QKRotationWrapper(original_func, *args, **kwargs),
+        lambda original_func: QKRotationWrapper(
+            original_func,
+            *args,
+            q_norm=q_norm,
+            k_norm=k_norm,
+            **kwargs,
+        ),
     )
     setattr(module, attr_name, wrapper)
     return wrapper

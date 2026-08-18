@@ -16,6 +16,14 @@ os.environ.setdefault("HF_DATASETS_TRUST_REMOTE_CODE", "1")
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
 import torch  # noqa: E402  (env var must come first)
+from utils.reproducibility import configure_deterministic_sdpa  # noqa: E402
+
+# LR-search workers can request a fully deterministic SDPA path.  The shared
+# reproducibility helper uses ``warn_only=True`` because general experiments
+# may prefer the faster memory-efficient kernel, but an optimizer comparing
+# very close KL values must not rank candidates using atomic-backward noise.
+if os.environ.get("REALQ_DETERMINISTIC_SDPA") == "1":
+    configure_deterministic_sdpa()
 
 from realq import config as cfg_mod
 from realq import pipeline

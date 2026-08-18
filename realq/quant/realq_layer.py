@@ -31,6 +31,7 @@ from realq.quant.triton_column_block import (
     prepared_scale_matrix,
     quantize_column_block,
 )
+from realq.quant import triton_refresh_stitch
 from realq.utils import nvtx
 from utils import dist_utils
 
@@ -43,6 +44,49 @@ if TYPE_CHECKING:
 _ACT_ORDER_STITCH_IMPLEMENTATIONS = frozenset(
     {"full_weight_legacy", "prefix_q_trailing_w_exact"}
 )
+
+
+def _hessian_matmul(
+    left: torch.Tensor,
+    right: torch.Tensor,
+    *,
+    use_tf32: bool,
+) -> torch.Tensor:
+    """Run only the Hessian GEMM under the requested CUDA TF32 policy.
+
+    Both inputs and the returned tensor are FP32.  On CUDA, TF32 changes the
+    multiply input precision while the Tensor Core accumulator and output stay
+    FP32.  Restoring the process-global backend flag immediately after
+    dispatch keeps Cholesky, refresh loss, and unrelated FP32 matmuls on their
+    existing policies.
+    """
+
+    if left.dtype != torch.float32 or right.dtype != torch.float32:
+        raise TypeError("Hessian matmul requires FP32 inputs.")
+    if left.device != right.device:
+        raise ValueError("Hessian matmul inputs must be on the same device.")
+    if left.ndim != right.ndim or left.ndim not in (2, 3):
+        raise ValueError("Hessian matmul expects matching rank-2 or rank-3 inputs.")
+
+    def run() -> torch.Tensor:
+        return torch.bmm(left, right) if left.ndim == 3 else left.matmul(right)
+
+    range_name = "hessian.matmul_tf32" if use_tf32 else "hessian.matmul_fp32"
+    with nvtx.nvtx_range(range_name):
+        if not left.is_cuda:
+            result = run()
+        else:
+            previous = torch.backends.cuda.matmul.allow_tf32
+            torch.backends.cuda.matmul.allow_tf32 = use_tf32
+            try:
+                result = run()
+            finally:
+                torch.backends.cuda.matmul.allow_tf32 = previous
+    if result.dtype != torch.float32:
+        raise RuntimeError(
+            f"Hessian matmul must return FP32, got {result.dtype}."
+        )
+    return result
 
 
 def _rebuild_permuted_weight_from_prefix_and_trailing_(
@@ -67,6 +111,28 @@ def _rebuild_permuted_weight_from_prefix_and_trailing_(
     return destination
 
 
+def _stitch_natural_refresh_weight(
+    full_q: torch.Tensor,
+    full_w: torch.Tensor,
+    invperm: torch.Tensor,
+    trailing_col_start: int,
+    *,
+    fused: bool,
+) -> torch.Tensor:
+    """Build the functional-forward weight in natural column order."""
+
+    if fused and triton_refresh_stitch.can_stitch(full_q, full_w, invperm):
+        return triton_refresh_stitch.stitch_natural_weight(
+            full_q, full_w, invperm, trailing_col_start
+        )
+    q_natural = full_q[:, invperm]
+    w_natural = full_w[:, invperm]
+    stitched = w_natural.clone()
+    committed = invperm < trailing_col_start
+    stitched[:, committed] = q_natural[:, committed]
+    return stitched
+
+
 class RealQLayer:
     def __init__(
         self,
@@ -76,10 +142,17 @@ class RealQLayer:
         num_groups: int,
         dev: torch.device,
         group_parallel_quant: str = "none",
+        hessian_tf32: bool = True,
     ) -> None:
         self.linear = linear
         self.dev = dev
         self.num_groups = num_groups
+        if type(hessian_tf32) is not bool:
+            raise ValueError(
+                "hessian_tf32 must be bool, got "
+                f"{hessian_tf32!r}."
+            )
+        self.hessian_tf32 = hessian_tf32
         self.rows, self.columns = linear.weight.shape
         if self.rows % num_groups != 0:
             raise ValueError(
@@ -169,6 +242,7 @@ class RealQLayer:
         self.H = torch.zeros(
             (int(self.hessian_group_ids.numel()), self.columns, self.columns),
             device=dev,
+            dtype=torch.float32,
         )
         if self.hessian_group_sharded:
             # Stride-0 zeros buffer reused as the non-owner input slot in
@@ -176,7 +250,9 @@ class RealQLayer:
             self.hessian_group_zero = torch.zeros(
                 (), device=dev, dtype=self.H.dtype,
             ).expand(self.columns, self.columns)
-        self.act_square = torch.zeros((self.columns,), device=dev)
+        self.act_square = torch.zeros(
+            (self.columns,), device=dev, dtype=torch.float32
+        )
         self.index = 0          # local sample cursor into saliency_cpu
         self.token_count = 0    # local token count (sum of B*T per add_batch)
         self._finalized = False
@@ -246,16 +322,22 @@ class RealQLayer:
             inp_T = inp.transpose(0, 1).contiguous()
             for group_id in range(self.num_groups):
                 weighted = inp.mul(sal[:, group_id].unsqueeze(1))   # (BT, C)
-                block = inp_T.matmul(weighted)                       # (C, C)
+                block = _hessian_matmul(
+                    inp_T, weighted, use_tf32=self.hessian_tf32
+                )                                                    # (C, C)
                 self._reduce_scatter_hessian_group_(group_id, block)
                 local_pos = int(self.hessian_group_to_pos[group_id].item())
                 if local_pos >= 0:
+                    # The TF32 policy applies only to the GEMM above. Both
+                    # operands and this cross-batch accumulation are FP32.
                     self.H[local_pos].add_(block)
         else:
             # Per-group weighted X^T diag(s_g) X, shape (G, C, C).
             weighted = inp.unsqueeze(0).mul(sal.transpose(0, 1).unsqueeze(-1))  # (G, BT, C)
             inp_T = inp.transpose(0, 1).unsqueeze(0).expand(self.num_groups, -1, -1)
-            block = torch.bmm(inp_T, weighted)  # (G, C, C)
+            block = _hessian_matmul(
+                inp_T, weighted, use_tf32=self.hessian_tf32
+            )  # (G, C, C), FP32 output / accumulator
             self.H.add_(block)
         self.act_square.add_((inp ** 2).sum(0))
         self.token_count += inp.shape[0]
@@ -326,7 +408,8 @@ class RealQLayer:
 
         ``grad_refresh_fn``: see ``realq.refresh.block_gd`` docstring. Factory
         closures declare ``_realq_update_layout`` as either
-        ``"full_natural"`` (full-block REAL-Q) or
+        ``"full_natural"`` (compatibility full-block REAL-Q),
+        ``"trailing_quant_order_full_block"`` (compact full-block REAL-Q), or
         ``"trailing_quant_order"`` (legacy public callback); unmarked custom
         callbacks retain the legacy trailing contract.
 
@@ -400,12 +483,19 @@ class RealQLayer:
             None,
             "trailing_quant_order",
             "full_natural",
+            "trailing_quant_order_full_block",
         ):
             raise ValueError(
                 "unknown grad refresh update layout "
                 f"{refresh_update_layout!r}."
             )
         full_refresh_update = refresh_update_layout == "full_natural"
+        compact_full_refresh_update = (
+            refresh_update_layout == "trailing_quant_order_full_block"
+        )
+        full_block_refresh = (
+            full_refresh_update or compact_full_refresh_update
+        )
 
         self.quantizer_inner_fastpath_audit = {
             "requested": quantizer_inner_fastpath,
@@ -872,11 +962,13 @@ class RealQLayer:
                                         )
                                 else:
                                     full_W = W_local
-                                Q_nat = full_Q[:, invperm]
-                                W_nat = full_W[:, invperm]
-                                quant_nat_cols = perm[:i2]
-                                stitched_nat = W_nat.clone()
-                                stitched_nat[:, quant_nat_cols] = Q_nat[:, quant_nat_cols]
+                                stitched_nat = _stitch_natural_refresh_weight(
+                                    full_Q,
+                                    full_W,
+                                    invperm,
+                                    i2,
+                                    fused=compact_full_refresh_update,
+                                )
                                 # Persistent Adam state stays in NATURAL
                                 # coordinates. The closure returns a full
                                 # natural-order update with zeros in locked
@@ -885,12 +977,22 @@ class RealQLayer:
                                     grad_refresh_fn(
                                         stitched_nat, i2, perm=perm
                                     )
-                                    if full_refresh_update
+                                    if full_block_refresh
                                     else grad_refresh_fn(stitched_nat, 0)
                                 )
                                 if full_update is not None:
-                                    update_permuted = full_update[:, perm]
-                                    W_local[:, i2:].sub_(update_permuted[row_sl, i2:])
+                                    if compact_full_refresh_update:
+                                        update_local = full_update[row_sl]
+                                    else:
+                                        # Both the compatibility full-block
+                                        # callback and the unmarked legacy
+                                        # callback return natural-order full
+                                        # weights in this branch.  The latter
+                                        # is invoked with trailing_start=0.
+                                        update_local = full_update[:, perm][
+                                            row_sl, i2:
+                                        ]
+                                    W_local[:, i2:].sub_(update_local)
                     block_idx += 1
 
             # All-gather the per-rank Q_local into the full-rows Q so the
@@ -1111,11 +1213,13 @@ class RealQLayer:
                                         )
                                 else:
                                     full_W = W_local_2d
-                                Q_nat = full_Q[:, invperm]
-                                W_nat = full_W[:, invperm]
-                                quant_nat_cols = perm[:i2]
-                                stitched_nat = W_nat.clone()
-                                stitched_nat[:, quant_nat_cols] = Q_nat[:, quant_nat_cols]
+                                stitched_nat = _stitch_natural_refresh_weight(
+                                    full_Q,
+                                    full_W,
+                                    invperm,
+                                    i2,
+                                    fused=compact_full_refresh_update,
+                                )
                                 # Pass perm so the closure re-keys natural-order grad
                                 # into permuted coord before Adam (see block_gd.py
                                 # rationale; mirrors old GPTQPlus permuted-state Adam).
@@ -1247,11 +1351,13 @@ class RealQLayer:
                                     )
                                     W[:, i2:].sub_(update_trailing)
                             else:
-                                Q_nat = Q[:, invperm]
-                                W_nat = W[:, invperm]
-                                quant_nat_cols = perm[:i2]
-                                stitched_nat = W_nat.clone()
-                                stitched_nat[:, quant_nat_cols] = Q_nat[:, quant_nat_cols]
+                                stitched_nat = _stitch_natural_refresh_weight(
+                                    Q,
+                                    W,
+                                    invperm,
+                                    i2,
+                                    fused=compact_full_refresh_update,
+                                )
                                 # Pass perm so the closure re-keys grad to permuted
                                 # coord (see block_gd.py rationale).
                                 update = grad_refresh_fn(stitched_nat, i2, perm=perm)

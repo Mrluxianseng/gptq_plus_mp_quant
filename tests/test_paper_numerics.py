@@ -254,9 +254,15 @@ def test_activation_aware_uses_reported_constant_lr_but_fp16_flag_is_noop():
 
 def test_paper_defaults_and_conditional_akv_clip_presets():
     fp = Config()
-    assert fp.quantizer_inner_fastpath is False
-    assert fp.act_order_stitch_impl == "full_weight_legacy"
-    assert fp.w_clip_update_impl == "guarded"
+    assert fp.quantizer_inner_fastpath is True
+    assert fp.prepared_clamp_bound_cache is True
+    assert fp.triton_column_block is True
+    assert fp.fused_block_adam is True
+    assert fp.w_clip_search_impl == "symmetric_union_exact"
+    assert fp.fisher_fp32_cache is True
+    assert fp.act_order_stitch_impl == "prefix_q_trailing_w_exact"
+    assert fp.w_clip_update_impl == "where_out"
+    assert fp.w_group_param_layout == "compact"
     assert fp.grad_hessian_topk <= 0
     assert fp.kl_topk <= 0
     assert fp.saliency_clip_percentile == pytest.approx(0.99)
@@ -315,12 +321,32 @@ def test_activation_loss_clip_scope_is_explicit_and_validated():
         Config(a_loss_clip_scope="per_token")
 
 
+def test_required_static_cache_hit_needs_an_explicit_cache_path():
+    with pytest.raises(ValueError, match="requires `static_cache_path`"):
+        Config(require_static_cache_hit=True)
+    assert Config(
+        static_cache_path="/tmp/static-cache",
+        require_static_cache_hit=True,
+    ).require_static_cache_hit is True
+    assert Config(
+        require_reference_cache_hit=True
+    ).require_reference_cache_hit is True
+
+
 @pytest.mark.parametrize(
     ("kwargs", "message"),
     [
         ({"w_bits": 1}, "w_bits"),
         ({"w_asym": True}, "w_asym"),
-        ({"w_groupsize": 64, "blocksize": 128}, "w_groupsize"),
+        ({"w_groupsize": 96, "blocksize": 128}, "integer multiple"),
+        (
+            {
+                "w_groupsize": 64,
+                "blocksize": 128,
+                "act_order": False,
+            },
+            "act_order=True",
+        ),
         ({"w_clip_search_impl": "unordered"}, "w_clip_search_impl"),
         ({"w_clip_update_impl": "unordered"}, "w_clip_update_impl"),
         ({"group_parallel_quant": "tensor"}, "group_parallel_quant"),
@@ -333,6 +359,12 @@ def test_refactored_weight_config_rejects_unsupported_modes(
 ):
     with pytest.raises(ValueError, match=message):
         Config(**kwargs)
+
+
+def test_refactored_weight_config_accepts_multiple_static_groups_per_block():
+    cfg = Config(w_groupsize=128, blocksize=512, act_order=True)
+    assert cfg.w_groupsize == 128
+    assert cfg.blocksize == 512
 
 
 def test_legacy_single_hessian_retry_does_not_accumulate_damping():

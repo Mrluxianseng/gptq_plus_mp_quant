@@ -121,6 +121,36 @@ def test_reference_cache_atomic_write_preserves_old_file_on_failure(
     assert not temporary_paths[0].exists()
 
 
+def test_required_reference_cache_hit_refuses_regeneration(
+    tmp_path,
+    monkeypatch,
+):
+    args = SimpleNamespace(
+        cache_dir=str(tmp_path),
+        model_name="fake",
+        eval_seq_len=2048,
+        require_reference_cache_hit=True,
+    )
+    monkeypatch.setattr(
+        eval_utils,
+        "_reference_cache_metadata",
+        lambda *_args, **_kwargs: {"identity": "test"},
+    )
+    monkeypatch.setattr(
+        eval_utils,
+        "_get_logits",
+        lambda *_args, **_kwargs: pytest.fail("must not regenerate"),
+    )
+
+    with pytest.raises(RuntimeError, match="Required reference-logit cache"):
+        eval_utils.get_ref_logits(
+            args,
+            analyzer=object(),
+            dataset="wikitext2",
+            dataloader=object(),
+        )
+
+
 def test_paper_qa_tasks_require_every_task_and_accuracy_fallback():
     available = set(eval_utils.PAPER_QA_TASKS)
 
@@ -153,6 +183,32 @@ def test_paper_qa_tasks_require_every_task_and_accuracy_fallback():
     assert eval_utils._task_accuracy("boolq", {"acc,none": 0.75}) == 75.0
     with pytest.raises(RuntimeError, match="neither"):
         eval_utils._task_accuracy("broken", {})
+
+
+def test_kl_ppl_logs_exact_metric_for_lr_selection(monkeypatch, caplog):
+    monkeypatch.setattr(
+        eval_utils,
+        "_kl_ppl_eval",
+        lambda *_args, **_kwargs: (
+            12.345678901234567,
+            0.012345678901234567,
+        ),
+    )
+    args = SimpleNamespace(eval_datasets=["wikitext2"])
+
+    with caplog.at_level("INFO"):
+        eval_utils.kl_ppl_eval(
+            args,
+            analyzer=object(),
+            orig_lm_head=object(),
+            test_loader_dict={"wikitext2": object()},
+            ref_logits_dict={"wikitext2": object()},
+        )
+
+    assert (
+        "Exact KL&PPL on wikitext2: "
+        "0.012345678901234567, 12.345678901234567"
+    ) in caplog.text
 
 
 def test_kl_ppl_uses_fp32_distribution_math(monkeypatch):

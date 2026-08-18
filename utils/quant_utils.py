@@ -15,7 +15,7 @@ import torch.nn as nn
 from torch._tensor import Tensor
 import transformers
 
-from utils import hadamard_utils, model_utils
+from utils import hadamard_utils, model_utils, triton_activation_quant
 
 
 def get_minq_maxq(bits, sym):
@@ -268,19 +268,66 @@ class ActQuantizer(torch.nn.Module):
         self.scale = None
 
     def forward(self, x):
-        x_dtype = x.dtype
         if self.bits == 16:
             return x
-        elif self.sym:
-            return STEQuantize.apply(x, self.scale, self.maxq).to(x_dtype)
-        return AsymSTEQuantize.apply(x, self.scale, self.zero, self.maxq).to(x_dtype)
+        columns = int(x.shape[-1])
+        group_size = columns if self.groupsize == -1 else self.groupsize
+        maxq = 2 ** (self.bits - 1) - 1 if self.sym else 2**self.bits - 1
+        zero = None if self.sym else self.zero
+        if triton_activation_quant.can_fuse(x, self.scale, zero):
+            return triton_activation_quant.fake_quant_compact(
+                x,
+                self.scale,
+                zero,
+                maxq=maxq,
+                symmetric=self.sym,
+                group_size=group_size,
+            )
+
+        # Exact eager fallback for CPU, non-contiguous tensors, and the legacy
+        # groupwise BF16-qparam case.  Iterate over compact groups instead of
+        # constructing full-shape scale/zero tensors.
+        rows = x.reshape(-1, columns)
+        outputs = []
+        for group, start in enumerate(range(0, columns, group_size)):
+            end = min(start + group_size, columns)
+            scale = self.scale[:, group : group + 1]
+            if self.sym:
+                output = STEQuantize.apply(rows[:, start:end], scale, self.maxq)
+            else:
+                zero_group = self.zero[:, group : group + 1]
+                output = AsymSTEQuantize.apply(
+                    rows[:, start:end], scale, zero_group, self.maxq
+                )
+            # Mixed BF16/FP32 QDQ produces FP32 in the established per-token
+            # equation.  This cast is required on eager paths; CUDA fuses it
+            # into the Triton store above.
+            outputs.append(output.to(x.dtype))
+        return torch.cat(outputs, dim=-1).reshape(x.shape)
 
     # Different from `forward`, this method returns quantized integers, scales (and zeros if asymmetric).
     def quantize(self, x):
+        columns = int(x.shape[-1])
+        group_size = columns if self.groupsize == -1 else self.groupsize
+        rows = x.reshape(-1, columns)
+        quantized = []
+        for group, start in enumerate(range(0, columns, group_size)):
+            end = min(start + group_size, columns)
+            scale = self.scale[:, group : group + 1]
+            if self.sym:
+                q, _ = sym_quant(rows[:, start:end], scale, self.maxq)
+            else:
+                q, _, _ = asym_quant(
+                    rows[:, start:end],
+                    scale,
+                    self.zero[:, group : group + 1],
+                    self.maxq,
+                )
+            quantized.append(q)
+        q = torch.cat(quantized, dim=-1).reshape(x.shape)
         if self.sym:
-            return sym_quant(x, self.scale, self.maxq)
-        else:
-            return asym_quant(x, self.scale, self.zero, self.maxq)
+            return q, self.scale
+        return q, self.scale, self.zero
 
     def configure(
         self, bits: int, groupsize: int = -1, sym: bool = False, clip_ratio: float = 1.0
@@ -345,16 +392,11 @@ class ActQuantizer(torch.nn.Module):
                 scale = (xmax - xmin) / self.maxq
                 zero = torch.round(-xmin / scale)
 
-            expanded_shape = (*group.shape[:-1], end - start)
-            scale_groups.append(
-                scale.unsqueeze(1).expand(-1, end - start).reshape(expanded_shape)
-            )
-            zero_groups.append(
-                zero.unsqueeze(1).expand(-1, end - start).reshape(expanded_shape)
-            )
+            scale_groups.append(scale)
+            zero_groups.append(zero)
 
-        self.scale = torch.cat(scale_groups, dim=-1)
-        self.zero = torch.cat(zero_groups, dim=-1)
+        self.scale = torch.stack(scale_groups, dim=1)
+        self.zero = torch.stack(zero_groups, dim=1)
 
     def find_params(self, x) -> None:
         if self.bits == 16:
@@ -362,8 +404,6 @@ class ActQuantizer(torch.nn.Module):
 
         dev = x.device
         self.maxq = self.maxq.to(dev)
-
-        init_shape = x.shape
 
         if self.groupsize > 0:
             # group-wise per-token quantization
@@ -379,9 +419,8 @@ class ActQuantizer(torch.nn.Module):
         if self.sym:
             xmax = torch.maximum(torch.abs(xmin), xmax)
             tmp = xmax == 0
-            self.scale = (xmax / self.maxq).unsqueeze(1).repeat(1, reshaped_x.shape[-1])
+            self.scale = (xmax / self.maxq).unsqueeze(1)
             self.scale[tmp] = 1
-            self.scale = self.scale.reshape(init_shape)
             self.zero = torch.zeros_like(self.scale)
         else:
             tmp = (xmin == 0) & (xmax == 0)
@@ -390,16 +429,8 @@ class ActQuantizer(torch.nn.Module):
             self.scale = (xmax - xmin) / self.maxq
             self.zero = torch.round(-xmin / self.scale)
 
-            self.scale = (
-                self.scale.unsqueeze(1)
-                .repeat(1, reshaped_x.shape[-1])
-                .reshape(init_shape)
-            )
-            self.zero = (
-                self.zero.unsqueeze(1)
-                .repeat(1, reshaped_x.shape[-1])
-                .reshape(init_shape)
-            )
+            self.scale = self.scale.unsqueeze(1)
+            self.zero = self.zero.unsqueeze(1)
 
 
 class ActQuantWrapper(torch.nn.Module):
@@ -467,12 +498,15 @@ class ActQuantWrapper(torch.nn.Module):
             init_shape = x.shape
             if self.K == 1:
                 x = (
-                    hadamard_utils.HadamardTransform.apply(
+                    hadamard_utils.scaled_hadamard_transform(
                         x.reshape(
                             -1, init_shape[-1] // self.had_dim, self.had_dim
-                        ).transpose(1, 2)
+                        ).transpose(1, 2),
+                        scale=(
+                            1.0
+                            / math.sqrt(init_shape[-1] // self.had_dim)
+                        ),
                     )
-                    / math.sqrt(init_shape[-1] // self.had_dim)
                 ).transpose(1, 2)
             else:
                 x = (
@@ -486,19 +520,31 @@ class ActQuantWrapper(torch.nn.Module):
 
         if self.quantizer.bits < 16:  # Quantize, if needed
             self.quantizer.find_params(x)
-            x = self.quantizer(x).to(x_dtype)
+            x = self.quantizer(x)
             self.quantizer.free()
         if R1 is not None:
-            x = self.module(x, R1, R2, transpose).to(x_dtype)
+            x = self.module(x, R1, R2, transpose)
         else:
-            x = self.module(x).to(x_dtype)
+            x = self.module(x)
 
         if self.out_quantizer.bits < 16:  # Quantize the output, if needed
             self.out_quantizer.find_params(x)
-            x = self.out_quantizer(x).to(x_dtype)
+            x = self.out_quantizer(x)
             self.out_quantizer.free()
 
         return x
+
+
+class _WeightFakeQuantVersionUnavailable(RuntimeError):
+    """A tensor needed by the trusted weight fast path has no version counter."""
+
+    def __init__(self, tensor_label: str) -> None:
+        self.tensor_label = tensor_label
+        super().__init__(
+            "The prevalidated weight fast path requires version-tracked "
+            f"{tensor_label} tensors and cannot run under torch.inference_mode() "
+            "or with tensors created there."
+        )
 
 
 class _PrevalidatedWeightFakeQuant:
@@ -532,6 +578,11 @@ class _PrevalidatedWeightFakeQuant:
         "source_maxq_version",
         "prepared_scale",
         "prepared_scale_version",
+        "cache_clamp_bound",
+        "_cache_clamp_bound_snapshot",
+        "prepared_clamp_min",
+        "prepared_clamp_min_version",
+        "_prepared_clamp_min_snapshot",
         "bits",
         "weight_groupsize",
         "w_group_param_layout",
@@ -548,11 +599,7 @@ class _PrevalidatedWeightFakeQuant:
         try:
             return tensor._version
         except RuntimeError as exc:
-            raise RuntimeError(
-                "The prevalidated weight fast path requires version-tracked "
-                f"{label} tensors and cannot run under torch.inference_mode(); "
-                "use the REAL-Q runner's torch.no_grad() path."
-            ) from exc
+            raise _WeightFakeQuantVersionUnavailable(label) from exc
 
     def __init__(
         self,
@@ -566,6 +613,7 @@ class _PrevalidatedWeightFakeQuant:
         device,
         dtype,
         grouped,
+        cache_clamp_bound,
     ) -> None:
         self.owner = owner
         self.source_scale = source_scale
@@ -580,6 +628,21 @@ class _PrevalidatedWeightFakeQuant:
         self.prepared_scale_version = self._tracked_version(
             prepared_scale, "prepared scale"
         )
+        self.cache_clamp_bound = cache_clamp_bound
+        self._cache_clamp_bound_snapshot = cache_clamp_bound
+        if cache_clamp_bound:
+            # Preserve the exact tensor-bound clamp expression while hoisting
+            # its two invariant integer tensor operations out of the column
+            # loop (P10).
+            self.prepared_clamp_min = -(source_maxq + 1)
+            self.prepared_clamp_min_version = self._tracked_version(
+                self.prepared_clamp_min, "prepared clamp minimum"
+            )
+            self._prepared_clamp_min_snapshot = self.prepared_clamp_min
+        else:
+            self.prepared_clamp_min = None
+            self.prepared_clamp_min_version = None
+            self._prepared_clamp_min_snapshot = None
         self.bits = owner.bits
         self.weight_groupsize = owner.weight_groupsize
         self.w_group_param_layout = getattr(
@@ -608,6 +671,9 @@ class WeightQuantizer(torch.nn.Module):
         # inverted when the final natural-column group is short.
         self.w_group_param_layout = "expanded"
         self.weight_ncolumns = None
+        # Structured reason for the only production-safe P01 fallback:
+        # qparams created in inference_mode have no readable version counter.
+        self._inner_fastpath_fallback_reason = None
 
     def configure(
         self,
@@ -1107,6 +1173,7 @@ class WeightQuantizer(torch.nn.Module):
         st_idx=None,
         end_idx=None,
         col_idx=None,
+        cache_clamp_bound=False,
     ):
         """Prevalidate one REAL-Q block's private column-wise fast path.
 
@@ -1146,6 +1213,11 @@ class WeightQuantizer(torch.nn.Module):
         if (st_idx is None) != (end_idx is None):
             raise ValueError(
                 "st_idx and end_idx must either both be provided or both be None."
+            )
+        if type(cache_clamp_bound) is not bool:
+            raise ValueError(
+                "cache_clamp_bound must be bool; got "
+                f"{cache_clamp_bound!r}."
             )
         if not hasattr(self, "bits") or self.bits >= 16:
             raise RuntimeError(
@@ -1250,7 +1322,22 @@ class WeightQuantizer(torch.nn.Module):
             device=device,
             dtype=dtype,
             grouped=grouped,
+            cache_clamp_bound=cache_clamp_bound,
         )
+
+    def _try_prepare_fake_quantize_inner(self, **kwargs):
+        """Prepare P01, falling back only for inference-mode qparams."""
+
+        self._inner_fastpath_fallback_reason = None
+        try:
+            return self._prepare_fake_quantize_inner(**kwargs)
+        except _WeightFakeQuantVersionUnavailable as exc:
+            self._inner_fastpath_fallback_reason = {
+                "code": "tensor_version_unavailable",
+                "tensor": exc.tensor_label,
+                "action": "legacy_fake_quantize",
+            }
+            return None
 
     def _fake_quantize_prevalidated(self, x, prepared, column_offset):
         """Fake-quantize one weight column using a validated block context.
@@ -1278,6 +1365,19 @@ class WeightQuantizer(torch.nn.Module):
             or self.scale._version != prepared.source_scale_version
             or self.maxq is not prepared.source_maxq
             or self.maxq._version != prepared.source_maxq_version
+            or (
+                prepared.cache_clamp_bound
+                is not prepared._cache_clamp_bound_snapshot
+            )
+            or (
+                prepared._cache_clamp_bound_snapshot
+                and (
+                    prepared.prepared_clamp_min
+                    is not prepared._prepared_clamp_min_snapshot
+                    or prepared.prepared_clamp_min._version
+                    != prepared.prepared_clamp_min_version
+                )
+            )
             or self.bits != prepared.bits
             or self.weight_groupsize != prepared.weight_groupsize
             or getattr(self, "w_group_param_layout", "expanded")
@@ -1323,7 +1423,11 @@ class WeightQuantizer(torch.nn.Module):
         x_dtype = x.dtype
         q = torch.clamp(
             torch.round(x / scale),
-            -(self.maxq + 1),
+            (
+                prepared.prepared_clamp_min
+                if prepared.cache_clamp_bound
+                else -(self.maxq + 1)
+            ),
             self.maxq,
         )
         return (scale * q).to(x_dtype), q, scale

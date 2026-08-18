@@ -192,7 +192,6 @@ class Config:
     # default — when off, the wrapper is a nullcontext (no behavior change,
     # no synchronization, no allocation).
     nsys_profile: bool = False
-
     # ----- output ---------------------------------------------------------
     load_qmodel_path: Optional[str] = None
     allow_unsafe_legacy_checkpoint: bool = False
@@ -256,6 +255,12 @@ class Config:
     # autotuned Triton program. The cross-block Err@Hinv compensation remains
     # a separate one-shot GEMM/BMM.
     triton_column_block: bool = True
+    # Normal single-rank Block-GD fast path: consume the single backward's
+    # low-precision gradient directly and fuse cast, clipping, Adam moment
+    # updates, active-column indexing, and master/update writeback into one
+    # streaming Triton kernel. Multi-rank/multi-chunk runs retain the exact
+    # FP32 accumulation path before entering the same fused Adam update.
+    fused_block_adam: bool = True
 
     # ----- generation-based inference evaluation -------------------------
     reasoning_eval: bool = False
@@ -306,7 +311,24 @@ class Config:
     moe_gpu_resident: bool = True
     moe_joint_column_block: bool = True
     moe_expert_loss_slide_window: bool = True
-
+    # Optional CUDA-profiler capture window, using zero-based transformer
+    # layer indices.  Appended to preserve Config's positional constructor
+    # ABI.  When both endpoints are set, the runner calls cudaProfilerStart
+    # immediately before the first layer and cudaProfilerStop immediately
+    # after the last layer.  The nsys launcher must use
+    # ``--capture-range=cudaProfilerApi``.  Layers outside the inclusive
+    # window still execute normally but do not enter the trace.
+    nsys_capture_start_layer: Optional[int] = None
+    nsys_capture_end_layer: Optional[int] = None
+    # ``flash_attention_4`` uses the pinned CuTe DSL FA4 package and is
+    # intentionally limited to RealQ's dense, unpadded, causal calibration /
+    # refresh path. ``sdpa`` preserves the historical Transformers behavior.
+    attention_backend: str = "sdpa"
+    # Use TensorFloat-32 multiply with FP32 accumulation/output for the
+    # Hessian X^T diag(s) X matrix multiplication.  The persistent Hessian
+    # buffer and every cross-batch ``H.add_`` accumulation remain FP32.
+    # Appended to preserve Config's positional constructor ABI.
+    hessian_tf32: bool = True
     # REAL-Q Plus extends every refresh from the current linear's unquantized
     # suffix to all not-yet-quantized linears in the current Transformer
     # block (and, for an active sliding arm, the next block).  Appended to
@@ -320,6 +342,16 @@ class Config:
             # Mirror the old process_args convention: model_name = basename
             # of the model path, used as a cache-key fragment by eval_utils.
             self.model_name = os.path.basename(self.model.rstrip("/")) or "model"
+        if self.attention_backend not in ("sdpa", "flash_attention_4"):
+            raise ValueError(
+                "`attention_backend` must be 'sdpa' or "
+                f"'flash_attention_4'. Got {self.attention_backend!r}."
+            )
+        if type(self.hessian_tf32) is not bool:
+            raise ValueError(
+                "`hessian_tf32` must be bool. Got "
+                f"{self.hessian_tf32!r}."
+            )
         if type(self.full_block_refresh) is not bool:
             raise ValueError(
                 "`full_block_refresh` must be bool. Got "
@@ -340,6 +372,33 @@ class Config:
                 "`require_reference_cache_hit` must be bool. Got "
                 f"{self.require_reference_cache_hit!r}."
             )
+        capture_start = self.nsys_capture_start_layer
+        capture_end = self.nsys_capture_end_layer
+        if (capture_start is None) != (capture_end is None):
+            raise ValueError(
+                "`nsys_capture_start_layer` and "
+                "`nsys_capture_end_layer` must be set together."
+            )
+        if capture_start is not None:
+            if capture_start < 0 or capture_end < 0:
+                raise ValueError("nsys capture layer indices must be non-negative.")
+            if capture_start > capture_end:
+                raise ValueError(
+                    "`nsys_capture_start_layer` must be <= "
+                    "`nsys_capture_end_layer`."
+                )
+            if not self.nsys_profile:
+                raise ValueError(
+                    "layer-scoped nsys capture requires `nsys_profile=True`."
+                )
+            if (
+                self.quant_stop_layer is not None
+                and capture_end > self.quant_stop_layer
+            ):
+                raise ValueError(
+                    "`nsys_capture_end_layer` must be <= `quant_stop_layer` "
+                    "when an early stop is configured."
+                )
         if not self.reasoning_tasks:
             raise ValueError("`reasoning_tasks` must not be empty.")
         if self.reasoning_batch_size <= 0:
@@ -650,6 +709,11 @@ class Config:
                 "`final_layer_backward_bsz` must be positive. Got "
                 f"{self.final_layer_backward_bsz}."
             )
+        if type(self.fused_block_adam) is not bool:
+            raise ValueError(
+                "`fused_block_adam` must be bool. Got "
+                f"{self.fused_block_adam!r}."
+            )
         if self.cpu_master and not self.fsdp:
             raise ValueError("`cpu_master=True` requires `fsdp=True`.")
         if self.cpu_master and self.load_qmodel_path:
@@ -785,6 +849,8 @@ def parse_cli(argv: list[str] | None = None) -> Config:
             "quant_stop_layer",
             "final_layer_backward_bsz",
             "perf_measure_layer",
+            "nsys_capture_start_layer",
+            "nsys_capture_end_layer",
         } and isinstance(v, str):
             raw[f.name] = int(v)
     return Config(**raw)

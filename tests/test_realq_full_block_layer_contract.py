@@ -14,12 +14,13 @@ def _quantize(
     act_order: bool,
     refresh_fn=None,
     initial_weight_fp32: torch.Tensor | None = None,
+    refresh_layout: str = "full_natural",
 ) -> torch.Tensor:
     if refresh_fn is not None:
         # Hand-written callbacks here intentionally exercise the new complete
         # natural-coordinate update contract. Production factory closures
         # carry the same marker themselves.
-        refresh_fn._realq_update_layout = "full_natural"
+        refresh_fn._realq_update_layout = refresh_layout
     rows, columns = module_weight.shape
     linear = nn.Linear(columns, rows, bias=False)
     linear.weight.data.copy_(module_weight)
@@ -142,5 +143,44 @@ def test_transferred_fp32_master_is_the_gptq_starting_weight(
         module_weight,
         act_order=act_order,
         initial_weight_fp32=transferred.clone(),
+    )
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("act_order", [False, True])
+def test_compact_full_block_update_matches_full_natural_contract(
+    act_order: bool,
+) -> None:
+    weight = _base_weight()
+
+    def full_refresh(stitched, trailing_start, perm=None):
+        update = torch.zeros_like(stitched)
+        active = (
+            slice(trailing_start, None)
+            if perm is None
+            else perm[trailing_start:]
+        )
+        update[:, active] = 0.03125
+        return update
+
+    def compact_refresh(stitched, trailing_start, perm=None):
+        del perm
+        return torch.full(
+            (stitched.shape[0], stitched.shape[1] - trailing_start),
+            0.03125,
+            dtype=stitched.dtype,
+            device=stitched.device,
+        )
+
+    expected = _quantize(
+        weight,
+        act_order=act_order,
+        refresh_fn=full_refresh,
+    )
+    actual = _quantize(
+        weight,
+        act_order=act_order,
+        refresh_fn=compact_refresh,
+        refresh_layout="trailing_quant_order_full_block",
     )
     assert torch.equal(actual, expected)

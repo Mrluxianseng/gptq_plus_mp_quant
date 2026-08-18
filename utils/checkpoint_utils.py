@@ -49,6 +49,9 @@ _WEIGHT_PROVENANCE_FIELDS = (
     "w_clip",
     "w_method",
     "quantizer_inner_fastpath",
+    "prepared_clamp_bound_cache",
+    "triton_column_block",
+    "fused_block_adam",
     "w_clip_search_impl",
     "fisher_fp32_cache",
     "act_order_stitch_impl",
@@ -60,6 +63,9 @@ _WEIGHT_PROVENANCE_HISTORICAL_DEFAULTS = {
     # fields therefore mean the historical implementation, not whatever
     # value happened to be present on the caller's evaluation Config.
     "quantizer_inner_fastpath": False,
+    "prepared_clamp_bound_cache": False,
+    "triton_column_block": False,
+    "fused_block_adam": False,
     "w_clip_search_impl": "cartesian_legacy",
     "fisher_fp32_cache": False,
     "act_order_stitch_impl": "full_weight_legacy",
@@ -251,9 +257,23 @@ def _validate_weight_provenance(provenance: Mapping[str, Any]) -> None:
         raise ValueError(
             "Checkpoint weight-quantization provenance must be a mapping."
         )
-    for name in ("quantizer_inner_fastpath", "fisher_fp32_cache"):
+    for name in (
+        "quantizer_inner_fastpath",
+        "prepared_clamp_bound_cache",
+        "triton_column_block",
+        "fused_block_adam",
+        "fisher_fp32_cache",
+    ):
         if name in provenance and type(provenance[name]) is not bool:
             raise ValueError(f"Checkpoint field {name!r} must be bool.")
+    if (
+        provenance.get("prepared_clamp_bound_cache", False)
+        and provenance.get("quantizer_inner_fastpath") is not True
+    ):
+        raise ValueError(
+            "Checkpoint field 'prepared_clamp_bound_cache=true' requires "
+            "'quantizer_inner_fastpath=true'."
+        )
     if (
         "w_clip_search_impl" in provenance
         and provenance["w_clip_search_impl"]

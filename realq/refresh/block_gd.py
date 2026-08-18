@@ -32,6 +32,7 @@ from realq.alignment import (
     RefreshTraceWriter,
 )
 from realq.refresh.fisher_loss import fisher_mse_loss
+from realq.refresh import triton_block_adam
 from realq.utils import nvtx
 from utils import dist_utils
 from utils.saliency_utils import global_percentile
@@ -170,6 +171,7 @@ class RefreshContext:
         trace_module: str | None = None,
         blocksize: int | None = None,
         log_column_block_loss: bool = False,
+        fused_block_adam: bool = False,
     ) -> None:
         self.module = module
         self.layer_lr = float(layer_lr)
@@ -181,10 +183,16 @@ class RefreshContext:
         self.trace_module = trace_module
         self.blocksize = blocksize
         self.log_column_block_loss = log_column_block_loss
+        self.fused_block_adam = fused_block_adam
         if type(self.log_column_block_loss) is not bool:
             raise ValueError(
                 "log_column_block_loss must be bool, got "
                 f"{self.log_column_block_loss!r}"
+            )
+        if type(self.fused_block_adam) is not bool:
+            raise ValueError(
+                "fused_block_adam must be bool, got "
+                f"{self.fused_block_adam!r}"
             )
         if self.loss_observation_enabled and (
             trace_layer is None or trace_module is None or blocksize is None
@@ -609,7 +617,7 @@ class BlockRefreshState:
                 if not state.quantizing:
                     raise RuntimeError(
                         f"current module {name!r} is not marked quantizing"
-                    )
+                )
                 source = current_weight_fp32
                 if perm is None:
                     active_columns: slice | torch.Tensor | None = slice(
@@ -635,12 +643,13 @@ class BlockRefreshState:
                 )
             # BF16/FP16 leaves reproduce the deployed forward precision while
             # the source/master and optimizer state remain FP32.
-            leaf = (
-                source.to(dtype=state.module.weight.dtype)
-                .detach()
-                .clone()
-                .requires_grad_(True)
-            )
+            leaf = source.to(dtype=state.module.weight.dtype)
+            # FP32 master -> BF16/FP16 conversion already allocates distinct
+            # storage. Cloning it again was one full weight copy per active
+            # linear and refresh.
+            if leaf.data_ptr() == source.data_ptr():
+                leaf = leaf.clone()
+            leaf = leaf.detach().requires_grad_(True)
             overrides[state.parameter_name] = leaf
             active.append(
                 _ActiveWeight(
@@ -740,8 +749,9 @@ def _adam_update_selected(
     *,
     lr: float,
     grad_clip: float,
+    compact_update: bool = False,
 ) -> torch.Tensor:
-    """Advance one natural-coordinate Adam state and return a full update."""
+    """Advance one Adam state and return a full or active-only update."""
 
     if state.exp_avg is None or state.exp_avg_sq is None:
         raise RuntimeError(f"optimizer state for {state.name!r} was released")
@@ -774,6 +784,8 @@ def _adam_update_selected(
     denom = ev.sqrt() / math.sqrt(bc2)
     denom.add_(eps)
     selected_update = (lr / bc1) * (ea / denom)
+    if compact_update:
+        return selected_update
     update = torch.zeros_like(grad)
     if columns is None:
         update.copy_(selected_update)
@@ -786,12 +798,15 @@ def _adam_update_selected(
 
 def _apply_block_adam(
     active: list[_ActiveWeight],
-    grad_sums: list[torch.Tensor],
+    grad_sums: list[torch.Tensor | None],
     global_used: list[bool],
     global_count: int,
     *,
     lr: float,
     grad_clip: float,
+    compact_update: bool = False,
+    collect_audits: bool = True,
+    gradients_are_means: bool = False,
 ) -> tuple[torch.Tensor, tuple[ActiveWeightAudit, ...]]:
     """Update every active FP32 master and return auditable runtime evidence."""
 
@@ -800,7 +815,9 @@ def _apply_block_adam(
     scalar_tensors: list[torch.Tensor] = []
 
     def scalar_index(value: torch.Tensor) -> int:
-        scalar_tensors.append(value.detach().float())
+        # All callers pass norms of FP32 masters/updates.  The old ``float``
+        # calls were dtype no-ops and obscured that invariant.
+        scalar_tensors.append(value.detach())
         return len(scalar_tensors) - 1
 
     for entry, grad_sum, used in zip(active, grad_sums, global_used):
@@ -811,13 +828,40 @@ def _apply_block_adam(
                 "during one backward invocation"
             )
         step_before = int(entry.state.step)
-        source_l2_before_index = scalar_index(
-            torch.linalg.vector_norm(entry.source.float())
+        source_l2_before_index = (
+            scalar_index(torch.linalg.vector_norm(entry.source))
+            if collect_audits
+            else None
         )
         source_l2_after_index: int | None = None
         storage_after: str | None = None
         if not used:
-            update = torch.zeros_like(grad_sum)
+            if grad_sum is not None:
+                rows, columns = grad_sum.shape
+                device = grad_sum.device
+            else:
+                rows, columns = entry.state.shape
+                device = entry.source.device
+            if compact_update:
+                if entry.active_columns is None:
+                    active_columns = columns
+                elif isinstance(entry.active_columns, slice):
+                    active_columns = len(
+                        range(*entry.active_columns.indices(columns))
+                    )
+                else:
+                    active_columns = int(entry.active_columns.numel())
+                update = torch.zeros(
+                    (rows, active_columns),
+                    dtype=torch.float32,
+                    device=device,
+                )
+            else:
+                update = torch.zeros(
+                    (rows, columns),
+                    dtype=torch.float32,
+                    device=device,
+                )
             if entry.is_current:
                 current_update = update
             else:
@@ -829,21 +873,64 @@ def _apply_block_adam(
                 storage_after = tensor_storage_identity(
                     entry.state.master
                 )
-                source_l2_after_index = scalar_index(
-                    torch.linalg.vector_norm(
-                        entry.state.master.float()
+                if collect_audits:
+                    source_l2_after_index = scalar_index(
+                        torch.linalg.vector_norm(entry.state.master)
                     )
-                )
         else:
-            grad = grad_sum / float(global_count)
-            update = _adam_update_selected(
-                entry.state,
-                grad,
-                entry.active_columns,
-                lr=lr,
-                grad_clip=grad_clip,
-            )
+            if grad_sum is None:
+                raise RuntimeError(
+                    f"active gradient for {entry.state.name!r} is missing"
+                )
+            fused = False
+            update: torch.Tensor | None = None
+            if (
+                compact_update
+                and not collect_audits
+                and not isinstance(entry.active_columns, slice)
+                and entry.state.exp_avg is not None
+                and entry.state.exp_avg_sq is not None
+                and triton_block_adam.can_fuse(
+                    grad_sum,
+                    entry.state.exp_avg,
+                    entry.state.exp_avg_sq,
+                    entry.source,
+                    entry.active_columns,
+                )
+            ):
+                entry.state.step += 1
+                update = triton_block_adam.fused_adam_step(
+                    grad_sum,
+                    entry.state.exp_avg,
+                    entry.state.exp_avg_sq,
+                    entry.source,
+                    entry.active_columns,
+                    step=entry.state.step,
+                    lr=lr,
+                    grad_clip=grad_clip,
+                    grad_scale=(
+                        1.0
+                        if gradients_are_means
+                        else 1.0 / float(global_count)
+                    ),
+                    update_source=not entry.is_current,
+                )
+                fused = True
+            else:
+                grad = grad_sum.detach().float()
+                if not gradients_are_means:
+                    grad = grad / float(global_count)
+                update = _adam_update_selected(
+                    entry.state,
+                    grad,
+                    entry.active_columns,
+                    lr=lr,
+                    grad_clip=grad_clip,
+                    compact_update=compact_update,
+                )
             if entry.is_current:
+                if update is None:
+                    raise RuntimeError("current fused Adam returned no update")
                 current_update = update
             else:
                 if entry.state.master is None:
@@ -858,15 +945,17 @@ def _apply_block_adam(
                         f"{entry.scope}:{entry.state.name} no longer "
                         "updates the backward source master"
                     )
-                entry.state.master.sub_(update)
+                if not fused:
+                    if update is None:
+                        raise RuntimeError("future Adam returned no update")
+                    entry.state.master.sub_(update)
                 storage_after = tensor_storage_identity(
                     entry.state.master
                 )
-                source_l2_after_index = scalar_index(
-                    torch.linalg.vector_norm(
-                        entry.state.master.float()
+                if collect_audits:
+                    source_l2_after_index = scalar_index(
+                        torch.linalg.vector_norm(entry.state.master)
                     )
-                )
         if entry.active_columns is None:
             active_column_count = entry.state.shape[1]
         elif isinstance(entry.active_columns, slice):
@@ -875,7 +964,9 @@ def _apply_block_adam(
             )
         else:
             active_column_count = int(entry.active_columns.numel())
-        pending_audits.append(
+        if collect_audits:
+            assert update is not None
+            pending_audits.append(
             {
                 "entry": entry,
                 "used": bool(used),
@@ -884,14 +975,16 @@ def _apply_block_adam(
                 "step_before": step_before,
                 "step_after": int(entry.state.step),
                 "update_l2_index": scalar_index(
-                    torch.linalg.vector_norm(update.float())
+                    torch.linalg.vector_norm(update)
                 ),
                 "source_l2_before_index": source_l2_before_index,
                 "source_l2_after_index": source_l2_after_index,
             }
-        )
+            )
     if current_update is None:
         raise RuntimeError("block refresh did not produce a current-weight update")
+    if not collect_audits:
+        return current_update, ()
     scalar_values = (
         torch.stack(scalar_tensors).cpu().tolist()
         if scalar_tensors
@@ -1279,16 +1372,16 @@ def _make_single_linear_grad_refresh_fn_legacy(
                     partial_count += batch_size
                     if partial_loss_sums is not None:
                         partial_loss_sums[0].add_(
-                            loss.detach().float(), alpha=float(batch_size),
+                            loss.detach(), alpha=float(batch_size),
                         )
                         if partial_loss_sums.numel() == 3:
                             partial_loss_sums[1].add_(
-                                loss_curr.detach().float(),
+                                loss_curr.detach(),
                                 alpha=float(batch_size),
                             )
                         if loss_next is not None and partial_loss_sums.numel() == 3:
                             partial_loss_sums[2].add_(
-                                loss_next.detach().float(),
+                                loss_next.detach(),
                                 alpha=float(batch_size),
                             )
                 iter_idx += 1
@@ -1437,9 +1530,9 @@ def make_grad_refresh_fn(
     quantisable weight reached by the graph, while already-quantized weights
     remain locked in ``module.weight``.
 
-    The closure returns a *full, natural-column-order* FP32 update for the
-    current linear.  ``RealQLayer`` applies only its still-unquantized columns
-    to the private working weight.
+    With ``ctx.fused_block_adam`` the closure returns only the active suffix in
+    GPTQ quant order.  The compatibility path returns the historical full,
+    natural-column-order FP32 update.  ``RealQLayer`` understands both layouts.
     """
 
     if module_name is None or block_state is None:
@@ -1524,10 +1617,25 @@ def make_grad_refresh_fn(
                 )
                 active.extend(next_active)
             leaves = [entry.leaf for entry in active]
-            partial_grad_sums = [
-                torch.zeros_like(entry.state.exp_avg)
-                for entry in active
-            ]
+            # The normal one-GPU protocol is exactly one 32-sample backward.
+            # Its loss is already a batch mean, so the historical
+            # ``bf16_grad.float() * 32 / 32`` accumulation is algebraically
+            # redundant.  Keep that raw autograd tensor alive until the fused
+            # Adam kernel consumes it.  Multi-rank and multi-chunk runs retain
+            # the accumulation/all-reduce oracle below.
+            direct_single_chunk = bool(
+                ctx.fused_block_adam
+                and dist_utils.get_world_size() == 1
+                and 0 < len(selected) <= ctx.backward_bsz
+            )
+            partial_grad_sums: list[torch.Tensor | None] = (
+                [None] * len(active)
+                if direct_single_chunk
+                else [
+                    torch.zeros_like(entry.state.exp_avg)
+                    for entry in active
+                ]
+            )
             partial_used = [False] * len(active)
             partial_count = 0
             backward_chunk_sizes: list[int] = []
@@ -1717,38 +1825,69 @@ def make_grad_refresh_fn(
                     for index, batch_grad in enumerate(batch_grads):
                         if batch_grad is None:
                             continue
-                        partial_grad_sums[index].add_(
-                            batch_grad.detach().float(),
-                            alpha=float(batch_size),
-                        )
+                        if direct_single_chunk:
+                            if partial_grad_sums[index] is not None:
+                                raise RuntimeError(
+                                    "single-chunk refresh received a second "
+                                    "gradient contribution"
+                                )
+                            partial_grad_sums[index] = batch_grad.detach()
+                        else:
+                            grad_sum = partial_grad_sums[index]
+                            if grad_sum is None:
+                                raise RuntimeError(
+                                    "gradient accumulation buffer is missing"
+                                )
+                            grad_sum.add_(
+                                batch_grad.detach().float(),
+                                alpha=float(batch_size),
+                            )
                         partial_used[index] = True
                     partial_count += batch_size
                     if partial_loss_sums is not None:
                         partial_loss_sums[0].add_(
-                            loss.detach().float(),
+                            loss.detach(),
                             alpha=float(batch_size),
                         )
                         if partial_loss_sums.numel() == 3:
                             partial_loss_sums[1].add_(
-                                loss_curr.detach().float(),
+                                loss_curr.detach(),
                                 alpha=float(batch_size),
                             )
                             partial_loss_sums[2].add_(
-                                loss_next.detach().float(),
+                                loss_next.detach(),
                                 alpha=float(batch_size),
                             )
 
         with nvtx.nvtx_range("refresh.grad_allreduce"):
-            (
-                global_count,
-                global_used,
-                global_loss_sums,
-            ) = _aggregate_block_refresh_sums(
-                partial_grad_sums,
-                partial_used,
-                partial_count,
-                partial_loss_sums if ctx.trace_enabled else None,
-            )
+            if direct_single_chunk:
+                if partial_count <= 0:
+                    raise RuntimeError("block refresh produced zero samples")
+                global_count = partial_count
+                global_used = list(partial_used)
+                global_loss_sums = (
+                    partial_loss_sums if ctx.trace_enabled else None
+                )
+            else:
+                dense_grad_sums = [
+                    grad_sum
+                    for grad_sum in partial_grad_sums
+                    if grad_sum is not None
+                ]
+                if len(dense_grad_sums) != len(partial_grad_sums):
+                    raise RuntimeError(
+                        "dense refresh accumulation unexpectedly lost a buffer"
+                    )
+                (
+                    global_count,
+                    global_used,
+                    global_loss_sums,
+                ) = _aggregate_block_refresh_sums(
+                    dense_grad_sums,
+                    partial_used,
+                    partial_count,
+                    partial_loss_sums if ctx.trace_enabled else None,
+                )
         if ctx.log_column_block_loss and not ctx.trace_enabled:
             if partial_loss_sums is None:
                 raise RuntimeError(
@@ -1765,6 +1904,9 @@ def make_grad_refresh_fn(
                 global_count,
                 lr=ctx.layer_lr,
                 grad_clip=ctx.grad_clip,
+                compact_update=ctx.fused_block_adam,
+                collect_audits=ctx.trace_enabled,
+                gradients_are_means=direct_single_chunk,
             )
         if global_loss_sums is not None:
             ctx.record_loss_observation(
@@ -1788,5 +1930,9 @@ def make_grad_refresh_fn(
             )
         return update
 
-    refresh._realq_update_layout = "full_natural"
+    refresh._realq_update_layout = (
+        "trailing_quant_order_full_block"
+        if ctx.fused_block_adam
+        else "full_natural"
+    )
     return refresh

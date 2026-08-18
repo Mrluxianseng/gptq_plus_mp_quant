@@ -9,12 +9,14 @@ exactly so the final layer doesn't need any extra precompute pipeline.
 """
 from __future__ import annotations
 
+import logging
 import math
 from typing import TYPE_CHECKING, Callable
 
 import torch
 import torch.nn as nn
 from torch.func import functional_call
+from torch.utils.checkpoint import checkpoint
 
 from realq.refresh.block_gd import (
     BlockRefreshState,
@@ -33,6 +35,17 @@ if TYPE_CHECKING:
     from realq.refresh.block_gd import RefreshContext
     from realq.runner.streams import LayerInputs
     from utils.model_utils import ModelAnalyzer
+
+
+# This is a projection-memory tile, not a training microbatch.  The enclosing
+# refresh still selects and forwards exactly ``backward_bsz`` samples, forms
+# one mean KL objective over every selected token, calls Adam once, and reports
+# the original logical backward chunk.  Checkpointing only prevents the full
+# ``backward_bsz * seq_len * vocab`` logits graph from being materialized at
+# once.  A fixed token count keeps the reduction partition deterministic.
+FINAL_KL_PROJECTION_TOKEN_CHUNK = 512
+_LOGGER = logging.getLogger(__name__)
+_PROJECTION_CHUNK_ANNOUNCED = False
 
 
 def kl_topk_loss(
@@ -60,6 +73,70 @@ def kl_topk_loss(
         logits_fp, indices = logits_fp.topk(kl_topk, dim=-1, sorted=False)
         logits = logits.gather(-1, indices)
     return tokenwise_kl_from_logits(logits, logits_fp).mean()
+
+
+def memory_bounded_kl_topk_loss(
+    q_hidden: torch.Tensor,
+    fp_hidden: torch.Tensor,
+    analyzer: "ModelAnalyzer",
+    kl_topk: int,
+) -> torch.Tensor:
+    """Evaluate the same mean token KL with bounded projection memory.
+
+    ``norm + lm_head`` is pointwise over all leading token dimensions, so
+    flattening ``(B, T)`` and partitioning it into fixed token tiles preserves
+    the objective.  Non-reentrant checkpointing discards each tile's large
+    vocabulary-logit intermediates after its forward value is produced and
+    recomputes that tile during autograd.  Sample selection, logical
+    ``backward_bsz``, gradient averaging, clipping, and Adam update cadence are
+    unchanged.
+    """
+
+    if q_hidden.shape != fp_hidden.shape:
+        raise ValueError(
+            "student/teacher hidden shape mismatch: "
+            f"{tuple(q_hidden.shape)} != {tuple(fp_hidden.shape)}"
+        )
+    if q_hidden.ndim < 2:
+        raise ValueError(
+            f"KL hidden states must have at least two dimensions: {q_hidden.shape}"
+        )
+    global _PROJECTION_CHUNK_ANNOUNCED
+
+    hidden_size = q_hidden.shape[-1]
+    q_tokens = q_hidden.reshape(-1, hidden_size)
+    fp_tokens = fp_hidden.reshape(-1, hidden_size)
+    token_count = q_tokens.shape[0]
+    if token_count <= FINAL_KL_PROJECTION_TOKEN_CHUNK:
+        return kl_topk_loss(q_tokens, fp_tokens, analyzer, kl_topk)
+
+    if not _PROJECTION_CHUNK_ANNOUNCED:
+        _LOGGER.info(
+            "[realq] bounded final-KL projection enabled: tokens=%d, "
+            "token_chunk=%d; logical backward batch and Adam cadence unchanged",
+            token_count,
+            FINAL_KL_PROJECTION_TOKEN_CHUNK,
+        )
+        _PROJECTION_CHUNK_ANNOUNCED = True
+
+    def token_tile_loss(
+        q_tile: torch.Tensor,
+        fp_tile: torch.Tensor,
+    ) -> torch.Tensor:
+        return kl_topk_loss(q_tile, fp_tile, analyzer, kl_topk)
+
+    weighted_losses = []
+    for start in range(0, token_count, FINAL_KL_PROJECTION_TOKEN_CHUNK):
+        stop = min(start + FINAL_KL_PROJECTION_TOKEN_CHUNK, token_count)
+        tile_loss = checkpoint(
+            token_tile_loss,
+            q_tokens[start:stop],
+            fp_tokens[start:stop],
+            use_reentrant=False,
+            preserve_rng_state=False,
+        )
+        weighted_losses.append(tile_loss * float(stop - start))
+    return torch.stack(weighted_losses).sum() / float(token_count)
 
 
 def _make_single_linear_kl_refresh_fn_legacy(
@@ -160,7 +237,12 @@ def _make_single_linear_kl_refresh_fn_legacy(
                         )
                         q_hidden = out[0] if isinstance(out, tuple) else out
                     with nvtx.nvtx_range("kl_refresh.loss"):
-                        loss = kl_topk_loss(q_hidden, fp_target_hidden, analyzer, kl_topk)
+                        loss = memory_bounded_kl_topk_loss(
+                            q_hidden,
+                            fp_target_hidden,
+                            analyzer,
+                            kl_topk,
+                        )
                     with nvtx.nvtx_range("kl_refresh.backward"):
                         (batch_grad,) = torch.autograd.grad(loss, override_weight, retain_graph=False)
                 with nvtx.nvtx_range("kl_refresh.accumulate"):
@@ -168,7 +250,8 @@ def _make_single_linear_kl_refresh_fn_legacy(
                     partial_grad_sum.add_(batch_grad_fp32, alpha=float(batch_size))
                     partial_count += batch_size
                     if partial_loss_sums is not None:
-                        weighted_loss = loss.detach().float()
+                        # KL loss is already FP32 (logits are promoted above).
+                        weighted_loss = loss.detach()
                         partial_loss_sums[0].add_(
                             weighted_loss, alpha=float(batch_size),
                         )
@@ -338,7 +421,7 @@ def make_kl_refresh_fn(
                             out[0] if isinstance(out, tuple) else out
                         )
                     with nvtx.nvtx_range("kl_refresh.loss"):
-                        loss = kl_topk_loss(
+                        loss = memory_bounded_kl_topk_loss(
                             q_hidden,
                             fp_target_hidden,
                             analyzer,
@@ -363,7 +446,7 @@ def make_kl_refresh_fn(
                     partial_count += batch_size
                     if partial_loss_sums is not None:
                         partial_loss_sums[0].add_(
-                            loss.detach().float(),
+                            loss.detach(),
                             alpha=float(batch_size),
                         )
 
@@ -394,6 +477,8 @@ def make_kl_refresh_fn(
                 global_count,
                 lr=ctx.layer_lr,
                 grad_clip=ctx.grad_clip,
+                compact_update=ctx.fused_block_adam,
+                collect_audits=ctx.trace_enabled,
             )
         if global_loss_sums is not None:
             ctx.record_loss_observation(
@@ -415,5 +500,9 @@ def make_kl_refresh_fn(
             )
         return update
 
-    refresh._realq_update_layout = "full_natural"
+    refresh._realq_update_layout = (
+        "trailing_quant_order_full_block"
+        if ctx.fused_block_adam
+        else "full_natural"
+    )
     return refresh

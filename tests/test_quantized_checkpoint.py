@@ -84,12 +84,15 @@ def _fully_divergent_runtime_cfg():
         w_groupsize=128,
         w_asym=True,
         w_clip=False,
-        quantizer_inner_fastpath=True,
-        w_clip_search_impl="symmetric_union_exact",
-        fisher_fp32_cache=True,
-        act_order_stitch_impl="prefix_q_trailing_w_exact",
-        w_clip_update_impl="where_out",
-        w_group_param_layout="compact",
+        quantizer_inner_fastpath=False,
+        w_clip_search_impl="cartesian_legacy",
+        fisher_fp32_cache=False,
+        act_order_stitch_impl="full_weight_legacy",
+        w_clip_update_impl="guarded",
+        w_group_param_layout="expanded",
+        prepared_clamp_bound_cache=False,
+        triton_column_block=False,
+        fused_block_adam=False,
     )
     # The refactored Config has one weight algorithm, but legacy argparse
     # namespaces still carry w_method and the checkpoint code preserves it.
@@ -137,6 +140,9 @@ def test_missing_performance_provenance_restores_historical_build_defaults():
         "act_order_stitch_impl",
         "w_clip_update_impl",
         "w_group_param_layout",
+        "prepared_clamp_bound_cache",
+        "triton_column_block",
+        "fused_block_adam",
     ):
         manifest["weight_quantization"].pop(name)
 
@@ -147,6 +153,9 @@ def test_missing_performance_provenance_restores_historical_build_defaults():
         act_order_stitch_impl="prefix_q_trailing_w_exact",
         w_clip_update_impl="where_out",
         w_group_param_layout="compact",
+        prepared_clamp_bound_cache=True,
+        triton_column_block=True,
+        fused_block_adam=True,
     )
     assert checkpoint_utils.apply_runtime_manifest(restored_cfg, manifest)
     assert restored_cfg.quantizer_inner_fastpath is False
@@ -155,6 +164,9 @@ def test_missing_performance_provenance_restores_historical_build_defaults():
     assert restored_cfg.act_order_stitch_impl == "full_weight_legacy"
     assert restored_cfg.w_clip_update_impl == "guarded"
     assert restored_cfg.w_group_param_layout == "expanded"
+    assert restored_cfg.prepared_clamp_bound_cache is False
+    assert restored_cfg.triton_column_block is False
+    assert restored_cfg.fused_block_adam is False
 
 
 def _rope(q, k):
@@ -230,6 +242,7 @@ def test_checkpoint_is_weights_only_safe_and_restores_exact_a_v_runtime(
         k_cache_quant_aware_gptq=False,
         w_bits=16,
         quantizer_inner_fastpath=False,
+        prepared_clamp_bound_cache=False,
     )
     assert checkpoint_utils.apply_runtime_manifest(restored_cfg, loaded)
     assert restored_cfg.a_bits == 4
@@ -546,7 +559,7 @@ def test_act_quant_dynamic_buffers_never_enter_state_dict():
     quantizer = quant_utils.ActQuantizer()
     quantizer.configure(bits=4, groupsize=-1, sym=True, clip_ratio=0.9)
     quantizer.find_params(torch.tensor([[1.0, -2.0, 3.0, -4.0]]))
-    assert quantizer.scale.numel() == 4
+    assert quantizer.scale.numel() == 1
     assert quantizer.state_dict() == {}
 
 
@@ -591,6 +604,13 @@ def test_realq_load_skips_quantization_and_saves_only_after_runtime_restore(
         pipeline,
         "_prepare_loaded_runtime_wrappers",
         lambda *_args: events.append("prepare_wrappers"),
+    )
+    # Backend installation is independently covered by attention tests.  The
+    # tiny Linear sentinel deliberately has no Transformers ``config``.
+    monkeypatch.setattr(
+        pipeline.attention,
+        "configure_attention_backend",
+        lambda *_args: None,
     )
     monkeypatch.setattr(
         pipeline.checkpoint_utils,

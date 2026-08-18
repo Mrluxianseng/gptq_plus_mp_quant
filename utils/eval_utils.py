@@ -307,6 +307,12 @@ def get_ref_logits(args, analyzer, dataset, dataloader):
         else None
     )
     if ref_logits is None:
+        if getattr(args, "require_reference_cache_hit", False):
+            raise RuntimeError(
+                "Required reference-logit cache hit was unavailable for "
+                f"{dataset}: {ref_logits_path}. Run the dedicated static "
+                "precompute producer successfully before sweep consumers."
+            )
         logging.info(f"Generating reference logits for {dataset} at {ref_logits_path}...")
         ref_logits, _ = _get_logits(args, analyzer, dataloader, torch.device("cuda"))
         if dist_utils.is_main():
@@ -394,6 +400,14 @@ def kl_ppl_eval(args, analyzer, orig_lm_head, test_loader_dict, ref_logits_dict)
         ppl, kl_loss = _kl_ppl_eval(args, analyzer, orig_lm_head, test_loader_dict[eval_dataset], ref_logits_dict[eval_dataset])
         metric_vals[f"KL-{eval_dataset}"] = f"{kl_loss:.2e}"
         metric_vals[f"PPL-{eval_dataset}"] = f"{ppl:.2f}"
+        # The Markdown table remains paper-friendly, while this canonical
+        # machine-readable line preserves enough precision for LR selection.
+        logging.info(
+            "Exact KL&PPL on %s: %.17g, %.17g",
+            eval_dataset,
+            kl_loss,
+            ppl,
+        )
         logging.info(f"KL&PPL on {eval_dataset}: {kl_loss:.2e}, {ppl:.2f}")
     pretty_print_results(metric_vals)
 
@@ -438,8 +452,13 @@ def qa_eval(model, tokenizer, lm_eval_batch_size=32):
         results[task_name] = acc
         logging.info(f"acc: {acc}%")
     results_str.update({task: f"{result:.2f}" for task, result in results.items()})
-    results_str['acc_avg'] = f"{sum(results.values()) / len(task_names):.2f}"
+    acc_avg = round(sum(results.values()) / len(task_names), 2)
+    results_str['acc_avg'] = f"{acc_avg:.2f}"
     pretty_print_results(results_str)
+    # Existing REAL-Q callers intentionally ignore this return.  Exposing the
+    # already-computed values lets controlled comparison entry points persist
+    # the exact fixed-task result without parsing human-readable logs.
+    return {**results, "acc_avg": acc_avg}
 
 
 def pretty_print_results(data):

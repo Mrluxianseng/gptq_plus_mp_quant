@@ -8,3 +8,11 @@ termcolor==3.1.0
 debugpy==1.8.16
 tensorboard==2.20.0
 loguru==0.7.3
+# CuTe DSL FlashAttention-4 backend. Pin quack explicitly because newer
+# releases currently require a different CUTLASS DSL build than FA4 beta 25.
+flash-attn-4==4.0.0b25
+quack-kernels==0.5.3
+einops==0.8.1
+# v1.1.0.post2 adds CUDA 12.8 SM100/SM120 code generation.  Pin the exact
+# upstream revision because the PyPI 1.1.0 sdist predates those Blackwell flags.
+fast-hadamard-transform @ git+https://github.com/Dao-AILab/fast-hadamard-transform.git@e7706faf8d1c3b9f241e36860640ad1dac644ede
