@@ -1,0 +1,78 @@
+{
+  "campaign_id": "realq-fullmodel-two-branch-retune-20260818-v6-run15",
+  "protocol_fingerprint": "28884e05eaa731631a5dac1e495de76bd5a995dfceed8459736171bcd1bb4e2e",
+  "kind": "post_plan_static_cache_augmentation",
+  "created_at": "2026-08-18T11:07:00+00:00",
+  "reason": "The representative Qwen3-4B producer froze the global_loss_bsz=4 static cache, while qwen3-4b_w2a16 is formally frozen at global_loss_bsz=8 and therefore has a distinct cache key.",
+  "scientific_scope": {
+    "model": "qwen3-4b",
+    "config": "qwen3-4b_w2a16",
+    "global_loss_bsz": 8,
+    "hessian_accum_bsz": 64,
+    "calibration_tokens_unchanged": true,
+    "seed": 1,
+    "rotation_seed": 0,
+    "refresh_seed": 0,
+    "attention_backend": "flash_attention_4==4.0.0b25",
+    "deterministic_algorithms": true,
+    "cublas_workspace_config": ":4096:8"
+  },
+  "producer": {
+    "source_spec_path": "/minimax-avatar-new/zhangqian/realq/experiment_data/realq_fullmodel_retune_20260818_v6_run15/trials/full_block__qwen3-4b_w2a16__cosine__lr_8dfe73009662/spec.json",
+    "source_spec_sha256": "8f018252199f23a772b459136b50497757d74483306858a1cf884c825a04ba4c",
+    "source_command_sha256": "3bc583d6e39475dfa37bb99169929173a571a0a6086f2a99ef846691ea4f39ab",
+    "command_mutations": {
+      "--exit_after_precompute": "true",
+      "--require_static_cache_hit": "false",
+      "--require_reference_cache_hit": "true",
+      "--skip_eval": "true",
+      "--skip_kl_ppl_eval": "true",
+      "--output_dir": "/minimax-avatar-new/zhangqian/realq/experiment_data/realq_fullmodel_retune_20260818_v6_run15/shared_cache/qwen3-4b/attempts/glbsz8_20260818T1042Z/realq_output",
+      "--exp": "run15_cache_producer_glbsz8"
+    },
+    "reconstructed_command_sha256": "2b008b185dae64f4faec9fd3c20452aca77c3398baf489c262095c6e04d794bb",
+    "environment_unset": [
+      "NVIDIA_TF32_OVERRIDE",
+      "REALQ_DETERMINISTIC_SDPA"
+    ],
+    "log_path": "/minimax-avatar-new/zhangqian/realq/experiment_data/realq_fullmodel_retune_20260818_v6_run15/orchestration/cache_qwen3-4b_glbsz8_gpu3.log",
+    "log_sha256": "e3dacaeab3626393f97f7bd4fad21917a6f5d4dcb1bdf05053e492325c434db0",
+    "started_at": "2026-08-18T10:43:08+00:00",
+    "finished_at": "2026-08-18T10:45:38+00:00",
+    "exit_after_precompute_observed": true
+  },
+  "artifact": {
+    "path": "/minimax-avatar-new/zhangqian/realq/experiment_data/realq_fullmodel_retune_20260818_v6_run15/shared_cache/qwen3-4b/static/Qwen3-4B_wikitext2_n256_sl2048_abf27a685b1a_world1_rank0.pt",
+    "size_bytes": 2585887859,
+    "mtime": "2026-08-18 18:45:37.815847294 +0800",
+    "sha256": "c093fd8b78598ca72fedc6bacd2053249aea132940d3d798730e733f66985db6"
+  },
+  "retry_manifest": {
+    "path": "/minimax-avatar-new/zhangqian/realq/experiment_data/realq_fullmodel_retune_20260818_v6_run15/manifests/batch00_cachefix_q4_w2_zero_20260818_1047.json",
+    "sha256": "7599fd647c88458d8198b25b4681e95b791b2ae1a281348296ed238d161d4a66"
+  },
+  "consumer_results": [
+    {
+      "identity": "full_block__qwen3-4b_w2a16__cosine__lr_8dfe73009662__rep_cachefix1",
+      "result_sha256": "f821cf019694d9b43e404ba32ced421b38c1707c41c16e812e928ecbaf646bb0",
+      "exact_kl": 0.8796077370643616,
+      "ppl": 22.448204040527344
+    },
+    {
+      "identity": "single_linear__qwen3-4b_w2a16__cosine__lr_8374c8ab83a2__rep_cachefix1",
+      "result_sha256": "64a3b59bcbd8bc3445297455795a9795fc58d59d1abe1867067258275c2cc49e",
+      "exact_kl": 0.9118282198905945,
+      "ppl": 23.123069763183594
+    }
+  ],
+  "retained_failures": [
+    {
+      "identity": "full_block__qwen3-4b_w2a16__cosine__lr_8dfe73009662",
+      "result_sha256": "ff69be644e22174bf251bd8772e99f6b180f8070d1f4f9462416cc761af1fee2"
+    },
+    {
+      "identity": "single_linear__qwen3-4b_w2a16__cosine__lr_8374c8ab83a2",
+      "result_sha256": "92974379ccf610f1708402d925ae2cc68d8687c25ba930b87ec1cebc36618aca"
+    }
+  ]
+}
