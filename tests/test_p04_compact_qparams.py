@@ -433,8 +433,8 @@ def test_invalid_layout_is_rejected_before_configure_mutates_quantizer():
     ) == before
 
 
-def test_compact_layout_config_and_cli_are_explicit_default_legacy():
-    assert Config().w_group_param_layout == "expanded"
+def test_compact_layout_config_and_cli_default_to_optimized():
+    assert Config().w_group_param_layout == "compact"
     assert (
         parse_cli(["--w_group_param_layout", "compact"])
         .w_group_param_layout

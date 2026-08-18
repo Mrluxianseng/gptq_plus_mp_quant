@@ -22,7 +22,7 @@ from gptq_utils.quant_aware_utils import (
     configure_activation_quantizers_for_gptq,
     configure_k_cache_quantizers_for_gptq,
 )
-from utils import quant_utils, rotation_utils
+from utils import quant_utils, rotation_utils, triton_qwen3_fusions
 
 if TYPE_CHECKING:
     from realq.config import Config
@@ -40,6 +40,10 @@ def install_actquant_wrappers(analyzer: "ModelAnalyzer") -> None:
     ``Wrapper(Wrapper(Linear))`` and breaking every downstream isinstance check.
     """
     model = analyzer.model
+    # This patch changes only the MLP expression, not module/state_dict
+    # topology.  Install it before the wrapper idempotence guard because a
+    # pre-rotated model may already own ActQuantWrapper sites.
+    triton_qwen3_fusions.install_qwen3_swiglu_fusion(model)
     if (
         bool(getattr(model, "_realq_actquant_wrappers_installed", False))
         or bool(getattr(model, "_gptqplus_rotation_wrappers_installed", False))

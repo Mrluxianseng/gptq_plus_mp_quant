@@ -11,6 +11,13 @@ logical GPTQ column-block length (with masked power-of-two storage).
 This module only replaces the *in-block* Python/CUDA-launch loop.  Callers must
 still apply the original one-shot cross-block compensation
 ``Err @ Hinv[block, trailing]`` after this function returns.
+
+SM100 A/B rejected TMA and automatic warp specialization for this kernel: each
+tile is transferred only once and the 128 loop iterations have a strict state
+dependency, so descriptor/barrier/specialized-warp overhead exceeded any copy
+overlap.  WGMMA/TCGen05 is likewise a poor fit for the per-iteration K=1 outer
+product.  The retained path uses coalesced vector transactions and register
+state; reproducible timings are recorded in the accompanying optimization doc.
 """
 from __future__ import annotations
 
@@ -75,36 +82,72 @@ if triton is not None:
         col_mask = cols < N_COLS
         tile_mask = row_mask[:, None] & col_mask[None, :]
 
-        # One global read per W/scale element for this program. Triton keeps
-        # these tiles in program-local on-chip storage across the full
-        # sequential column loop.
+        # One global read per W element. Triton keeps this recurrent tile in
+        # registers/on-chip storage across the complete sequential loop.
         w = tl.load(
-            w_ptr + rows[:, None] * stride_wr + cols[None, :] * stride_wc,
+            w_ptr
+            + rows[:, None] * stride_wr
+            + cols[None, :] * stride_wc,
             mask=tile_mask,
             other=0.0,
-        ).to(tl.float32)
-        scales = tl.load(
-            scale_ptr
-            + rows[:, None] * stride_sr
-            + cols[None, :] * stride_sc,
-            mask=tile_mask,
-            other=1.0,
+            cache_modifier=".ca",
         ).to(tl.float32)
         maxq = tl.load(maxq_ptr).to(tl.float32)
         minq = -(maxq + 1.0)
+        if stride_sc == 0:
+            q_tile = tl.zeros((BLOCK_ROWS, BLOCK_COLS), tl.float32)
+            error_tile = tl.zeros((BLOCK_ROWS, BLOCK_COLS), tl.float32)
+
+        # A broadcast per-row scale is invariant across the loop.  Grouped
+        # per-column scales use a coalesced tile load below because column-wise
+        # scalar loads would be badly strided in the row-major matrix.
+        if stride_sc == 0:
+            broadcast_scale = tl.load(
+                scale_ptr + rows * stride_sr,
+                mask=row_mask,
+                other=1.0,
+                cache_modifier=".ca",
+            ).to(tl.float32)
+        else:
+            # Column-dependent qparams are row-major.  Loading their tile once
+            # is coalesced; fetching one column per iteration directly from
+            # global memory would use a 128-float stride between row lanes.
+            scale_tile = tl.load(
+                scale_ptr
+                + rows[:, None] * stride_sr
+                + cols[None, :] * stride_sc,
+                mask=tile_mask,
+                other=1.0,
+                cache_modifier=".ca",
+            ).to(tl.float32)
 
         # ``tl.range`` deliberately avoids unrolling a 128-column dependency
         # chain into a giant program. Each Hinv row is read exactly once and
         # retained in SRAM/registers for the current compensation step.
-        for i in tl.range(0, N_COLS, loop_unroll_factor=1):
+        for i in tl.range(
+            0,
+            N_COLS,
+            num_stages=2,
+            loop_unroll_factor=1,
+        ):
             is_i = cols == i
-            w_i = tl.sum(
-                tl.where(is_i[None, :], w, 0.0), axis=1
+            # Dynamic register gather replaces a BLOCK_COLS-wide masked
+            # reduction for each row on every sequential iteration.
+            gather_index = tl.full((BLOCK_ROWS, 1), i, tl.int32)
+            # ``tl.gather`` keeps the gathered dimension.  Reshape it away;
+            # dynamic tensor indexing (``[:, 0]``) is not legal Triton IR.
+            w_i = tl.reshape(
+                tl.gather(w, gather_index, axis=1),
+                (BLOCK_ROWS,),
             )
-            scale_i = tl.sum(
-                tl.where(is_i[None, :], scales, 0.0), axis=1
-            )
-            q_int = libdevice.rint(w_i / scale_i)
+            if stride_sc == 0:
+                scale_i = broadcast_scale
+            else:
+                scale_i = tl.reshape(
+                    tl.gather(scale_tile, gather_index, axis=1),
+                    (BLOCK_ROWS,),
+                )
+            q_int = libdevice.rint(libdevice.div_rn(w_i, scale_i))
             q_int = tl.minimum(tl.maximum(q_int, minq), maxq)
             q_i = scale_i * q_int
 
@@ -115,24 +158,60 @@ if triton is not None:
                 + cols * stride_hj,
                 mask=col_mask,
                 other=0.0,
+                cache_modifier=".ca",
             ).to(tl.float32)
-            diagonal = tl.sum(tl.where(is_i, hinv_row, 0.0), axis=0)
-            error_i = (w_i - q_i) / diagonal
+            # The diagonal is a scalar global load.  The old implementation
+            # selected it from hinv_row with another BLOCK_COLS reduction.
+            diagonal = tl.load(
+                hinv_ptr
+                + group_id * stride_hg
+                + i * stride_hi
+                + i * stride_hj,
+                cache_modifier=".ca",
+            ).to(tl.float32)
+            error_i = libdevice.div_rn(w_i - q_i, diagonal)
 
-            tl.store(
-                q_ptr + rows * stride_qr + i * stride_qc,
-                q_i,
-                mask=row_mask,
-            )
-            tl.store(
-                err_ptr + rows * stride_er + i * stride_ec,
-                error_i,
-                mask=row_mask,
-            )
+            if stride_sc == 0:
+                # With one broadcast scale the saved register tile leaves
+                # room to accumulate outputs and issue two coalesced stores.
+                q_tile = tl.where(is_i[None, :], q_i[:, None], q_tile)
+                error_tile = tl.where(
+                    is_i[None, :], error_i[:, None], error_tile
+                )
+            else:
+                # A grouped-scale tile is already resident.  Retaining two
+                # more output tiles spills registers, so store each completed
+                # column immediately in this specialization.
+                tl.store(
+                    q_ptr + rows * stride_qr + i * stride_qc,
+                    q_i,
+                    mask=row_mask,
+                )
+                tl.store(
+                    err_ptr + rows * stride_er + i * stride_ec,
+                    error_i,
+                    mask=row_mask,
+                )
 
             active_suffix = (cols >= i)[None, :] & tile_mask
             compensated = w - error_i[:, None] * hinv_row[None, :]
             w = tl.where(active_suffix, compensated, w)
+
+        if stride_sc == 0:
+            tl.store(
+                q_ptr
+                + rows[:, None] * stride_qr
+                + cols[None, :] * stride_qc,
+                q_tile,
+                mask=tile_mask,
+            )
+            tl.store(
+                err_ptr
+                + rows[:, None] * stride_er
+                + cols[None, :] * stride_ec,
+                error_tile,
+                mask=tile_mask,
+            )
 
 
 def is_available() -> bool:
@@ -267,5 +346,9 @@ def quantize_column_block(
         stride_er=errors.stride(0),
         stride_ec=errors.stride(1),
         BLOCK_COLS=block_columns,
+        # The eager recurrence materializes ``error * Hinv`` before its
+        # subtraction.  Contracting it into FFMA changes later rounding
+        # boundaries after enough sequential columns.
+        enable_fp_fusion=False,
     )
     return q, errors

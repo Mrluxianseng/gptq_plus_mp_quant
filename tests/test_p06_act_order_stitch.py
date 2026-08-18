@@ -93,8 +93,8 @@ def test_rebuild_helper_preserves_arbitrary_float32_raw_bits(
 
 
 def test_config_default_cli_validation_and_checkpoint_provenance():
-    assert Config().act_order_stitch_impl == LEGACY
-    assert parse_cli([]).act_order_stitch_impl == LEGACY
+    assert Config().act_order_stitch_impl == EXACT
+    assert parse_cli([]).act_order_stitch_impl == EXACT
     assert (
         parse_cli(["--act_order_stitch_impl", EXACT]).act_order_stitch_impl
         == EXACT

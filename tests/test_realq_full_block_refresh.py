@@ -87,7 +87,9 @@ def _layer_inputs(x: torch.Tensor) -> SimpleNamespace:
     )
 
 
-def _context(module: nn.Module) -> RefreshContext:
+def _context(
+    module: nn.Module, *, fused_block_adam: bool = False
+) -> RefreshContext:
     return RefreshContext(
         module=module,
         layer_lr=1e-2,
@@ -98,10 +100,11 @@ def _context(module: nn.Module) -> RefreshContext:
             chunk_size=2,
             seed=0,
         ),
+        fused_block_adam=fused_block_adam,
     )
 
 
-def test_full_block_refresh_defaults_to_legacy_single_linear_scope() -> None:
+def test_full_block_refresh_cli_can_select_legacy_single_linear_scope() -> None:
     assert parse_cli([]).full_block_refresh is False
     assert (
         parse_cli(["--full_block_refresh", "true"]).full_block_refresh
@@ -407,3 +410,53 @@ def test_functional_overrides_follow_act_quant_wrapper_weight_aliases() -> None:
     loss = changed.square().mean()
     grads = torch.autograd.grad(loss, [entry.leaf for entry in active])
     assert all(torch.count_nonzero(grad) > 0 for grad in grads)
+
+
+def test_compact_single_chunk_refresh_matches_full_update_oracle() -> None:
+    torch.manual_seed(43)
+    x = torch.randn(2, 3, 4)
+    teacher = _ToyBlock(seed=47)
+    with torch.no_grad():
+        fp_out = teacher(x)[0].clone()
+    perm = torch.tensor([2, 0, 3, 1])
+
+    def run(fused_block_adam: bool):
+        block = _ToyBlock(seed=47)
+        state = BlockRefreshState(block, _named_linears(block))
+        first_master = state.begin_quantization("first")
+        refresh = make_grad_refresh_fn(
+            layer=block,
+            module=block.first,
+            module_name="first",
+            block_state=state,
+            layer_state=_layer_inputs(x),
+            fp_out_for_this_layer=fp_out,
+            fisher=torch.eye(4),
+            ctx=_context(
+                block.first, fused_block_adam=fused_block_adam
+            ),
+        )
+        update = refresh(
+            first_master + 0.125,
+            trailing_col_start=2,
+            perm=perm,
+        )
+        return update, state
+
+    full_update, full_state = run(False)
+    compact_update, compact_state = run(True)
+
+    assert compact_update.shape == (4, 2)
+    assert compact_update.dtype == torch.float32
+    torch.testing.assert_close(
+        compact_update,
+        full_update.index_select(1, perm[2:]),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        compact_state._states["second"].master,
+        full_state._states["second"].master,
+        rtol=0,
+        atol=0,
+    )

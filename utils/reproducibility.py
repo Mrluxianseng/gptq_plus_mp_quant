@@ -13,6 +13,17 @@ import torch
 _CUBLAS_WORKSPACE_CONFIG = ":4096:8"
 
 
+def configure_deterministic_sdpa() -> None:
+    """Disable CUDA SDPA kernels with non-deterministic backward paths."""
+    try:
+        torch.backends.cuda.enable_flash_sdp(False)
+        torch.backends.cuda.enable_mem_efficient_sdp(False)
+        torch.backends.cuda.enable_math_sdp(True)
+    except AttributeError:
+        # CPU-only and older supported torch builds need no special handling.
+        pass
+
+
 def configure_reproducibility(seed: int, *, deterministic: bool = True) -> None:
     """Seed every RNG used by REAL-Q and request deterministic CUDA kernels.
 

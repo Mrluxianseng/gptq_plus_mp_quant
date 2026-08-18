@@ -42,11 +42,11 @@ class _ToyNextLayer(nn.Module):
         return (self.proj(hidden_states),)
 
 
-def test_fisher_fp32_cache_is_explicit_default_off_and_validated():
-    assert Config().fisher_fp32_cache is False
+def test_fisher_fp32_cache_is_default_on_and_validated():
+    assert Config().fisher_fp32_cache is True
     assert parse_cli(
-        ["--fisher_fp32_cache", "true"]
-    ).fisher_fp32_cache is True
+        ["--fisher_fp32_cache", "false"]
+    ).fisher_fp32_cache is False
     with pytest.raises(ValueError, match="fisher_fp32_cache"):
         Config(fisher_fp32_cache=1)
 

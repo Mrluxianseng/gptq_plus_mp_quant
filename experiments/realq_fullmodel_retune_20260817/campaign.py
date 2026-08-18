@@ -67,6 +67,20 @@ OOM_RE = re.compile(
     re.IGNORECASE,
 )
 TORCH_DISTRIBUTED_ENV = tuner.TORCH_DISTRIBUTED_ENV
+WORKER_ENV_OVERRIDES = {
+    "PYTHONUNBUFFERED": "1",
+    "PYTHONDONTWRITEBYTECODE": "1",
+    "PYTORCH_ALLOC_CONF": "expandable_segments:True",
+    "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+    "HF_DATASETS_OFFLINE": "1",
+    "HF_HUB_OFFLINE": "1",
+    "TRANSFORMERS_OFFLINE": "1",
+    "REALQ_DETERMINISTIC_SDPA": "1",
+    "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
+    "PYTHONHASHSEED": "0",
+    "NVIDIA_TF32_OVERRIDE": "0",
+}
+WORKER_ENV_UNSET: tuple[str, ...] = ()
 CODE_INPUTS = (
     "realq/config.py",
     "realq/pipeline.py",
@@ -641,6 +655,25 @@ def _gpu_inventory(cuda_id: str) -> dict[str, str]:
     return {"index": index, "name": name, "uuid": uuid}
 
 
+def _worker_environment(cuda_id: str) -> dict[str, str]:
+    """Build the audited child environment for one isolated GPU worker.
+
+    Derivative campaigns may replace ``WORKER_ENV_OVERRIDES`` and
+    ``WORKER_ENV_UNSET`` before freezing their plan.  Keeping that policy in a
+    named hook avoids copying the trial lifecycle merely to select a faster,
+    independently deterministic attention backend.
+    """
+
+    environment = os.environ.copy()
+    for key in TORCH_DISTRIBUTED_ENV:
+        environment.pop(key, None)
+    for key in WORKER_ENV_UNSET:
+        environment.pop(key, None)
+    environment.update(WORKER_ENV_OVERRIDES)
+    environment["CUDA_VISIBLE_DEVICES"] = cuda_id
+    return environment
+
+
 def _claim_trial(
     plan: Mapping[str, Any], trial: Mapping[str, Any], trial_dir: Path, spec: Mapping[str, Any]
 ) -> bool:
@@ -689,6 +722,7 @@ def _run_trial(
     result_path = trial_dir / "result.json"
     command = _build_trial_command(plan, trial, trial_dir)
     gpu = _gpu_inventory(cuda_id)
+    environment = _worker_environment(cuda_id)
     spec = {
         "campaign_id": CAMPAIGN_ID,
         "protocol_fingerprint": plan["protocol_fingerprint"],
@@ -704,6 +738,10 @@ def _run_trial(
         "command_sha256": _canonical_sha256(command),
         "cuda_visible_devices": cuda_id,
         "gpu": gpu,
+        "execution_environment_contract": {
+            "set": dict(sorted(WORKER_ENV_OVERRIDES.items())),
+            "unset": sorted(WORKER_ENV_UNSET),
+        },
         "created_at": _utc_now(),
     }
     claimed = _claim_trial(plan, trial, trial_dir, spec)
@@ -711,23 +749,6 @@ def _run_trial(
         result = _read_json(result_path)
         return 0 if result.get("status") == "succeeded" else 1
 
-    environment = os.environ.copy()
-    for key in TORCH_DISTRIBUTED_ENV:
-        environment.pop(key, None)
-    environment.update(
-        CUDA_VISIBLE_DEVICES=cuda_id,
-        PYTHONUNBUFFERED="1",
-        PYTHONDONTWRITEBYTECODE="1",
-        PYTORCH_ALLOC_CONF="expandable_segments:True",
-        PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True",
-        HF_DATASETS_OFFLINE="1",
-        HF_HUB_OFFLINE="1",
-        TRANSFORMERS_OFFLINE="1",
-        REALQ_DETERMINISTIC_SDPA="1",
-        CUBLAS_WORKSPACE_CONFIG=":4096:8",
-        PYTHONHASHSEED="0",
-        NVIDIA_TF32_OVERRIDE="0",
-    )
     log_path = trial_dir / "execution.log"
     started_at = _utc_now()
     started = time.monotonic()

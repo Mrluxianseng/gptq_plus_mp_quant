@@ -61,6 +61,8 @@ GRAD_LR=${GRAD_LR:-3e-4}
 CPU_MASTER=${CPU_MASTER:-0}
 FSDP=${FSDP:-0}
 QUANT_STOP_LAYER=${QUANT_STOP_LAYER:-}   # empty = full quant (Config default = None)
+NSYS_CAPTURE_START_LAYER=${NSYS_CAPTURE_START_LAYER:-}
+NSYS_CAPTURE_END_LAYER=${NSYS_CAPTURE_END_LAYER:-}
 
 # ---- profile-only ----------------------------------------------------------
 EXP_NAME=${EXP_NAME:-realq_profile}
@@ -75,6 +77,8 @@ NSYS_MODE=${NSYS_MODE:-rank0_cuda}
 NSYS_TRACE_RANK0=${NSYS_TRACE_RANK0:-${NSYS_TRACE:-cuda,nvtx}}
 NSYS_TRACE_ALL=${NSYS_TRACE_ALL:-nvtx}
 NSYS_WAIT=${NSYS_WAIT:-primary}
+NSYS_GPU_METRICS_DEVICES=${NSYS_GPU_METRICS_DEVICES:-}
+NSYS_GPU_METRICS_FREQUENCY=${NSYS_GPU_METRICS_FREQUENCY:-}
 if [[ -z "${NSYS_BIN:-}" ]]; then
     if [[ -x /usr/local/bin/nsys ]]; then
         NSYS_BIN=/usr/local/bin/nsys
@@ -101,6 +105,27 @@ if [[ "${NSYS_MODE}" != "rank0_cuda" && "${NSYS_MODE}" != "all_nvtx" ]]; then
     echo "ERROR: NSYS_MODE must be rank0_cuda or all_nvtx; got ${NSYS_MODE}." >&2
     exit 2
 fi
+if [[ -n "${NSYS_GPU_METRICS_FREQUENCY}" && -z "${NSYS_GPU_METRICS_DEVICES}" ]]; then
+    echo "ERROR: NSYS_GPU_METRICS_FREQUENCY requires NSYS_GPU_METRICS_DEVICES." >&2
+    exit 2
+fi
+if [[ -n "${NSYS_GPU_METRICS_FREQUENCY}" && ! "${NSYS_GPU_METRICS_FREQUENCY}" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: NSYS_GPU_METRICS_FREQUENCY must be an integer in Hz; got ${NSYS_GPU_METRICS_FREQUENCY}." >&2
+    exit 2
+fi
+if [[ -n "${NSYS_CAPTURE_START_LAYER}" || -n "${NSYS_CAPTURE_END_LAYER}" ]]; then
+    if [[ -z "${NSYS_CAPTURE_START_LAYER}" || -z "${NSYS_CAPTURE_END_LAYER}" ]]; then
+        echo "ERROR: NSYS_CAPTURE_START_LAYER and NSYS_CAPTURE_END_LAYER must be set together." >&2
+        exit 2
+    fi
+    if [[ "${NSYS}" != "1" || "${NVTX}" != "1" ]]; then
+        echo "ERROR: layer-scoped capture requires NSYS=1 and NVTX=1." >&2
+        exit 2
+    fi
+    NSYS_CAPTURE_RANGE=cudaProfilerApi
+else
+    NSYS_CAPTURE_RANGE=none
+fi
 
 export CUDA_VISIBLE_DEVICES=${DEVICE}
 IFS=',' read -r -a _DEVICE_LIST <<< "${DEVICE}"
@@ -117,6 +142,8 @@ echo "  dataset  : ${DATASET}  n=${NSAMPLES}  seq=${SEQ_LEN}  bsz=${BSZ}"
 echo "  quant    : w_bits=${W_BITS}  groups=${NUM_GROUPS}  grad_lr=${GRAD_LR}"
 echo "  shard    : cpu_master=${CPU_MASTER}  fsdp=${FSDP}"
 echo "  stop@    : ${QUANT_STOP_LAYER:-<none, full quant>}"
+echo "  capture  : ${NSYS_CAPTURE_START_LAYER:-<process start>}-${NSYS_CAPTURE_END_LAYER:-<process end>} (${NSYS_CAPTURE_RANGE})"
+echo "  metrics  : devices=${NSYS_GPU_METRICS_DEVICES:-<off>} frequency=${NSYS_GPU_METRICS_FREQUENCY:-<default>}"
 echo "============================================================"
 
 # ---- realq.ptq arg list ----------------------------------------------------
@@ -131,6 +158,22 @@ fi
 QUANT_STOP_ARG=()
 if [[ -n "${QUANT_STOP_LAYER}" ]]; then
     QUANT_STOP_ARG=(--quant_stop_layer "${QUANT_STOP_LAYER}")
+fi
+
+NSYS_CAPTURE_ARGS=()
+if [[ -n "${NSYS_CAPTURE_START_LAYER}" ]]; then
+    NSYS_CAPTURE_ARGS=(
+        --nsys_capture_start_layer "${NSYS_CAPTURE_START_LAYER}"
+        --nsys_capture_end_layer "${NSYS_CAPTURE_END_LAYER}"
+    )
+fi
+
+NSYS_GPU_METRICS_ARGS=()
+if [[ -n "${NSYS_GPU_METRICS_DEVICES}" ]]; then
+    NSYS_GPU_METRICS_ARGS+=(--gpu-metrics-devices="${NSYS_GPU_METRICS_DEVICES}")
+fi
+if [[ -n "${NSYS_GPU_METRICS_FREQUENCY}" ]]; then
+    NSYS_GPU_METRICS_ARGS+=(--gpu-metrics-frequency="${NSYS_GPU_METRICS_FREQUENCY}")
 fi
 
 CMD=(
@@ -151,6 +194,7 @@ CMD=(
     --fsdp "${FSDP}"
     --skip_eval true
     "${QUANT_STOP_ARG[@]}"
+    "${NSYS_CAPTURE_ARGS[@]}"
     "${NSYS_PROFILE_ARG[@]}"
     "$@"
 )
@@ -190,7 +234,9 @@ if [[ "${N_GPUS}" -le 1 ]]; then
         --backtrace=none \
         --python-sampling=false \
         --wait="${NSYS_WAIT}" \
-        --capture-range=none \
+        --capture-range="${NSYS_CAPTURE_RANGE}" \
+        --capture-range-end=stop \
+        "${NSYS_GPU_METRICS_ARGS[@]}" \
         --output="${NSYS_OUTPUT}" \
         "${CMD[@]}"
     exit $?
@@ -203,7 +249,8 @@ fi
 # fix is to let torchrun launch a per-rank bash wrapper. In `rank0_cuda` only
 # rank 0 execs nsys and all other ranks exec Python directly; in `all_nvtx`
 # every rank gets an independent NVTX-only .nsys-rep.
-export NSYS_BIN NSYS_MODE NSYS_TRACE_RANK0 NSYS_TRACE_ALL NSYS_WAIT
+export NSYS_BIN NSYS_MODE NSYS_TRACE_RANK0 NSYS_TRACE_ALL NSYS_WAIT NSYS_CAPTURE_RANGE
+export NSYS_GPU_METRICS_DEVICES NSYS_GPU_METRICS_FREQUENCY
 NSYS_OUTPUT_BASE="${NSYS_OUTPUT}"
 export NSYS_OUTPUT_BASE
 
@@ -220,6 +267,13 @@ if [[ "${NSYS_MODE}" == "all_nvtx" ]]; then
 else
     NSYS_RANK_TRACE="${NSYS_TRACE_RANK0}"
 fi
+NSYS_RANK_GPU_METRICS_ARGS=()
+if [[ -n "${NSYS_GPU_METRICS_DEVICES}" ]]; then
+    NSYS_RANK_GPU_METRICS_ARGS+=(--gpu-metrics-devices="${NSYS_GPU_METRICS_DEVICES}")
+fi
+if [[ -n "${NSYS_GPU_METRICS_FREQUENCY}" ]]; then
+    NSYS_RANK_GPU_METRICS_ARGS+=(--gpu-metrics-frequency="${NSYS_GPU_METRICS_FREQUENCY}")
+fi
 exec "${NSYS_BIN}" profile \
     --force-overwrite=true \
     --trace="${NSYS_RANK_TRACE}" \
@@ -228,7 +282,9 @@ exec "${NSYS_BIN}" profile \
     --backtrace=none \
     --python-sampling=false \
     --wait="${NSYS_WAIT}" \
-    --capture-range=none \
+    --capture-range="${NSYS_CAPTURE_RANGE}" \
+    --capture-range-end=stop \
+    "${NSYS_RANK_GPU_METRICS_ARGS[@]}" \
     --output="${NSYS_OUTPUT_BASE}_rank${LOCAL_RANK:-0}" \
     "$@"
 EOF

@@ -63,6 +63,8 @@ def configure_k_cache_quantizers_for_gptq(args, analyzer):
             layer.self_attn,
             rope_function_name,
             head_dim=analyzer.head_dim,
+            q_norm=getattr(layer.self_attn, "q_norm", None),
+            k_norm=getattr(layer.self_attn, "k_norm", None),
             **k_quant_config,
         )
         count += 1

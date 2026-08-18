@@ -18,11 +18,74 @@ from __future__ import annotations
 
 import torch
 
+from realq.refresh import triton_fisher
+from realq.utils import nvtx
+
 
 # torch.quantile materialises a sorted view of the input. Past ~16M elements
 # this OOMs on a 24 GB card for fp32 inputs and also issues a host sync.
 # Mirrors old ``_TORCH_QUANTILE_SAFE_NUMEL`` (gptq_plus_utils.py:43).
 _TORCH_QUANTILE_SAFE_NUMEL = 16 * 1024 * 1024
+
+
+def _fisher_tf32_matmul(
+    left: torch.Tensor, right: torch.Tensor
+) -> torch.Tensor:
+    """TF32 multiply inputs with an FP32 Tensor Core accumulator/output."""
+
+    if left.dtype != torch.float32 or right.dtype != torch.float32:
+        raise TypeError("Fisher TF32 matmul requires FP32 storage inputs.")
+    if not left.is_cuda:
+        return left @ right
+    previous = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = True
+    try:
+        with nvtx.nvtx_range("fisher_loss.matmul_tf32"):
+            return left @ right
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = previous
+
+
+class _FisherQuadraticTF32(torch.autograd.Function):
+    """CUDA Fisher quadratic with direct TF32/FP32 forward and backward."""
+
+    @staticmethod
+    def forward(
+        ctx, delta_flat: torch.Tensor, fisher: torch.Tensor
+    ) -> torch.Tensor:
+        left = _fisher_tf32_matmul(delta_flat, fisher)
+        if triton_fisher.can_fuse(left, delta_flat):
+            with nvtx.nvtx_range("fisher_loss.row_inner_tf32"):
+                half_quad = triton_fisher.rowwise_inner_tf32(
+                    left, delta_flat
+                )
+        else:
+            # CPU/Triton-less compatibility path.  CUDA production always
+            # uses the explicit TF32-input fused reduction above.
+            half_quad = 0.5 * (left * delta_flat).sum(dim=-1)
+        ctx.save_for_backward(delta_flat, fisher, left)
+        ctx.rows = delta_flat.shape[0]
+        return half_quad.mean()
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        delta_flat, fisher, left = ctx.saved_tensors
+        right = _fisher_tf32_matmul(delta_flat, fisher.transpose(0, 1))
+        if triton_fisher.can_fuse(left, right):
+            with nvtx.nvtx_range("fisher_loss.backward_tf32"):
+                grad_delta = triton_fisher.quadratic_grad_tf32(
+                    left,
+                    right,
+                    grad_output,
+                    rows=ctx.rows,
+                )
+        else:
+            grad_delta = (
+                (left + right)
+                * (0.5 / float(ctx.rows))
+                * grad_output
+            )
+        return grad_delta, None
 
 
 def _activation_clip_threshold(tensor: torch.Tensor, q: float) -> torch.Tensor | None:
@@ -141,5 +204,15 @@ def fisher_mse_loss(
     delta = delta.float()
     fisher = fisher.to(device=delta.device, dtype=torch.float32)  # (H, H)
     delta_flat = delta.reshape(-1, H)                             # (B*T, H)
+    if delta_flat.is_cuda:
+        # All large multiplications now use TF32 input precision.  GEMMs keep
+        # FP32 Tensor Core accumulators; the fused row-inner kernel explicitly
+        # rounds its two FP32-storage operands to TF32 mantissas and reduces in
+        # FP32.  The custom backward avoids autograd's expanded FP32
+        # MulFunctor chain and applies the same policy to the transpose GEMM.
+        return _FisherQuadraticTF32.apply(delta_flat, fisher)
+
+    # CPU remains the exact legacy FP32 oracle used by the paper-numerics
+    # tests and by environments without CUDA.
     quad = (delta_flat @ fisher * delta_flat).sum(dim=-1)         # (B*T,)
     return 0.5 * quad.mean()

@@ -597,6 +597,7 @@ def quantize_one_layer(
                             num_groups=cfg.num_groups,
                             dev=dev,
                             group_parallel_quant=cfg.group_parallel_quant,
+                            hessian_tf32=cfg.hessian_tf32,
                         )
                         realqs[name] = r
                 with nvtx.nvtx_range("group.hessian_accum"):
@@ -635,6 +636,7 @@ def quantize_one_layer(
                                     log_column_block_loss=(
                                         cfg.log_column_block_loss
                                     ),
+                                    fused_block_adam=cfg.fused_block_adam,
                                 )
                                 # slide_alpha closure: returns CURRENT α and advances the
                                 # layer-shared cumulative refresh cursor. Must be called
@@ -830,6 +832,19 @@ def quantize_all_layers(
     if cfg.quant_stop_layer is not None:
         n_layers = min(n_layers, cfg.quant_stop_layer + 1)
 
+    profiler_capture = None
+    if cfg.nsys_capture_start_layer is not None:
+        if cfg.nsys_capture_end_layer >= n_layers:
+            raise ValueError(
+                "nsys capture window exceeds the layers selected for "
+                f"quantization: end={cfg.nsys_capture_end_layer}, "
+                f"selected_layers={n_layers}."
+            )
+        profiler_capture = nvtx.CudaProfilerLayerCapture(
+            cfg.nsys_capture_start_layer,
+            cfg.nsys_capture_end_layer,
+        )
+
     alignment_trace_config = {}
     if cfg.alignment_trace_path is not None:
         alignment_trace_config = default_refresh_trace_config(cfg)
@@ -849,6 +864,7 @@ def quantize_all_layers(
                 "second_order_scale": 1.0,
                 "block_atomic_quant": False,
                 "pre_clip": False,
+                "fused_block_adam": cfg.fused_block_adam,
                 # Refactored refresh sampling always uses one shared global
                 # scheduler and rank-local filtering.
                 "dp_global_shuffle": True,
@@ -895,6 +911,8 @@ def quantize_all_layers(
             desc="Quantising layers",
             disable=not parallel_env.is_main(),
         ):
+            if profiler_capture is not None:
+                profiler_capture.before_layer(layer_idx)
             # loss_slide_window needs the NEXT transformer block on GPU during
             # this layer's refreshes. Old GPTQ+ (lines 8284-8287) gates slide
             # on ``i <= final_layer_idx - 2``: i.e. the last TWO layers
@@ -944,7 +962,11 @@ def quantize_all_layers(
                     trace_writer=trace_writer,
                     block_refresh_states=block_refresh_states,
                 )
+            if profiler_capture is not None:
+                profiler_capture.after_layer(layer_idx)
     finally:
+        if profiler_capture is not None:
+            profiler_capture.close()
         for pending_state in block_refresh_states.values():
             pending_state.release()
         block_refresh_states.clear()

@@ -19,19 +19,35 @@ def _hadamard_transform_torch(u: torch.Tensor) -> torch.Tensor:
     h = 1
     while h < n:
         x = x.view(-1, n // (2 * h), 2, h)
-        a = x[:, :, 0, :].clone()
-        b = x[:, :, 1, :].clone()
-        x[:, :, 0, :] = a + b
-        x[:, :, 1, :] = a - b
-        x = x.view(-1, n)
+        a = x[:, :, 0, :]
+        b = x[:, :, 1, :]
+        # Keep the fallback purely functional.  Besides avoiding mutation of
+        # views, this is required when the transform is executed from a
+        # custom autograd.Function's torch.func JVP rule.
+        x = torch.stack((a + b, a - b), dim=2).reshape(-1, n)
         h *= 2
     return x.view(orig_shape)
 
 
-def _hadamard_transform(u: torch.Tensor) -> torch.Tensor:
-    if fast_hadamard_transform is not None:
-        return fast_hadamard_transform.hadamard_transform(u)
-    return _hadamard_transform_torch(u)
+def _hadamard_transform(
+    u: torch.Tensor, scale: float = 1.0
+) -> torch.Tensor:
+    if fast_hadamard_transform is not None and u.is_cuda:
+        # The CUDA extension applies scale while storing its output, avoiding
+        # a separate normalization kernel and intermediate tensor traversal.
+        return fast_hadamard_transform.hadamard_transform(
+            u.contiguous(), scale=scale
+        )
+    output = _hadamard_transform_torch(u)
+    return output if scale == 1.0 else output * scale
+
+
+def scaled_hadamard_transform(
+    u: torch.Tensor, scale: float
+) -> torch.Tensor:
+    """Hadamard transform with normalization fused when FHT is installed."""
+
+    return _hadamard_transform(u, scale=scale)
 
 
 def get_hadK(n, transpose=False):
@@ -90,12 +106,23 @@ class HadamardTransform(torch.autograd.Function):
     """The unnormalized Hadamard transform (i.e. without dividing by sqrt(2))"""
 
     @staticmethod
-    def forward(ctx, u):
-        return _hadamard_transform(u)
+    def forward(u):
+        return _hadamard_transform(u, scale=1.0)
+
+    @staticmethod
+    def setup_context(ctx, inputs, output):
+        # The transform is linear and has no saved-tensor state.  Defining
+        # setup_context (and using the ctx-free forward signature) makes this
+        # custom Function composable with torch.func transforms.
+        pass
 
     @staticmethod
     def backward(ctx, grad):
-        return _hadamard_transform(grad)
+        return _hadamard_transform(grad, scale=1.0)
+
+    @staticmethod
+    def jvp(ctx, grad_u):
+        return _hadamard_transform(grad_u, scale=1.0)
 
 
 def matmul_hadU(X, transpose=False):
@@ -121,12 +148,16 @@ def matmul_hadU(X, transpose=False):
 def matmul_hadU_cuda(X, hadK, K):
     n = X.shape[-1]
     if K == 1:
-        return HadamardTransform.apply(X.contiguous()) / torch.tensor(n).sqrt()
+        return scaled_hadamard_transform(
+            X.contiguous(), scale=1.0 / math.sqrt(n)
+        )
     # if transpose:
     #     hadK = hadK.T.contiguous()
     input = X.view(-1, K, n // K)
-    input = HadamardTransform.apply(input.contiguous()) / torch.tensor(n).sqrt()
-    input = hadK.to(input.device).to(input.dtype) @ input
+    input = scaled_hadamard_transform(
+        input.contiguous(), scale=1.0 / math.sqrt(n)
+    )
+    input = hadK.to(device=input.device, dtype=input.dtype) @ input
     return input.reshape(X.shape)
 
 
@@ -141,7 +172,7 @@ def apply_exact_had_to_linear(module, had_dim=-1, output=False, R2=None):
     dtype = W_.dtype
     dev = W_.device
     init_shape = W_.shape
-    W_ = W_.float().cuda()
+    W_ = W_.to(device="cuda", dtype=torch.float32)
 
     if had_dim == -1:
         if output:

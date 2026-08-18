@@ -45,14 +45,9 @@ def test_a4_symmetric_per_token_matches_shared_implementation_equation(clip):
     actual = quantizer(x)
     expected = _manual_sym_per_token(x, bits=4, clip=clip)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    # Dynamic per-token quantization means one scale per row, broadcast over
-    # the feature dimension (the implementation stores the broadcast shape).
-    torch.testing.assert_close(
-        quantizer.scale,
-        quantizer.scale[..., :1].expand_as(x),
-        rtol=0,
-        atol=0,
-    )
+    # Dynamic per-token quantization stores one compact scale per flattened
+    # token row.  The QDQ kernel broadcasts it without a full-shape tensor.
+    assert quantizer.scale.shape == (2, 1)
 
 
 def test_a16_is_an_exact_noop_and_groupwise_supports_a_short_tail():
@@ -74,7 +69,7 @@ def test_a16_is_an_exact_noop_and_groupwise_supports_a_short_tail():
         dim=-1,
     )
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    assert grouped.scale.shape == x.shape
+    assert grouped.scale.shape == (1, 3)
 
     affine = quant_utils.ActQuantizer()
     affine.configure(bits=4, groupsize=2, sym=False, clip_ratio=1.0)
@@ -212,9 +207,8 @@ class _FakeAttention(torch.nn.Module):
 
 
 def _hadamard_last_dim(x):
-    return (
-        hadamard_utils.HadamardTransform.apply(x.float())
-        / math.sqrt(x.shape[-1])
+    return hadamard_utils.scaled_hadamard_transform(
+        x.float(), scale=1.0 / math.sqrt(x.shape[-1])
     ).to(x.dtype)
 
 
