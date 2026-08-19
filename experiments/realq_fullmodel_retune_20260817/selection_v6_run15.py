@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import math
 import sys
 from pathlib import Path
 from typing import Any, Sequence
@@ -30,9 +31,65 @@ SELECTION_PATH = v6.OUTPUT_ROOT / "selections.json"
 core.SELECTION_ID = SELECTION_ID
 core.SELECTION_PATH = SELECTION_PATH
 
+# User-mandated full-model coarse sweep (2026-08-19).  Every branch/config
+# must measure these exact points before the selector may consume any local
+# bracket/refinement result.  Existing off-grid measurements remain valid
+# evidence, but cannot by themselves satisfy this gate.
+REQUIRED_COARSE_LRS = (5e-7, 1e-6, 3e-6, 7e-6, 1e-5, 3e-5, 5e-5)
+
+
+def _has_lr(measured: Sequence[float], wanted: float) -> bool:
+    return any(
+        math.isclose(value, wanted, rel_tol=1e-12, abs_tol=0.0)
+        for value in measured
+    )
+
+
+def _apply_required_coarse_grid(payload: dict[str, Any]) -> dict[str, Any]:
+    """Apply the user-required coarse-grid gate to core selector output."""
+
+    for row in payload["rows"]:
+        measured = [float(item["lr"]) for item in row.get("aggregates", [])]
+        missing = [
+            lr for lr in REQUIRED_COARSE_LRS if not _has_lr(measured, lr)
+        ]
+        row["required_coarse_grid"] = list(REQUIRED_COARSE_LRS)
+        row["missing_coarse_lrs"] = missing
+        row["coarse_grid_gate"] = not missing
+        if not missing:
+            continue
+
+        # Preserve the deferred local actions for audit/debugging, but do not
+        # expose them as launch suggestions until all seven coarse points are
+        # measured.  This makes "coarse first, then refine" fail closed.
+        row["deferred_local_suggestions"] = list(row.get("suggestions", []))
+        row["suggestions"] = [
+            {"reason": "complete_user_required_coarse_grid", "lr": lr}
+            for lr in missing
+        ]
+        row["selected_lr"] = None
+        row["ready"] = False
+        row["reason"] = (
+            "user-required seven-point coarse grid incomplete; local "
+            "refinement and final selection are deferred"
+        )
+
+    payload["counts"]["ready"] = sum(
+        bool(row["ready"]) for row in payload["rows"]
+    )
+    payload["required_coarse_grid"] = list(REQUIRED_COARSE_LRS)
+    payload["coarse_grid_complete_groups"] = sum(
+        bool(row["coarse_grid_gate"]) for row in payload["rows"]
+    )
+    return payload
+
+
+def _analyze_all() -> dict[str, Any]:
+    return _apply_required_coarse_grid(core.analyze_all())
+
 
 def _status(args: argparse.Namespace) -> int:
-    payload = core.analyze_all()
+    payload = _analyze_all()
     if args.output:
         c._atomic_json(args.output.expanduser().resolve(), payload)
     print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
@@ -41,7 +98,7 @@ def _status(args: argparse.Namespace) -> int:
 
 def _freeze(_: argparse.Namespace) -> int:
     plan = core._read_plan()
-    analysis = core.analyze_all()
+    analysis = _analyze_all()
     not_ready = [
         f"{row['branch']}/{row['config']}"
         for row in analysis["rows"]
@@ -65,6 +122,8 @@ def _freeze(_: argparse.Namespace) -> int:
             "bracket": row["bracket"],
             "high_side_worse_lrs": row["high_side_worse_lrs"],
             "two_percent_plateau": row["two_percent_plateau"],
+            "required_coarse_grid": row["required_coarse_grid"],
+            "coarse_grid_gate": row["coarse_grid_gate"],
             "launches": row["launches"],
         }
         for row in analysis["rows"]
@@ -99,6 +158,8 @@ def _freeze(_: argparse.Namespace) -> int:
                 "the first two executions differs"
             ),
             "high_side_worse_points": 2,
+            "required_full_model_coarse_lrs": list(REQUIRED_COARSE_LRS),
+            "coarse_grid_must_complete_before_local_refinement": True,
             "tie_break": (
                 "lower LR when top-two gap <= observed same-branch repeat range"
             ),
