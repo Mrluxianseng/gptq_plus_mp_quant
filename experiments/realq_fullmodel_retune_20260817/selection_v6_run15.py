@@ -14,8 +14,9 @@ import datetime as dt
 import json
 import math
 import sys
+from collections import defaultdict
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from experiments.realq_fullmodel_retune_20260817 import campaign as c
 from experiments.realq_fullmodel_retune_20260817 import campaign_v6_run15 as v6
@@ -36,6 +37,20 @@ core.SELECTION_PATH = SELECTION_PATH
 # bracket/refinement result.  Existing off-grid measurements remain valid
 # evidence, but cannot by themselves satisfy this gate.
 REQUIRED_COARSE_LRS = (5e-7, 1e-6, 3e-6, 7e-6, 1e-5, 3e-5, 5e-5)
+CAP32_EXTENSION_CAMPAIGN_ID = (
+    "realq-fullmodel-two-branch-retune-20260818-v6-cap32-extension-v1"
+)
+CAP32_EXTENSION_PLAN_PATH = v6.OUTPUT_ROOT / "cap32_extension" / "plan.json"
+CAP32_EXTENSION_MODULE_PATH = (
+    Path(__file__).resolve().parent / "campaign_v6_cap32_extension.py"
+)
+NUMERICAL_PARITY_KEYS = (
+    "configurations",
+    "cache_snapshots",
+    "calibration_token_hashes",
+    "determinism",
+    "optimization_profile",
+)
 
 
 def _has_lr(measured: Sequence[float], wanted: float) -> bool:
@@ -43,6 +58,108 @@ def _has_lr(measured: Sequence[float], wanted: float) -> bool:
         math.isclose(value, wanted, rel_tol=1e-12, abs_tol=0.0)
         for value in measured
     )
+
+
+def _verify_code_snapshot(plan: Mapping[str, Any]) -> None:
+    frozen = plan["code_snapshot"]
+    observed = []
+    for item in frozen["files"]:
+        path = c.REPO_ROOT / str(item["path"])
+        if not path.is_file():
+            raise c.CampaignError(f"execution code input missing: {path}")
+        current = {
+            "path": str(item["path"]),
+            "size_bytes": path.stat().st_size,
+            "sha256": c._file_sha256(path),
+        }
+        if current != item:
+            raise c.CampaignError(f"execution code input changed: {path}")
+        observed.append(current)
+    if c._canonical_sha256(observed) != frozen["sha256"]:
+        raise c.CampaignError("execution code snapshot aggregate mismatch")
+
+
+def _read_canonical_plan(path: Path) -> dict[str, Any]:
+    plan = c._read_json(path)
+    stable = dict(plan)
+    fingerprint = stable.pop("protocol_fingerprint", None)
+    stable.pop("created_at", None)
+    if c._canonical_sha256(stable) != fingerprint:
+        raise c.CampaignError(f"execution plan fingerprint mismatch: {path}")
+    _verify_code_snapshot(plan)
+    return plan
+
+
+def _execution_campaign_provenance() -> list[dict[str, Any]]:
+    """Validate every charged/result artifact against V6 or its cap extension."""
+
+    primary = core._read_plan()
+    plans = {v6.CAMPAIGN_ID: primary}
+    plan_paths = {v6.CAMPAIGN_ID: v6.PLAN_PATH}
+    if CAP32_EXTENSION_PLAN_PATH.is_file():
+        extension = _read_canonical_plan(CAP32_EXTENSION_PLAN_PATH)
+        if extension.get("campaign_id") != CAP32_EXTENSION_CAMPAIGN_ID:
+            raise c.CampaignError("unexpected cap32 extension campaign id")
+        source_ref = extension.get("source_v6_plan", {})
+        if source_ref != {
+            "path": str(v6.PLAN_PATH),
+            "sha256": c._file_sha256(v6.PLAN_PATH),
+            "campaign_id": primary["campaign_id"],
+            "protocol_fingerprint": primary["protocol_fingerprint"],
+        }:
+            raise c.CampaignError("cap32 extension source-plan reference mismatch")
+        if int(extension.get("max_launches_per_branch_config", 0)) != 32:
+            raise c.CampaignError("cap32 extension launch cap mismatch")
+        for key in NUMERICAL_PARITY_KEYS:
+            if extension.get(key) != primary.get(key):
+                raise c.CampaignError(
+                    f"cap32 extension changed numerical protocol field: {key}"
+                )
+        plans[CAP32_EXTENSION_CAMPAIGN_ID] = extension
+        plan_paths[CAP32_EXTENSION_CAMPAIGN_ID] = CAP32_EXTENSION_PLAN_PATH
+
+    counts: dict[str, dict[str, int]] = defaultdict(
+        lambda: {"charged_specs": 0, "results": 0}
+    )
+    trial_root = v6.OUTPUT_ROOT / "trials"
+    for filename, counter in (("spec.json", "charged_specs"), ("result.json", "results")):
+        for artifact_path in sorted(trial_root.glob(f"*/{filename}")):
+            artifact = c._read_json(artifact_path)
+            campaign_id = str(artifact.get("campaign_id"))
+            if campaign_id not in plans:
+                raise c.CampaignError(
+                    f"unrecognized execution campaign in {artifact_path}: {campaign_id}"
+                )
+            if artifact.get("protocol_fingerprint") != plans[campaign_id][
+                "protocol_fingerprint"
+            ]:
+                raise c.CampaignError(
+                    f"execution fingerprint mismatch: {artifact_path}"
+                )
+            command = artifact.get("command")
+            if not isinstance(command, list) or artifact.get(
+                "command_sha256"
+            ) != c._canonical_sha256(command):
+                raise c.CampaignError(f"execution command hash mismatch: {artifact_path}")
+            c._validate_full_profile(
+                command,
+                branch=str(artifact["branch"]),
+                config=str(artifact["config"]),
+            )
+            counts[campaign_id][counter] += 1
+
+    return [
+        {
+            "campaign_id": campaign_id,
+            "protocol_fingerprint": plan["protocol_fingerprint"],
+            "plan": {
+                "path": str(plan_paths[campaign_id]),
+                "sha256": c._file_sha256(plan_paths[campaign_id]),
+            },
+            **counts[campaign_id],
+        }
+        for campaign_id, plan in plans.items()
+    ]
 
 
 def _apply_required_coarse_grid(payload: dict[str, Any]) -> dict[str, Any]:
@@ -85,7 +202,10 @@ def _apply_required_coarse_grid(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _analyze_all() -> dict[str, Any]:
-    return _apply_required_coarse_grid(core.analyze_all())
+    execution_campaigns = _execution_campaign_provenance()
+    payload = _apply_required_coarse_grid(core.analyze_all())
+    payload["execution_campaigns"] = execution_campaigns
+    return payload
 
 
 def _status(args: argparse.Namespace) -> int:
@@ -133,6 +253,8 @@ def _freeze(_: argparse.Namespace) -> int:
         Path(v6.__file__).resolve(),
         Path(__file__).resolve(),
     ]
+    if CAP32_EXTENSION_MODULE_PATH.is_file():
+        code_paths.append(CAP32_EXTENSION_MODULE_PATH)
     body: dict[str, Any] = {
         "selection_id": SELECTION_ID,
         "campaign_id": v6.CAMPAIGN_ID,
@@ -145,6 +267,7 @@ def _freeze(_: argparse.Namespace) -> int:
             {"path": str(path), "sha256": c._file_sha256(path)}
             for path in code_paths
         ],
+        "execution_campaigns": analysis["execution_campaigns"],
         "protocol": {
             "primary_metric": "wikitext2 Exact KL",
             "a_loss_ratio": 1.0,
