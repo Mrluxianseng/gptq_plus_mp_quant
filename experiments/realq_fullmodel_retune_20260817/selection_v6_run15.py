@@ -203,8 +203,21 @@ def _apply_required_coarse_grid(payload: dict[str, Any]) -> dict[str, Any]:
 
 def _analyze_all() -> dict[str, Any]:
     execution_campaigns = _execution_campaign_provenance()
+    effective_cap = (
+        32
+        if any(
+            item["campaign_id"] == CAP32_EXTENSION_CAMPAIGN_ID
+            for item in execution_campaigns
+        )
+        else 20
+    )
+    # The core selector uses this constant only to report/slice the remaining
+    # launch budget.  Trial admission remains independently enforced by each
+    # immutable execution plan.
+    c.MAX_LAUNCHES_PER_BRANCH_CONFIG = effective_cap
     payload = _apply_required_coarse_grid(core.analyze_all())
     payload["execution_campaigns"] = execution_campaigns
+    payload["effective_max_launches_per_branch_config"] = effective_cap
     return payload
 
 
@@ -283,6 +296,9 @@ def _freeze(_: argparse.Namespace) -> int:
             "high_side_worse_points": 2,
             "required_full_model_coarse_lrs": list(REQUIRED_COARSE_LRS),
             "coarse_grid_must_complete_before_local_refinement": True,
+            "effective_max_launches_per_branch_config": analysis[
+                "effective_max_launches_per_branch_config"
+            ],
             "tie_break": (
                 "lower LR when top-two gap <= observed same-branch repeat range"
             ),
