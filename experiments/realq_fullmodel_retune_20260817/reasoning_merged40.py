@@ -153,6 +153,12 @@ def _reasoning_settings(
         "--reasoning_system_prompt": (
             "You are a careful reasoning assistant. Follow the requested output format exactly."
         ),
+        # The run15 FA4 adapter is deliberately restricted to dense,
+        # unpadded, no-KV-cache calibration/refresh.  lm-eval generation uses
+        # padded batches and cached decoding, so retain the established
+        # 20-group evaluation backend here instead of silently discarding its
+        # attention mask.
+        "--attention_backend": "sdpa",
         "--require_static_cache_hit": "false",
         "--require_reference_cache_hit": "false",
         "--output_dir": str(pipeline_output),

@@ -15,7 +15,7 @@ from experiments.realq_fullmodel_retune_20260817 import formal_v6_run15 as forma
 from experiments.realq_fullmodel_retune_20260817 import reasoning_merged40 as core
 
 
-REASONING_ID = "realq-fullmodel-two-branch-reasoning-20260820-v6-run15"
+REASONING_ID = "realq-fullmodel-two-branch-reasoning-20260820-v6-run15-sdpa-v2"
 REASONING_PLAN_PATH = v6.OUTPUT_ROOT / "reasoning_plan.json"
 REASONING_AUDIT_PATH = v6.OUTPUT_ROOT / "reasoning_final_audit.json"
 _IMPLEMENTATION_PATH = Path(core.__file__).resolve()
@@ -61,8 +61,16 @@ def _build_plan() -> dict[str, Any]:
     protocol = dict(body["protocol"])
     protocol.update(
         {
-            "attention_backend": "flash_attention_4==4.0.0b25",
-            "execution_environment_matches_v6_formal": True,
+            "attention_backend": "sdpa",
+            "attention_backend_scope": (
+                "reasoning generation only; formal quantization remains "
+                "flash_attention_4==4.0.0b25"
+            ),
+            "attention_backend_reason": (
+                "lm-eval generation requires padded batches and KV-cache "
+                "decoding; matches the prior 20-group reasoning protocol"
+            ),
+            "execution_environment_matches_v6_formal_except_attention_backend": True,
         }
     )
     body["protocol"] = protocol

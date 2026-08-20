@@ -7,6 +7,7 @@ import pytest
 
 from experiments.realq_fullmodel_retune_20260817 import campaign as base
 from experiments.realq_fullmodel_retune_20260817 import campaign_v6_run15 as v6
+from experiments.realq_fullmodel_retune_20260817 import reasoning_merged40
 
 
 def _command(*, branch: str, config: str) -> list[str]:
@@ -102,3 +103,14 @@ def test_run15_worker_environment_unsets_math_sdpa_and_global_tf32_blocker(
     assert "NVIDIA_TF32_OVERRIDE" not in environment
     assert os.environ["REALQ_DETERMINISTIC_SDPA"] == "1"
     assert os.environ["NVIDIA_TF32_OVERRIDE"] == "0"
+
+
+@pytest.mark.parametrize("task", ["gsm8k", "math_500", "humaneval_plus"])
+def test_reasoning_generation_overrides_dense_only_fa4_with_sdpa(task: str):
+    settings = reasoning_merged40._reasoning_settings(
+        "full_block",
+        "qwen3-32b_w4a16",
+        task,
+        base.OUTPUT_ROOT / "reasoning-attempt",
+    )
+    assert settings["--attention_backend"] == "sdpa"
