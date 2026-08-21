@@ -1,9 +1,10 @@
-# GPTAQ / GuidedQuant / REALQ 双分支：20 设定公平横向总表
+# GPTAQ / GuidedQuant / ResComp-C / REALQ 双分支：20 设定公平横向总表
 
 > 生成日期：2026-08-21。数值由原始 marker / final audit 自动交叉核验后汇总；不是手工抄表。
 
 ## 方法与列定义
 
+- `ResComp-C`：`ResComp core + controlled REAL-Q backend`；使用官方 ResComp CAE 方程与 `full` P/R 布局，但不声称是 native 官方脚本复现。
 - `REALQ-F`：量化当前线性层时，同时更新 transformer block 内其他线性层（full-block）。
 - `REALQ-S`：默认分支，不更新 transformer block 内其他线性层（single-linear）。
 - 推理三项为 GSM8K、MATH-500、HumanEval+；HumanEval+ 一列同时给官方 EvalPlus base/plus pass@1。
@@ -14,108 +15,134 @@
 
 | 项目 | 审计结论 |
 |---|---|
-| 矩阵 | 5 个相同模型 × 4 个相同量化设定；每个设定均有 GPTAQ、GuidedQuant、REALQ-F、REALQ-S。 |
-| 校准集 | 严格相同的 WikiText-2 train `256×2048` token tensor；两轮均直接引用 `realq_20group_20260808/shared_cache` 的同一物理文件。 |
+| 矩阵 | 5 个相同模型 × 4 个相同量化设定；每个设定均有 GPTAQ、GuidedQuant、ResComp-C、REALQ-F、REALQ-S。 |
+| 校准集 | 严格相同的 WikiText-2 train `256×2048=524,288` token tensor；三轮均直接引用 `realq_20group_20260808/shared_cache` 的同一物理文件，顺序不变。 |
 | 校准哈希 | qwen3-0.6b=aed4e972d312…；llama31-8b-instruct=8030125e31c8…；qwen3-4b=21210e1929aa…；qwen3-8b=a7acbd907d64…；qwen3-32b=749360f8fb36…；REALQ 两分支逐模型也完全相同。 |
-| 量化公共项 | 单卡、G128、blocksize=128、对称 MSE weight clipping、act-order、QuaRot、`seed/rotation_seed/refresh_seed=1/0/0`；W4A4KV4 均为 A/K/V-aware、clip=0.9。clipping 数学定义相同，baseline 的 legacy search 与 REALQ 的 optimized exact search 是不同实现。 |
-| 质量评测 | WikiText-2 PPL、同一十项 QA 与同一平均口径；两轮各自 final gate 均完整。baseline 评测走旧 HF/SDPA 路径，REALQ run15 质量评测走 deterministic FA4，因此属于完整方法结果，不是 attention-kernel-controlled 消融。 |
+| 量化公共项 | 单卡、G128 natural-column grouping、blocksize=128、对称 per-output-channel MSE weight clipping、act-order、QuaRot、`seed/rotation_seed/refresh_seed=1/0/0`；W4A4KV4 均为对称 per-token A/K/V-aware、groupsize=-1、clip=0.9。GPTAQ/GuidedQuant 的 legacy Cartesian search 与 ResComp-C/REALQ 的 optimized-exact search 在本次有限 FP32 对称域上产生相同 raw scale/zero。 |
+| A16 无效参数 | ResComp-C 的 A16KV16 组仍记录 clip=0.9，其他方法为 1.0；但 bits=16 直接返回原 tensor，aware=false 且不安装 K wrapper，因此该字段不进入数值路径。 |
+| 质量评测 | WikiText-2 PPL、同一十项 QA 与同一平均口径；三轮各自 final gate 均完整。GPTAQ/GuidedQuant/ResComp-C 走旧 HF/SDPA 路径，REALQ run15 质量评测走 deterministic FA4，因此属于完整方法结果，不是 attention-kernel-controlled 消融。 |
 | 推理评测 | 完全相同的 `realq_zero_shot_v1`：SDPA、seed=1234、greedy、thinking on；GSM8K 1319、MATH-500 500、HumanEval+ 164，EvalPlus 0.3.1 官方评分。三项逐样本 prompt SHA-256 序列也已跨轮核验完全一致。 |
-| 硬件 | 四方法均为单张 `NVIDIA L20C`；评测时间不计入 GPU-hour。 |
-| 方法专属项 | GPTAQ `alpha=0.25`、Guided 四组 saliency、REALQ 学习率/Block-GD 属于各方法定义；因此这是完整方法 benchmark，不是逐 kernel 消融。 |
+| 硬件 | 五方法均为单张 `NVIDIA L20C`；评测时间不计入 GPU-hour。 |
+| 方法专属项 | GPTAQ `alpha=0.25`、Guided 四组 saliency、ResComp-C `alpha/alpha2=0.25/0.25` 与 W2=`org`/W3–W4=`allw`、REALQ 学习率/Block-GD 属于各方法定义；因此这是完整方法 benchmark，不是逐 kernel 消融。 |
+
+### 量化数值后端的严格限制
+
+REALQ run15 量化使用 deterministic FA4，Hessian/Fisher 使用 TF32 input / FP32 accumulate；GPTAQ、GuidedQuant 和 ResComp-C 的历史量化使用 HF/SDPA 且 CUDA matmul TF32 关闭。因此本表可用于“完整方法”横评，但不能宣称为只替换 solver 方程的严格数值消融。若要后者，需统一 attention backend 和 Hessian 精度后重新量化；仅重跑评测不足够。
 
 ### Exact-KL 的严格限制
 
-GPTAQ/GuidedQuant 使用旧 SDPA BF16 reference cache，REALQ run15 使用重新生成的确定性 FA4 BF16 reference cache。已对五个模型逐文件执行二进制比较，结果全部 `different`。因此下表保留两份实验各自通过审计的 Exact-KL，但以 `KL†` 标记：它们适合观察量级，不满足“同一 teacher logits、bitwise-controlled”的严格 KL 胜负条件。PPL、QA 和三项推理不依赖该 reference-logits cache；其中推理满足同一后端与逐样本 prompt 的严格门禁，PPL/QA 则应解释为完整方法 benchmark，而不是 attention backend 消融。
+GPTAQ/GuidedQuant/ResComp-C 使用同一旧 SDPA BF16 reference cache，REALQ run15 使用重新生成的确定性 FA4 BF16 reference cache。已对五个模型逐文件执行二进制比较，结果全部 `different`。因此下表保留三轮实验各自通过审计的 Exact-KL，但以 `KL†` 标记：它们适合观察量级，不满足“五方法共享同一 teacher logits、bitwise-controlled”的严格 KL 胜负条件。PPL、QA 和三项推理不依赖该 reference-logits cache；其中推理满足同一后端与逐样本 prompt 的严格门禁，PPL/QA 则应解释为完整方法 benchmark，而不是 attention backend 消融。
 
 ### GPU-hour 的统一口径
 
 - GPTAQ：原 `algorithm_core_v1`（fusion/rotation + quantization core）。
 - GuidedQuant：原 `algorithm_core_v1` + 每模型 saliency producer 的 `1/4`（按本 4-setting campaign 摊销）。
+- ResComp-C：每组原始 algorithm timer，含 LN fusion、QuaRot、calibration/H/dXXT、`full` P/R 预计算与所有 decoder weight quantization；无跨设定共享 producer，不再摊销。
 - 每个 REALQ 分支：从正式日志的 `Fusing LN`、`Rotating`、`Quantising layers` 三个完整 phase timer 求和，再加该模型 deterministic-FA4 static/Fisher producer 的 `1/4`。
-- 四者统一排除模型加载、checkpoint I/O 和全部评测。REALQ 的 phase timer 为整秒精度，因此 `GPU·h*` 保留 6 位仅用于账本复算，不表示微秒级测量精度。
+- 五者统一排除模型加载、checkpoint I/O 和全部评测。REALQ 的 phase timer 为整秒精度，因此 `GPU·h*` 保留 6 位仅用于账本复算，不表示微秒级测量精度。
 
-## 20 设定 × 4 算法总表
+## 20 设定 × 5 算法总表
 
 | ID | 模型 | 设定 | 算法 | KL† ↓ | PPL ↓ | QA Avg ↑ | GSM8K ↑ | MATH-500 ↑ | HumanEval+ base/plus ↑ | GPU·h* ↓ |
 |---:|---|---|---|---:|---:|---:|---:|---:|---:|---:|
 | C01 | Qwen3-0.6B | W4A16 | GPTAQ | 0.0908936 | 22.4740 | 45.14 | 61.03 | 37.60 | 25.00 / 20.12 | 0.217318 |
 | C01 | Qwen3-0.6B | W4A16 | GuidedQuant | 0.0649882 | 21.8767 | 46.01 | 58.23 | 35.80 | 28.05 / 25.61 | 0.443612 |
+| C01 | Qwen3-0.6B | W4A16 | ResComp-C | 0.0961812 | 22.4961 | 45.99 | 58.45 | 33.20 | 25.61 / 22.56 | 0.106359 |
 | C01 | Qwen3-0.6B | W4A16 | REALQ-F | 0.0490497 | 21.4895 | 45.41 | 58.45 | 37.00 | 23.78 / 21.34 | 0.133832 |
 | C01 | Qwen3-0.6B | W4A16 | REALQ-S | 0.0581371 | 21.6447 | 46.22 | 59.44 | 37.20 | 30.49 / 27.44 | 0.129943 |
 | C02 | Qwen3-0.6B | W4A4KV4 | GPTAQ | 3.2861776 | 369.8404 | 31.78 | 0.30 | 1.40 | 0.00 / 0.00 | 0.241737 |
 | C02 | Qwen3-0.6B | W4A4KV4 | GuidedQuant | 5.0477214 | 2050.4565 | 32.18 | 0.30 | 0.80 | 0.00 / 0.00 | 0.525772 |
+| C02 | Qwen3-0.6B | W4A4KV4 | ResComp-C | 3.2300003 | 356.8748 | 31.82 | 0.23 | 0.80 | 0.00 / 0.00 | 0.101168 |
 | C02 | Qwen3-0.6B | W4A4KV4 | REALQ-F | 0.6171737 | 32.4357 | 36.83 | 1.21 | 1.00 | 0.00 / 0.00 | 0.134388 |
 | C02 | Qwen3-0.6B | W4A4KV4 | REALQ-S | 0.9768985 | 45.4517 | 35.38 | 0.30 | 0.00 | 0.00 / 0.00 | 0.134943 |
 | C03 | Qwen3-0.6B | W3A16 | GPTAQ | 0.3475016 | 27.9098 | 39.49 | 19.79 | 4.80 | 0.00 / 0.00 | 0.291707 |
 | C03 | Qwen3-0.6B | W3A16 | GuidedQuant | 0.2359724 | 24.5254 | 40.56 | 21.15 | 8.20 | 0.61 / 0.61 | 1.075958 |
+| C03 | Qwen3-0.6B | W3A16 | ResComp-C | 0.3571067 | 28.7269 | 40.56 | 8.34 | 4.40 | 0.00 / 0.00 | 0.080069 |
 | C03 | Qwen3-0.6B | W3A16 | REALQ-F | 0.1601806 | 23.1354 | 40.54 | 13.57 | 6.20 | 0.00 / 0.00 | 0.081888 |
 | C03 | Qwen3-0.6B | W3A16 | REALQ-S | 0.2004293 | 23.9394 | 41.38 | 14.40 | 5.00 | 0.61 / 0.61 | 0.079665 |
 | C04 | Qwen3-0.6B | W2A16 | GPTAQ | 1.7180772 | 95.9490 | 31.45 | 0.53 | 1.60 | 0.00 / 0.00 | 0.413600 |
 | C04 | Qwen3-0.6B | W2A16 | GuidedQuant | 1.8523664 | 95.8677 | 31.04 | 0.53 | 3.20 | 0.00 / 0.00 | 0.945503 |
+| C04 | Qwen3-0.6B | W2A16 | ResComp-C | 1.8813474 | 112.1039 | 30.67 | 0.30 | 1.20 | 0.00 / 0.00 | 0.073716 |
 | C04 | Qwen3-0.6B | W2A16 | REALQ-F | 0.7272639 | 36.4075 | 33.95 | 0.45 | 1.00 | 0.00 / 0.00 | 0.086332 |
 | C04 | Qwen3-0.6B | W2A16 | REALQ-S | 1.0211524 | 47.9279 | 32.12 | 0.45 | 0.60 | 0.00 / 0.00 | 0.080776 |
 | C05 | Llama-3.1-8B-Instruct | W4A16 | GPTAQ | 0.0296730 | 7.4266 | 66.17 | 80.52 | 37.60 | 60.98 / 57.32 | 0.965085 |
 | C05 | Llama-3.1-8B-Instruct | W4A16 | GuidedQuant | 0.0282109 | 7.4091 | 66.39 | 83.62 | 37.60 | 58.54 / 55.49 | 2.242274 |
+| C05 | Llama-3.1-8B-Instruct | W4A16 | ResComp-C | 0.0316809 | 7.4581 | 66.62 | 80.14 | 36.60 | 59.76 / 55.49 | 0.330392 |
 | C05 | Llama-3.1-8B-Instruct | W4A16 | REALQ-F | 0.0235466 | 7.3748 | 66.75 | 82.41 | 39.20 | 57.93 / 53.66 | 0.719296 |
 | C05 | Llama-3.1-8B-Instruct | W4A16 | REALQ-S | 0.0243065 | 7.3778 | 66.18 | 82.94 | 37.40 | 60.98 / 56.10 | 0.633740 |
 | C06 | Llama-3.1-8B-Instruct | W4A4KV4 | GPTAQ | 0.2108026 | 8.8535 | 61.46 | 69.60 | 20.80 | 42.68 / 39.02 | 0.911918 |
 | C06 | Llama-3.1-8B-Instruct | W4A4KV4 | GuidedQuant | 0.2572249 | 9.3783 | 61.24 | 68.92 | 22.00 | 34.76 / 30.49 | 2.120096 |
+| C06 | Llama-3.1-8B-Instruct | W4A4KV4 | ResComp-C | 0.2164089 | 8.9312 | 61.59 | 68.76 | 22.80 | 40.24 / 35.98 | 0.346384 |
 | C06 | Llama-3.1-8B-Instruct | W4A4KV4 | REALQ-F | 0.1865258 | 8.6264 | 62.42 | 65.28 | 18.00 | 32.93 / 29.27 | 0.762351 |
 | C06 | Llama-3.1-8B-Instruct | W4A4KV4 | REALQ-S | 0.1947299 | 8.6514 | 61.70 | 66.41 | 25.80 | 36.59 / 32.32 | 0.682351 |
 | C07 | Llama-3.1-8B-Instruct | W3A16 | GPTAQ | 0.1186237 | 8.1196 | 64.17 | 70.28 | 23.60 | 31.71 / 29.27 | 1.561493 |
 | C07 | Llama-3.1-8B-Instruct | W3A16 | GuidedQuant | 0.1168033 | 8.1115 | 64.49 | 72.10 | 29.00 | 39.63 / 35.37 | 3.951369 |
+| C07 | Llama-3.1-8B-Instruct | W3A16 | ResComp-C | 0.1240302 | 8.1658 | 64.23 | 73.31 | 24.40 | 35.37 / 30.49 | 0.330496 |
 | C07 | Llama-3.1-8B-Instruct | W3A16 | REALQ-F | 0.0887108 | 7.8848 | 64.85 | 76.35 | 25.80 | 40.85 / 37.80 | 0.669573 |
 | C07 | Llama-3.1-8B-Instruct | W3A16 | REALQ-S | 0.0934429 | 7.9078 | 65.08 | 74.30 | 26.40 | 45.73 / 39.02 | 0.594296 |
 | C08 | Llama-3.1-8B-Instruct | W2A16 | GPTAQ | 0.7193087 | 14.5583 | 42.31 | 1.52 | 1.60 | 0.00 / 0.00 | 1.568030 |
 | C08 | Llama-3.1-8B-Instruct | W2A16 | GuidedQuant | 0.8518013 | 16.7646 | 41.80 | 1.06 | 2.00 | 0.00 / 0.00 | 4.457617 |
+| C08 | Llama-3.1-8B-Instruct | W2A16 | ResComp-C | 0.7578120 | 15.1865 | 40.92 | 0.91 | 2.00 | 0.00 / 0.00 | 0.337421 |
 | C08 | Llama-3.1-8B-Instruct | W2A16 | REALQ-F | 0.4759767 | 11.5564 | 50.53 | 1.52 | 5.00 | 0.00 / 0.00 | 0.674573 |
 | C08 | Llama-3.1-8B-Instruct | W2A16 | REALQ-S | 0.5412298 | 12.2670 | 48.11 | 1.97 | 2.40 | 0.00 / 0.00 | 0.594573 |
 | C09 | Qwen3-4B | W4A16 | GPTAQ | 0.0534650 | 14.3889 | 62.66 | 84.91 | 57.60 | 44.51 / 41.46 | 0.685467 |
 | C09 | Qwen3-4B | W4A16 | GuidedQuant | 0.0483016 | 14.0191 | 63.35 | 86.05 | 56.00 | 57.93 / 55.49 | 1.539205 |
+| C09 | Qwen3-4B | W4A16 | ResComp-C | 0.0581144 | 14.5369 | 63.05 | 80.59 | 57.40 | 42.07 / 40.24 | 0.244697 |
 | C09 | Qwen3-4B | W4A16 | REALQ-F | 0.0449052 | 13.6841 | 63.42 | 85.90 | 57.00 | 43.90 / 40.85 | 0.183413 |
 | C09 | Qwen3-4B | W4A16 | REALQ-S | 0.0433823 | 13.6594 | 62.66 | 85.75 | 58.40 | 45.73 / 43.90 | 0.418135 |
 | C10 | Qwen3-4B | W4A4KV4 | GPTAQ | 0.4555909 | 18.9317 | 53.53 | 60.35 | 35.20 | 4.88 / 4.88 | 0.779974 |
 | C10 | Qwen3-4B | W4A4KV4 | GuidedQuant | 0.4383935 | 17.7117 | 54.17 | 56.48 | 41.00 | 18.90 / 17.68 | 1.884250 |
+| C10 | Qwen3-4B | W4A4KV4 | ResComp-C | 0.4167263 | 18.0522 | 55.02 | 66.41 | 40.60 | 10.37 / 9.15 | 0.261402 |
 | C10 | Qwen3-4B | W4A4KV4 | REALQ-F | 0.3132432 | 14.8569 | 55.44 | 5.76 | 3.80 | 0.00 / 0.00 | 0.395913 |
 | C10 | Qwen3-4B | W4A4KV4 | REALQ-S | 0.3368861 | 15.1805 | 56.60 | 76.50 | 44.80 | 20.73 / 19.51 | 0.367857 |
 | C11 | Qwen3-4B | W3A16 | GPTAQ | 0.1917843 | 15.6079 | 59.81 | 81.96 | 51.00 | 33.54 / 31.71 | 1.109987 |
 | C11 | Qwen3-4B | W3A16 | GuidedQuant | 0.1727959 | 15.0495 | 60.74 | 82.64 | 54.80 | 36.59 / 34.76 | 2.886723 |
+| C11 | Qwen3-4B | W3A16 | ResComp-C | 0.1980814 | 15.5336 | 60.56 | 78.32 | 44.40 | 29.27 / 27.44 | 0.245180 |
 | C11 | Qwen3-4B | W3A16 | REALQ-F | 0.1395495 | 14.1028 | 60.51 | 77.94 | 28.60 | 1.22 / 1.22 | 0.393135 |
 | C11 | Qwen3-4B | W3A16 | REALQ-S | 0.1478296 | 14.0337 | 59.84 | 83.17 | 50.20 | 32.32 / 29.88 | 0.370635 |
 | C12 | Qwen3-4B | W2A16 | GPTAQ | 1.0151397 | 28.8031 | 36.64 | 0.38 | 0.40 | 0.00 / 0.00 | 1.204253 |
 | C12 | Qwen3-4B | W2A16 | GuidedQuant | 1.0710428 | 26.0585 | 35.88 | 1.06 | 1.60 | 0.00 / 0.00 | 3.414326 |
+| C12 | Qwen3-4B | W2A16 | ResComp-C | 1.0711416 | 30.5105 | 36.37 | 0.23 | 0.80 | 0.00 / 0.00 | 0.248224 |
 | C12 | Qwen3-4B | W2A16 | REALQ-F | 0.6035457 | 18.6937 | 42.38 | 0.00 | 0.00 | 0.00 / 0.00 | 0.398968 |
 | C12 | Qwen3-4B | W2A16 | REALQ-S | 0.6874864 | 19.3721 | 42.43 | 0.68 | 3.40 | 0.00 / 0.00 | 0.375357 |
 | C13 | Qwen3-8B | W4A16 | GPTAQ | 0.0376639 | 10.0189 | 67.67 | 87.19 | 56.80 | 43.90 / 42.68 | 0.967987 |
 | C13 | Qwen3-8B | W4A16 | GuidedQuant | 0.0340581 | 9.8978 | 67.28 | 85.82 | 56.20 | 45.12 / 43.29 | 2.179010 |
+| C13 | Qwen3-8B | W4A16 | ResComp-C | 0.0409121 | 10.0599 | 67.02 | 84.31 | 55.40 | 42.68 / 40.24 | 0.349820 |
 | C13 | Qwen3-8B | W4A16 | REALQ-F | 0.0329012 | 9.8567 | 67.22 | 88.55 | 57.00 | 48.17 / 45.73 | 0.788137 |
 | C13 | Qwen3-8B | W4A16 | REALQ-S | 0.0322576 | 9.8468 | 67.77 | 89.16 | 57.80 | 46.34 / 43.90 | 0.703137 |
 | C14 | Qwen3-8B | W4A4KV4 | GPTAQ | 0.3056938 | 12.1756 | 60.49 | 82.94 | 50.40 | 24.39 / 23.17 | 0.977770 |
 | C14 | Qwen3-8B | W4A4KV4 | GuidedQuant | 0.3093038 | 11.7392 | 60.99 | 72.63 | 47.40 | 18.90 / 17.07 | 2.575195 |
+| C14 | Qwen3-8B | W4A4KV4 | ResComp-C | 0.2961951 | 11.9966 | 60.68 | 80.59 | 47.60 | 24.39 / 22.56 | 0.354657 |
 | C14 | Qwen3-8B | W4A4KV4 | REALQ-F | 0.2313476 | 10.8214 | 62.18 | 68.46 | 41.40 | 0.61 / 0.61 | 0.786748 |
 | C14 | Qwen3-8B | W4A4KV4 | REALQ-S | 0.2538300 | 11.3427 | 62.82 | 85.60 | 51.20 | 35.98 / 33.54 | 0.709525 |
 | C15 | Qwen3-8B | W3A16 | GPTAQ | 0.1313733 | 10.6531 | 64.84 | 81.96 | 49.00 | 18.29 / 16.46 | 1.522448 |
 | C15 | Qwen3-8B | W3A16 | GuidedQuant | 0.1226893 | 10.4331 | 65.07 | 79.91 | 49.60 | 17.68 / 16.46 | 4.169223 |
+| C15 | Qwen3-8B | W3A16 | ResComp-C | 0.1432403 | 10.8061 | 64.94 | 83.93 | 49.20 | 14.63 / 13.41 | 0.338383 |
 | C15 | Qwen3-8B | W3A16 | REALQ-F | 0.1053917 | 10.2426 | 64.02 | 79.68 | 46.40 | 15.85 / 14.63 | 0.738137 |
 | C15 | Qwen3-8B | W3A16 | REALQ-S | 0.1146509 | 10.3685 | 65.54 | 82.18 | 49.80 | 20.73 / 18.90 | 0.660081 |
 | C16 | Qwen3-8B | W2A16 | GPTAQ | 0.7033842 | 16.6954 | 43.43 | 1.36 | 4.40 | 0.00 / 0.00 | 1.703465 |
 | C16 | Qwen3-8B | W2A16 | GuidedQuant | 0.7389094 | 15.6147 | 41.20 | 1.14 | 3.60 | 0.00 / 0.00 | 4.747457 |
+| C16 | Qwen3-8B | W2A16 | ResComp-C | 0.6828204 | 16.1136 | 41.94 | 1.36 | 2.00 | 0.00 / 0.00 | 0.351449 |
 | C16 | Qwen3-8B | W2A16 | REALQ-F | 0.4635496 | 13.2725 | 49.41 | 3.71 | 4.80 | 0.00 / 0.00 | 0.732025 |
 | C16 | Qwen3-8B | W2A16 | REALQ-S | 0.5552680 | 14.8193 | 48.81 | 2.20 | 3.40 | 0.00 / 0.00 | 0.662859 |
 | C17 | Qwen3-32B | W4A16 | GPTAQ | 0.0595478 | 7.7030 | 71.13 | 92.27 | 61.40 | 50.00 / 48.78 | 2.915012 |
 | C17 | Qwen3-32B | W4A16 | GuidedQuant | 0.0493096 | 7.7314 | 71.59 | 92.80 | 62.20 | 46.95 / 45.73 | 7.573424 |
+| C17 | Qwen3-32B | W4A16 | ResComp-C | 0.0518231 | 7.7295 | 71.63 | 93.48 | 61.40 | 51.22 / 50.00 | 1.289660 |
 | C17 | Qwen3-32B | W4A16 | REALQ-F | 0.0443056 | 7.6214 | 71.67 | 94.62 | 62.80 | 51.83 / 49.39 | 3.863427 |
 | C17 | Qwen3-32B | W4A16 | REALQ-S | 0.0446449 | 7.5997 | 71.94 | 93.78 | 61.40 | 48.17 / 45.12 | 3.351760 |
 | C18 | Qwen3-32B | W4A4KV4 | GPTAQ | 0.4107974 | 9.4401 | 64.87 | 88.25 | 54.40 | 16.46 / 15.24 | 3.097557 |
 | C18 | Qwen3-32B | W4A4KV4 | GuidedQuant | 0.4482003 | 9.8140 | 63.79 | 88.70 | 54.40 | 18.29 / 17.07 | 7.467291 |
+| C18 | Qwen3-32B | W4A4KV4 | ResComp-C | 0.4012597 | 9.4089 | 65.20 | 90.07 | 55.40 | 16.46 / 15.85 | 1.391882 |
 | C18 | Qwen3-32B | W4A4KV4 | REALQ-F | 0.2421060 | 8.2235 | 68.66 | 92.34 | 60.00 | 42.07 / 40.24 | 3.800371 |
 | C18 | Qwen3-32B | W4A4KV4 | REALQ-S | 0.2531693 | 8.2750 | 68.76 | 93.33 | 61.00 | 38.41 / 37.20 | 3.339260 |
 | C19 | Qwen3-32B | W3A16 | GPTAQ | 0.1558156 | 8.0272 | 70.97 | 93.48 | 59.00 | 46.95 / 43.90 | 4.516529 |
 | C19 | Qwen3-32B | W3A16 | GuidedQuant | 0.1496158 | 8.0312 | 70.66 | 92.87 | 58.20 | 37.20 / 36.59 | 14.328829 |
+| C19 | Qwen3-32B | W3A16 | ResComp-C | 0.1524957 | 8.0018 | 71.40 | 91.51 | 57.20 | 36.59 / 34.76 | 1.358441 |
 | C19 | Qwen3-32B | W3A16 | REALQ-F | 0.1259979 | 7.7586 | 71.15 | 94.01 | 59.40 | 15.24 / 14.63 | 3.834260 |
 | C19 | Qwen3-32B | W3A16 | REALQ-S | 0.1289309 | 7.7515 | 70.62 | 94.24 | 59.60 | 45.12 / 43.90 | 3.314260 |
 | C20 | Qwen3-32B | W2A16 | GPTAQ | 0.7156695 | 12.1626 | 53.02 | 5.61 | 2.00 | 0.00 / 0.00 | 5.098336 |
 | C20 | Qwen3-32B | W2A16 | GuidedQuant | 0.6648021 | 11.4255 | 51.37 | 12.66 | 4.00 | 0.61 / 0.61 | 17.569220 |
+| C20 | Qwen3-32B | W2A16 | ResComp-C | 0.6412292 | 11.3898 | 50.95 | 4.09 | 3.20 | 0.00 / 0.00 | 1.377077 |
 | C20 | Qwen3-32B | W2A16 | REALQ-F | 0.4410363 | 9.5436 | 61.92 | 30.40 | 9.80 | 0.00 / 0.00 | 3.802316 |
 | C20 | Qwen3-32B | W2A16 | REALQ-S | 0.4786879 | 9.7955 | 54.46 | 5.16 | 3.20 | 0.00 / 0.00 | 3.299538 |
 
@@ -125,11 +152,13 @@ GPTAQ/GuidedQuant 使用旧 SDPA BF16 reference cache，REALQ run15 使用重新
 |---|---:|---:|
 | GPTAQ | 30.749673 | 1.537484 |
 | GuidedQuant | 86.096354 | 4.304818 |
+| ResComp-C | 9.516878 | 0.475844 |
 | REALQ-F | 22.979081 | 1.148954 |
 | REALQ-S | 20.502692 | 1.025135 |
 
 ## 数据来源与审计身份
 
 - GPTAQ/GuidedQuant：`docs/GPTAQ_GuidedQuant_Llama31_Qwen3_20组实验记录_20260809.md`；plan fingerprint `46de88a0f17fe8cf481204d1040458944b52f3753d36cb47604e6dab06093211`。40/40 quant、40/40 quality、120/120 reasoning generation、40/40 EvalPlus official。
+- ResComp-C：`docs/ResComp_Llama31_Qwen3_20组量化评测_20260809.md`；plan fingerprint `670d13cc6ef4884098fb2f34ed99b1c238d0019fe4fce73ae00d05d30fba73cb`，audit fingerprint `5814da6be832cec0b6b373ff9fbd1295d6062c8fbfbee8f7f24ad06c87d845ce`。20/20 quant、20/20 quality、60/60 reasoning generation、20/20 EvalPlus official。
 - REALQ 双分支：`docs/REALQ_双分支20组全模型重新调参与评测_20260817.md`；protocol fingerprint `28884e05eaa731631a5dac1e495de76bd5a995dfceed8459736171bcd1bb4e2e`。formal audit `2ee57616cc0e710501bb83dc91436a7d8a19f3d5287eddfeb0a70a287a0f5170`，quality audit `0adb5fd0cdd5de2274e014286d2a5cac642719099023a051931a94f3460f816a`，reasoning audit `7b5f44f1b2c1c9d94172843199c9dadee43d3400acdce3d776068c4a81135046`。
-- 生成时再次核验：baseline 40 行均与 `quant_success.json`、`quality_success.json`、HumanEval+ `official_success.json` 一致；REALQ 三份 final audit 均为 `complete` 且各覆盖 40 行。
+- 生成时再次核验：baseline 40 行均与 `quant_success.json`、`quality_success.json`、HumanEval+ `official_success.json` 一致；ResComp-C final audit 为 `complete` 且覆盖 20 行；REALQ 三份 final audit 均为 `complete` 且各覆盖 40 行。
