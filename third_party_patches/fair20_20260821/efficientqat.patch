@@ -1,0 +1,455 @@
+diff --git a/quantize/block_ap.py b/quantize/block_ap.py
+index 39a563e..44d5a8d 100644
+--- a/quantize/block_ap.py
++++ b/quantize/block_ap.py
+@@ -6,7 +6,15 @@ import quantize.int_linear_real as int_linear_real
+ from torch.optim.lr_scheduler import CosineAnnealingLR
+ import copy
+ import math
+-import utils
++try:
++    # When EfficientQAT is called from the RealQ repository root, RealQ's
++    # top-level ``utils`` package may already be present in sys.modules.
++    # Import the scaler through the checkout namespace so that we cannot
++    # silently bind to the unrelated package.
++    from EfficientQAT import utils as efficientqat_utils
++except ImportError:
++    # Preserve the upstream standalone invocation from inside EfficientQAT/.
++    import utils as efficientqat_utils
+ import pdb
+ import gc
+ from quantize.utils import (
+@@ -19,14 +27,38 @@ from torch.utils.data import DataLoader
+ import shutil
+ import os
+ 
+-def update_dataset(layer, dataset, dev, attention_mask, position_ids):
++
++class _InputCaptureComplete(Exception):
++    """Stop a full-model forward after recording a decoder-block input."""
++
++
++def _tree_to(value, device):
++    if torch.is_tensor(value):
++        return value.to(device)
++    if isinstance(value, tuple):
++        return tuple(_tree_to(item, device) for item in value)
++    if isinstance(value, list):
++        return [_tree_to(item, device) for item in value]
++    if isinstance(value, dict):
++        return {key: _tree_to(item, device) for key, item in value.items()}
++    return value
++
++
++def _hidden_states(output):
++    # transformers<=4.40 returned a tuple here, while transformers 4.56
++    # LlamaDecoderLayer returns the hidden-state tensor directly.
++    return output[0] if isinstance(output, (tuple, list)) else output
++
++
++def update_dataset(layer, dataset, dev, layer_kwargs):
+     with torch.no_grad():
+         with torch.cuda.amp.autocast():
+             for index, inps in enumerate(dataset):
+                 inps = inps.to(dev)
+                 if len(inps.shape)==2:
+                     inps = inps.unsqueeze(0)
+-                new_data = layer(inps, attention_mask=attention_mask,position_ids=position_ids)[0].to('cpu')
++                kwargs = _tree_to(layer_kwargs, dev)
++                new_data = _hidden_states(layer(inps, **kwargs)).to('cpu')
+                 dataset.update_data(index,new_data)
+ 
+                     
+@@ -82,17 +114,21 @@ def block_ap(
+             self.module = module
+             self.dataset = dataset
+             self.index = 0
+-            self.attention_mask = None
+-            self.position_ids = None
++            self.layer_kwargs = None
++            # Qwen3's model-level forward selects the causal-mask variant from
++            # this immutable decoder-layer attribute before calling the layer.
++            # Preserve it while the real first block is temporarily wrapped.
++            if hasattr(module, "attention_type"):
++                self.attention_type = module.attention_type
+ 
+         def forward(self, inp, **kwargs):
+             self.dataset.update_data(self.index, inp.squeeze(0).to('cpu'))
+             self.index += 1
+-            if self.attention_mask is None:
+-                self.attention_mask = kwargs["attention_mask"]
+-            if self.position_ids is None:
+-                self.position_ids = kwargs["position_ids"]
+-            raise ValueError
++            if self.layer_kwargs is None:
++                # Llama-3.2 on transformers 4.56 additionally needs
++                # cache_position and precomputed position_embeddings.
++                self.layer_kwargs = _tree_to(kwargs, "cpu")
++            raise _InputCaptureComplete
+     
+     # step 3.1: catch the input of training set
+     layers[0] = Catcher(layers[0],fp_train_inps)
+@@ -102,31 +138,28 @@ def block_ap(
+             data = torch.cat([trainloader[j][0] for j in range(i*args.batch_size,(i+1)*args.batch_size)],dim=0)
+             try:
+                 model(data.to(dev))
+-            except ValueError:
++            except _InputCaptureComplete:
+                 pass
++    layer_kwargs = layers[0].layer_kwargs
+     layers[0] = layers[0].module
+ 
+     # step 3.2: catch the input of validation set
+-    layers[0] = Catcher(layers[0],fp_val_inps)
+-    iters = len(valloader)//args.batch_size
+-    with torch.no_grad():
+-        for i in range(iters):
+-            data = torch.cat([valloader[j][0] for j in range(i*args.batch_size,(i+1)*args.batch_size)],dim=0)
+-            try:
+-                model(data.to(dev))
+-            except ValueError:
+-                pass
+-    attention_mask = layers[0].attention_mask
+-    position_ids = layers[0].position_ids
+-    layers[0] = layers[0].module
+-    if attention_mask is not None:
+-        attention_mask_batch = attention_mask.repeat(args.batch_size,1,1,1).float()
+-    else:
+-        logger.info(
+-            "No attention mask caught from the first layer."
+-            " Seems that model's attention works without a mask."
+-        )
+-        attention_mask_batch = None
++    if args.val_size > 0:
++        layers[0] = Catcher(layers[0],fp_val_inps)
++        iters = len(valloader)//args.batch_size
++        with torch.no_grad():
++            for i in range(iters):
++                data = torch.cat([valloader[j][0] for j in range(i*args.batch_size,(i+1)*args.batch_size)],dim=0)
++                try:
++                    model(data.to(dev))
++                except _InputCaptureComplete:
++                    pass
++        layers[0] = layers[0].module
++    if layer_kwargs is None:
++        raise RuntimeError("Failed to capture decoder-layer keyword arguments")
++    # These tensors are constant for fixed-length, unpadded calibration
++    # batches. Keep one device copy instead of transferring them per step.
++    layer_kwargs = _tree_to(layer_kwargs, dev)
+     
+     # step 4: move embedding layer and first layer to cpu
+     layers[0] = layers[0].cpu()
+@@ -158,14 +191,21 @@ def block_ap(
+ 
+     # step 6: start training    
+     loss_func = torch.nn.MSELoss()
+-    for block_index in range(len(layers)):
++    max_blocks = int(getattr(args, "max_blocks", -1))
++    block_count = len(layers) if max_blocks < 0 else min(max_blocks, len(layers))
++    for block_index in range(block_count):
+         logger.info(f"=== Start quantize blocks {block_index}===")
+         # step 6.1: replace torch.nn.Linear with QuantLinear for QAT
+         layer = layers[block_index].to(dev)
+         qlayer = copy.deepcopy(layer)
+         for name, module in qlayer.named_modules():
+             if isinstance(module,torch.nn.Linear):
+-                quantlinear = int_linear_fake.QuantLinear(module, args.wbits, args.group_size)
++                quantlinear = int_linear_fake.QuantLinear(
++                    module,
++                    args.wbits,
++                    args.group_size,
++                    symmetric=bool(getattr(args, "weight_symmetric", False)),
++                )
+                 set_op_by_name(qlayer, name, quantlinear)  
+                 del module  
+         qlayer.to(dev)
+@@ -174,8 +214,9 @@ def block_ap(
+         # step 6.2: obtain output of full-precision model for MSE
+         set_quant_state(qlayer,weight_quant=False) # deactivate quantization for obtaining ground truth
+         if args.epochs > 0:
+-            update_dataset(qlayer,fp_train_inps,dev,attention_mask,position_ids)
+-            update_dataset(qlayer,fp_val_inps,dev,attention_mask,position_ids)
++            update_dataset(qlayer,fp_train_inps,dev,layer_kwargs)
++            if args.val_size > 0:
++                update_dataset(qlayer,fp_val_inps,dev,layer_kwargs)
+         set_quant_state(qlayer,weight_quant=True)  # activate quantization
+         
+         
+@@ -207,7 +248,7 @@ def block_ap(
+             else:
+                 set_weight_parameters(qlayer,False)
+             optimizer = torch.optim.AdamW(param, weight_decay=args.wd)
+-            loss_scaler = utils.NativeScalerWithGradNormCount()
++            loss_scaler = efficientqat_utils.NativeScalerWithGradNormCount()
+             trainable_number = trainable_parameters_num(qlayer)
+             print(f"trainable parameter number: {trainable_number/1e6}M")
+ 
+@@ -223,7 +264,9 @@ def block_ap(
+                     with torch.cuda.amp.autocast():
+                         input = quant_inps.to(dev)
+                         label = fp_inps.to(dev)
+-                        quant_out = qlayer(input, attention_mask=attention_mask_batch,position_ids=position_ids)[0]
++                        quant_out = _hidden_states(
++                            qlayer(input, **_tree_to(layer_kwargs, dev))
++                        )
+                         reconstruction_loss = loss_func(label, quant_out)
+                         loss =  reconstruction_loss
+ 
+@@ -245,27 +288,34 @@ def block_ap(
+ 
+                 # step 6.5: calculate validation loss
+                 val_loss_list = []
+-                for index, (quant_inps,fp_inps) in enumerate(zip(quant_val_inps, fp_val_inps)):  
++                for index, (quant_inps,fp_inps) in enumerate(zip(quant_val_inps, fp_val_inps)):
+                     # obtain output of quantization model
+                     with torch.no_grad():
+                         with torch.cuda.amp.autocast():
+                             input = quant_inps.to(dev)
+                             label = fp_inps.to(dev)
+-                            quant_out = qlayer(input, attention_mask=attention_mask_batch,position_ids=position_ids)[0]
++                            quant_out = _hidden_states(
++                                qlayer(input, **_tree_to(layer_kwargs, dev))
++                            )
+                             reconstruction_loss = loss_func(label, quant_out)
+                     val_loss_list.append(reconstruction_loss.cpu())
+                  
+                 train_mean_num = min(len(loss_list),64) # calculate the average training loss of last train_mean_num samples
+                 loss_mean = torch.stack(loss_list)[-(train_mean_num-1):].mean()
+-                val_loss_mean = torch.stack(val_loss_list).mean()
++                val_loss_mean = (
++                    torch.stack(val_loss_list).mean()
++                    if val_loss_list
++                    else torch.tensor(float("nan"))
++                )
+                 norm_mean = torch.stack(norm_list).mean()
+                 logger.info(f"blocks {block_index} epoch {epoch} recon_loss:{loss_mean} val_loss:{val_loss_mean} quant_lr:{quant_scheduler.get_lr()[0]} norm:{norm_mean:.8f} max memory_allocated {torch.cuda.max_memory_allocated(dev) / 1024**2} time {time.time()-start_time} ")
+-                if val_loss_mean < best_val_loss:
+-                    best_val_loss = val_loss_mean
+-                else:
+-                    early_stop_flag += 1
+-                    if args.early_stop > 0 and early_stop_flag >=args.early_stop:
+-                        break
++                if val_loss_list:
++                    if val_loss_mean < best_val_loss:
++                        best_val_loss = val_loss_mean
++                    else:
++                        early_stop_flag += 1
++                        if args.early_stop > 0 and early_stop_flag >=args.early_stop:
++                            break
+             optimizer.zero_grad()
+             del optimizer
+ 
+@@ -276,8 +326,9 @@ def block_ap(
+ 
+         # step 6.7: update inputs of quantization model
+         if args.epochs>0:
+-            update_dataset(qlayer,quant_train_inps,dev,attention_mask,position_ids)
+-            update_dataset(qlayer,quant_val_inps,dev,attention_mask,position_ids)
++            update_dataset(qlayer,quant_train_inps,dev,layer_kwargs)
++            if args.val_size > 0:
++                update_dataset(qlayer,quant_val_inps,dev,layer_kwargs)
+         layers[block_index] = qlayer.to("cpu")
+ 
+         # step 7: pack quantized weights into low-bits format, note that this process is slow on poor CPU or busy CPU
+@@ -285,7 +336,15 @@ def block_ap(
+             named_linears = get_named_linears(qlayer, int_linear_fake.QuantLinear)
+             for name, module in named_linears.items():
+                 scales = module.weight_quantizer.scale.clamp(1e-4,1e4).detach()
+-                zeros = module.weight_quantizer.zero_point.detach().cuda().round().cpu()
++                zeros = (
++                    module.weight_quantizer.zero_point.detach()
++                    .round()
++                    .clamp(
++                        module.weight_quantizer.qmin,
++                        module.weight_quantizer.qmax,
++                    )
++                    .cpu()
++                )
+                 group_size = module.weight_quantizer.group_size
+                 dim0 = module.weight.shape[0]
+                 scales = scales.view(dim0,-1).transpose(0,1).contiguous()
+@@ -308,4 +367,3 @@ def block_ap(
+     gc.collect()                    
+     model.config.use_cache = use_cache
+     return model
+-
+diff --git a/quantize/int_linear_fake.py b/quantize/int_linear_fake.py
+index 59b4349..fe913ea 100644
+--- a/quantize/int_linear_fake.py
++++ b/quantize/int_linear_fake.py
+@@ -16,7 +16,8 @@ class QuantLinear(nn.Module):
+         self,
+         org_module: nn.Linear,
+         wbits=4,
+-        group_size=64
++        group_size=64,
++        symmetric=False,
+     ):
+         super().__init__()
+         self.fwd_kwargs = dict()
+@@ -31,7 +32,12 @@ class QuantLinear(nn.Module):
+         # de-activate the quantized forward default
+         self.use_weight_quant = False
+         # initialize quantizer
+-        self.weight_quantizer = UniformAffineQuantizer(wbits, group_size, weight=org_module.weight)
++        self.weight_quantizer = UniformAffineQuantizer(
++            wbits,
++            group_size,
++            weight=org_module.weight,
++            symmetric=symmetric,
++        )
+         self.use_temporary_parameter = False
+ 
+     
+@@ -55,4 +61,3 @@ class QuantLinear(nn.Module):
+ 
+ 
+ 
+-
+diff --git a/quantize/int_linear_real.py b/quantize/int_linear_real.py
+index fbdb655..b9192f9 100644
+--- a/quantize/int_linear_real.py
++++ b/quantize/int_linear_real.py
+@@ -17,6 +17,13 @@ from quantize.utils import get_named_linears,set_op_by_name
+ logger = getLogger(__name__)
+ 
+ 
++# Keep the temporary tensor small enough for the largest Qwen3 projections
++# while avoiding one PyTorch dispatcher call per input feature.  The operation
++# is elementwise, so batching adjacent input features preserves the original
++# rounding and integer layout exactly.
++_PACK_INPUT_CHUNK_SIZE = 256
++
++
+ class TritonModuleMixin:
+     @classmethod
+     def warmup(cls, model, transpose=False, seqlen=2048):
+@@ -110,16 +117,17 @@ class QuantLinear(nn.Module, TritonModuleMixin):
+         if linear.bias is not None:
+             self.bias = linear.bias.clone().half()
+ 
+-        intweight = []
+-        for idx in range(self.infeatures):
+-            intweight.append(
+-                torch.round(
+-                    (
+-                        W[:, idx] + scale_zeros[g_idx[idx]]) / self.scales[g_idx[idx]]
+-                ).to(torch.int)[:, None]
+-            )
+-        intweight = torch.cat(intweight, dim=1)
+-        intweight = intweight.t().contiguous()
++        intweight = torch.empty(
++            (self.infeatures, self.outfeatures), dtype=torch.int32
++        )
++        for start in range(0, self.infeatures, _PACK_INPUT_CHUNK_SIZE):
++            stop = min(start + _PACK_INPUT_CHUNK_SIZE, self.infeatures)
++            groups = g_idx[start:stop]
++            intweight[start:stop] = torch.round(
++                (
++                    W[:, start:stop].t() + scale_zeros[groups]
++                ) / self.scales[groups]
++            ).to(torch.int)
+         intweight = intweight.numpy().astype(np.uint32)
+ 
+         i = 0
+@@ -171,11 +179,13 @@ class QuantLinear(nn.Module, TritonModuleMixin):
+         return out
+ 
+ 
+-def load_quantized_model(model_path, wbits, group_size):
++def load_quantized_model(model_path, wbits, group_size, device_map=None):
+     print(f"Loading quantized model from {model_path}")
+ 
+     # import pdb;pdb.set_trace()
+-    tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
++    # Llama-3.2 checkpoints in the controlled comparison ship tokenizer.json
++    # but no SentencePiece tokenizer.model.
++    tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
+     config = AutoConfig.from_pretrained(model_path)
+     with init_empty_weights():
+         model = AutoModelForCausalLM.from_config(config=config,torch_dtype=torch.float16, trust_remote_code=True)
+@@ -190,7 +200,8 @@ def load_quantized_model(model_path, wbits, group_size):
+     torch.cuda.empty_cache()
+     gc.collect()
+     model.tie_weights()
+-    device_map = infer_auto_device_map(model)
++    if device_map is None:
++        device_map = infer_auto_device_map(model)
+     print("Loading pre-computed quantized weights...")
+     load_checkpoint_in_model(model,checkpoint=model_path,device_map=device_map,offload_state_dict=True)
+     print("Loading pre-computed quantized weights Successfully")
+diff --git a/quantize/quantizer.py b/quantize/quantizer.py
+index 0f52dcd..fe358de 100644
+--- a/quantize/quantizer.py
++++ b/quantize/quantizer.py
+@@ -26,34 +26,58 @@ class UniformAffineQuantizer(nn.Module):
+         n_bits: int = 8,
+         group_size=None,
+         weight=None,
++        symmetric: bool = False,
+     ):
+         super().__init__()
+         assert 2 <= n_bits <= 16, "bitwidth not supported"
++        if type(symmetric) is not bool:
++            raise TypeError(
++                f"symmetric must be bool, got {type(symmetric).__name__}"
++            )
+         self.n_bits = n_bits
++        self.symmetric = symmetric
+         self.qmin = 0
+         self.qmax = 2 ** (n_bits) - 1
+         self.group_size = group_size if group_size != -1 else weight.shape[-1]
+         assert weight.shape[-1] % group_size == 0
+         self.enable = True
+         
+-        # init scale and zero point through Max-Min quantization
++        # The upstream path is unsigned asymmetric min-max.  The optional
++        # symmetric path uses the exact signed grid used by REAL-Q,
++        # [-2**(b-1), 2**(b-1)-1], represented in the existing unsigned
++        # packed format by the fixed offset 2**(b-1).  In particular W3 uses
++        # signed codes [-4, 3], packed codes [0, 7], and fixed zero-point 4.
+         with torch.no_grad():
+             if weight is not None:
+                 x = weight.reshape(-1,self.group_size)
+                 xmin = x.amin([-1], keepdim=True)
+                 xmax =  x.amax([-1], keepdim=True)
+-                range = xmax - xmin
+-                scale = range / (2**self.n_bits-1)
++                if self.symmetric:
++                    signed_qmax = 2 ** (self.n_bits - 1) - 1
++                    scale = torch.maximum(xmin.abs(), xmax.abs()) / signed_qmax
++                    zero_point = torch.full_like(
++                        scale, 2 ** (self.n_bits - 1)
++                    )
++                else:
++                    range = xmax - xmin
++                    scale = range / (2**self.n_bits-1)
++                    zero_point = -(xmin/scale).clamp(min=-1e4, max=1e4)
+                 scale = scale.clamp(min=1e-4, max=1e4)
+-                zero_point = -(xmin/scale).clamp(min=-1e4, max=1e4) 
+                 self.scale = nn.Parameter(scale)
+-                self.zero_point = nn.Parameter(zero_point.round())
++                if self.symmetric:
++                    self.register_buffer("zero_point", zero_point.round())
++                else:
++                    self.zero_point = nn.Parameter(zero_point.round())
+             
+ 
+     def change_n_bits(self, n_bits):
++        assert 2 <= n_bits <= 16, "bitwidth not supported"
+         self.n_bits = n_bits
+         self.qmin = 0
+         self.qmax = int(2 ** (n_bits) - 1)
++        if self.symmetric and hasattr(self, "zero_point"):
++            with torch.no_grad():
++                self.zero_point.fill_(2 ** (n_bits - 1))
+         
+     def fake_quant(self, x):
+         scale = clamp_ste(self.scale,1e-4, 1e4)
+@@ -83,4 +107,4 @@ class UniformAffineQuantizer(nn.Module):
+ 
+         
+ 
+-    
+\ No newline at end of file
++    

@@ -1,0 +1,266 @@
+{
+  "schema_version": 1,
+  "campaign": "efficientqat-sym-weightonly-15group-20260821-v3",
+  "created_at": "2026-08-21T12:00:00+08:00",
+  "objective": "Run EfficientQAT Block-AP plus E2E-QP on the five-model comparison matrix for the 15 unique W2/W3/W4 weight-only settings.",
+  "workspace": "/minimax-avatar-new/zhangqian/realq/gptq_plus",
+  "venv_python": "/minimax-avatar-new/zhangqian/realq/gptq_plus/.venv.py312-broken-20260729/bin/python",
+  "output_root": "/minimax-avatar-new/zhangqian/realq/experiment_data/efficientqat_weightonly_15group_20260821_v3",
+  "preflight_path": "/minimax-avatar-new/zhangqian/realq/experiment_data/efficientqat_weightonly_15group_20260821_v3/_preflight/artifacts.json",
+  "models": {
+    "qwen3-0.6b": {
+      "path": "/minimax-avatar-new/zhangqian/realq/gptq_plus/modelzoo/Qwen3/Qwen3-0.6B",
+      "config_sha256": "660db3b73d788119c04535e48cf9be5f55bc3100841a718637ae695b442f27dd",
+      "tokenizer_json_sha256": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4",
+      "tokenizer_config_sha256": "d5d09f07b48c3086c508b30d1c9114bd1189145b74e982a265350c923acd8101",
+      "tokenizer_vocab_size": 151669,
+      "checkpoint_file_count": 1,
+      "checkpoint_bytes": 1503300328,
+      "index_sha256": null
+    },
+    "llama31-8b-instruct": {
+      "path": "/minimax-avatar-new/zhangqian/realq/gptq_plus/modelzoo/Llama/Llama-3.1-8B-Instruct",
+      "config_sha256": "29e4c210b0d6ac178b16b2a255a568bdb23b581e50ca1ef6a6d071dd85704e6e",
+      "tokenizer_json_sha256": "79e3e522635f3171300913bb421464a87de6222182a0570b9b2ccba2a964b2b4",
+      "tokenizer_config_sha256": "177c7b61e616fecb84c17ce0591acb92c6c4d60e9ac5ababfb940ff23bbcd424",
+      "tokenizer_vocab_size": 128256,
+      "checkpoint_file_count": 4,
+      "checkpoint_bytes": 16060556376,
+      "index_sha256": "146776fce3f6db1103aa6f249e65ee5544c5923ce6f971b092eee79aa6e5d37b"
+    },
+    "qwen3-4b": {
+      "path": "/minimax-avatar-new/zhangqian/realq/gptq_plus/modelzoo/Qwen3/Qwen3-4B",
+      "config_sha256": "8ba006f74fecfaaeb392872a60f4a480e7ec9860153d2e1b769ec81f9a147f8a",
+      "tokenizer_json_sha256": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4",
+      "tokenizer_config_sha256": "d5d09f07b48c3086c508b30d1c9114bd1189145b74e982a265350c923acd8101",
+      "tokenizer_vocab_size": 151669,
+      "checkpoint_file_count": 3,
+      "checkpoint_bytes": 8044982000,
+      "index_sha256": "6dc0981b8829fead746441f68f38f24c5ca4a3a66351f652c26c6df0efc43ab2"
+    },
+    "qwen3-8b": {
+      "path": "/minimax-avatar-new/zhangqian/realq/gptq_plus/modelzoo/Qwen3/Qwen3-8B",
+      "config_sha256": "f7c4eadfbbf522470667b797a3c89be2524832d2d599797248dc304fff447c30",
+      "tokenizer_json_sha256": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4",
+      "tokenizer_config_sha256": "d5d09f07b48c3086c508b30d1c9114bd1189145b74e982a265350c923acd8101",
+      "tokenizer_vocab_size": 151669,
+      "checkpoint_file_count": 5,
+      "checkpoint_bytes": 16381516776,
+      "index_sha256": "f9fdbcb91c23971c13ec5d5f2573d2349e8f61f2f049371ec699281748fdb1bc"
+    },
+    "qwen3-32b": {
+      "path": "/minimax-avatar-new/zhangqian/realq/gptq_plus/modelzoo/Qwen3/Qwen3-32B",
+      "config_sha256": "97e295b63283935788fac5e4f8860862a56d4089538cafc93f0431f2ebe483bb",
+      "tokenizer_json_sha256": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4",
+      "tokenizer_config_sha256": "d5d09f07b48c3086c508b30d1c9114bd1189145b74e982a265350c923acd8101",
+      "tokenizer_vocab_size": 151669,
+      "checkpoint_file_count": 17,
+      "checkpoint_bytes": 65524328560,
+      "index_sha256": "bed42c6c55274bc08a1f616bceb3bcb84b3f02cb6584c573bd18c6519291ecd0"
+    }
+  },
+  "calibrations": {
+    "qwen3-0.6b-wiki256": {
+      "dataset": "wikitext2",
+      "split": "train",
+      "num_samples": 256,
+      "seq_len": 2048,
+      "seed": 1,
+      "validation_policy": "disabled_validation_size_0_all_sequences_train_only",
+      "token_artifact": {
+        "path": "/minimax-avatar-new/zhangqian/realq/experiment_data/realq_20group_20260808/shared_cache/qwen3-0.6b/tokens/Qwen3-0.6B_wikitext2_train_n256_sl2048_seed1.pt",
+        "size_bytes": 4273927,
+        "sha256": "aed4e972d31207526d57a4bb62414c24b6c92ff51eda1fa9d70c36c1dfea5d34"
+      }
+    },
+    "llama31-8b-instruct-wiki256": {
+      "dataset": "wikitext2",
+      "split": "train",
+      "num_samples": 256,
+      "seq_len": 2048,
+      "seed": 1,
+      "validation_policy": "disabled_validation_size_0_all_sequences_train_only",
+      "token_artifact": {
+        "path": "/minimax-avatar-new/zhangqian/realq/experiment_data/realq_20group_20260808/shared_cache/llama31-8b-instruct/tokens/Llama-3.1-8B-Instruct_wikitext2_train_n256_sl2048_seed1.pt",
+        "size_bytes": 4276937,
+        "sha256": "8030125e31c8738d6cea839d9afd5252617acf9517a226b56ebd1c69804be95e"
+      }
+    },
+    "qwen3-4b-wiki256": {
+      "dataset": "wikitext2",
+      "split": "train",
+      "num_samples": 256,
+      "seq_len": 2048,
+      "seed": 1,
+      "validation_policy": "disabled_validation_size_0_all_sequences_train_only",
+      "token_artifact": {
+        "path": "/minimax-avatar-new/zhangqian/realq/experiment_data/realq_20group_20260808/shared_cache/qwen3-4b/tokens/Qwen3-4B_wikitext2_train_n256_sl2048_seed1.pt",
+        "size_bytes": 4273339,
+        "sha256": "21210e1929aa90ea23572e7904f8ebda7b3af75ebf8d9037e8196b3d2c52a399"
+      }
+    },
+    "qwen3-8b-wiki256": {
+      "dataset": "wikitext2",
+      "split": "train",
+      "num_samples": 256,
+      "seq_len": 2048,
+      "seed": 1,
+      "validation_policy": "disabled_validation_size_0_all_sequences_train_only",
+      "token_artifact": {
+        "path": "/minimax-avatar-new/zhangqian/realq/experiment_data/realq_20group_20260808/shared_cache/qwen3-8b/tokens/Qwen3-8B_wikitext2_train_n256_sl2048_seed1.pt",
+        "size_bytes": 4273339,
+        "sha256": "a7acbd907d640eb8ab33a52153da1bf36e4eb550cbc107fe081c9bdc047d3b6f"
+      }
+    },
+    "qwen3-32b-wiki256": {
+      "dataset": "wikitext2",
+      "split": "train",
+      "num_samples": 256,
+      "seq_len": 2048,
+      "seed": 1,
+      "validation_policy": "disabled_validation_size_0_all_sequences_train_only",
+      "token_artifact": {
+        "path": "/minimax-avatar-new/zhangqian/realq/experiment_data/realq_20group_20260808/shared_cache/qwen3-32b/tokens/Qwen3-32B_wikitext2_train_n256_sl2048_seed1.pt",
+        "size_bytes": 4273665,
+        "sha256": "749360f8fb36a6ac91936954f61a7ec688fa8eb0b0d17a61fe4349ff6ec06364"
+      }
+    }
+  },
+  "method_contract": {
+    "method_label": "EfficientQAT-Sym-WO",
+    "stages": [
+      "Block-AP",
+      "E2E-QP"
+    ],
+    "weight_group_size": 128,
+    "weight_quantizer": {
+      "family": "uniform_scalar",
+      "initializer": "symmetric_max_abs",
+      "signed": true,
+      "symmetric": true,
+      "integer_ranges": {
+        "2": [-2, 1],
+        "3": [-4, 3],
+        "4": [-8, 7]
+      },
+      "packed_fixed_zero": {
+        "2": 2,
+        "3": 4,
+        "4": 8
+      },
+      "learnable_scale": true,
+      "learnable_zero_point": false,
+      "vector_quantization": false
+    },
+    "rotation": {
+      "enabled": false,
+      "quarot": false
+    },
+    "activation_kv_quantization": {
+      "enabled": false,
+      "a_bits": 16,
+      "k_bits": 16,
+      "v_bits": 16,
+      "symmetry": "not_applicable_bf16_identity"
+    },
+    "block_ap": {
+      "batch_size": 2,
+      "epochs": 2,
+      "quantizer_lr": 0.0001,
+      "weight_lr_by_weight_bits": {
+        "2": 0.00002,
+        "3": 0.00001,
+        "4": 0.00001
+      },
+      "weight_decay": 0.0,
+      "scheduler": "cosine",
+      "minimum_lr_ratio": 0.05,
+      "objective": "block_output_mse_reconstruction",
+      "precision": "fp16_amp",
+      "train_all_block_parameters": true,
+      "validation_size": 0,
+      "max_blocks": -1
+    },
+    "e2e_qp": {
+      "micro_batch_size": 4,
+      "gradient_accumulation_steps": 8,
+      "effective_batch_size": 32,
+      "epochs": 1,
+      "scale_lr_by_weight_bits": {
+        "2": 0.00002,
+        "3": 0.00001,
+        "4": 0.00001
+      },
+      "weight_decay": 0.0,
+      "scheduler": "cosine",
+      "warmup_ratio": 0.03,
+      "max_grad_norm": 0.3,
+      "precision": "bf16",
+      "optimizer": "torch.optim.AdamW",
+      "optimizer_compatibility_substitution": true,
+      "trainable_parameters": "quantized_linear_scales_only",
+      "positive_scale_projection": {
+        "enabled": true,
+        "minimum": 0.0001,
+        "reason": "preserve the positive-step convention required by the controlled symmetric scalar quantizer"
+      }
+    },
+    "calibration_override": {
+      "paper_dataset": "RedPajama",
+      "controlled_dataset": "WikiText-2 train",
+      "paper_sample_count": 4096,
+      "controlled_sample_count": 256,
+      "block_ap_context": 2048,
+      "paper_e2e_context": 4096,
+      "controlled_e2e_context": 2048
+    }
+  },
+  "runtime_contract": {
+    "versions": {
+      "python": "3.12.3",
+      "torch": "2.9.1+cu128",
+      "transformers": "4.56.2",
+      "lm_eval": "0.4.4"
+    },
+    "minimum_free_gpu_bytes": 150323855360,
+    "single_gpu_per_run": true,
+    "determinism": {
+      "enabled": true,
+      "python_hash_seed": 1,
+      "cublas_workspace_config": ":4096:8",
+      "torch_deterministic_algorithms": true,
+      "cudnn_benchmark": false,
+      "cudnn_deterministic": true,
+      "allow_tf32": false
+    },
+    "quantization_gpu_hours_include": [
+      "Block-AP",
+      "E2E-QP"
+    ],
+    "quantization_gpu_hours_exclude": [
+      "model loading",
+      "checkpoint IO",
+      "CPU materialization",
+      "KL/PPL evaluation",
+      "ten-task QA evaluation",
+      "three-task reasoning evaluation"
+    ]
+  },
+  "runs": [
+    {"run_id": "EQ15-Q32-W4", "model": "qwen3-32b", "calibration": "qwen3-32b-wiki256", "setting": "W4A16KV16", "w_bits": 4, "a_bits": 16, "k_bits": 16, "v_bits": 16, "rotation": false, "job_id": "j-4mj21jb084", "canoe_pod": "j-4mj21jb084-master-0", "physical_gpu": 0, "output_subdir": "j-4mj21jb084/qwen3-32b/w4a16kv16"},
+    {"run_id": "EQ15-Q32-W3", "model": "qwen3-32b", "calibration": "qwen3-32b-wiki256", "setting": "W3A16KV16", "w_bits": 3, "a_bits": 16, "k_bits": 16, "v_bits": 16, "rotation": false, "job_id": "j-4mj21jb084", "canoe_pod": "j-4mj21jb084-master-0", "physical_gpu": 1, "output_subdir": "j-4mj21jb084/qwen3-32b/w3a16kv16"},
+    {"run_id": "EQ15-Q8-W4", "model": "qwen3-8b", "calibration": "qwen3-8b-wiki256", "setting": "W4A16KV16", "w_bits": 4, "a_bits": 16, "k_bits": 16, "v_bits": 16, "rotation": false, "job_id": "j-4mj21jb084", "canoe_pod": "j-4mj21jb084-master-0", "physical_gpu": 2, "output_subdir": "j-4mj21jb084/qwen3-8b/w4a16kv16"},
+    {"run_id": "EQ15-Q8-W3", "model": "qwen3-8b", "calibration": "qwen3-8b-wiki256", "setting": "W3A16KV16", "w_bits": 3, "a_bits": 16, "k_bits": 16, "v_bits": 16, "rotation": false, "job_id": "j-4mj21jb084", "canoe_pod": "j-4mj21jb084-master-0", "physical_gpu": 3, "output_subdir": "j-4mj21jb084/qwen3-8b/w3a16kv16"},
+    {"run_id": "EQ15-Q4-W4", "model": "qwen3-4b", "calibration": "qwen3-4b-wiki256", "setting": "W4A16KV16", "w_bits": 4, "a_bits": 16, "k_bits": 16, "v_bits": 16, "rotation": false, "job_id": "j-4mj21jb084", "canoe_pod": "j-4mj21jb084-master-0", "physical_gpu": 4, "output_subdir": "j-4mj21jb084/qwen3-4b/w4a16kv16"},
+    {"run_id": "EQ15-Q4-W3", "model": "qwen3-4b", "calibration": "qwen3-4b-wiki256", "setting": "W3A16KV16", "w_bits": 3, "a_bits": 16, "k_bits": 16, "v_bits": 16, "rotation": false, "job_id": "j-4mj21jb084", "canoe_pod": "j-4mj21jb084-master-0", "physical_gpu": 5, "output_subdir": "j-4mj21jb084/qwen3-4b/w3a16kv16"},
+    {"run_id": "EQ15-L8-W4", "model": "llama31-8b-instruct", "calibration": "llama31-8b-instruct-wiki256", "setting": "W4A16KV16", "w_bits": 4, "a_bits": 16, "k_bits": 16, "v_bits": 16, "rotation": false, "job_id": "j-4mj21jb084", "canoe_pod": "j-4mj21jb084-master-0", "physical_gpu": 6, "output_subdir": "j-4mj21jb084/llama31-8b-instruct/w4a16kv16"},
+    {"run_id": "EQ15-Q06-W4", "model": "qwen3-0.6b", "calibration": "qwen3-0.6b-wiki256", "setting": "W4A16KV16", "w_bits": 4, "a_bits": 16, "k_bits": 16, "v_bits": 16, "rotation": false, "job_id": "j-4mj21jb084", "canoe_pod": "j-4mj21jb084-master-0", "physical_gpu": 7, "output_subdir": "j-4mj21jb084/qwen3-0.6b/w4a16kv16"},
+    {"run_id": "EQ15-Q32-W2", "model": "qwen3-32b", "calibration": "qwen3-32b-wiki256", "setting": "W2A16KV16", "w_bits": 2, "a_bits": 16, "k_bits": 16, "v_bits": 16, "rotation": false, "job_id": "j-zogxxxduju", "canoe_pod": "j-zogxxxduju-master-0", "physical_gpu": 0, "output_subdir": "j-zogxxxduju/qwen3-32b/w2a16kv16"},
+    {"run_id": "EQ15-Q8-W2", "model": "qwen3-8b", "calibration": "qwen3-8b-wiki256", "setting": "W2A16KV16", "w_bits": 2, "a_bits": 16, "k_bits": 16, "v_bits": 16, "rotation": false, "job_id": "j-zogxxxduju", "canoe_pod": "j-zogxxxduju-master-0", "physical_gpu": 1, "output_subdir": "j-zogxxxduju/qwen3-8b/w2a16kv16"},
+    {"run_id": "EQ15-Q4-W2", "model": "qwen3-4b", "calibration": "qwen3-4b-wiki256", "setting": "W2A16KV16", "w_bits": 2, "a_bits": 16, "k_bits": 16, "v_bits": 16, "rotation": false, "job_id": "j-zogxxxduju", "canoe_pod": "j-zogxxxduju-master-0", "physical_gpu": 2, "output_subdir": "j-zogxxxduju/qwen3-4b/w2a16kv16"},
+    {"run_id": "EQ15-L8-W3", "model": "llama31-8b-instruct", "calibration": "llama31-8b-instruct-wiki256", "setting": "W3A16KV16", "w_bits": 3, "a_bits": 16, "k_bits": 16, "v_bits": 16, "rotation": false, "job_id": "j-zogxxxduju", "canoe_pod": "j-zogxxxduju-master-0", "physical_gpu": 3, "output_subdir": "j-zogxxxduju/llama31-8b-instruct/w3a16kv16"},
+    {"run_id": "EQ15-L8-W2", "model": "llama31-8b-instruct", "calibration": "llama31-8b-instruct-wiki256", "setting": "W2A16KV16", "w_bits": 2, "a_bits": 16, "k_bits": 16, "v_bits": 16, "rotation": false, "job_id": "j-zogxxxduju", "canoe_pod": "j-zogxxxduju-master-0", "physical_gpu": 4, "output_subdir": "j-zogxxxduju/llama31-8b-instruct/w2a16kv16"},
+    {"run_id": "EQ15-Q06-W3", "model": "qwen3-0.6b", "calibration": "qwen3-0.6b-wiki256", "setting": "W3A16KV16", "w_bits": 3, "a_bits": 16, "k_bits": 16, "v_bits": 16, "rotation": false, "job_id": "j-zogxxxduju", "canoe_pod": "j-zogxxxduju-master-0", "physical_gpu": 5, "output_subdir": "j-zogxxxduju/qwen3-0.6b/w3a16kv16"},
+    {"run_id": "EQ15-Q06-W2", "model": "qwen3-0.6b", "calibration": "qwen3-0.6b-wiki256", "setting": "W2A16KV16", "w_bits": 2, "a_bits": 16, "k_bits": 16, "v_bits": 16, "rotation": false, "job_id": "j-zogxxxduju", "canoe_pod": "j-zogxxxduju-master-0", "physical_gpu": 6, "output_subdir": "j-zogxxxduju/qwen3-0.6b/w2a16kv16"}
+  ]
+}

@@ -1,0 +1,20 @@
+# Install with --no-deps into an isolated overlay layered on top of the
+# repository's validated runtime. Do not replace its torch/transformers pins.
+math-verify==0.9.0
+latex2sympy2-extended==1.11.0
+antlr4-python3-runtime==4.13.2
+evalplus==0.3.1
+wget==3.2
+tempdir==0.7.1
+appdirs==1.4.4
+fire==0.7.1
+tree-sitter==0.25.2
+tree-sitter-python==0.25.0
+rich==14.2.0
+termcolor==3.1.0
+# LiveCodeBench commit:
+# 28fef95ea8c9f7a547c8329f2cd3d32b92c1fa24
+#
+# Use the pinned source checkout documented in REALQ_BENCHMARK_TUTORIAL.md.
+# That upstream commit's pyproject builds an incomplete wheel containing only
+# lcb_runner/lm_styles.py, so a git URL requirement is intentionally omitted.

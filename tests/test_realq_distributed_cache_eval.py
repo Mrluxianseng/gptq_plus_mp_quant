@@ -68,21 +68,40 @@ def test_static_cache_single_rank_needs_no_collective(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("case", "cached", "all_hit", "returns_cached"),
+    (
+        "case",
+        "cached",
+        "all_hit",
+        "fsdp",
+        "returns_cached",
+        "expected_teardown",
+    ),
     [
         (
-            "all-hit",
+            "all-hit-non-fsdp",
+            {"saliency": ["rank-local"], "fisher": ["global"]},
+            True,
+            False,
+            True,
+            ["model.cpu", "cleanup"],
+        ),
+        (
+            "all-hit-fsdp",
             {"saliency": ["rank-local"], "fisher": ["global"]},
             True,
             True,
+            True,
+            [],
         ),
         (
             "partial-hit",
             {"saliency": ["rank-local"], "fisher": ["global"]},
             False,
             False,
+            False,
+            [],
         ),
-        ("all-miss", None, False, False),
+        ("all-miss", None, False, False, False, []),
     ],
 )
 def test_static_e2e_only_returns_cache_on_collective_all_hit(
@@ -90,12 +109,21 @@ def test_static_e2e_only_returns_cache_on_collective_all_hit(
     case,
     cached,
     all_hit,
+    fsdp,
     returns_cached,
+    expected_teardown,
 ):
     del case
 
     class RecomputeStarted(Exception):
         pass
+
+    teardown = []
+
+    class Model:
+        def cpu(self):
+            teardown.append("model.cpu")
+            return self
 
     cfg = SimpleNamespace(
         static_cache_path="/unused-cache",
@@ -104,12 +132,18 @@ def test_static_e2e_only_returns_cache_on_collective_all_hit(
         seq_len=4,
         nsamples=2,
         seed=0,
+        fsdp=fsdp,
     )
-    analyzer = SimpleNamespace(tokenizer=object())
+    analyzer = SimpleNamespace(tokenizer=object(), model=Model())
     monkeypatch.setattr(static_e2e.parallel_env, "get_rank", lambda: 0)
     monkeypatch.setattr(static_e2e.parallel_env, "get_world_size", lambda: 2)
     monkeypatch.setattr(cache_mod, "build_cache_key", lambda *_args: "key")
     monkeypatch.setattr(cache_mod, "try_load", lambda *_args: cached)
+    monkeypatch.setattr(
+        static_e2e.mem_utils,
+        "cleanup_memory",
+        lambda: teardown.append("cleanup"),
+    )
 
     def consensus(local_hit, world):
         assert local_hit is (cached is not None)
@@ -130,6 +164,23 @@ def test_static_e2e_only_returns_cache_on_collective_all_hit(
     else:
         with pytest.raises(RecomputeStarted):
             static_e2e.run(cfg, analyzer)
+    assert teardown == expected_teardown
+
+
+def test_static_e2e_required_cache_hit_refuses_recompute(monkeypatch):
+    cfg = SimpleNamespace(
+        static_cache_path="/required-cache",
+        require_static_cache_hit=True,
+        fsdp=False,
+    )
+    analyzer = SimpleNamespace(tokenizer=object(), model=object())
+    monkeypatch.setattr(static_e2e.parallel_env, "get_rank", lambda: 0)
+    monkeypatch.setattr(static_e2e.parallel_env, "get_world_size", lambda: 1)
+    monkeypatch.setattr(cache_mod, "build_cache_key", lambda *_args: "key")
+    monkeypatch.setattr(cache_mod, "try_load", lambda *_args: None)
+
+    with pytest.raises(RuntimeError, match="required static cache hit"):
+        static_e2e.run(cfg, analyzer)
 
 
 def test_static_cache_save_atomically_replaces_in_same_directory(

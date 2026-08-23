@@ -1,0 +1,267 @@
+{
+  "schema_version": 1,
+  "objective_revision": "2026-07-24",
+  "models": {
+    "llama3.2-3b": "modelzoo/Llama/Llama-3.2-3B",
+    "qwen3-4b": "modelzoo/Qwen3/Qwen3-4B",
+    "qwen3-32b": "modelzoo/Qwen3/Qwen3-32B"
+  },
+  "model_signatures": {
+    "llama3.2-3b": {
+      "model_type": "llama",
+      "hidden_size": 3072,
+      "num_hidden_layers": 28,
+      "architectures": [
+        "LlamaForCausalLM"
+      ]
+    },
+    "qwen3-4b": {
+      "model_type": "qwen3",
+      "hidden_size": 2560,
+      "num_hidden_layers": 36,
+      "architectures": [
+        "Qwen3ForCausalLM"
+      ]
+    },
+    "qwen3-32b": {
+      "model_type": "qwen3",
+      "hidden_size": 5120,
+      "num_hidden_layers": 64,
+      "architectures": [
+        "Qwen3ForCausalLM"
+      ]
+    }
+  },
+  "settings": {
+    "3W16A": {
+      "w_bits": 3,
+      "a_bits": 16,
+      "k_bits": 16,
+      "v_bits": 16
+    },
+    "2W16A": {
+      "w_bits": 2,
+      "a_bits": 16,
+      "k_bits": 16,
+      "v_bits": 16
+    },
+    "4W4A": {
+      "w_bits": 4,
+      "a_bits": 4,
+      "k_bits": 4,
+      "v_bits": 4
+    },
+    "3W4A": {
+      "w_bits": 3,
+      "a_bits": 4,
+      "k_bits": 4,
+      "v_bits": 4
+    },
+    "2W4A": {
+      "w_bits": 2,
+      "a_bits": 4,
+      "k_bits": 4,
+      "v_bits": 4
+    }
+  },
+  "methods": [
+    "realq",
+    "gptaq",
+    "guided_gptq",
+    "bf16"
+  ],
+  "resolutions": {
+    "canoe_submit_confirmed": true,
+    "canoe_job_id": "j-abmvtvxw97",
+    "q4_protocol": "paper_a4k4v4_no_independent_q",
+    "a16_aware_semantics": "weight_only_aware_not_applicable",
+    "final_nsamples_policy": "all_quantized_runs_256",
+    "final_layer_lr_policy": "model_size_le_4b_1e-5_gt_4b_1e-6",
+    "lr_boundary_policy": "expand_outward_until_an_interior_kl_minimum_is_bracketed",
+    "tune_group_block_policy": "proxy_per_row_block256",
+    "runtime_preflight_manifest": "output/lowbit_activation/runtime_preflight_j-abmvtvxw97.json"
+  },
+  "fixed_numerics": {
+    "dataset": "wikitext2",
+    "eval_datasets": [
+      "wikitext2"
+    ],
+    "eval_seq_len": 2048,
+    "num_groups": 4,
+    "w_clip": true,
+    "act_order": true,
+    "symmetric": true,
+    "percdamp": 0.01,
+    "rotate": true,
+    "seed": 1,
+    "rotation_seed": 0,
+    "refresh_seed": 0,
+    "grad_clip": 1.0,
+    "final_layer_grad_clip": null,
+    "grad_hessian_topk": -1,
+    "kl_topk": -1,
+    "saliency_clip_percentile": 0.99,
+    "a_loss_clip_scope": "local_backward_chunk",
+    "loss_slide_window": true,
+    "group_parallel_quant": "rank",
+    "fsdp": false,
+    "cpu_master": false,
+    "quantizer_inner_fastpath": false,
+    "w_clip_search_impl": "cartesian_legacy",
+    "fisher_fp32_cache": false,
+    "act_order_stitch_impl": "full_weight_legacy",
+    "w_clip_update_impl": "guarded",
+    "w_group_param_layout": "expanded",
+    "activation_clip_ratio": 0.9,
+    "qwen3_4b_a_loss_ratio": 0.95,
+    "other_model_a_loss_ratio": 1.0
+  },
+  "tuning": {
+    "world_size": 1,
+    "nsamples": 256,
+    "seq_len": 2048,
+    "bsz": 32,
+    "global_loss_bsz": 8,
+    "hessian_accum_bsz": 32,
+    "backward_samples": 16,
+    "backward_bsz": 16,
+    "final_layer_backward_bsz": 16,
+    "blocksize": 256,
+    "lm_eval": false,
+    "max_attempts_per_model_setting": 20,
+    "search_policy": {
+      "strategy": "adaptive_bracket_then_canonical_refine",
+      "canonical_mantissas": [1, 2, 3, 5, 7],
+      "boundary_expansion_batch_size": 2,
+      "reserved_refinement_attempts": 3,
+      "zero_boundary_probe_ratios": [0.1, 0.3, 0.7],
+      "fixed_upper_lr_ceiling": null,
+      "require_complete_coarse_round": true,
+      "require_local_refinement": true
+    },
+    "lr_candidates": [
+      0.0,
+      0.000001,
+      0.000005,
+      0.00001,
+      0.00005,
+      0.0001,
+      0.0005,
+      0.001,
+      0.005
+    ]
+  },
+  "final": {
+    "world_size": 4,
+    "nsamples": 256,
+    "seq_len": 2048,
+    "bsz": 128,
+    "global_loss_bsz": 32,
+    "hessian_accum_bsz": 128,
+    "backward_samples": 32,
+    "backward_bsz": 32,
+    "final_layer_backward_bsz": 32,
+    "blocksize": 128,
+    "lm_eval": true,
+    "lm_eval_batch_size": 32
+  },
+  "final_layer_grad_lr_by_model": {
+    "llama3.2-3b": 0.00001,
+    "qwen3-4b": 0.00001,
+    "qwen3-32b": 0.000001
+  },
+  "selected_grad_lr_by_model_setting": {
+    "llama3.2-3b": {
+      "3W16A": null,
+      "2W16A": null,
+      "4W4A": null,
+      "3W4A": null,
+      "2W4A": null
+    },
+    "qwen3-4b": {
+      "3W16A": null,
+      "2W16A": null,
+      "4W4A": null,
+      "3W4A": null,
+      "2W4A": null
+    },
+    "qwen3-32b": {
+      "3W16A": null,
+      "2W16A": null,
+      "4W4A": null,
+      "3W4A": null,
+      "2W4A": null
+    }
+  },
+  "baseline_numerics": {
+    "offload_inps": false,
+    "gptaq_alpha": 0.25,
+    "guided_saliency_gradient_scale": 1000.0,
+    "cholesky_damp_auto_increment": 0.0015,
+    "cholesky_retry_semantics": "historical_cumulative_diagonal_additions",
+    "weight_mse_norm": 2.4,
+    "weight_mse_grid": 50,
+    "weight_mse_maxshrink": 0.5,
+    "weight_mse_search_impl": "cartesian_legacy",
+    "weight_mse_update_impl": "guarded",
+    "guided_num_groups": 4,
+    "guided_act_order_score": "shared_unweighted_input_energy"
+  },
+  "qwen3_32b_memory_policy": {
+    "fsdp": false,
+    "adjust_only_batch_knobs_on_oom": true,
+    "bsz_note": "record_only_in_refactored_pipeline_do_not_use_as_an_oom_knob",
+    "tuning_ladders": {
+      "global_loss_bsz": [8, 4, 2, 1],
+      "hessian_accum_bsz": [32, 16, 8, 4, 2, 1],
+      "backward_bsz": [16, 8, 4, 2, 1],
+      "final_layer_backward_bsz": [16, 8, 4, 2, 1]
+    },
+    "final_ladders": {
+      "global_loss_bsz": [32, 16, 8, 4],
+      "hessian_accum_bsz": [128, 64, 32, 16, 8, 4, 2, 1],
+      "backward_bsz": [32, 16, 8, 4],
+      "final_layer_backward_bsz": [32, 16, 8, 4],
+      "lm_eval_batch_size": [32, 16, 8, 4, 2, 1]
+    }
+  },
+  "runtime_environment": {
+    "HF_HOME": "/minimax-avatar-new/zhangqian/realq/gptq_plus/datasets/lm_eval_hf_cache",
+    "HF_DATASETS_OFFLINE": "1",
+    "HF_HUB_OFFLINE": "1",
+    "TRANSFORMERS_OFFLINE": "1",
+    "HF_DATASETS_TRUST_REMOTE_CODE": "1",
+    "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+    "TOKENIZERS_PARALLELISM": "false",
+    "HF_HUB_DISABLE_TELEMETRY": "1"
+  },
+  "python_environment": {
+    "venv": "/minimax-avatar-new/zhangqian/realq/gptq_plus/.venv",
+    "activation_required": true
+  },
+  "runtime_requirements": {
+    "minimum_gpu_count": 8,
+    "minimum_gpu_memory_gib": 120
+  },
+  "runtime_versions": {
+    "torch": "2.9.1",
+    "torch_runtime": "2.9.1+cu128",
+    "transformers": "4.56.2",
+    "lm-eval": "0.4.4"
+  },
+  "paper_zero_shot_tasks": [
+    "piqa",
+    "hellaswag",
+    "arc_easy",
+    "arc_challenge",
+    "winogrande",
+    "lambada_openai",
+    "ceval-valid",
+    "boolq",
+    "openbookqa",
+    "social_iqa"
+  ],
+  "output_root": "output/lowbit_activation",
+  "static_cache_root": "cache/lowbit_activation/static",
+  "legacy_cache_root": "cache/lowbit_activation/legacy"
+}

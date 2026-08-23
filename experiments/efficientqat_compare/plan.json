@@ -1,0 +1,437 @@
+{
+  "schema_version": 1,
+  "plan_id": "efficientqat_llama32_common_eval_20260725",
+  "created_at": "2026-07-25T14:42:24+08:00",
+  "last_updated_at": "2026-07-25T15:33:00+08:00",
+  "objective": "Run the full EfficientQAT Block-AP plus E2E-QP method for Llama-3.2-1B and Llama-3.2-3B at W4A16KV16, W3A16KV16, and W2A4KV4, then evaluate all six artifacts with the shared RealQ evaluator.",
+  "execution_control": {
+    "launch_enabled": true,
+    "default_command": "plan",
+    "dry_run_by_default": true,
+    "allowed_commands": [
+      "plan",
+      "launch",
+      "status"
+    ],
+    "execute_requires_flag": true,
+    "execute_requires_exact_plan_sha256": true,
+    "execute_requires_all_confirmations_resolved": true,
+    "execute_requires_exact_canoe_pod": true,
+    "runner_module": "experiments.efficientqat_compare.run_one",
+    "runner_implementation_status": "ready",
+    "note": "All static, representative GPU, reference-cache, evaluator identity, runtime-version, controlled-source, and artifact gates passed. Execution still requires --execute and the exact current plan SHA256."
+  },
+  "runtime": {
+    "canoe_job_id": "j-7x9o0je4pk",
+    "canoe_pod": "j-7x9o0je4pk-master-0",
+    "canoe_cluster": "pa-cne02-prod-01",
+    "canoe_queue": "minimax-avatar-h800new",
+    "canoe_node": "e01-cn-rij4mvgjj0d",
+    "ssh_target": "u-7s51rmjf43+j-7x9o0je4pk-master-0.canoe-jobs.pod@pa-cne02-prod-01-ssh.xaminim.com",
+    "ssh_command": "ssh -F /dev/null -tt -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null u-7s51rmjf43+j-7x9o0je4pk-master-0.canoe-jobs.pod@pa-cne02-prod-01-ssh.xaminim.com",
+    "workspace": "/minimax-avatar-new/zhangqian/realq/gptq_plus",
+    "venv": "/minimax-avatar-new/zhangqian/realq/gptq_plus/.venv",
+    "hf_home": "/minimax-avatar-new/zhangqian/realq/gptq_plus/datasets/lm_eval_hf_cache",
+    "output_root": "/minimax-avatar-new/zhangqian/realq/experiment_data/efficientqat_compare_20260725/j-7x9o0je4pk",
+    "observed_at": "2026-07-25T14:32:00+08:00",
+    "observed_state": "Running",
+    "gpu": {
+      "count": 8,
+      "model": "NVIDIA L20C",
+      "memory_mib_each": 183359,
+      "compute_capability": "8.9",
+      "driver": "580.95.05",
+      "training_gpu_pool": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "evaluation_gpu_pool": [
+        6,
+        7
+      ],
+      "scheduling_policy": "Launch six independent training pipelines concurrently on GPUs 0-5. Queue completed-checkpoint evaluations round-robin on GPUs 6-7 so evaluation can overlap remaining training when artifacts become ready.",
+      "device_visibility_contract": "Each worker sees exactly two physical GPUs through CUDA_VISIBLE_DEVICES=<training_gpu>,<evaluation_gpu>; inside that worker training uses cuda:0 and evaluation uses cuda:1.",
+      "evaluation_lock_contract": "Before using local cuda:1, the runner must hold an exclusive output_root/_locks/eval_gpu_<physical_id>.lock so runs sharing GPU 6 or 7 cannot overlap.",
+      "evaluation_excluded_from_gpu_hours": true
+    },
+    "offline_environment": {
+      "HF_HOME": "/minimax-avatar-new/zhangqian/realq/gptq_plus/datasets/lm_eval_hf_cache",
+      "HF_DATASETS_CACHE": "/minimax-avatar-new/zhangqian/realq/gptq_plus/datasets/lm_eval_hf_cache/datasets",
+      "HF_HUB_CACHE": "/minimax-avatar-new/zhangqian/realq/gptq_plus/datasets/lm_eval_hf_cache/hub",
+      "HF_DATASETS_OFFLINE": "1",
+      "HF_HUB_OFFLINE": "1",
+      "TRANSFORMERS_OFFLINE": "1",
+      "HF_HUB_DISABLE_TELEMETRY": "1",
+      "TOKENIZERS_PARALLELISM": "false",
+      "PYTHONDONTWRITEBYTECODE": "1"
+    }
+  },
+  "code_identity": {
+    "workspace_git_commit": "b2da01754c95ad06e61159603711dbeb24d31b17",
+    "workspace_worktree_policy": "The launcher manifest must record the commit plus a hash of the relevant uncommitted diff at actual launch time.",
+    "efficientqat_source": "/minimax-avatar-new/zhangqian/realq/gptq_plus/EfficientQAT",
+    "efficientqat_upstream_commit": "39f37f3b6053681c9b1cd4c9dcaf692d8999459e",
+    "efficientqat_dirty_patch_sha256": "b1c82cde20e2ab1d9944b1524510bd11d58a38f70b5faaf86b9f09119f70b4a2",
+    "controlled_code_manifest": {
+      "path": "/minimax-avatar-new/zhangqian/realq/gptq_plus/experiments/efficientqat_compare/code_manifest.json",
+      "sha256": "d3ba8f1f6e4c355cf885c4d531afebaa0c8cff3f6d9e39c113c4f8a8cbac3ac2",
+      "file_count": 31
+    },
+    "shared_eval_source": "/minimax-avatar-new/zhangqian/realq/gptq_plus/utils/eval_utils.py"
+  },
+  "runtime_versions": {
+    "python": "3.12.3",
+    "torch": "2.9.1+cu128",
+    "transformers": "4.56.2",
+    "datasets": "3.6.0",
+    "accelerate": "1.12.0",
+    "lm_eval": "0.4.4",
+    "triton": "3.5.1",
+    "numpy": "2.5.1",
+    "bitsandbytes_observed": null,
+    "bitsandbytes_upstream_requirement": "0.41.0",
+    "bitsandbytes_compatible_candidate": "0.49.2",
+    "bitsandbytes_resolution": "not_installed_not_used_user_confirmed_torch_optim_adamw_compatibility_substitution"
+  },
+  "models": {
+    "llama3.2-1b": {
+      "path": "/minimax-avatar-new/zhangqian/realq/gptq_plus/modelzoo/Llama/Llama-3.2-1B",
+      "config_sha256": "bfb5d39c327ee5c3a65e3574596ff30b052a445cfc59a25bdf3b4c0c5a44f4d2",
+      "tokenizer_json_sha256": "79e3e522635f3171300913bb421464a87de6222182a0570b9b2ccba2a964b2b4",
+      "tokenizer_config_sha256": "8004530facf809ac432114de2a4dcc65fcb632da5ec16d666091aeb6a2ee444a",
+      "special_tokens_map_sha256": "cc2e013b7545f183ef03e079a3c91c6f364fa37e4068c512d7dd843e59024535",
+      "checkpoint_files": [
+        "model.safetensors"
+      ],
+      "checkpoint_bytes": 2471645608
+    },
+    "llama3.2-3b": {
+      "path": "/minimax-avatar-new/zhangqian/realq/gptq_plus/modelzoo/Llama/Llama-3.2-3B",
+      "config_sha256": "35f063e9f381e8678eea34bc56c3ecef3c6d10149f6b2cbdf27b8ee1bad3073d",
+      "tokenizer_json_sha256": "79e3e522635f3171300913bb421464a87de6222182a0570b9b2ccba2a964b2b4",
+      "tokenizer_config_sha256": "8004530facf809ac432114de2a4dcc65fcb632da5ec16d666091aeb6a2ee444a",
+      "special_tokens_map_sha256": "cc2e013b7545f183ef03e079a3c91c6f364fa37e4068c512d7dd843e59024535",
+      "checkpoint_files": [
+        "model-00001-of-00002.safetensors",
+        "model-00002-of-00002.safetensors",
+        "model.safetensors.index.json"
+      ],
+      "checkpoint_bytes": 6425529048
+    }
+  },
+  "calibration_contract": {
+    "dataset": "wikitext2",
+    "split": "train",
+    "num_samples": 2048,
+    "seq_len": 2048,
+    "seed": 1,
+    "must_use_exact_saved_tensor_for_all_six_runs": true,
+    "token_artifact": {
+      "path": "/minimax-avatar-new/zhangqian/realq/gptq_plus/cache/tokens/Llama-3.2-1B_wikitext2_train_n2048_sl2048_seed1.pt",
+      "size_bytes": 34193798,
+      "sha256": "681fc508df99ab1e0bbe985d7cc918ebaa848b042615b353d6b53cc9f0f96efb",
+      "serialization": "torch.save",
+      "object_type": "list",
+      "length": 2048,
+      "item_type": "torch.Tensor",
+      "item_shape": [
+        2048
+      ],
+      "item_dtype": "torch.int64"
+    },
+    "shared_tokenizer_evidence": {
+      "model_tokenizer_files_byte_identical": true,
+      "n2048_prefix_equals_llama1b_n256": true,
+      "n2048_prefix_equals_llama3b_n256": true,
+      "comparison": "all 256 corresponding tensors passed torch.equal"
+    },
+    "validation_policy": "disabled_validation_size_0_all_2048_sequences_train_only"
+  },
+  "method_contract": {
+    "method_label": "EfficientQAT-native-minmax",
+    "stages": [
+      "Block-AP",
+      "E2E-QP"
+    ],
+    "weight_group_size": 128,
+    "weight_quantizer": {
+      "family": "EfficientQAT official unsigned asymmetric min-max",
+      "signed": false,
+      "symmetric": false,
+      "learnable_scale": true,
+      "learnable_zero_point_during_block_ap": true,
+      "replace_with_realq_w_clip": false
+    },
+    "rotation": {
+      "enabled": false,
+      "reason": "EfficientQAT has no native QuaRot path and the user explicitly declined adding it."
+    },
+    "block_ap": {
+      "dataset_artifact": "calibration_contract.token_artifact",
+      "batch_size": 2,
+      "epochs": 2,
+      "quantizer_lr": 0.0001,
+      "weight_lr_by_weight_bits": {
+        "2": 0.00002,
+        "3": 0.00001,
+        "4": 0.00001
+      },
+      "weight_decay": 0.0,
+      "scheduler": "cosine",
+      "minimum_lr_ratio": 0.05,
+      "objective": "block output MSE reconstruction",
+      "precision": "fp16_amp"
+    },
+    "e2e_qp": {
+      "dataset_artifact": "calibration_contract.token_artifact",
+      "micro_batch_size": 4,
+      "gradient_accumulation_steps": 8,
+      "effective_batch_size": 32,
+      "epochs": 1,
+      "scale_lr_by_weight_bits": {
+        "2": 0.00002,
+        "3": 0.00001,
+        "4": 0.00001
+      },
+      "weight_decay": 0.0,
+      "scheduler": "cosine",
+      "warmup_ratio": 0.03,
+      "max_grad_norm": 0.3,
+      "precision": "bf16",
+      "optimizer": "torch.optim.AdamW",
+      "optimizer_compatibility_disclosure": "User-confirmed compatibility substitution for released bitsandbytes.optim.AdamW because pinned bitsandbytes 0.41.0 is unavailable and incompatible with the current CUDA 12.8 stack."
+    },
+    "activation_kv_quantization": {
+      "W4A16KV16": {
+        "enabled": false,
+        "aware": "not_applicable"
+      },
+      "W3A16KV16": {
+        "enabled": false,
+        "aware": "not_applicable"
+      },
+      "W2A4KV4": {
+        "enabled": true,
+        "timing": "post-training evaluation path",
+        "aware": false,
+        "result_label": "unaware",
+        "a_bits": 4,
+        "k_bits": 4,
+        "v_bits": 4,
+        "symmetric": true,
+        "granularity": "per-token",
+        "a_clip_ratio": 0.9,
+        "k_clip_ratio": 0.9,
+        "v_clip_ratio": 0.9,
+        "independent_q_quantization": false,
+        "qk_hadamard": false,
+        "quarot": false
+      }
+    },
+    "materialization": {
+      "quality_eval_representation": "standard Hugging Face nn.Linear with fake-dequantized weights",
+      "output_dtype": "bf16",
+      "packed_kernel_used_for_quality_eval": false
+    }
+  },
+  "unified_eval_contract": {
+    "implementation_module": "utils.eval_utils",
+    "qa_function": "qa_eval",
+    "kl_ppl_function": "kl_ppl_eval",
+    "must_be_same_imported_file_as_realq": true,
+    "fresh_process_per_run": true,
+    "lm_eval_version": "0.4.4",
+    "lm_eval_batch_size": 32,
+    "qa_tasks": [
+      "piqa",
+      "hellaswag",
+      "arc_easy",
+      "arc_challenge",
+      "winogrande",
+      "lambada_openai",
+      "ceval-valid",
+      "boolq",
+      "openbookqa",
+      "social_iqa"
+    ],
+    "qa_average": "arithmetic mean over the ten per-task percentage scores after each is rounded to two decimals; the mean is then rounded to two decimals",
+    "qa_score_protocol": "Persist exactly the current shared RealQ qa_eval return: ten percentage accuracies rounded to two decimals plus their two-decimal arithmetic mean. Do not introduce a separate unrounded path, because the existing RealQ results were produced by this evaluator.",
+    "qa_raw_scores_must_be_persisted": false,
+    "kl_dataset": "wikitext2",
+    "ppl_dataset": "wikitext2",
+    "eval_seq_len": 2048,
+    "kl_topk": -1,
+    "kl_vocabulary": "full",
+    "kl_and_cross_entropy_dtype": "fp32",
+    "reference_model": "the exact unquantized checkpoint corresponding to each run",
+    "reference_tokens": "the shared RealQ WikiText2 test tensor and slicing path",
+    "reference_cache_preflight": {
+      "status": "succeeded",
+      "path": "/minimax-avatar-new/zhangqian/realq/experiment_data/efficientqat_compare_20260725/j-7x9o0je4pk/_preflight/reference_cache.json",
+      "sha256": "38d7179166b0d635971530d663de4b51a01e28d28dcda3df19647884952b5df3",
+      "validated_plan_sha256": "515591c509afa6fff745be4785c2a7ccfc03b105a87fcd909f62e59ff0672de2",
+      "cuda_available": false,
+      "evaluator_sha256": "e486fcd2d7fe31b78eeb8a407e8667b6f4774c7f2395e728b4654f7c41e1cbff",
+      "models": [
+        "llama3.2-1b",
+        "llama3.2-3b"
+      ]
+    },
+    "dataset_cache_root": "/minimax-avatar-new/zhangqian/realq/gptq_plus/datasets/lm_eval_hf_cache",
+    "offline_cache_sources_verified": [
+      "allenai___ai2_arc",
+      "winogrande",
+      "super_glue",
+      "hellaswag",
+      "EleutherAI___lambada_openai",
+      "ceval___ceval-exam",
+      "piqa",
+      "openbookqa",
+      "social_i_qa",
+      "wikitext"
+    ],
+    "evaluation_time_excluded_from_quantization_gpu_hours": true
+  },
+  "timing_contract": {
+    "quantization_gpu_hours_include": [
+      "data preparation required by the method",
+      "Block-AP",
+      "E2E-QP"
+    ],
+    "quantization_gpu_hours_exclude": [
+      "CPU-only weight materialization (its wall time is recorded separately)",
+      "KL evaluation",
+      "PPL evaluation",
+      "lm-eval QA evaluation"
+    ],
+    "record_wall_seconds_per_stage": true,
+    "record_gpu_seconds_per_stage": true,
+    "record_start_and_end_timestamp": true,
+    "record_eta_updates": true
+  },
+  "confirmations": {
+    "block_ap_precision": {
+      "required": true,
+      "status": "resolved",
+      "question": "Keep the released EfficientQAT Block-AP FP16 AMP behavior while E2E-QP remains BF16, or change Block-AP to BF16 for the Llama checkpoints?",
+      "proposed": "fp16_amp_for_method_fidelity",
+      "resolution": "fp16_amp",
+      "resolved_by": "user",
+      "resolved_at": "2026-07-25T14:50:00+08:00"
+    },
+    "e2e_optimizer": {
+      "required": true,
+      "status": "resolved",
+      "question": "The released code pins bitsandbytes 0.41.0, which is incompatible with CUDA 12.8, while the job has no bitsandbytes. Install and smoke-test bitsandbytes 0.49.2, or disclose a switch to torch.optim.AdamW?",
+      "proposed": "bitsandbytes_0.49.2_then_one_step_numerical_smoke",
+      "resolution": "torch.optim.AdamW compatibility substitution",
+      "resolved_by": "user",
+      "resolved_at": "2026-07-25T14:50:00+08:00"
+    },
+    "validation_policy": {
+      "required": true,
+      "status": "resolved",
+      "question": "Use all 2048 saved WikiText2 sequences for training with validation_size=0, avoiding any additional or held-out calibration tensor?",
+      "proposed": "no_validation_split",
+      "resolution": "disabled; validation_size=0; all 2048 saved sequences are training data",
+      "resolved_by": "user",
+      "resolved_at": "2026-07-25T14:50:00+08:00"
+    }
+  },
+  "runs": [
+    {
+      "run_id": "EQAT-L32-1B-W4A16KV16",
+      "slug": "llama3.2-1b_w4a16kv16",
+      "model": "llama3.2-1b",
+      "setting": "W4A16KV16",
+      "w_bits": 4,
+      "a_bits": 16,
+      "k_bits": 16,
+      "v_bits": 16,
+      "activation_kv_label": "not_applicable",
+      "training_gpu": 0,
+      "evaluation_gpu": 6,
+      "output_subdir": "llama3.2-1b/w4a16kv16",
+      "status": "planned"
+    },
+    {
+      "run_id": "EQAT-L32-1B-W3A16KV16",
+      "slug": "llama3.2-1b_w3a16kv16",
+      "model": "llama3.2-1b",
+      "setting": "W3A16KV16",
+      "w_bits": 3,
+      "a_bits": 16,
+      "k_bits": 16,
+      "v_bits": 16,
+      "activation_kv_label": "not_applicable",
+      "training_gpu": 1,
+      "evaluation_gpu": 7,
+      "output_subdir": "llama3.2-1b/w3a16kv16",
+      "status": "planned"
+    },
+    {
+      "run_id": "EQAT-L32-1B-W2A4KV4-unaware",
+      "slug": "llama3.2-1b_w2a4kv4_unaware",
+      "model": "llama3.2-1b",
+      "setting": "W2A4KV4",
+      "w_bits": 2,
+      "a_bits": 4,
+      "k_bits": 4,
+      "v_bits": 4,
+      "activation_kv_label": "unaware",
+      "training_gpu": 2,
+      "evaluation_gpu": 6,
+      "output_subdir": "llama3.2-1b/w2a4kv4_unaware",
+      "status": "planned"
+    },
+    {
+      "run_id": "EQAT-L32-3B-W4A16KV16",
+      "slug": "llama3.2-3b_w4a16kv16",
+      "model": "llama3.2-3b",
+      "setting": "W4A16KV16",
+      "w_bits": 4,
+      "a_bits": 16,
+      "k_bits": 16,
+      "v_bits": 16,
+      "activation_kv_label": "not_applicable",
+      "training_gpu": 3,
+      "evaluation_gpu": 7,
+      "output_subdir": "llama3.2-3b/w4a16kv16",
+      "status": "planned"
+    },
+    {
+      "run_id": "EQAT-L32-3B-W3A16KV16",
+      "slug": "llama3.2-3b_w3a16kv16",
+      "model": "llama3.2-3b",
+      "setting": "W3A16KV16",
+      "w_bits": 3,
+      "a_bits": 16,
+      "k_bits": 16,
+      "v_bits": 16,
+      "activation_kv_label": "not_applicable",
+      "training_gpu": 4,
+      "evaluation_gpu": 6,
+      "output_subdir": "llama3.2-3b/w3a16kv16",
+      "status": "planned"
+    },
+    {
+      "run_id": "EQAT-L32-3B-W2A4KV4-unaware",
+      "slug": "llama3.2-3b_w2a4kv4_unaware",
+      "model": "llama3.2-3b",
+      "setting": "W2A4KV4",
+      "w_bits": 2,
+      "a_bits": 4,
+      "k_bits": 4,
+      "v_bits": 4,
+      "activation_kv_label": "unaware",
+      "training_gpu": 5,
+      "evaluation_gpu": 7,
+      "output_subdir": "llama3.2-3b/w2a4kv4_unaware",
+      "status": "planned"
+    }
+  ]
+}

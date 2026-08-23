@@ -1,0 +1,31 @@
+{
+  "artifact_kind": "observed_reconstructed_timing_sidecar",
+  "campaign_id": "gptaq-guided-llama31-qwen3-20group-20260809-v1",
+  "candidate": {
+    "path": "experiments/gptaq_guided_20group_20260809/observed_timing_recovery/qwen3-8b_w4a4kv4_attempt001.json",
+    "sha256": "5d6904a60d31982f92ffbd835bf8f52e3359041ff2c4e21d9b6c5efec73826f4",
+    "size_bytes": 1041
+  },
+  "observation": {
+    "complete_payload_read_before_overwrite": true,
+    "elapsed_seconds_reported_to_user_before_overwrite": 3519.972524226,
+    "original_bytes_independently_preserved": false,
+    "original_sha256_independently_recorded": false,
+    "original_size_bytes_observed": 1041,
+    "overwritten_payload_preserved_before_restore": false
+  },
+  "run_id": "gptaq_qwen3-8b_w4a4kv4",
+  "schema_version": 1,
+  "serializer": {
+    "ensure_ascii": false,
+    "indent": 2,
+    "sort_keys": true,
+    "trailing_newline": true
+  },
+  "validation": {
+    "complete": true,
+    "elapsed_matches_monotonic_interval_exactly": true,
+    "scope_id": "algorithm_core_v1",
+    "timing_status": "complete"
+  }
+}

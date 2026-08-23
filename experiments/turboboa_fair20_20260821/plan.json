@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "campaign": "turboboa-fair20-20260821-v1",
+  "created_at": "2026-08-21T12:40:00+08:00",
+  "workspace": "/minimax-avatar-new/zhangqian/realq/gptq_plus",
+  "venv_python": "/minimax-avatar-new/zhangqian/realq/gptq_plus/.venv.py312-broken-20260729/bin/python",
+  "source_plan": "/minimax-avatar-new/zhangqian/realq/gptq_plus/experiments/efficientqat_weightonly_15group_20260821/plan.json",
+  "source_plan_sha256": "ceffe64189f07a5753a4feffa21553d8c802fa4c798af645ca6199b0fa271032",
+  "output_root": "/minimax-avatar-new/zhangqian/realq/experiment_data/turboboa_fair20_20260821_v1",
+  "preflight_path": "/minimax-avatar-new/zhangqian/realq/experiment_data/turboboa_fair20_20260821_v1/_preflight/artifacts.json",
+  "jobs": {
+    "j-4mj21jb084": {"canoe_pod": "j-4mj21jb084-master-0", "gpu_count": 8},
+    "j-zogxxxduju": {"canoe_pod": "j-zogxxxduju-master-0", "gpu_count": 8}
+  },
+  "method_contract": {
+    "method_label": "TurboBOA-C (RealQ-MSE, grouped-F3)",
+    "calibration": {"dataset": "wikitext2", "num_samples": 256, "seq_len": 2048, "seed": 1, "explicit_path_and_sha": true},
+    "weight_quantizer": {"family": "uniform_scalar", "implementation": "realq_mse", "signed": true, "symmetric": true, "mse": true, "groupsize": 128, "search_impl": "cartesian_legacy", "vector_quantization": false},
+    "solver": {"block_v": true, "n_quant_rows": 16, "consider_dX": true, "alpha": 0.25, "adaptive_qparam": true, "refine_qparam": true, "n_iters": 1, "act_order_col": true, "act_order_row": false, "qwen3_qk_rmsnorm_hessian_mode": "mean_jacobian_kfac"},
+    "rotation": {"enabled": true, "implementation": "QuaRot", "rotation_seed": 0},
+    "activation_kv": {"W4A4KV4": {"a_bits": 4, "k_bits": 4, "v_bits": 4, "groupsize": -1, "symmetric": true, "clip_ratio": 0.9, "activation_aware": true, "k_cache_aware": true}, "A16KV16": {"a_bits": 16, "k_bits": 16, "v_bits": 16, "groupsize": -1, "symmetric": true, "clip_ratio": 1.0, "activation_aware": false, "k_cache_aware": false}},
+    "determinism": {"global_seed": 1, "python_hash_seed": 1, "python_random_seed": 1, "numpy_random_seed": 1, "torch_seed": 1, "cublas_workspace_config": ":4096:8", "torch_deterministic_algorithms": true, "cudnn_benchmark": false, "cudnn_deterministic": true, "allow_tf32": false},
+    "timing": "algorithm including calibration load, precompute and rotation; excluding checkpoint IO and evaluation"
+  },
+  "runs": [
+    {"run_id": "TB20-Q32-W4A4", "model": "qwen3-32b", "calibration": "qwen3-32b-wiki256", "setting": "W4A4KV4", "w_bits": 4, "a_bits": 4, "k_bits": 4, "v_bits": 4, "job_id": "j-4mj21jb084", "canoe_pod": "j-4mj21jb084-master-0", "physical_gpu": 0, "queue_order": 0},
+    {"run_id": "TB20-Q32-W4", "model": "qwen3-32b", "calibration": "qwen3-32b-wiki256", "setting": "W4A16KV16", "w_bits": 4, "a_bits": 16, "k_bits": 16, "v_bits": 16, "job_id": "j-4mj21jb084", "canoe_pod": "j-4mj21jb084-master-0", "physical_gpu": 1, "queue_order": 0},
+    {"run_id": "TB20-Q8-W4A4", "model": "qwen3-8b", "calibration": "qwen3-8b-wiki256", "setting": "W4A4KV4", "w_bits": 4, "a_bits": 4, "k_bits": 4, "v_bits": 4, "job_id": "j-4mj21jb084", "canoe_pod": "j-4mj21jb084-master-0", "physical_gpu": 2, "queue_order": 0},
+    {"run_id": "TB20-Q8-W4", "model": "qwen3-8b", "calibration": "qwen3-8b-wiki256", "setting": "W4A16KV16", "w_bits": 4, "a_bits": 16, "k_bits": 16, "v_bits": 16, "job_id": "j-4mj21jb084", "canoe_pod": "j-4mj21jb084-master-0", "physical_gpu": 3, "queue_order": 0},
+    {"run_id": "TB20-Q4-W4A4", "model": "qwen3-4b", "calibration": "qwen3-4b-wiki256", "setting": "W4A4KV4", "w_bits": 4, "a_bits": 4, "k_bits": 4, "v_bits": 4, "job_id": "j-4mj21jb084", "canoe_pod": "j-4mj21jb084-master-0", "physical_gpu": 4, "queue_order": 0},
+    {"run_id": "TB20-Q4-W4", "model": "qwen3-4b", "calibration": "qwen3-4b-wiki256", "setting": "W4A16KV16", "w_bits": 4, "a_bits": 16, "k_bits": 16, "v_bits": 16, "job_id": "j-4mj21jb084", "canoe_pod": "j-4mj21jb084-master-0", "physical_gpu": 5, "queue_order": 0},
+    {"run_id": "TB20-L8-W4A4", "model": "llama31-8b-instruct", "calibration": "llama31-8b-instruct-wiki256", "setting": "W4A4KV4", "w_bits": 4, "a_bits": 4, "k_bits": 4, "v_bits": 4, "job_id": "j-4mj21jb084", "canoe_pod": "j-4mj21jb084-master-0", "physical_gpu": 6, "queue_order": 0},
+    {"run_id": "TB20-L8-W3", "model": "llama31-8b-instruct", "calibration": "llama31-8b-instruct-wiki256", "setting": "W3A16KV16", "w_bits": 3, "a_bits": 16, "k_bits": 16, "v_bits": 16, "job_id": "j-4mj21jb084", "canoe_pod": "j-4mj21jb084-master-0", "physical_gpu": 6, "queue_order": 1},
+    {"run_id": "TB20-L8-W2", "model": "llama31-8b-instruct", "calibration": "llama31-8b-instruct-wiki256", "setting": "W2A16KV16", "w_bits": 2, "a_bits": 16, "k_bits": 16, "v_bits": 16, "job_id": "j-4mj21jb084", "canoe_pod": "j-4mj21jb084-master-0", "physical_gpu": 6, "queue_order": 2},
+    {"run_id": "TB20-Q32-W3", "model": "qwen3-32b", "calibration": "qwen3-32b-wiki256", "setting": "W3A16KV16", "w_bits": 3, "a_bits": 16, "k_bits": 16, "v_bits": 16, "job_id": "j-zogxxxduju", "canoe_pod": "j-zogxxxduju-master-0", "physical_gpu": 0, "queue_order": 0},
+    {"run_id": "TB20-Q32-W2", "model": "qwen3-32b", "calibration": "qwen3-32b-wiki256", "setting": "W2A16KV16", "w_bits": 2, "a_bits": 16, "k_bits": 16, "v_bits": 16, "job_id": "j-zogxxxduju", "canoe_pod": "j-zogxxxduju-master-0", "physical_gpu": 1, "queue_order": 0},
+    {"run_id": "TB20-Q8-W3", "model": "qwen3-8b", "calibration": "qwen3-8b-wiki256", "setting": "W3A16KV16", "w_bits": 3, "a_bits": 16, "k_bits": 16, "v_bits": 16, "job_id": "j-zogxxxduju", "canoe_pod": "j-zogxxxduju-master-0", "physical_gpu": 2, "queue_order": 0},
+    {"run_id": "TB20-Q8-W2", "model": "qwen3-8b", "calibration": "qwen3-8b-wiki256", "setting": "W2A16KV16", "w_bits": 2, "a_bits": 16, "k_bits": 16, "v_bits": 16, "job_id": "j-zogxxxduju", "canoe_pod": "j-zogxxxduju-master-0", "physical_gpu": 3, "queue_order": 0},
+    {"run_id": "TB20-Q4-W3", "model": "qwen3-4b", "calibration": "qwen3-4b-wiki256", "setting": "W3A16KV16", "w_bits": 3, "a_bits": 16, "k_bits": 16, "v_bits": 16, "job_id": "j-zogxxxduju", "canoe_pod": "j-zogxxxduju-master-0", "physical_gpu": 4, "queue_order": 0},
+    {"run_id": "TB20-Q4-W2", "model": "qwen3-4b", "calibration": "qwen3-4b-wiki256", "setting": "W2A16KV16", "w_bits": 2, "a_bits": 16, "k_bits": 16, "v_bits": 16, "job_id": "j-zogxxxduju", "canoe_pod": "j-zogxxxduju-master-0", "physical_gpu": 5, "queue_order": 0},
+    {"run_id": "TB20-L8-W4", "model": "llama31-8b-instruct", "calibration": "llama31-8b-instruct-wiki256", "setting": "W4A16KV16", "w_bits": 4, "a_bits": 16, "k_bits": 16, "v_bits": 16, "job_id": "j-zogxxxduju", "canoe_pod": "j-zogxxxduju-master-0", "physical_gpu": 6, "queue_order": 0},
+    {"run_id": "TB20-Q06-W4A4", "model": "qwen3-0.6b", "calibration": "qwen3-0.6b-wiki256", "setting": "W4A4KV4", "w_bits": 4, "a_bits": 4, "k_bits": 4, "v_bits": 4, "job_id": "j-zogxxxduju", "canoe_pod": "j-zogxxxduju-master-0", "physical_gpu": 7, "queue_order": 0},
+    {"run_id": "TB20-Q06-W4", "model": "qwen3-0.6b", "calibration": "qwen3-0.6b-wiki256", "setting": "W4A16KV16", "w_bits": 4, "a_bits": 16, "k_bits": 16, "v_bits": 16, "job_id": "j-zogxxxduju", "canoe_pod": "j-zogxxxduju-master-0", "physical_gpu": 7, "queue_order": 1},
+    {"run_id": "TB20-Q06-W3", "model": "qwen3-0.6b", "calibration": "qwen3-0.6b-wiki256", "setting": "W3A16KV16", "w_bits": 3, "a_bits": 16, "k_bits": 16, "v_bits": 16, "job_id": "j-zogxxxduju", "canoe_pod": "j-zogxxxduju-master-0", "physical_gpu": 7, "queue_order": 2},
+    {"run_id": "TB20-Q06-W2", "model": "qwen3-0.6b", "calibration": "qwen3-0.6b-wiki256", "setting": "W2A16KV16", "w_bits": 2, "a_bits": 16, "k_bits": 16, "v_bits": 16, "job_id": "j-zogxxxduju", "canoe_pod": "j-zogxxxduju-master-0", "physical_gpu": 7, "queue_order": 3}
+  ]
+}

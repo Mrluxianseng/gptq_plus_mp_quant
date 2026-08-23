@@ -88,9 +88,11 @@ class GPTAQ:
 
         damp_percent = percdamp
         damp_auto_increment = 0.0015
+        damp_attempts = []
         while 1 > damp_percent > 0:
             try:
                 damp = damp_percent * torch.mean(torch.diag(H))
+                damp_attempts.append(float(damp.item()))
                 diag = torch.arange(self.columns, device=self.dev)
                 H[diag, diag] += damp
 
@@ -105,6 +107,16 @@ class GPTAQ:
 
         if not (0 < damp_percent < 1):
             raise ValueError(f"Quantization: `damp_percent` must between 0 and 1. current is {damp_percent}")
+        if len(damp_attempts) > 1:
+            logging.warning(
+                "GPTAQ Cholesky retry settled at reported damp_percent=%.5f "
+                "(requested %.5f); historical baseline semantics accumulate "
+                "diagonal additions across attempts: attempts=%s total=%g.",
+                damp_percent,
+                percdamp,
+                damp_attempts,
+                sum(damp_attempts),
+            )
 
         # scale it by alpha due to collection of dXXT and H
         P = alpha * ((self.dXXT @ Hinv.T).triu_(diagonal=1)) @ Hinv
@@ -354,10 +366,12 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                 pbar.set_postfix(module=f"layers.{i}." + name)
                 layer_w_groupsize = args.w_groupsize
                 gptq[name].fasterquant(
+                    blocksize=args.blocksize,
                     percdamp=args.percdamp,
                     groupsize=layer_w_groupsize,
                     actorder=args.act_order,
                     static_groups=args.act_order,
+                    alpha=args.alpha,
                 )
                 quantizers["model.layers.%d.%s" % (i, name)] = gptq[name].quantizer
                 gptq[name].free()

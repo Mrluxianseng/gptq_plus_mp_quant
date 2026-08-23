@@ -3,6 +3,10 @@ datasets*
 outputs*
 cache*
 *__pycache__*
+.venv/
+.venv.py312-broken-20260729/
+.wheelhouse/
+datasets/lm_eval_hf_cache/
 
 .vscode
 tmp*

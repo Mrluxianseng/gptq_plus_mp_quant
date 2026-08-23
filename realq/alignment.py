@@ -38,6 +38,7 @@ REFRESH_TRACE_CONFIG_KEYS = (
     "group_parallel_quant",
     "global_loss_bsz",
     "hessian_accum_bsz",
+    "hessian_tf32",
     "saliency_clip_percentile",
     "grad_hessian_topk",
     "grad_lr",

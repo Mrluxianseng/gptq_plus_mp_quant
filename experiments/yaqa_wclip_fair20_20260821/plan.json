@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "campaign": "yaqa-wclip-fair20-20260821-v1",
+  "created_at": "2026-08-21T13:00:00+08:00",
+  "workspace": "/minimax-avatar-new/zhangqian/realq/gptq_plus",
+  "venv_python": "/minimax-avatar-new/zhangqian/realq/gptq_plus/.venv.py312-broken-20260729/bin/python",
+  "source_plan": "/minimax-avatar-new/zhangqian/realq/gptq_plus/experiments/efficientqat_weightonly_15group_20260821/plan.json",
+  "source_plan_sha256": "ceffe64189f07a5753a4feffa21553d8c802fa4c798af645ca6199b0fa271032",
+  "output_root": "/minimax-avatar-new/zhangqian/realq/experiment_data/yaqa_wclip_fair20_20260821_v1",
+  "preflight_path": "/minimax-avatar-new/zhangqian/realq/experiment_data/yaqa_wclip_fair20_20260821_v1/_preflight/artifacts.json",
+  "jobs": {
+    "j-4mj21jb084": {"canoe_pod": "j-4mj21jb084-master-0", "gpu_count": 8},
+    "j-zogxxxduju": {"canoe_pod": "j-zogxxxduju-master-0", "gpu_count": 8}
+  },
+  "method_contract": {
+    "method_label": "YAQA_wclip-C",
+    "calibration": {"dataset": "wikitext2", "num_samples": 256, "seq_len": 2048, "seed": 1, "explicit_path_and_sha": true},
+    "weight_quantizer": {"implementation": "realq_wclip", "version": 1, "family": "uniform_scalar", "signed": true, "symmetric": true, "mse": true, "groupsize": 128, "search_impl": "cartesian_legacy", "update_impl": "guarded", "tie_rule": "strict_lt_first_winner", "vector_dim": 1},
+    "hessian": {"sketch": "B", "power_iters": 1, "world_size": 1, "batch_size_per_rank": 8, "global_batch_size": 8, "iterations": 32, "collection_dtype": "ieee_fp32", "fp64_accum": false},
+    "solver": {"ft_epochs": 0, "scale_override": 1.0, "td_x": 1, "td_y": 128, "sigma_reg": 0.01, "weight_work_dtype": "float32", "hessian_solver_dtype": "float64", "native_two_sided_rht": true, "anti_diagonal_ldlq": true, "extra_quarot": false},
+    "rotation": {"rotation_seed": 0, "layer_sign_seed_rule": "rotation_seed_plus_layer_index"},
+    "activation_kv": {"W4A4KV4": {"a_bits": 4, "k_bits": 4, "v_bits": 4, "groupsize": -1, "symmetric": true, "clip_ratio": 0.9, "hessian_aware": true, "extra_qk_hadamard": false}, "A16KV16": {"a_bits": 16, "k_bits": 16, "v_bits": 16, "groupsize": -1, "symmetric": true, "clip_ratio": 1.0, "hessian_aware": false}},
+    "determinism": {"global_seed": 1, "python_hash_seed": 1, "python_random_seed": 1, "numpy_random_seed": 1, "torch_seed": 1, "cublas_workspace_config": ":4096:8", "torch_deterministic_algorithms": true, "cudnn_benchmark": false, "cudnn_deterministic": true, "allow_tf32": false},
+    "checkpoint": {"dense_fake_quant": true, "persist_integer_codes": true, "persist_compact_scales": true, "persist_su_sv": true, "packed": false, "lowbit_kernel": false}
+  },
+  "stages": [
+    {"stage_id": "YH-Q06-A16", "kind": "hessian", "model": "qwen3-0.6b", "calibration": "qwen3-0.6b-wiki256", "hessian_mode": "a16", "job_id": "j-4mj21jb084", "canoe_pod": "j-4mj21jb084-master-0", "physical_gpu": 7, "queue_order": 0},
+    {"stage_id": "YQ-Q06-W4", "kind": "quantize", "model": "qwen3-0.6b", "calibration": "qwen3-0.6b-wiki256", "setting": "W4A16KV16", "w_bits": 4, "hessian_id": "YH-Q06-A16", "job_id": "j-4mj21jb084", "canoe_pod": "j-4mj21jb084-master-0", "physical_gpu": 7, "queue_order": 1},
+    {"stage_id": "YQ-Q06-W3", "kind": "quantize", "model": "qwen3-0.6b", "calibration": "qwen3-0.6b-wiki256", "setting": "W3A16KV16", "w_bits": 3, "hessian_id": "YH-Q06-A16", "job_id": "j-4mj21jb084", "canoe_pod": "j-4mj21jb084-master-0", "physical_gpu": 7, "queue_order": 2},
+    {"stage_id": "YQ-Q06-W2", "kind": "quantize", "model": "qwen3-0.6b", "calibration": "qwen3-0.6b-wiki256", "setting": "W2A16KV16", "w_bits": 2, "hessian_id": "YH-Q06-A16", "job_id": "j-4mj21jb084", "canoe_pod": "j-4mj21jb084-master-0", "physical_gpu": 7, "queue_order": 3},
+    {"stage_id": "YH-Q06-A4", "kind": "hessian", "model": "qwen3-0.6b", "calibration": "qwen3-0.6b-wiki256", "hessian_mode": "a4", "job_id": "j-zogxxxduju", "canoe_pod": "j-zogxxxduju-master-0", "physical_gpu": 7, "queue_order": 0},
+    {"stage_id": "YQ-Q06-W4A4", "kind": "quantize", "model": "qwen3-0.6b", "calibration": "qwen3-0.6b-wiki256", "setting": "W4A4KV4", "w_bits": 4, "hessian_id": "YH-Q06-A4", "job_id": "j-zogxxxduju", "canoe_pod": "j-zogxxxduju-master-0", "physical_gpu": 7, "queue_order": 1},
+
+    {"stage_id": "YH-Q4-A16", "kind": "hessian", "model": "qwen3-4b", "calibration": "qwen3-4b-wiki256", "hessian_mode": "a16", "job_id": "j-4mj21jb084", "canoe_pod": "j-4mj21jb084-master-0", "physical_gpu": 5, "queue_order": 0},
+    {"stage_id": "YQ-Q4-W4", "kind": "quantize", "model": "qwen3-4b", "calibration": "qwen3-4b-wiki256", "setting": "W4A16KV16", "w_bits": 4, "hessian_id": "YH-Q4-A16", "job_id": "j-4mj21jb084", "canoe_pod": "j-4mj21jb084-master-0", "physical_gpu": 5, "queue_order": 1},
+    {"stage_id": "YQ-Q4-W3", "kind": "quantize", "model": "qwen3-4b", "calibration": "qwen3-4b-wiki256", "setting": "W3A16KV16", "w_bits": 3, "hessian_id": "YH-Q4-A16", "job_id": "j-zogxxxduju", "canoe_pod": "j-zogxxxduju-master-0", "physical_gpu": 5, "queue_order": 0},
+    {"stage_id": "YQ-Q4-W2", "kind": "quantize", "model": "qwen3-4b", "calibration": "qwen3-4b-wiki256", "setting": "W2A16KV16", "w_bits": 2, "hessian_id": "YH-Q4-A16", "job_id": "j-zogxxxduju", "canoe_pod": "j-zogxxxduju-master-0", "physical_gpu": 5, "queue_order": 1},
+    {"stage_id": "YH-Q4-A4", "kind": "hessian", "model": "qwen3-4b", "calibration": "qwen3-4b-wiki256", "hessian_mode": "a4", "job_id": "j-4mj21jb084", "canoe_pod": "j-4mj21jb084-master-0", "physical_gpu": 4, "queue_order": 0},
+    {"stage_id": "YQ-Q4-W4A4", "kind": "quantize", "model": "qwen3-4b", "calibration": "qwen3-4b-wiki256", "setting": "W4A4KV4", "w_bits": 4, "hessian_id": "YH-Q4-A4", "job_id": "j-4mj21jb084", "canoe_pod": "j-4mj21jb084-master-0", "physical_gpu": 4, "queue_order": 1},
+
+    {"stage_id": "YH-Q8-A16", "kind": "hessian", "model": "qwen3-8b", "calibration": "qwen3-8b-wiki256", "hessian_mode": "a16", "job_id": "j-4mj21jb084", "canoe_pod": "j-4mj21jb084-master-0", "physical_gpu": 3, "queue_order": 0},
+    {"stage_id": "YQ-Q8-W4", "kind": "quantize", "model": "qwen3-8b", "calibration": "qwen3-8b-wiki256", "setting": "W4A16KV16", "w_bits": 4, "hessian_id": "YH-Q8-A16", "job_id": "j-4mj21jb084", "canoe_pod": "j-4mj21jb084-master-0", "physical_gpu": 3, "queue_order": 1},
+    {"stage_id": "YQ-Q8-W3", "kind": "quantize", "model": "qwen3-8b", "calibration": "qwen3-8b-wiki256", "setting": "W3A16KV16", "w_bits": 3, "hessian_id": "YH-Q8-A16", "job_id": "j-zogxxxduju", "canoe_pod": "j-zogxxxduju-master-0", "physical_gpu": 3, "queue_order": 0},
+    {"stage_id": "YQ-Q8-W2", "kind": "quantize", "model": "qwen3-8b", "calibration": "qwen3-8b-wiki256", "setting": "W2A16KV16", "w_bits": 2, "hessian_id": "YH-Q8-A16", "job_id": "j-zogxxxduju", "canoe_pod": "j-zogxxxduju-master-0", "physical_gpu": 3, "queue_order": 1},
+    {"stage_id": "YH-Q8-A4", "kind": "hessian", "model": "qwen3-8b", "calibration": "qwen3-8b-wiki256", "hessian_mode": "a4", "job_id": "j-4mj21jb084", "canoe_pod": "j-4mj21jb084-master-0", "physical_gpu": 2, "queue_order": 0},
+    {"stage_id": "YQ-Q8-W4A4", "kind": "quantize", "model": "qwen3-8b", "calibration": "qwen3-8b-wiki256", "setting": "W4A4KV4", "w_bits": 4, "hessian_id": "YH-Q8-A4", "job_id": "j-4mj21jb084", "canoe_pod": "j-4mj21jb084-master-0", "physical_gpu": 2, "queue_order": 1},
+
+    {"stage_id": "YH-Q32-A16", "kind": "hessian", "model": "qwen3-32b", "calibration": "qwen3-32b-wiki256", "hessian_mode": "a16", "job_id": "j-4mj21jb084", "canoe_pod": "j-4mj21jb084-master-0", "physical_gpu": 1, "queue_order": 0},
+    {"stage_id": "YQ-Q32-W4", "kind": "quantize", "model": "qwen3-32b", "calibration": "qwen3-32b-wiki256", "setting": "W4A16KV16", "w_bits": 4, "hessian_id": "YH-Q32-A16", "job_id": "j-4mj21jb084", "canoe_pod": "j-4mj21jb084-master-0", "physical_gpu": 1, "queue_order": 1},
+    {"stage_id": "YQ-Q32-W3", "kind": "quantize", "model": "qwen3-32b", "calibration": "qwen3-32b-wiki256", "setting": "W3A16KV16", "w_bits": 3, "hessian_id": "YH-Q32-A16", "job_id": "j-zogxxxduju", "canoe_pod": "j-zogxxxduju-master-0", "physical_gpu": 1, "queue_order": 0},
+    {"stage_id": "YQ-Q32-W2", "kind": "quantize", "model": "qwen3-32b", "calibration": "qwen3-32b-wiki256", "setting": "W2A16KV16", "w_bits": 2, "hessian_id": "YH-Q32-A16", "job_id": "j-zogxxxduju", "canoe_pod": "j-zogxxxduju-master-0", "physical_gpu": 1, "queue_order": 1},
+    {"stage_id": "YH-Q32-A4", "kind": "hessian", "model": "qwen3-32b", "calibration": "qwen3-32b-wiki256", "hessian_mode": "a4", "job_id": "j-4mj21jb084", "canoe_pod": "j-4mj21jb084-master-0", "physical_gpu": 0, "queue_order": 0},
+    {"stage_id": "YQ-Q32-W4A4", "kind": "quantize", "model": "qwen3-32b", "calibration": "qwen3-32b-wiki256", "setting": "W4A4KV4", "w_bits": 4, "hessian_id": "YH-Q32-A4", "job_id": "j-4mj21jb084", "canoe_pod": "j-4mj21jb084-master-0", "physical_gpu": 0, "queue_order": 1},
+
+    {"stage_id": "YH-L8-A16", "kind": "hessian", "model": "llama31-8b-instruct", "calibration": "llama31-8b-instruct-wiki256", "hessian_mode": "a16", "job_id": "j-4mj21jb084", "canoe_pod": "j-4mj21jb084-master-0", "physical_gpu": 6, "queue_order": 0},
+    {"stage_id": "YQ-L8-W4", "kind": "quantize", "model": "llama31-8b-instruct", "calibration": "llama31-8b-instruct-wiki256", "setting": "W4A16KV16", "w_bits": 4, "hessian_id": "YH-L8-A16", "job_id": "j-4mj21jb084", "canoe_pod": "j-4mj21jb084-master-0", "physical_gpu": 6, "queue_order": 1},
+    {"stage_id": "YH-L8-A4", "kind": "hessian", "model": "llama31-8b-instruct", "calibration": "llama31-8b-instruct-wiki256", "hessian_mode": "a4", "job_id": "j-zogxxxduju", "canoe_pod": "j-zogxxxduju-master-0", "physical_gpu": 6, "queue_order": 0},
+    {"stage_id": "YQ-L8-W4A4", "kind": "quantize", "model": "llama31-8b-instruct", "calibration": "llama31-8b-instruct-wiki256", "setting": "W4A4KV4", "w_bits": 4, "hessian_id": "YH-L8-A4", "job_id": "j-zogxxxduju", "canoe_pod": "j-zogxxxduju-master-0", "physical_gpu": 6, "queue_order": 1},
+    {"stage_id": "YQ-L8-W3", "kind": "quantize", "model": "llama31-8b-instruct", "calibration": "llama31-8b-instruct-wiki256", "setting": "W3A16KV16", "w_bits": 3, "hessian_id": "YH-L8-A16", "job_id": "j-zogxxxduju", "canoe_pod": "j-zogxxxduju-master-0", "physical_gpu": 4, "queue_order": 0},
+    {"stage_id": "YQ-L8-W2", "kind": "quantize", "model": "llama31-8b-instruct", "calibration": "llama31-8b-instruct-wiki256", "setting": "W2A16KV16", "w_bits": 2, "hessian_id": "YH-L8-A16", "job_id": "j-zogxxxduju", "canoe_pod": "j-zogxxxduju-master-0", "physical_gpu": 4, "queue_order": 1}
+  ]
+}

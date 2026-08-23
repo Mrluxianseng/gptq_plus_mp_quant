@@ -1,0 +1,4000 @@
+diff --git a/README.md b/README.md
+index 803568f..563792a 100644
+--- a/README.md
++++ b/README.md
+@@ -5,7 +5,8 @@ This repository contains the code for the ICLR 2026 paper **TurboBoA: Faster and
+ The current release includes the following features:
+   - Implementation of the proposed TurboBoA: `turboboa.py`
+   - Quantization of OPT, Llama family models: `main.py`
+-  - Evaluating the perplexity and 0-shot accuracy (8 tasks) of quantized models
++  - REAL-Q-compatible full-vocabulary WikiText-2 KL/PPL and the fixed ten
++    paper zero-shot tasks
+ 
+ ## Installation
+ 
+@@ -15,23 +16,63 @@ The current release includes the following features:
+    cd turboboa
+    ```
+ 
+-2. Install dependencies:
++2. Use the parent workspace environment. It pins the evaluator and shared
++   QuaRot implementation used by both methods:
+    ```bash
++   cd ..
+    pip install -r requirements.txt
+    ```
+ 
++   Do not install `turboBOA/requirements.txt` over that environment: the
++   upstream file pins older Torch/Transformers versions.
++
+ ## Usage
+ 
+-The main entry point for quantization and evaluation is `main.py`.
++In this workspace TurboBoA is packaged to avoid colliding with REAL-Q's
++top-level `utils` package. Run the entry point from the parent workspace as
++`python -m turboBOA.main`.
+ 
+ ### Basic Usage
+ 
+-To quantize a model (e.g., OPT-125m) with default settings (2-bit weights):
++To run the workspace's controlled Llama-3.2 2-bit configuration:
+ 
+ ```bash
+-python main.py --llm_path facebook/opt-125m --w_bits 2 --block_v --n_quant_rows 16 --consider_dX --adaptive_qparam --refine_qparam
++python -m turboBOA.main \
++  --llm_path modelzoo/Llama/Llama-3.2-1B \
++  --tokenizer_path modelzoo/Llama/Llama-3.2-1B \
++  --w_bits 2 --group_size 128 \
++  --weight_quantizer realq_mse --qparam_comput RealQ-MSE \
++  --block_v --n_quant_rows 16 --consider_dX \
++  --adaptive_qparam --refine_qparam \
++  --act_order_col --no-act_order_row \
++  --a_bits 4 --k_bits 4 --v_bits 4 \
++  --a_clip_ratio 0.9 --k_clip_ratio 0.9 --v_clip_ratio 0.9 \
++  --act_quant_aware_gptq --k_cache_quant_aware_gptq \
++  --lm_eval --lm_eval_batch_size 8 \
++  --results_path output/turboboa/llama32-1b-w2a4kv4.json
+ ```
+ 
++The entry point always uses WikiText-2 `256 x 2048` calibration by default,
++captures the full-precision reference before any transformation, and applies
++the same random QuaRot and A/V/K wrappers as REAL-Q. Evaluation order is
++full-vocabulary WikiText-2 KL/PPL first, then the fixed ten lm-eval tasks.
++Successful runs publish strict JSON atomically at `--results_path`.
++
++For a short plumbing smoke (not a comparable result), quantize only layer 0
++and skip evaluation:
++
++```bash
++CUDA_VISIBLE_DEVICES=0 python -m turboBOA.main \
++  --llm_path modelzoo/Llama/Llama-3.2-1B \
++  --w_bits 2 --group_size 128 \
++  --nsamples 1 --seqlen 128 \
++  --quant_stop_layer 0 --skip_eval \
++  --results_path output/turboboa/smoke-layer0.json
++```
++
++`--quant_stop_layer` is an inclusive index. Remaining transformer layers stay
++full precision, so this option and `--skip_eval` are debug-only.
++
+ ### TurboBoA Options
+ 
+ - TurboBoA introduces three key features to enhance both the efficiency and accuracy of the conventional [BoA](https://github.com/SamsungLabs/BOA).
+diff --git a/custom_modelings/modeling_llama.py b/custom_modelings/modeling_llama.py
+index fab59f7..a851e86 100644
+--- a/custom_modelings/modeling_llama.py
++++ b/custom_modelings/modeling_llama.py
+@@ -40,7 +40,16 @@ from transformers.modeling_outputs import (
+ from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
+ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
+ from transformers.processing_utils import Unpack
+-from transformers.utils import LossKwargs, auto_docstring, can_return_tuple, logging
++from transformers.utils import auto_docstring, can_return_tuple, logging
++
++try:
++    from transformers.utils import LossKwargs
++except ImportError:
++    # TurboBoA's Llama fork was generated against ``LossKwargs``.  In the
++    # workspace-pinned Transformers 4.56.2 it was replaced by the compatible
++    # ``TransformersKwargs`` superset.  Both names are TypedDicts used only by
++    # ``Unpack`` annotations, so this alias does not alter model execution.
++    from transformers.utils import TransformersKwargs as LossKwargs
+ from transformers.models.llama.configuration_llama import LlamaConfig
+ 
+ 
+diff --git a/main.py b/main.py
+index 21fe3c0..f5ebb84 100644
+--- a/main.py
++++ b/main.py
+@@ -2,40 +2,201 @@ import io
+ import time
+ from contextlib import redirect_stdout
+ 
+-from quantize import turboboa_fwrd
+-from utils.data_utils import get_calib_data
+-from utils.eval_utils import evaluate
+-from utils.model_utils import get_model
+-from utils.process_args import get_turboboa_arguments, get_turboboa_weight_quant_infos
++import torch
++
++from realq import akv
++from utils import checkpoint_utils as shared_checkpoint_utils
++from utils import model_utils as shared_model_utils
++from utils import rotation_utils as shared_rotation_utils
++
++from .quantize import turboboa_fwrd
++from .utils.experiment_utils import (
++    atomic_write_json,
++    build_result_payload,
++    capture_fp_reference,
++    evaluate_shared,
++    load_shared_calibration,
++    prepare_shared_args,
++)
++from .utils.model_utils import get_model, install_post_rope_observers
++from .utils.process_args import (
++    get_turboboa_arguments,
++    get_turboboa_weight_quant_infos,
++)
++
++
++def _synchronize_cuda() -> None:
++    """Close CUDA's asynchronous work before an experiment timing boundary."""
++    if torch.cuda.is_available():
++        torch.cuda.synchronize()
++
++
++def run(args):
++    """Run the controlled TurboBoA comparison pipeline."""
++    total_tick = time.time()
++    prepare_shared_args(args)
+ 
+-if __name__ == '__main__':
+-    args = get_turboboa_arguments()
+-    
+     # load model
+     with redirect_stdout(io.StringIO()) as f:
+         llm = get_model(args.llm_path)
+     llm.seqlen = args.seqlen
+     llm.eval()
+ 
+-    # evaluate the fp model performance
++    if type(llm).__name__ not in (
++        "LlamaForCausalLM",
++        "Qwen3ForCausalLM",
++    ):
++        raise NotImplementedError(
++            "The controlled REAL-Q-compatible TurboBoA entry point currently "
++            "targets Llama and Qwen3; got "
++            f"{type(llm).__name__}."
++        )
++
++    analyzer = shared_model_utils.ModelAnalyzer(
++        llm,
++        args.seqlen,
++        tokenizer_source=args.tokenizer_path,
++        skip_state_dict=True,
++    )
++    llm = analyzer.model
++
++    algorithm_tick = None
++    if not args.eval_fp:
++        _synchronize_cuda()
++        algorithm_tick = time.perf_counter()
++
++    # Both immutable data artifacts are prepared before any model transform.
++    calibration = (
++        None
++        if args.eval_fp
++        else load_shared_calibration(args, analyzer)
++    )
++    reference = (
++        None
++        if args.skip_eval
++        else capture_fp_reference(args, analyzer)
++    )
++
+     if args.eval_fp:
+-        results = evaluate(llm, args)
+-        print(results)
+-        exit(0)
++        metrics = evaluate_shared(args, analyzer, reference)
++        total_seconds = time.time() - total_tick
++        payload = build_result_payload(
++            args,
++            metrics=metrics,
++            quantization_seconds=0.0,
++            total_seconds=total_seconds,
++        )
++        atomic_write_json(args.results_path, payload)
++        print(metrics)
++        print(f"Results written atomically to {args.results_path}")
++        return payload
+ 
+-    # load calib. data
+-    calib_data = get_calib_data(args)
++    # Reuse the workspace's exact QuaRot and A/V/K wrapper implementation.
++    # The custom TurboBoA Llama model is retained because its rot_out_Q/K hook
++    # points are required by the attention-aware H_out collector.
++    shared_rotation_utils.prepare_model_for_rotated_quantization(
++        args, analyzer
++    )
++    # prepare_model_for_rotated_quantization has installed the shared wrappers
++    # in both rotate and non-rotate modes.
++    analyzer.model._realq_actquant_wrappers_installed = True
++    akv.setup_aware_pre_quant(analyzer, args)
++    install_post_rope_observers(analyzer.model)
+ 
+     # quantize
+     qconfigs, turboboa_opts, hyperparams = get_turboboa_weight_quant_infos(args)
++    _synchronize_cuda()
++    quantization_tick = time.perf_counter()
++    precompute_and_rotation_seconds = quantization_tick - algorithm_tick
+     print("Start quantization")
+-    tick = time.time()
+-    turboboa_fwrd(llm, calib_data, qconfigs, turboboa_opts, hyperparams, args)
+-    process_time = round(time.time() - tick, 3)
+-    print(f"Quantization processing time: {process_time}")
+-    
+-    # evaluate
++    turboboa_fwrd(
++        llm,
++        calibration,
++        qconfigs,
++        turboboa_opts,
++        hyperparams,
++        args,
++    )
++    _synchronize_cuda()
++    quant_algorithm_end = time.perf_counter()
++    process_time = quant_algorithm_end - quantization_tick
++    algorithm_seconds = quant_algorithm_end - algorithm_tick
++    print(f"Quantization processing time: {process_time:.3f}")
++    print(
++        "Algorithm time including precompute and rotation, excluding eval: "
++        f"{algorithm_seconds:.3f}"
++    )
++
++    post_quant_tick = time.perf_counter()
++    akv.setup_unaware_post_quant(analyzer, args)
++    _synchronize_cuda()
++    post_quant_seconds = time.perf_counter() - post_quant_tick
++    print(
++        "Post-quant runtime wrapper setup time, excluded from algorithm: "
++        f"{post_quant_seconds:.3f}"
++    )
++
++    checkpoint_save_seconds = None
++    if args.save_qmodel_path is not None:
++        # Store truthful weight provenance using the shared versioned
++        # checkpoint format.  The timing boundary above deliberately excludes
++        # serialization: requested GPU-hour is the quantization algorithm
++        # (including precompute/rotation), not checkpoint I/O or evaluation.
++        args.w_groupsize = args.group_size
++        args.w_asym = not args.w_sym
++        args.w_clip = args.weight_quantizer == "realq_mse"
++        args.w_method = (
++            "turboboa_rmsnorm_mean_jacobian_kfac"
++            if type(analyzer.model).__name__ == "Qwen3ForCausalLM"
++            else "turboboa"
++        )
++        checkpoint_tick = time.perf_counter()
++        shared_checkpoint_utils.save_quantized_checkpoint(
++            args.save_qmodel_path,
++            analyzer.model,
++            args,
++            tokenizer=analyzer.tokenizer,
++        )
++        checkpoint_save_seconds = time.perf_counter() - checkpoint_tick
++        print(
++            "Saved quantized checkpoint atomically to "
++            f"{args.save_qmodel_path} in "
++            f"{checkpoint_save_seconds:.3f}s"
++        )
++
++    metrics = (
++        None
++        if args.skip_eval
++        else evaluate_shared(args, analyzer, reference)
++    )
++    total_seconds = time.time() - total_tick
++    payload = build_result_payload(
++        args,
++        metrics=metrics,
++        quantization_seconds=process_time,
++        total_seconds=total_seconds,
++        precompute_and_rotation_seconds=precompute_and_rotation_seconds,
++        algorithm_seconds=algorithm_seconds,
++    )
++    if checkpoint_save_seconds is not None:
++        payload["runtime_seconds"]["checkpoint_save"] = float(
++            checkpoint_save_seconds
++        )
++        payload["quantized_checkpoint"] = args.save_qmodel_path
++    payload["runtime_seconds"]["post_quant_wrapper_setup"] = float(
++        post_quant_seconds
++    )
++    atomic_write_json(args.results_path, payload)
+     print(args)
+-    results = evaluate(llm, args)
+-    results['time'] = process_time
+-    print(results)
++    print(metrics)
++    print(f"Results written atomically to {args.results_path}")
++    return payload
++
++
++def main(argv=None):
++    args = get_turboboa_arguments(argv)
++    run(args)
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/quantize.py b/quantize.py
+index cacef6b..10789c5 100644
+--- a/quantize.py
++++ b/quantize.py
+@@ -2,14 +2,60 @@ import functools
+ 
+ import torch
+ 
+-from quantizers.minmax import MinMaxQuantizer
+-from quantizers.turboboa import TurboBoA
+-from utils.model_utils import cache_first_transformer_input, get_head_info, get_rotary_emb, get_transformer_blocks
+-from utils.utils import cleanup_memory, find_layers
++from gptq_utils.quant_aware_utils import disable_fp_path_quant
++from utils import hadamard_utils as shared_hadamard_utils
++
++from .quantizers.minmax import MinMaxQuantizer
++from .quantizers.realq_mse import RealQMSEQuantizer
++from .quantizers.turboboa import TurboBoA
++from .utils.model_utils import (
++    cache_first_transformer_input,
++    get_head_info,
++    get_rotary_emb,
++    get_transformer_blocks,
++)
++from .utils.utils import cleanup_memory, find_layers
+ 
+ QKV_NAMES = {"query": "self_attn.q_proj", "key": "self_attn.k_proj", "value": "self_attn.v_proj"}
+ 
+ 
++def build_weight_quantizer(qconfigs, weight):
++    """Build either the controlled REAL-Q adapter or untouched upstream mode."""
++    mode = qconfigs["weight_quantizer"]
++    group_size = qconfigs["group_size"]
++    if group_size > 0 and weight.shape[-1] % group_size != 0:
++        raise ValueError(
++            "TurboBoA requires complete natural weight groups: "
++            f"in_features={weight.shape[-1]} is not divisible by "
++            f"group_size={group_size}."
++        )
++    if mode == "realq_mse":
++        quantizer = RealQMSEQuantizer()
++        quantizer.configure(
++            qconfigs["w_bits"],
++            per_channel=True,
++            group_size=group_size,
++            sym=qconfigs["w_sym"],
++            mse=True,
++        )
++        # REAL-Q observes cloned FP32 weights. Keeping this boundary identical
++        # is required for byte-exact initial qparams.
++        quantizer.find_params(weight.detach().clone().float())
++        return quantizer
++    if mode == "turboboa":
++        quantizer = MinMaxQuantizer()
++        quantizer.configure(
++            qconfigs["w_bits"],
++            per_channel=True,
++            group_size=group_size,
++            sym=qconfigs["w_sym"],
++            mse=False,
++        )
++        quantizer.find_params(weight)
++        return quantizer
++    raise ValueError(f"Unknown weight quantizer mode: {mode!r}.")
++
++
+ @torch.no_grad()
+ def turboboa_fwrd(llm, calib_data, qconfigs, turboboa_opts: dict, hyperparams: dict, args):
+     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+@@ -24,11 +70,45 @@ def turboboa_fwrd(llm, calib_data, qconfigs, turboboa_opts: dict, hyperparams: d
+     transformer_blocks = get_transformer_blocks(llm)
+     n_heads, n_kv_heads, head_dim = get_head_info(llm)
+     rotary_emb = get_rotary_emb(llm)
+-    rotary_matrix = get_rotary_matrix(rotary_emb, llm.config, block_kwargs['position_ids'].cpu()) if rotary_emb is not None else None
++    qk_hadamard = (
++        args.k_bits < 16 and args.k_cache_quant_aware_gptq
++    )
++    if qk_hadamard:
++        missing_qk_wrappers = [
++            index
++            for index, block in enumerate(transformer_blocks)
++            if not hasattr(
++                block.self_attn,
++                "apply_rotary_pos_emb_qk_rotation_wrapper",
++            )
++        ]
++        if missing_qk_wrappers:
++            raise RuntimeError(
++                "K-cache-aware TurboBoA requires the shared post-RoPE "
++                "QKRotationWrapper before Hessian collection; missing on "
++                f"blocks {missing_qk_wrappers[:8]}."
++            )
++    rotary_matrix = (
++        get_rotary_matrix(
++            rotary_emb,
++            llm.config,
++            block_kwargs['position_ids'].cpu(),
++            qk_hadamard=qk_hadamard,
++        )
++        if rotary_emb is not None
++        else None
++    )
+     
+     # quantize each Transformer block
+     ngpus = torch.cuda.device_count()
++    quant_stop_layer = getattr(args, "quant_stop_layer", None)
+     for i in range(len(transformer_blocks)):
++        if quant_stop_layer is not None and i > quant_stop_layer:
++            print(
++                "Stopping quantization after transformer layer "
++                f"{quant_stop_layer}; remaining layers stay FP."
++            )
++            break
+         print(f'>>>> Quantizing {i+1}-th Transformer Block.... ({i+1}/{len(transformer_blocks)})')
+         transformer_block = transformer_blocks[i].to(dev)
+         
+@@ -37,9 +117,9 @@ def turboboa_fwrd(llm, calib_data, qconfigs, turboboa_opts: dict, hyperparams: d
+         wrappers = {}
+         for name, fp_layer in fp_layers.items():
+             wrappers[name] = TurboBoA(fp_layer, turboboa_opts, hyperparams)
+-            wrappers[name].quantizer = MinMaxQuantizer()
+-            wrappers[name].quantizer.configure(qconfigs["w_bits"], per_channel=True, group_size=qconfigs["group_size"], sym=qconfigs["w_sym"], mse=False)
+-            wrappers[name].quantizer.find_params(wrappers[name].layer.weight.data)
++            wrappers[name].quantizer = build_weight_quantizer(
++                qconfigs, wrappers[name].layer.weight.data
++            )
+ 
+         # compute Hessians
+         block_v = turboboa_opts['block_v']
+@@ -68,7 +148,9 @@ def turboboa_fwrd(llm, calib_data, qconfigs, turboboa_opts: dict, hyperparams: d
+     llm.config.use_cache = use_cache
+ 
+ 
+-def get_rotary_matrix(rotary_emb, config, position_ids):
++def get_rotary_matrix(
++    rotary_emb, config, position_ids, *, qk_hadamard=False
++):
+     head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+     half_head_dim = head_dim // 2
+     seqlen = position_ids.shape[-1]
+@@ -83,18 +165,200 @@ def get_rotary_matrix(rotary_emb, config, position_ids):
+     rotary_matrix[:, half_head_dim:, half_head_dim:] = torch.diag_embed(cos[:, :half_head_dim])
+ 
+     rotary_matrix = rotary_matrix.unsqueeze(dim=1)
++    if qk_hadamard:
++        # The aware K-cache wrapper applies normalized Walsh-Hadamard after
++        # RoPE to both Q and K.  The projection-output transform is therefore
++        # T_t = H @ R_t, and attention H_out must be pulled back with T_t.
++        hadamard = shared_hadamard_utils.hadamard_matrix(
++            head_dim, rotary_matrix.device
++        ).to(dtype=rotary_matrix.dtype)
++        rotary_matrix = hadamard.view(
++            1, 1, head_dim, head_dim
++        ) @ rotary_matrix
+     return rotary_matrix
+ 
+ 
++def _build_rmsnorm_jacobian_collectors(
++    transformer_block,
++    n_heads,
++    n_kv_heads,
++    head_dim,
++    collector_cls,
++):
++    """Return Q/K pre-norm Jacobian collectors for Qwen3, or identity."""
++    attention = transformer_block.self_attn
++    has_q_norm = hasattr(attention, "q_norm")
++    has_k_norm = hasattr(attention, "k_norm")
++    if has_q_norm != has_k_norm:
++        raise RuntimeError(
++            "TurboBoA requires q_norm and k_norm to be present together; "
++            f"got q_norm={has_q_norm}, k_norm={has_k_norm}."
++        )
++    if not has_q_norm:
++        return {}
++    return {
++        QKV_NAMES["query"]: collector_cls(
++            attention.q_norm, n_heads, head_dim
++        ),
++        QKV_NAMES["key"]: collector_cls(
++            attention.k_norm, n_kv_heads, head_dim
++        ),
++    }
++
++
++def _register_rmsnorm_jacobian_hooks(
++    layers, rmsnorm_collectors, handles
++):
++    for name, collector in rmsnorm_collectors.items():
++        handles.append(
++            layers[name].register_forward_hook(collector.compute_batch)
++        )
++
++
++def _set_collector_stream(
++    cov_collectors, rmsnorm_collectors, cache_fp
++):
++    for collector in cov_collectors.values():
++        collector.cache_fp = cache_fp
++    for collector in rmsnorm_collectors.values():
++        collector.cache_fp = cache_fp
++
++
++def _register_attention_weight_capture(transformer_block, handles):
++    """Capture attention weights without relying on decoder return layout.
++
++    TurboBoA's copied Llama decoder optionally appends attention weights to
++    its return tuple.  Stock Qwen3 deliberately discards them and returns only
++    hidden states, even though ``self_attn`` itself still returns
++    ``(output, weights)``.  A direct hook keeps block-V mathematics identical
++    across both architectures.
++    """
++    captured = []
++
++    def capture(_module, _inputs, output):
++        if (
++            not isinstance(output, tuple)
++            or len(output) < 2
++            or not isinstance(output[1], torch.Tensor)
++            or output[1].ndim != 4
++        ):
++            raise RuntimeError(
++                "TurboBoA block-V requires self_attn to return a rank-4 "
++                "attention-weight tensor in eager mode."
++            )
++        captured.append(output[1])
++
++    handles.append(
++        transformer_block.self_attn.register_forward_hook(capture)
++    )
++    return captured
++
++
++def _take_attention_weights(captured):
++    if len(captured) != 1:
++        raise RuntimeError(
++            "Expected exactly one captured attention matrix for the current "
++            f"decoder forward, got {len(captured)}."
++        )
++    return captured.pop()
++
++
++def _assign_query_key_hout(
++    wrappers,
++    cov_collectors,
++    rmsnorm_collectors,
++    n_heads,
++    n_kv_heads,
++    head_dim,
++    rotary_matrix,
++):
++    """Assign projection-space Q/K output factors.
++
++    The original TurboBoA RoPE/GQA factor is preserved.  When q_norm/k_norm
++    exist, its projection-space pullback is extended with the per-head mean
++    RMSNorm Jacobian: ``H_pre = E[J]^T H_post E[J]``.
++    """
++    query_cov_key = (
++        "rot_out_Q" if rotary_matrix is not None
++        else QKV_NAMES["query"]
++    )
++    key_cov_key = (
++        "rot_out_K" if rotary_matrix is not None
++        else QKV_NAMES["key"]
++    )
++    query_cov = cov_collectors[query_cov_key].YYT
++    key_cov = cov_collectors[key_cov_key].YYT
++
++    if n_kv_heads != n_heads:
++        n_shared = n_heads // n_kv_heads
++        query_cov = query_cov.reshape(
++            n_kv_heads, n_shared, head_dim, head_dim
++        ).mean(dim=1)
++        key_cov = (
++            key_cov[:, None, :, :]
++            .expand(-1, n_shared, -1, -1)
++            .reshape(n_heads, head_dim, head_dim)
++        )
++
++    if rotary_matrix is None:
++        query_hout = key_cov
++        key_hout = query_cov
++    else:
++        rotary_matrix = rotary_matrix.to(key_cov.device)
++        query_hout = (
++            rotary_matrix.transpose(-1, -2)
++            @ key_cov
++            @ rotary_matrix
++        ).mean(0)
++        key_hout = (
++            rotary_matrix.transpose(-1, -2)
++            @ query_cov
++            @ rotary_matrix
++        ).mean(0)
++
++    if rmsnorm_collectors:
++        query_jacobian = rmsnorm_collectors[
++            QKV_NAMES["query"]
++        ].mean_jacobian().to(query_hout)
++        key_jacobian = rmsnorm_collectors[
++            QKV_NAMES["key"]
++        ].mean_jacobian().to(key_hout)
++        query_hout = (
++            query_jacobian.transpose(-1, -2)
++            @ query_hout
++            @ query_jacobian
++        )
++        key_hout = (
++            key_jacobian.transpose(-1, -2)
++            @ key_hout
++            @ key_jacobian
++        )
++
++    wrappers[QKV_NAMES["query"]].H_out = query_hout
++    wrappers[QKV_NAMES["key"]].H_out = key_hout
++
++
+ @torch.no_grad()
+ def compute_Hessian(transformer_block, n_heads, n_kv_heads, head_dim, wrappers, quant_inps, fp_inps, block_kwargs, block_v, rotary_matrix):
+-    from utils.hessian_utils import CovarianceCollector, compute_cov, preprocess
++    from .utils.hessian_utils import (
++        CovarianceCollector,
++        MeanRMSNormJacobianCollector,
++        compute_cov,
++        preprocess,
++    )
+     consider_dX = fp_inps is not None
+ 
+     layers = find_layers(transformer_block)
+     cov_collectors = {}
+     for name, layer in layers.items():
+         cov_collectors[name] = CovarianceCollector(layer)
++    rmsnorm_collectors = _build_rmsnorm_jacobian_collectors(
++        transformer_block,
++        n_heads,
++        n_kv_heads,
++        head_dim,
++        MeanRMSNormJacobianCollector,
++    )
+     if rotary_matrix is not None:  # For models exploiting RoPE, we need to save the covariance of outputs after RoPE.
+         cov_collectors['rot_out_Q'] = CovarianceCollector(transformer_block.self_attn.rot_out_Q)
+         cov_collectors['rot_out_K'] = CovarianceCollector(transformer_block.self_attn.rot_out_K)
+@@ -120,10 +384,16 @@ def compute_Hessian(transformer_block, n_heads, n_kv_heads, head_dim, wrappers,
+     else:
+         handles.append(transformer_block.self_attn.rot_out_Q.register_forward_hook(functools.partial(cov_collectors['rot_out_Q'].compute_cov_out_batch, n_heads=n_heads)))
+         handles.append(transformer_block.self_attn.rot_out_K.register_forward_hook(functools.partial(cov_collectors['rot_out_K'].compute_cov_out_batch, n_heads=n_kv_heads)))
++    _register_rmsnorm_jacobian_hooks(
++        layers, rmsnorm_collectors, handles
++    )
+ 
+     if block_v:
+         block_kwargs = block_kwargs.copy()
+         block_kwargs['output_attentions'] = True
++        captured_attention_weights = _register_attention_weight_capture(
++            transformer_block, handles
++        )
+         XXT_value, n_data_in_value = 0, 0
+         if consider_dX:
+             dXXT_value, n_data_res_in_value = 0, 0
+@@ -131,22 +401,36 @@ def compute_Hessian(transformer_block, n_heads, n_kv_heads, head_dim, wrappers,
+     cache_fp_list = [True, False] if consider_dX else [False]
+     for j in range(len(quant_inps)):
+         for cache_fp in cache_fp_list:
+-            for cov_collector in cov_collectors.values():
+-                cov_collector.cache_fp = cache_fp
++            _set_collector_stream(
++                cov_collectors, rmsnorm_collectors, cache_fp
++            )
+             
+             if cache_fp:
+-                outs = transformer_block(fp_inps[j].unsqueeze(0), **block_kwargs)
++                # F2's teacher stream must remain full precision even when
++                # aware A/V/K wrappers are already installed. Structural
++                # QuaRot/Hadamard transforms remain active in this context.
++                with disable_fp_path_quant(transformer_block):
++                    outs = transformer_block(
++                        fp_inps[j].unsqueeze(0), **block_kwargs
++                    )
+                 fp_inps[j] = outs[0]
+                 if block_v:
+                     fp_inp_value = cov_collectors[QKV_NAMES["value"]].fp_inp[0]
+-                    fp_A = outs[-1]
++                    fp_A = _take_attention_weights(
++                        captured_attention_weights
++                    )
+                     fp_inp_value = torch.einsum('bhli, bid -> bhld', fp_A, fp_inp_value)
+                     fp_inp_value = preprocess(fp_inp_value, n_heads)
+             else:
+                 if not block_v:
+                     transformer_block(quant_inps[j].unsqueeze(0), **block_kwargs)
+                 else:
+-                    quant_A = transformer_block(quant_inps[j].unsqueeze(0), **block_kwargs)[-1]
++                    transformer_block(
++                        quant_inps[j].unsqueeze(0), **block_kwargs
++                    )
++                    quant_A = _take_attention_weights(
++                        captured_attention_weights
++                    )
+                     quant_inp_value = cov_collectors[QKV_NAMES["value"]].quant_inp.pop()
+                     quant_inp_value = torch.einsum('bhli, bid -> bhld', quant_A, quant_inp_value)
+                     quant_inp_value = preprocess(quant_inp_value, n_heads)
+@@ -192,20 +476,18 @@ def compute_Hessian(transformer_block, n_heads, n_kv_heads, head_dim, wrappers,
+         if consider_dX:
+             wrappers[QKV_NAMES['value']].dXXT = cov_collectors[QKV_NAMES["value"]].dXXT
+ 
+-    # Assign H_out for query/key
+-    if n_kv_heads != n_heads:
+-        cov_collectors['rot_out_Q'].YYT = cov_collectors['rot_out_Q'].YYT.reshape(n_kv_heads, n_shared, head_dim, head_dim).mean(dim=1)
+-        cov_collectors['rot_out_K'].YYT = cov_collectors['rot_out_K'].YYT[:, None, :, :].expand(-1, n_shared, -1, -1).reshape(n_heads, head_dim, head_dim)
+-    
+-    if rotary_matrix is None:
+-        wrappers[QKV_NAMES["query"]].H_out = cov_collectors[QKV_NAMES["key"]].YYT
+-        wrappers[QKV_NAMES["key"]].H_out = cov_collectors[QKV_NAMES["query"]].YYT
+-    else:
+-        rotary_matrix = rotary_matrix.cuda()
+-        wrappers[QKV_NAMES["query"]].H_out = (rotary_matrix.transpose(-1, -2) @ cov_collectors['rot_out_K'].YYT @ rotary_matrix).mean(0)
+-        wrappers[QKV_NAMES["key"]].H_out = (rotary_matrix.transpose(-1, -2) @ cov_collectors['rot_out_Q'].YYT @ rotary_matrix).mean(0)
++    _assign_query_key_hout(
++        wrappers,
++        cov_collectors,
++        rmsnorm_collectors,
++        n_heads,
++        n_kv_heads,
++        head_dim,
++        rotary_matrix,
++    )
+ 
+     del cov_collectors
++    del rmsnorm_collectors
+     cleanup_memory(verbose=False)
+ 
+     return fp_inps
+@@ -214,13 +496,25 @@ def compute_Hessian(transformer_block, n_heads, n_kv_heads, head_dim, wrappers,
+ @torch.no_grad()
+ def compute_Hessian_multigpu(transformer_block, n_heads, n_kv_heads, head_dim, wrappers, quant_inps, fp_inps, block_kwargs, block_v, rotary_matrix):
+     gpus = [torch.device("cuda:%d" % i) for i in range(torch.cuda.device_count())]
+-    from utils.hessian_utils import CovarianceCollector, compute_cov, preprocess
++    from .utils.hessian_utils import (
++        CovarianceCollector,
++        MeanRMSNormJacobianCollector,
++        compute_cov,
++        preprocess,
++    )
+     consider_dX = fp_inps is not None
+ 
+     layers = find_layers(transformer_block)
+     cov_collectors = {}
+     for name, layer in layers.items():
+         cov_collectors[name] = CovarianceCollector(layer)
++    rmsnorm_collectors = _build_rmsnorm_jacobian_collectors(
++        transformer_block,
++        n_heads,
++        n_kv_heads,
++        head_dim,
++        MeanRMSNormJacobianCollector,
++    )
+     if rotary_matrix is not None:  # For models exploiting RoPE, we need to save the covariance of outputs after RoPE.
+         cov_collectors['rot_out_Q'] = CovarianceCollector(transformer_block.self_attn.rot_out_Q)
+         cov_collectors['rot_out_K'] = CovarianceCollector(transformer_block.self_attn.rot_out_K)
+@@ -246,10 +540,16 @@ def compute_Hessian_multigpu(transformer_block, n_heads, n_kv_heads, head_dim, w
+     else:
+         handles.append(transformer_block.self_attn.rot_out_Q.register_forward_hook(functools.partial(cov_collectors['rot_out_Q'].compute_cov_out_batch, n_heads=n_heads)))
+         handles.append(transformer_block.self_attn.rot_out_K.register_forward_hook(functools.partial(cov_collectors['rot_out_K'].compute_cov_out_batch, n_heads=n_kv_heads)))
++    _register_rmsnorm_jacobian_hooks(
++        layers, rmsnorm_collectors, handles
++    )
+ 
+     if block_v:
+         block_kwargs = block_kwargs.copy()
+         block_kwargs['output_attentions'] = True
++        captured_attention_weights = _register_attention_weight_capture(
++            transformer_block, handles
++        )
+         XXT_value, n_data_in_value = 0, 0
+         if consider_dX:
+             dXXT_value, n_data_res_in_value = 0, 0
+@@ -257,22 +557,33 @@ def compute_Hessian_multigpu(transformer_block, n_heads, n_kv_heads, head_dim, w
+     cache_fp_list = [True, False] if consider_dX else [False]
+     for j in range(len(quant_inps)):
+         for cache_fp in cache_fp_list:
+-            for cov_collector in cov_collectors.values():
+-                cov_collector.cache_fp = cache_fp
++            _set_collector_stream(
++                cov_collectors, rmsnorm_collectors, cache_fp
++            )
+             
+             if cache_fp:
+-                outs = transformer_block(fp_inps[j].unsqueeze(0), **block_kwargs)
++                with disable_fp_path_quant(transformer_block):
++                    outs = transformer_block(
++                        fp_inps[j].unsqueeze(0), **block_kwargs
++                    )
+                 fp_inps[j] = outs[0]
+                 if block_v:
+                     fp_inp_value = cov_collectors[QKV_NAMES["value"]].fp_inp[0]
+-                    fp_A = outs[-1]
++                    fp_A = _take_attention_weights(
++                        captured_attention_weights
++                    )
+                     fp_inp_value = torch.einsum('bhli, bid -> bhld', fp_A, fp_inp_value).to(device=gpus[-1])
+                     fp_inp_value = preprocess(fp_inp_value, n_heads)
+             else:
+                 if not block_v:
+                     transformer_block(quant_inps[j].unsqueeze(0), **block_kwargs)
+                 else:
+-                    quant_A = transformer_block(quant_inps[j].unsqueeze(0), **block_kwargs)[-1]
++                    transformer_block(
++                        quant_inps[j].unsqueeze(0), **block_kwargs
++                    )
++                    quant_A = _take_attention_weights(
++                        captured_attention_weights
++                    )
+                     quant_inp_value = cov_collectors[QKV_NAMES["value"]].quant_inp.pop()
+                     quant_inp_value = torch.einsum('bhli, bid -> bhld', quant_A, quant_inp_value).to(device=gpus[-1])
+                     quant_inp_value = preprocess(quant_inp_value, n_heads)
+@@ -318,21 +629,18 @@ def compute_Hessian_multigpu(transformer_block, n_heads, n_kv_heads, head_dim, w
+         if consider_dX:
+             wrappers[QKV_NAMES['value']].dXXT = cov_collectors[QKV_NAMES["value"]].dXXT
+ 
+-    # Assign H_out for query/key
+-    if n_kv_heads != n_heads:
+-        n_shared = n_heads // n_kv_heads
+-        cov_collectors['rot_out_Q'].YYT = cov_collectors['rot_out_Q'].YYT.reshape(n_kv_heads, n_shared, head_dim, head_dim).mean(dim=1)
+-        cov_collectors['rot_out_K'].YYT = cov_collectors['rot_out_K'].YYT[:, None, :, :].expand(-1, n_shared, -1, -1).reshape(n_heads, head_dim, head_dim)
+-    
+-    if rotary_matrix is None:
+-        wrappers[QKV_NAMES["query"]].H_out = cov_collectors[QKV_NAMES["key"]].YYT
+-        wrappers[QKV_NAMES["key"]].H_out = cov_collectors[QKV_NAMES["query"]].YYT
+-    else:
+-        rotary_matrix = rotary_matrix.cuda()
+-        wrappers[QKV_NAMES["query"]].H_out = (rotary_matrix.transpose(-1, -2) @ cov_collectors['rot_out_K'].YYT @ rotary_matrix).mean(0)
+-        wrappers[QKV_NAMES["key"]].H_out = (rotary_matrix.transpose(-1, -2) @ cov_collectors['rot_out_Q'].YYT @ rotary_matrix).mean(0)
++    _assign_query_key_hout(
++        wrappers,
++        cov_collectors,
++        rmsnorm_collectors,
++        n_heads,
++        n_kv_heads,
++        head_dim,
++        rotary_matrix,
++    )
+ 
+     del cov_collectors
++    del rmsnorm_collectors
+     cleanup_memory(verbose=False)
+ 
+     return fp_inps
+diff --git a/quantizers/minmax.py b/quantizers/minmax.py
+index 10838dd..c14ec82 100644
+--- a/quantizers/minmax.py
++++ b/quantizers/minmax.py
+@@ -1,7 +1,7 @@
+ import torch
+ import torch.nn as nn
+ 
+-from utils.quant_utils import fake_quantize, grid_search
++from ..utils.quant_utils import fake_quantize, grid_search
+ 
+ 
+ def get_min_max_range(weight, sym):
+@@ -22,6 +22,8 @@ def get_min_max_range(weight, sym):
+ 
+ 
+ class MinMaxQuantizer(nn.Module):
++    mode_name = "turboboa"
++
+     def __init__(self, shape=1):
+         super(MinMaxQuantizer, self).__init__()
+         self.register_buffer('maxq', torch.tensor(0))
+@@ -112,6 +114,19 @@ class MinMaxQuantizer(nn.Module):
+         
+         return fake_quantize(x, self.scale, self.zero, self.maxq)
+ 
++    def quantize_int(self, x, scale, zero):
++        """Return upstream TurboBoA's unsigned affine integer codes."""
++        from ..utils.quant_utils import quantize
++
++        return quantize(x, scale, zero, self.maxq)
++
++    @staticmethod
++    def center_int(q, zero):
++        return q - zero
++
++    def fake_quantize_values(self, x, scale, zero):
++        return fake_quantize(x, scale, zero, self.maxq)
++
+ 
+     def ready(self):
+         return torch.all(self.scale != 0)
+diff --git a/quantizers/turboboa.py b/quantizers/turboboa.py
+index 39731e2..052b7b8 100644
+--- a/quantizers/turboboa.py
++++ b/quantizers/turboboa.py
+@@ -1,19 +1,25 @@
+ import torch
+ 
+-from quantizers.utils import get_cholesky_of_inverse, reorder_col, reorder_row, reverse_reorder_col, reverse_reorder_row
+-from utils.quant_utils import (
++from .utils import (
++    get_cholesky_of_inverse,
++    reorder_col,
++    reorder_row,
++    reverse_reorder_col,
++    reverse_reorder_row,
++    reverse_reorder_square,
++)
++from ..utils.quant_utils import (
+     compute_loss_degradation,
+     damping,
+-    fake_quantize,
+     filter_dead_neuron,
+-    optimize_group_qparams,
+-    quantize,
++    refine_grouped_qparams,
+ )
+-from utils.utils import cleanup_memory
++from ..utils.utils import cleanup_memory
+ 
+ torch.backends.cuda.matmul.allow_tf32 = False
+ torch.backends.cudnn.allow_tf32 = False
+ 
++
+ class TurboBoA:
+     def __init__(self, layer, opts, hyperparams):
+         self.layer = layer
+@@ -43,45 +49,251 @@ class TurboBoA:
+ 
+         W, H_in, H_out, dXXT = self.preprocess()
+         
+-        # Hessian-based re-ordering for columns
++        # Hessian-based re-ordering for columns. ``perm_col`` maps solver
++        # positions back to original/natural columns; grouped quantization
++        # must use it to keep natural group membership fixed.
++        perm_col = invperm_col = None
+         if self.act_order_col:
+-            W, H_in, dXXT, invperm_col = reorder_col(W, H_in, dXXT)
++            W, H_in, dXXT, perm_col, invperm_col = reorder_col(
++                W, H_in, dXXT
++            )
++        natural_columns = (
++            perm_col
++            if self.act_order_col and self.quantizer.group_size > 0
++            else None
++        )
++        if natural_columns is not None and self.act_order_row:
++            raise NotImplementedError(
++                "Grouped natural-column act-order cannot be combined with "
++                "row act-order in the controlled integration."
++            )
++
++        n_heads, head_dim, n_groups, _ = W.shape
++        initial_scale = self.quantizer.scale.reshape(
++            n_heads, head_dim, n_groups, 1
++        ).to(device=W.device, dtype=W.dtype)
++        initial_zero = self.quantizer.zero.reshape(
++            n_heads, head_dim, n_groups, 1
++        ).to(device=W.device, dtype=W.dtype)
+ 
+         U_in = get_cholesky_of_inverse(H_in)
+         P = (dXXT @ U_in.transpose(-1, -2)).triu(diagonal=1) @ U_in if dXXT is not None else None 
+-        
++        columns_already_restored = False
++
+         if H_out is None:
+-            Q, scale, zero = self.gptq(W, H_in, U_in, P)
++            fixed_scale = None if self.adaptive_qparam else initial_scale
++            fixed_zero = None if self.adaptive_qparam else initial_zero
++            Q, scale, zero = self.gptq(
++                W,
++                H_in,
++                U_in,
++                P,
++                natural_columns=natural_columns,
++                fixed_scale=fixed_scale,
++                fixed_zero=fixed_zero,
++            )
+             if self.refine_qparam:
+-                Q, scale = self.optimize_qparam_gptq(W, Q, H_in, dXXT, scale, zero, self.quantizer.maxq)
++                if natural_columns is not None:
++                    W = reverse_reorder_col(W, invperm_col)
++                    Q = reverse_reorder_col(Q, invperm_col)
++                    H_in = reverse_reorder_square(H_in, invperm_col)
++                    dXXT = reverse_reorder_square(dXXT, invperm_col)
++                    columns_already_restored = True
++                Q, scale = self.optimize_qparam_gptq(
++                    W, Q, H_in, dXXT, scale, zero
++                )
+         else: 
+             # Hessian-based re-ordering for rows
+             if self.act_order_row:
+                 W, H_out, invperm_row  = reorder_row(W, H_out)
+             
+-            Q, scale, zero = self.turboboa(W, H_in, U_in, H_out, self.n_quant_rows, dXXT, P)
++            Q, scale, zero = self.turboboa(
++                W,
++                H_in,
++                U_in,
++                H_out,
++                self.n_quant_rows,
++                dXXT,
++                P,
++                natural_columns=natural_columns,
++                initial_scale=initial_scale,
++                initial_zero=initial_zero,
++            )
+             if self.refine_qparam:
+-                Q, scale = self.optimize_qparam_turboboa(W, Q, H_in, H_out, dXXT, scale, zero, self.quantizer.maxq)
++                if natural_columns is not None:
++                    W = reverse_reorder_col(W, invperm_col)
++                    Q = reverse_reorder_col(Q, invperm_col)
++                    H_in = reverse_reorder_square(H_in, invperm_col)
++                    dXXT = reverse_reorder_square(dXXT, invperm_col)
++                    columns_already_restored = True
++                Q, scale = self.optimize_qparam_turboboa(
++                    W, Q, H_in, H_out, dXXT, scale, zero
++                )
+             
+-            # reverse re-ordering for columns
++            # reverse re-ordering for rows
+             if self.act_order_row:
+                 Q, scale, zero = reverse_reorder_row(Q, scale, zero, invperm_row)
+         
+         # reverse re-ordering for columns
+-        if self.act_order_col:
++        if self.act_order_col and not columns_already_restored:
+             Q = reverse_reorder_col(Q, invperm_col)
+-        
++
+         self.free()
+         if print_memory_usage:
+             print(f'\t |GPU memory: {torch.cuda.max_memory_allocated("cuda") / 1024**3:.3f}|')
+ 
+         # assign quantized (fake-quant) weights
+-        self.layer.weight.data = Q.reshape(self.org_shape).to(dtype=self.org_dtype, device="cuda:0")
+-        self.quantizer.scale = scale.reshape(self.quantizer.scale.shape).to(device="cuda:0")
+-        self.quantizer.zero = zero.reshape(self.quantizer.zero.shape).to(device="cuda:0")
+-
++        target_device = self.layer.weight.device
++        self.layer.weight.data = Q.reshape(self.org_shape).to(
++            dtype=self.org_dtype, device=target_device
++        )
++        self.quantizer.scale = scale.reshape(self.quantizer.scale.shape).to(
++            device=target_device
++        )
++        self.quantizer.zero = zero.reshape(self.quantizer.zero.shape).to(
++            device=target_device
++        )
++
++
++    def _find_group_params(self, weight, H_in=None):
++        if self.qparam_comput in ("RealQ-MSE", "MinMax"):
++            return self.quantizer.find_params_H_group(
++                weight, None, search=False
++            )
++        if self.qparam_comput == "MMSE":
++            return self.quantizer.find_params_H_group(
++                weight, None, search=True
++            )
++        if self.qparam_comput == "Hessian":
++            return self.quantizer.find_params_H_group(
++                weight, H_in, search=True
++            )
++        raise NotImplementedError(
++            f"Unsupported qparam computation: {self.qparam_comput}"
++        )
++
++
++    def _find_single_group_params(self, weight, H_in=None):
++        if self.qparam_comput in ("RealQ-MSE", "MinMax"):
++            return self.quantizer.find_params_H(
++                weight, None, search=False
++            )
++        if self.qparam_comput == "MMSE":
++            return self.quantizer.find_params_H(
++                weight, None, search=True
++            )
++        if self.qparam_comput == "Hessian":
++            return self.quantizer.find_params_H(
++                weight, H_in, search=True
++            )
++        raise NotImplementedError(
++            f"Unsupported qparam computation: {self.qparam_comput}"
++        )
++
++
++    def _gptq_natural_groups(
++        self,
++        W,
++        H_in,
++        U_in,
++        P,
++        natural_columns,
++        fixed_scale,
++        fixed_zero,
++    ):
++        """GPTQ in global act-order while scales stay keyed by natural group."""
++        org_shape = W.shape
++        n_heads, n_rows, n_groups, group_size = org_shape
++        hidden_size = n_groups * group_size
++        if natural_columns.ndim != 2 or natural_columns.shape[-1] != hidden_size:
++            raise ValueError(
++                "natural_columns must be [hessian_heads, hidden_size]; got "
++                f"{tuple(natural_columns.shape)}."
++            )
++        if natural_columns.shape[0] not in (1, n_heads):
++            raise ValueError(
++                "natural_columns head axis must be one or match W; got "
++                f"{natural_columns.shape[0]} for W heads={n_heads}."
++            )
++
++        if fixed_scale is None:
++            invperm = torch.argsort(natural_columns, dim=-1)
++            natural_W = reverse_reorder_col(W, invperm)
++            natural_H = reverse_reorder_square(H_in, invperm)
++            scale, zero = self._find_group_params(natural_W, natural_H)
++        else:
++            if fixed_zero is None:
++                raise ValueError("fixed_zero is required with fixed_scale.")
++            scale, zero = fixed_scale.clone(), fixed_zero.clone()
++
++        expected = (n_heads, n_rows, n_groups, 1)
++        scale = scale.reshape(expected).to(W)
++        zero = zero.reshape(expected).to(W)
++        column_map = natural_columns
++        if column_map.shape[0] == 1 and n_heads != 1:
++            column_map = column_map.expand(n_heads, -1)
++
++        W_flat = W.reshape(n_heads, n_rows, hidden_size)
++        Q_flat = torch.zeros_like(W_flat)
++        W_update = W_flat.clone()
++        for ordered_col in range(hidden_size):
++            natural_col = column_map[:, ordered_col]
++            natural_group = torch.div(
++                natural_col, group_size, rounding_mode="floor"
++            )
++            gather_idx = natural_group[:, None, None, None].expand(
++                n_heads, n_rows, 1, 1
++            )
++            scale_col = torch.gather(scale, 2, gather_idx).squeeze(2)
++            zero_col = torch.gather(zero, 2, gather_idx).squeeze(2)
++
++            w = W_update[..., ordered_col].unsqueeze(-1)
++            q = self.quantizer.fake_quantize_values(
++                w, scale_col, zero_col
++            )
++            Q_flat[..., ordered_col] = q.squeeze(-1)
++            err = (w - q) / U_in[
++                ..., ordered_col, ordered_col
++            ].unsqueeze(-1).unsqueeze(-1)
++            if P is not None:
++                update = (
++                    err
++                    @ U_in[..., ordered_col, ordered_col:].unsqueeze(-2)
++                    - w
++                    @ P[..., ordered_col, ordered_col:].unsqueeze(-2)
++                )
++            else:
++                update = (
++                    err
++                    @ U_in[..., ordered_col, ordered_col:].unsqueeze(-2)
++                )
++            W_update[..., ordered_col:] -= update
++
++        return Q_flat.reshape(org_shape), scale, zero
++
++
++    def gptq(
++        self,
++        W,
++        H_in,
++        U_in,
++        P,
++        *,
++        natural_columns=None,
++        fixed_scale=None,
++        fixed_zero=None,
++    ):
++        if natural_columns is not None:
++            return self._gptq_natural_groups(
++                W,
++                H_in,
++                U_in,
++                P,
++                natural_columns,
++                fixed_scale,
++                fixed_zero,
++            )
+ 
+-    def gptq(self, W, H_in, U_in, P):
+         org_shape = W.shape
+         n_groups, group_size = org_shape[-2], org_shape[-1]
+ 
+@@ -90,20 +302,21 @@ class TurboBoA:
+         scale, zero = torch.ones((*W.shape[:-1], 1), device=W.device), torch.zeros((*W.shape[:-1], 1), device=W.device)
+         for idx_group in range(n_groups):
+             c_start = idx_group * group_size
+-            if self.qparam_comput == "MinMax":
+-                scale_group, zero_group = self.quantizer.find_params_H(W[..., idx_group, :], None, search=False)
+-            elif self.qparam_comput == "MMSE":
+-                scale_group, zero_group = self.quantizer.find_params_H(W[..., idx_group, :], None, search=True)
+-            elif self.qparam_comput == "Hessian":
+-                scale_group, zero_group = self.quantizer.find_params_H(W[..., idx_group, :], H_in[..., c_start:c_start+group_size, c_start:c_start+group_size], search=True)
+-            else:
+-                raise NotImplementedError()
++            scale_group, zero_group = self._find_single_group_params(
++                W[..., idx_group, :],
++                H_in[
++                    ..., c_start:c_start + group_size,
++                    c_start:c_start + group_size
++                ],
++            )
+             scale[..., idx_group, :] = scale_group
+             zero[..., idx_group, :] = zero_group
+ 
+             for c1 in range(group_size):
+                 w = W_update[..., idx_group, c1].unsqueeze(-1)
+-                q = fake_quantize(w, scale_group, zero_group, self.quantizer.maxq)
++                q = self.quantizer.fake_quantize_values(
++                    w, scale_group, zero_group
++                )
+                 Q[..., idx_group, c1] = q.squeeze(-1)
+ 
+                 err = (w - q) / U_in[..., c_start+c1, c_start+c1].unsqueeze(-1).unsqueeze(-1)
+@@ -118,22 +331,35 @@ class TurboBoA:
+         return Q, scale, zero    
+ 
+ 
+-    def turboboa(self, W, H_in, U_in, H_out, N_rows, dXXT, P):
++    def turboboa(
++        self,
++        W,
++        H_in,
++        U_in,
++        H_out,
++        N_rows,
++        dXXT,
++        P,
++        *,
++        natural_columns=None,
++        initial_scale=None,
++        initial_zero=None,
++    ):
+         org_shape = W.shape
+         n_heads, head_dim, n_groups, group_size = org_shape
+         U_out = get_cholesky_of_inverse(H_out)
+         dev = W.device
+ 
+         RHinv = dXXT @ U_in.transpose(-1, -2) @ U_in if dXXT is not None else None
+-        if not self.adaptive_qparam:
+-            if self.qparam_comput == "MinMax":
+-                scale, zero = self.quantizer.find_params_H_group(W, None, search=False)
+-            elif self.qparam_comput == "MMSE":
+-                scale, zero = self.quantizer.find_params_H_group(W, None, search=True)
+-            elif self.qparam_comput == "Hessian":
+-                scale, zero = self.quantizer.find_params_H_group(W, H_in, search=True)
+-            else:
+-                raise NotImplementedError()
++        if natural_columns is not None:
++            if initial_scale is None or initial_zero is None:
++                raise ValueError(
++                    "Natural-group act-order requires initial qparams."
++                )
++            scale = initial_scale.clone()
++            zero = initial_zero.clone()
++        elif not self.adaptive_qparam:
++            scale, zero = self._find_group_params(W, H_in)
+         else:
+             scale, zero = self.quantizer.scale.reshape(*org_shape[:-2], n_groups, 1), self.quantizer.zero.reshape(*org_shape[:-2], n_groups, 1)
+         
+@@ -148,7 +374,25 @@ class TurboBoA:
+                 U_out_sub_inv = 1 / U_out[:, r1:r2, r1:r2]
+             P2 = U_out.transpose(-1, -2)[:, r2:, r1:r2] @ U_out_sub_inv.transpose(-1, -2)
+ 
+-            Q_sub, scale_sub, zero_sub = self.gptq(W_update[:, r1:r2, :, :].clone(), H_in, U_in, P)
++            fixed_scale = (
++                None
++                if self.adaptive_qparam
++                else scale[:, r1:r2, :, :]
++            )
++            fixed_zero = (
++                None
++                if self.adaptive_qparam
++                else zero[:, r1:r2, :, :]
++            )
++            Q_sub, scale_sub, zero_sub = self.gptq(
++                W_update[:, r1:r2, :, :].clone(),
++                H_in,
++                U_in,
++                P,
++                natural_columns=natural_columns,
++                fixed_scale=fixed_scale,
++                fixed_zero=fixed_zero,
++            )
+             Q[:, r1:r2, :, :] = Q_sub
+             scale[:, r1:r2, :, :] = scale_sub
+             zero[:, r1:r2, :, :] = zero_sub
+@@ -162,9 +406,9 @@ class TurboBoA:
+         return Q, scale, zero
+ 
+ 
+-    def optimize_qparam_gptq(self, W, Q, H_in, dXXT, scale, zero, maxq):
+-        Q_int = quantize(Q, scale, zero, maxq)
+-        Q_int_shifted = Q_int - zero
++    def optimize_qparam_gptq(self, W, Q, H_in, dXXT, scale, zero):
++        Q_int = self.quantizer.quantize_int(Q, scale, zero)
++        Q_int_shifted = self.quantizer.center_int(Q_int, zero)
+         
+         n_heads, head_dim, n_groups, group_size = Q.shape
+         hidden_size = n_groups * group_size
+@@ -191,13 +435,26 @@ class TurboBoA:
+             return Q, scale
+         
+         else:
+-            print('NOT supported for group-wise quantization yet')
++            Q, scale = refine_grouped_qparams(
++                W,
++                Q,
++                H_in,
++                None,
++                dXXT,
++                scale.reshape(n_heads, head_dim, n_groups, 1),
++                Q_int_shifted,
++                n_iters=self.n_iters,
++            )
++            loss_new = compute_loss_degradation(W, Q, H_in, None, dXXT)
++            print(f"Loss: {loss_orig:.2f} -> {loss_new:.2f}")
+             return Q, scale
+ 
+ 
+-    def optimize_qparam_turboboa(self, W, Q, H_in, H_out, dXXT, scale, zero, maxq):
+-        Q_int = quantize(Q, scale, zero, maxq)
+-        Q_int_shifted = Q_int - zero
++    def optimize_qparam_turboboa(
++        self, W, Q, H_in, H_out, dXXT, scale, zero
++    ):
++        Q_int = self.quantizer.quantize_int(Q, scale, zero)
++        Q_int_shifted = self.quantizer.center_int(Q_int, zero)
+         
+         n_heads, head_dim, n_groups, group_size = Q.shape
+         hidden_size = n_groups * group_size
+@@ -230,7 +487,20 @@ class TurboBoA:
+             return Q, scale
+         
+         else:
+-            print('NOT supported for group-wise quantization yet')
++            Q, scale = refine_grouped_qparams(
++                W,
++                Q,
++                H_in,
++                H_out,
++                dXXT,
++                scale.reshape(n_heads, head_dim, n_groups, 1),
++                Q_int_shifted,
++                n_iters=self.n_iters,
++            )
++            loss_new = compute_loss_degradation(
++                W, Q, H_in, H_out, dXXT
++            )
++            print(f"Loss: {loss_orig:.2f} -> {loss_new:.2f}")
+             return Q, scale
+ 
+ 
+diff --git a/quantizers/utils.py b/quantizers/utils.py
+index 5879f61..919a344 100644
+--- a/quantizers/utils.py
++++ b/quantizers/utils.py
+@@ -1,6 +1,6 @@
+ import torch
+ 
+-from utils.quant_utils import damping
++from ..utils.quant_utils import damping
+ 
+ 
+ def get_cholesky_of_inverse(H):
+@@ -20,6 +20,13 @@ def get_cholesky_of_inverse(H):
+ 
+ 
+ def reorder_col(W, H_in, dXXT=None):
++    """Globally reorder columns and retain their natural-column identity.
++
++    ``perm[..., ordered_col]`` is the original/natural column index.  Keeping
++    this map is essential for static natural-column weight groups: act-order
++    changes the solver's processing order, but it must not redefine which
++    group owns a column's scale.
++    """
+     org_shape = W.shape
+     n_groups, group_size = org_shape[-2], org_shape[-1]
+     hidden_size = n_groups * group_size
+@@ -42,7 +49,7 @@ def reorder_col(W, H_in, dXXT=None):
+   
+     W = W.view(*org_shape[:-2], hidden_size).reshape(*org_shape[:-2], n_groups, group_size)
+ 
+-    return W, H_in, dXXT, invperm
++    return W, H_in, dXXT, perm, invperm
+ 
+ 
+ def reverse_reorder_col(W, invperm):
+@@ -57,6 +64,33 @@ def reverse_reorder_col(W, invperm):
+     return W
+ 
+ 
++def reverse_reorder_square(matrix, invperm):
++    """Restore both natural-column axes of a permuted square matrix."""
++    if matrix is None:
++        return None
++    if matrix.ndim == 2:
++        matrix = matrix.unsqueeze(0)
++        squeeze = True
++    else:
++        squeeze = False
++    if matrix.ndim != 3 or matrix.shape[0] != invperm.shape[0]:
++        raise ValueError(
++            "Square covariance and inverse permutation must have matching "
++            f"head axes; got {tuple(matrix.shape)} and {tuple(invperm.shape)}."
++        )
++    restored = torch.gather(
++        matrix,
++        dim=-2,
++        index=invperm.unsqueeze(-1).expand(-1, -1, matrix.shape[-1]),
++    )
++    restored = torch.gather(
++        restored,
++        dim=-1,
++        index=invperm.unsqueeze(-2).expand(-1, matrix.shape[-2], -1),
++    )
++    return restored.squeeze(0) if squeeze else restored
++
++
+ def reorder_row(W, H_out):
+     org_shape = W.shape
+     n_groups, group_size = org_shape[-2], org_shape[-1]
+diff --git a/utils/eval_utils.py b/utils/eval_utils.py
+index 5919e0d..4827b94 100644
+--- a/utils/eval_utils.py
++++ b/utils/eval_utils.py
+@@ -115,7 +115,7 @@ def eval_zero_shot(llm, args):
+             fail_some_tasks = True
+     
+     if fail_some_tasks:
+-        from utils.process_args import set_qmodel_path
++        from .process_args import set_qmodel_path
+         qmodel_path = set_qmodel_path(args)
+         llm.save_pretrained(qmodel_path)
+     else:
+diff --git a/utils/hessian_utils.py b/utils/hessian_utils.py
+index c35dd41..0a3569f 100644
+--- a/utils/hessian_utils.py
++++ b/utils/hessian_utils.py
+@@ -1,6 +1,107 @@
+ import torch
+ 
+ 
++class MeanRMSNormJacobianCollector:
++    """Collect a per-head mean Jacobian for head-wise RMSNorm.
++
++    For ``y = gamma * x / sqrt(mean(x**2) + eps)``, the per-token
++    Jacobian is
++
++        J(x) = diag(gamma) @ (
++            inv_r * I - inv_r**3 / d * x @ x.T
++        ).
++
++    Qwen3 applies this normalization between q/k projection and RoPE.  A
++    token-dependent Jacobian no longer admits TurboBoA's original single
++    Kronecker factor.  The controlled Qwen3 extension therefore accumulates
++    ``E[J(x)]`` per head and uses it in the local Gauss--Newton/KFAC pullback.
++    This collector intentionally observes only the quantized calibration
++    stream; ``cache_fp=True`` suppresses the F2 teacher pass.
++    """
++
++    def __init__(self, norm, n_heads, head_dim):
++        self.norm = norm
++        self.n_heads = int(n_heads)
++        self.head_dim = int(head_dim)
++        self.cache_fp = True
++        self.sum_inv_r = None
++        self.sum_inv_r3_xxt = None
++        self.n_data = 0
++
++        eps = getattr(norm, "variance_epsilon", getattr(norm, "eps", None))
++        if eps is None:
++            raise TypeError(
++                f"{type(norm).__name__} does not expose RMSNorm epsilon."
++            )
++        self.eps = float(eps)
++
++    def compute_batch(self, _, inp, out):
++        if self.cache_fp:
++            return
++        values = out.detach()
++        expected = self.n_heads * self.head_dim
++        if values.shape[-1] != expected:
++            raise RuntimeError(
++                "RMSNorm Jacobian collector observed an incompatible "
++                f"projection width {values.shape[-1]}; expected {expected} "
++                f"({self.n_heads} heads x {self.head_dim})."
++            )
++
++        # q_proj/k_proj return [B, L, H*d].  Treat every token as one
++        # observation while retaining the head axis.
++        values = values.reshape(-1, self.n_heads, self.head_dim)
++        values = values.transpose(0, 1).float()  # [H, N, d]
++        inv_r = torch.rsqrt(
++            values.square().mean(dim=-1) + self.eps
++        )  # [H, N]
++        batch_sum_inv_r = inv_r.sum(dim=-1)
++        scaled = values * inv_r.pow(1.5).unsqueeze(-1)
++        batch_sum_inv_r3_xxt = (
++            scaled.transpose(-1, -2) @ scaled
++        )
++
++        if self.sum_inv_r is None:
++            self.sum_inv_r = batch_sum_inv_r
++            self.sum_inv_r3_xxt = batch_sum_inv_r3_xxt
++        else:
++            self.sum_inv_r.add_(batch_sum_inv_r)
++            self.sum_inv_r3_xxt.add_(batch_sum_inv_r3_xxt)
++        self.n_data += values.shape[1]
++
++    def mean_jacobian(self):
++        if self.n_data <= 0:
++            raise RuntimeError(
++                "RMSNorm Jacobian collector has no quantized-stream samples."
++            )
++        mean_inv_r = self.sum_inv_r / self.n_data
++        mean_inv_r3_xxt = self.sum_inv_r3_xxt / self.n_data
++        eye = torch.eye(
++            self.head_dim,
++            device=mean_inv_r3_xxt.device,
++            dtype=mean_inv_r3_xxt.dtype,
++        ).expand(self.n_heads, -1, -1)
++        base = (
++            mean_inv_r[:, None, None] * eye
++            - mean_inv_r3_xxt / self.head_dim
++        )
++
++        gamma = self.norm.weight.detach().float().to(base.device)
++        if gamma.numel() == self.head_dim:
++            gamma = gamma.reshape(1, self.head_dim).expand(
++                self.n_heads, -1
++            )
++        elif gamma.numel() == self.n_heads * self.head_dim:
++            gamma = gamma.reshape(self.n_heads, self.head_dim)
++        else:
++            raise RuntimeError(
++                "RMSNorm weight has an incompatible shape "
++                f"{tuple(gamma.shape)} for {self.n_heads} heads x "
++                f"{self.head_dim}."
++            )
++        # diag(gamma) multiplies rows of the unscaled RMS Jacobian.
++        return gamma[:, :, None] * base
++
++
+ class CovarianceCollector:
+     def __init__(self, layer):
+         self.layer = layer
+@@ -80,4 +181,3 @@ def compute_cov(cov, n_data, data_1, data_2=None):
+ 
+     return cov, n_data
+ 
+-
+diff --git a/utils/model_utils.py b/utils/model_utils.py
+index a3f8fd7..e10b7b6 100644
+--- a/utils/model_utils.py
++++ b/utils/model_utils.py
+@@ -1,6 +1,8 @@
+ import torch
+ from torch import nn
+ 
++from utils import monkeypatch as shared_monkeypatch
++
+ from .utils import cleanup_memory
+ 
+ 
+@@ -18,15 +20,36 @@ def get_opt(model_path):
+ 
+ 
+ def get_llama(model_path):
+-    from custom_modelings.modeling_llama import LlamaForCausalLM
++    from ..custom_modelings.modeling_llama import LlamaForCausalLM
+     model = LlamaForCausalLM.from_pretrained(model_path, attn_implementation="eager", torch_dtype='auto')
+     return model
+ 
+ 
++def get_qwen3(model_path):
++    # Keep the stock implementation: q_norm/k_norm are part of Qwen3's
++    # algorithm and must remain on the actual forward path.
++    from transformers import AutoModelForCausalLM
++    model = AutoModelForCausalLM.from_pretrained(
++        model_path,
++        attn_implementation="eager",
++        torch_dtype="auto",
++        trust_remote_code=True,
++    )
++    if type(model).__name__ != "Qwen3ForCausalLM":
++        raise TypeError(
++            f"Expected Qwen3ForCausalLM at {model_path}, got "
++            f"{type(model).__name__}."
++        )
++    return model
++
++
+ def get_model(model_path):
+-    if 'llama' in model_path:
++    model_path_lower = model_path.lower()
++    if 'llama' in model_path_lower:
+         return get_llama(model_path)
+-    elif 'opt' in model_path:
++    elif 'qwen3' in model_path_lower:
++        return get_qwen3(model_path)
++    elif 'opt' in model_path_lower:
+         return get_opt(model_path)
+     else:
+         raise NotImplementedError(f"Not support {model_path.split('/')[-1]} model.")
+@@ -36,7 +59,7 @@ def get_transformer_blocks(llm):
+     llm_type = type(llm).__name__
+     if llm_type == "OPTForCausalLM":
+         transformer_blocks = llm.model.decoder.layers
+-    elif llm_type == "LlamaForCausalLM":
++    elif llm_type in ("LlamaForCausalLM", "Qwen3ForCausalLM"):
+         transformer_blocks = llm.model.layers
+     else:
+         raise NotImplementedError(f"{llm_type} models are NOT supported yet.")
+@@ -50,7 +73,7 @@ def get_head_info(llm):
+         n_heads = llm.config.num_attention_heads
+         n_kv_heads = n_heads
+         head_dim = llm.config.hidden_size // n_heads
+-    elif llm_type == "LlamaForCausalLM":
++    elif llm_type in ("LlamaForCausalLM", "Qwen3ForCausalLM"):
+         n_heads = llm.config.num_attention_heads
+         n_kv_heads = llm.config.num_key_value_heads
+         head_dim = getattr(llm.config, "head_dim", llm.config.hidden_size // n_heads)
+@@ -64,7 +87,7 @@ def get_rotary_emb(llm):
+     llm_type = type(llm).__name__
+     if llm_type == "OPTForCausalLM":
+         rotary_emb = None
+-    elif llm_type == "LlamaForCausalLM":
++    elif llm_type in ("LlamaForCausalLM", "Qwen3ForCausalLM"):
+         rotary_emb = llm.model.rotary_emb
+     else:
+         raise NotImplementedError(f"{llm_type} models are NOT supported.")
+@@ -72,6 +95,103 @@ def get_rotary_emb(llm):
+     return rotary_emb
+ 
+ 
++def install_post_rope_observers(llm):
++    """Expose Q/K tensors after the deployed RoPE/QK-aware transform.
++
++    TurboBoA's copied Llama attention already contains ``rot_out_Q/K``
++    identities.  Stock Qwen3 must be retained to preserve head-wise
++    q_norm/k_norm, so its forward is patched locally.  This function is
++    deliberately called *after* the shared QKRotationWrapper is installed:
++    the existing ``apply_rotary_pos_emb`` callable is wrapped without
++    unwrapping it, preserving the chain
++
++        RMSNorm -> RoPE -> optional shared QK Hadamard/K-QDQ -> observer.
++    """
++    llm_type = type(llm).__name__
++    blocks = get_transformer_blocks(llm)
++    if llm_type == "LlamaForCausalLM":
++        missing = [
++            index
++            for index, block in enumerate(blocks)
++            if not (
++                hasattr(block.self_attn, "rot_out_Q")
++                and hasattr(block.self_attn, "rot_out_K")
++            )
++        ]
++        if missing:
++            raise RuntimeError(
++                "TurboBoA's custom Llama attention is missing native "
++                f"post-RoPE observers on blocks {missing[:8]}."
++            )
++        return
++    if llm_type != "Qwen3ForCausalLM":
++        raise NotImplementedError(
++            f"Post-RoPE observers are not implemented for {llm_type}."
++        )
++
++    for index, block in enumerate(blocks):
++        attention = block.self_attn
++        if bool(
++            getattr(
++                attention,
++                "_turboboa_post_rope_observers_installed",
++                False,
++            )
++        ):
++            continue
++        if hasattr(attention, "rot_out_Q") or hasattr(
++            attention, "rot_out_K"
++        ):
++            raise RuntimeError(
++                "Refusing an ambiguous partial TurboBoA observer install on "
++                f"Qwen3 block {index}."
++            )
++
++        func = attention.forward.__func__
++        # In 4W4A aware mode the shared QK helper has already replaced the
++        # decorated method with a raw copied function containing its wrapper.
++        # In 3W16A mode unwrap the deprecation decorator to reach the forward
++        # that directly calls apply_rotary_pos_emb.
++        if not hasattr(
++            attention,
++            "apply_rotary_pos_emb_qk_rotation_wrapper",
++        ):
++            while hasattr(func, "__wrapped__"):
++                func = func.__wrapped__
++        method_globals = dict(func.__globals__)
++        if "apply_rotary_pos_emb" not in method_globals:
++            raise RuntimeError(
++                "Qwen3 attention forward no longer exposes a direct "
++                "apply_rotary_pos_emb call; TurboBoA observer patch is "
++                f"incompatible with block {index}."
++            )
++
++        rot_out_q = nn.Identity()
++        rot_out_k = nn.Identity()
++        original_apply_rotary = method_globals["apply_rotary_pos_emb"]
++
++        def observed_apply_rotary(
++            *args,
++            _original=original_apply_rotary,
++            _rot_out_q=rot_out_q,
++            _rot_out_k=rot_out_k,
++            **kwargs,
++        ):
++            query, key = _original(*args, **kwargs)
++            return _rot_out_q(query), _rot_out_k(key)
++
++        method_globals["apply_rotary_pos_emb"] = observed_apply_rotary
++        new_forward = shared_monkeypatch.copy_func_with_new_globals(
++            func, globals=method_globals
++        )
++        attention.rot_out_Q = rot_out_q
++        attention.rot_out_K = rot_out_k
++        attention.forward = new_forward.__get__(
++            attention, type(attention)
++        )
++        attention._turboboa_post_rope_observers_installed = True
++
++
+ @torch.no_grad()
+ def cache_first_transformer_input(llm, data):
+     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+@@ -123,7 +243,7 @@ def cache_first_transformer_input(llm, data):
+ 
+ def set_device_before_first_transformer_block(llm, dev):
+     llm_type = type(llm).__name__
+-    if llm_type == "LlamaForCausalLM":
++    if llm_type in ("LlamaForCausalLM", "Qwen3ForCausalLM"):
+         llm.model.embed_tokens = llm.model.embed_tokens.to(dev)
+     elif llm_type == "OPTForCausalLM":
+         llm.model.decoder.embed_tokens = llm.model.decoder.embed_tokens.to(dev) 
+@@ -137,7 +257,7 @@ def set_device_before_first_transformer_block(llm, dev):
+ @torch.no_grad()
+ def get_logits_from_last_hidden_states(llm, hidden_states):
+     llm_type = type(llm).__name__
+-    if llm_type == "LlamaForCausalLM":
++    if llm_type in ("LlamaForCausalLM", "Qwen3ForCausalLM"):
+         if llm.model.norm is not None:
+             hidden_states = llm.model.norm(hidden_states)
+         lm_logits = llm.lm_head(hidden_states)
+@@ -155,7 +275,7 @@ def get_logits_from_last_hidden_states(llm, hidden_states):
+ 
+ def set_device_after_last_transformer_block(llm, dev):
+     llm_type = type(llm).__name__
+-    if llm_type == "LlamaForCausalLM":
++    if llm_type in ("LlamaForCausalLM", "Qwen3ForCausalLM"):
+         if llm.model.norm is not None:
+             llm.model.norm = llm.model.norm.to(dev)
+         llm.lm_head = llm.lm_head.to(dev)
+diff --git a/utils/process_args.py b/utils/process_args.py
+index 634ca42..ccdd015 100644
+--- a/utils/process_args.py
++++ b/utils/process_args.py
+@@ -1,51 +1,257 @@
+ import argparse
+ from pathlib import Path
++import re
+ 
+ import transformers
+ 
+ 
+-def get_turboboa_arguments(**parser_kwargs):
++def get_turboboa_arguments(argv=None, **parser_kwargs):
+     parser = argparse.ArgumentParser(**parser_kwargs)
+ 
+     parser.add_argument("--cache_dir", type=str, default='cache')
+     parser.add_argument("--print_memory_usage", action='store_true')
+     
+     ## Model
+-    parser.add_argument("--llm_path", type=str, default='facebook/opt-125m')
++    parser.add_argument(
++        "--llm_path",
++        type=str,
++        default="modelzoo/Llama/Llama-3.2-1B",
++    )
+     parser.add_argument("--tokenizer_path", type=str, default=None)
+     parser.add_argument("--eval_fp", action='store_true', help='Whether to evaluate the original fp model performance')
+     
+     ## Calib. Data
+-    parser.add_argument('--calib_data', type=str, default="wikitext2", choices=["c4", "wikitext2", "redpajama"])
+-    parser.add_argument('--nsamples', type=int, default=128, help='Number of calibration data samples.')
++    parser.add_argument(
++        '--calib_data',
++        type=str,
++        default="wikitext2",
++        choices=["wikitext2"],
++        help="Controlled comparison calibration dataset (fixed).",
++    )
++    parser.add_argument('--nsamples', type=int, default=256, help='Number of calibration data samples.')
+     parser.add_argument('--seqlen', type=int, default=2048, help='Length of input sequences')
+-    parser.add_argument('--seed', type=int, default=0, help='Seed for sampling the calibration data.')
++    parser.add_argument('--seed', type=int, default=1, help='Seed for sampling the calibration data.')
++    parser.add_argument(
++        "--calib_tokens_file",
++        type=str,
++        default=None,
++        help=(
++            "Existing immutable calibration-token artifact. When provided, "
++            "TurboBoA loads this exact file and never samples or rewrites it."
++        ),
++    )
++    parser.add_argument(
++        "--calib_tokens_sha256",
++        type=str,
++        default=None,
++        help="Required SHA-256 for --calib_tokens_file.",
++    )
++    parser.add_argument(
++        "--require_calibration_cache_hit",
++        action=argparse.BooleanOptionalAction,
++        default=False,
++        help=(
++            "Refuse to regenerate the model-identified calibration-token "
++            "cache. Formal comparison consumers enable this after the "
++            "dedicated artifact producer succeeds."
++        ),
++    )
++    parser.add_argument(
++        "--require_reference_cache_hit",
++        action=argparse.BooleanOptionalAction,
++        default=False,
++        help=(
++            "Refuse to regenerate the model-identified full-precision "
++            "WikiText-2 reference cache."
++        ),
++    )
++    parser.add_argument(
++        "--quant_stop_layer",
++        type=int,
++        default=None,
++        help=(
++            "Inclusive transformer-layer index to stop after. Remaining "
++            "layers stay full precision; intended only for smoke/debug runs."
++        ),
++    )
+ 
+     ## Quant. Configs.
+     parser.add_argument('--w_bits', type=int, default=2)
+-    parser.add_argument('--group_size', type=int, default=-1)
+-    parser.add_argument('--w_sym', action="store_true")
++    parser.add_argument('--group_size', type=int, default=128)
++    parser.add_argument(
++        "--weight_quantizer",
++        choices=["realq_mse", "turboboa"],
++        default="realq_mse",
++        help=(
++            "realq_mse directly reuses the workspace REAL-Q WeightQuantizer "
++            "(signed symmetric MSE/w_clip); turboboa preserves the upstream "
++            "unsigned MinMax/MMSE/Hessian grid implementation."
++        ),
++    )
++    parser.add_argument(
++        '--w_sym',
++        action=argparse.BooleanOptionalAction,
++        default=True,
++    )
+     
+     ## TurboBoA Options
+-    parser.add_argument('--qparam_comput', type=str, default='Hessian', choices=['MinMax', 'MMSE', 'Hessian'], help="How to determine Quant. Params")
+-    parser.add_argument('--block_v', action="store_true", help="Whether to apply block-wise objective for the value projection. De-activate this option in memory-limited cases")
++    parser.add_argument(
++        '--qparam_comput',
++        type=str,
++        default='RealQ-MSE',
++        choices=['RealQ-MSE', 'MinMax', 'MMSE', 'Hessian'],
++        help=(
++            "How to determine starting quantization grids. RealQ-MSE is "
++            "required by --weight_quantizer realq_mse."
++        ),
++    )
++    parser.add_argument(
++        '--block_v',
++        action=argparse.BooleanOptionalAction,
++        default=True,
++        help="Whether to apply the block-wise objective for value projection.",
++    )
+     parser.add_argument('--n_quant_rows', type=int, default=16, help="Number of jointly quantized out-channels (feature 1).")
+-    parser.add_argument('--consider_dX', action='store_true', help='Whether to consider the input deviation induced by the quantization of preceding layers (feature 2).')
++    parser.add_argument(
++        '--consider_dX',
++        action=argparse.BooleanOptionalAction,
++        default=True,
++        help='Whether to compensate preceding-layer input deviation (F2).',
++    )
+     parser.add_argument('--alpha', type=float, default=.25, help='Percent of the residual term (feature 2). GPTAQ heuristic.')
+-    parser.add_argument('--adaptive_qparam', action='store_true', help='Whether to determine qparam adaptively to match the updated distribution (feature 3).')
+-    parser.add_argument('--refine_qparam', action='store_true', help='Whether to refine qparam after assigning integer weights (feature 3).')
++    parser.add_argument(
++        '--adaptive_qparam',
++        action=argparse.BooleanOptionalAction,
++        default=True,
++        help='Whether to adapt qparams to updated weights (F3).',
++    )
++    parser.add_argument(
++        '--refine_qparam',
++        action=argparse.BooleanOptionalAction,
++        default=True,
++        help='Whether to refine scales after integer assignment (F3).',
++    )
+     parser.add_argument('--n_iters', type=int, default=1, help='Number of iterations for coordinate descent-based scale refinement (feature 3).')
+-    parser.add_argument('--act_order_col', action='store_true')
+-    parser.add_argument('--act_order_row', action='store_true')
++    parser.add_argument(
++        '--act_order_col',
++        action=argparse.BooleanOptionalAction,
++        default=True,
++    )
++    parser.add_argument(
++        '--act_order_row',
++        action=argparse.BooleanOptionalAction,
++        default=False,
++    )
+ 
+     parser.add_argument('--replace', type=float, default=1, help='Value to be replaced for the Hessian diagonal elements corresponding to dead neurons')
++    parser.add_argument(
++        "--qk_rmsnorm_hessian_mode",
++        choices=["mean_jacobian_kfac"],
++        default="mean_jacobian_kfac",
++        help=(
++            "Qwen3 q_norm/k_norm output-factor pullback.  The only "
++            "controlled mode is the documented per-head mean-Jacobian "
++            "Gauss--Newton/KFAC extension."
++        ),
++    )
++
++    # Shared QuaRot / activation-aware runtime.  These names intentionally
++    # match REAL-Q's Config so its implementation can be reused directly.
++    parser.add_argument(
++        "--rotate",
++        action=argparse.BooleanOptionalAction,
++        default=True,
++    )
++    parser.add_argument("--rotation_seed", type=int, default=0)
++    parser.add_argument("--global_seed", type=int, default=1)
++    parser.add_argument(
++        "--deterministic",
++        action=argparse.BooleanOptionalAction,
++        default=False,
++        help="Enable the formal deterministic PyTorch/CUDA contract.",
++    )
++    parser.add_argument("--optimized_rotation_path", type=str, default=None)
++    parser.add_argument("--a_bits", type=int, default=16)
++    parser.add_argument("--a_groupsize", type=int, default=-1)
++    parser.add_argument(
++        "--a_asym",
++        action=argparse.BooleanOptionalAction,
++        default=False,
++    )
++    parser.add_argument("--a_clip_ratio", type=float, default=None)
++    parser.add_argument("--v_bits", type=int, default=16)
++    parser.add_argument("--v_groupsize", type=int, default=-1)
++    parser.add_argument(
++        "--v_asym",
++        action=argparse.BooleanOptionalAction,
++        default=False,
++    )
++    parser.add_argument("--v_clip_ratio", type=float, default=None)
++    parser.add_argument("--k_bits", type=int, default=16)
++    parser.add_argument("--k_groupsize", type=int, default=-1)
++    parser.add_argument(
++        "--k_asym",
++        action=argparse.BooleanOptionalAction,
++        default=False,
++    )
++    parser.add_argument("--k_clip_ratio", type=float, default=None)
++    parser.add_argument(
++        "--act_quant_aware_gptq",
++        action=argparse.BooleanOptionalAction,
++        default=False,
++    )
++    parser.add_argument(
++        "--k_cache_quant_aware_gptq",
++        action=argparse.BooleanOptionalAction,
++        default=False,
++    )
+     
+-    # LM Eval Arguments
+-    parser.add_argument("--lm_eval", action="store_true", help="Evaluate the model on LM Eval tasks.")
+-    parser.add_argument('--tasks', nargs='+', default=["piqa", "hellaswag", "arc_easy", "arc_challenge", "winogrande", "lambada_openai", "lambada_standard", "openbookqa", "boolq"])
+-    parser.add_argument('--lm_eval_batch_size', default="auto", help='Batch size for evaluating with lm eval harness.')
++    # Controlled evaluation. The task list lives in utils.eval_utils and is
++    # intentionally not user-overridable.
++    parser.add_argument(
++        "--skip_eval",
++        action=argparse.BooleanOptionalAction,
++        default=False,
++        help="Skip FP-reference capture and all evaluation (smoke/debug only).",
++    )
++    parser.add_argument(
++        "--eval_seq_len",
++        type=int,
++        default=2048,
++        help="WikiText-2 KL/PPL sequence length.",
++    )
++    parser.add_argument(
++        "--lm_eval",
++        action=argparse.BooleanOptionalAction,
++        default=False,
++        help="Evaluate the fixed ten paper tasks after KL/PPL.",
++    )
++    parser.add_argument(
++        '--lm_eval_batch_size',
++        type=int,
++        default=8,
++        help='Per-GPU batch size for lm-eval-harness.',
++    )
++    parser.add_argument(
++        "--results_path",
++        type=str,
++        default=None,
++        help=(
++            "Atomic JSON result destination. When omitted, a model/config "
++            "identified path under output/turboboa is used."
++        ),
++    )
++    parser.add_argument(
++        "--save_qmodel_path",
++        type=str,
++        default=None,
++        help=(
++            "Atomic shared-format checkpoint destination for the quantized "
++            "weights plus A/V/K runtime manifest."
++        ),
++    )
+     
+-    args = parser.parse_args()
++    args = parser.parse_args(argv)
+ 
+     Path(args.cache_dir).mkdir(parents=True, exist_ok=True)
+ 
+@@ -55,8 +261,84 @@ def get_turboboa_arguments(**parser_kwargs):
+     args.llm_type = args.llm_name.split('-')[0]
+     args.tokenizer_cls = transformers.AutoTokenizer
+ 
+-    if args.group_size != -1:
+-        args.act_order_col = False
++    if args.weight_quantizer == "realq_mse":
++        if args.qparam_comput != "RealQ-MSE":
++            parser.error(
++                "--weight_quantizer realq_mse requires "
++                "--qparam_comput RealQ-MSE; Hessian/MMSE grid selection would "
++                "not be the shared REAL-Q quantizer."
++            )
++        if not args.w_sym:
++            parser.error("--weight_quantizer realq_mse requires --w_sym.")
++    elif args.qparam_comput == "RealQ-MSE":
++        parser.error(
++            "--qparam_comput RealQ-MSE requires "
++            "--weight_quantizer realq_mse."
++        )
++
++    if args.group_size != -1 and args.act_order_col and args.act_order_row:
++        parser.error(
++            "Simultaneous grouped column and row act-order is outside the "
++            "controlled comparison. Use the fixed protocol "
++            "--act_order_col --no-act_order_row."
++        )
++
++    if args.group_size != -1 and args.group_size <= 0:
++        parser.error("--group_size must be -1 or a positive integer.")
++    if not 2 <= args.w_bits <= 16:
++        parser.error("--w_bits must be in [2, 16].")
++    if args.n_iters < 1:
++        parser.error("--n_iters must be positive.")
++    if args.nsamples <= 0:
++        parser.error("--nsamples must be positive.")
++    if args.seqlen <= 0:
++        parser.error("--seqlen must be positive.")
++    if args.eval_seq_len <= 0:
++        parser.error("--eval_seq_len must be positive.")
++    if args.lm_eval_batch_size <= 0:
++        parser.error("--lm_eval_batch_size must be positive.")
++    if args.quant_stop_layer is not None and args.quant_stop_layer < 0:
++        parser.error("--quant_stop_layer must be non-negative.")
++    if args.skip_eval and args.lm_eval:
++        parser.error("--skip_eval cannot be combined with --lm_eval.")
++    if args.skip_eval and args.eval_fp:
++        parser.error("--skip_eval cannot be combined with --eval_fp.")
++    if (args.calib_tokens_file is None) != (
++        args.calib_tokens_sha256 is None
++    ):
++        parser.error(
++            "--calib_tokens_file and --calib_tokens_sha256 must be supplied "
++            "together."
++        )
++    if args.calib_tokens_sha256 is not None:
++        args.calib_tokens_sha256 = args.calib_tokens_sha256.lower()
++        if re.fullmatch(r"[0-9a-f]{64}", args.calib_tokens_sha256) is None:
++            parser.error("--calib_tokens_sha256 must be 64 lowercase hex digits.")
++
++    for tensor_name in ("a", "v", "k"):
++        bits = getattr(args, f"{tensor_name}_bits")
++        groupsize = getattr(args, f"{tensor_name}_groupsize")
++        if not 2 <= bits <= 16:
++            parser.error(
++                f"--{tensor_name}_bits must be in [2, 16]; got {bits}."
++            )
++        if groupsize != -1 and groupsize <= 0:
++            parser.error(
++                f"--{tensor_name}_groupsize must be -1 or positive; "
++                f"got {groupsize}."
++            )
++        ratio_name = f"{tensor_name}_clip_ratio"
++        ratio = getattr(args, ratio_name)
++        if ratio is None:
++            ratio = 0.9 if bits < 16 else 1.0
++            setattr(args, ratio_name, ratio)
++        if not 0.0 < ratio <= 1.0:
++            parser.error(f"--{ratio_name} must be in (0, 1]; got {ratio}.")
++
++    if args.k_cache_quant_aware_gptq and args.k_bits >= 16:
++        parser.error(
++            "--k_cache_quant_aware_gptq requires --k_bits < 16."
++        )
+ 
+     args.replace = 1 / args.seqlen
+ 
+@@ -67,7 +349,8 @@ def get_turboboa_weight_quant_infos(args):
+     qconfigs = {
+         "w_bits": args.w_bits,
+         "group_size": args.group_size,
+-        "w_sym": args.w_sym
++        "w_sym": args.w_sym,
++        "weight_quantizer": args.weight_quantizer,
+     }
+     turboboa_opts = {
+         "qparam_comput": args.qparam_comput,
+@@ -88,7 +371,11 @@ def get_turboboa_weight_quant_infos(args):
+ 
+ def set_qmodel_path(args, qmodel_dir="qmodels"):
+     qmodel_dir += "/boa" if args.n_quant_rows == 1 else "/turboboa"
+-    qmodel_name = f"{args.llm_name}-w{args.w_bits}g{args.group_size}-{args.calib_data}-{args.qparam_comput.lower()}-n_quant_rows_{args.n_quant_rows}"
++    qmodel_name = (
++        f"{args.llm_name}-w{args.w_bits}g{args.group_size}-"
++        f"{args.calib_data}-{args.weight_quantizer}-"
++        f"{args.qparam_comput.lower()}-n_quant_rows_{args.n_quant_rows}"
++    )
+     if args.group_size == -1:
+         qmodel_name = qmodel_name.replace("g-1", "")
+     if args.consider_dX:
+diff --git a/utils/quant_utils.py b/utils/quant_utils.py
+index 66f7a4b..578c71b 100644
+--- a/utils/quant_utils.py
++++ b/utils/quant_utils.py
+@@ -86,6 +86,170 @@ def optimize_group_qparams(Q, W_org, H_in, dXXT, scale, zero, maxq):
+     return scale, Q
+ 
+ 
++def refine_grouped_qparams(
++    W,
++    Q,
++    H_in,
++    H_out,
++    dXXT,
++    scale,
++    centered_codes,
++    n_iters=1,
++):
++    """Coordinate-descent scale refinement for grouped TurboBoA weights.
++
++    Upstream's two F3 routines only update scales when ``n_groups == 1``.
++    This is the same closed-form coordinate minimizer applied to each
++    ``(head, output-row, natural-input-group)`` scale while holding the
++    integer codes and every other scale fixed.
++
++    With ``H_out is None`` the objective is the GPTQ/GPTAQ quadratic.  With
++    ``H_out`` present it is TurboBoA's Kronecker row/column quadratic:
++
++    ``tr(H_out @ dW @ H_in @ dW.T)``
++
++    plus the existing ``dXXT`` residual term.  The derivation assumes the
++    damped Hessians are symmetric, matching the solver's Cholesky contract.
++    Degenerate zero-code coordinates have a zero denominator and are left
++    unchanged instead of producing NaNs.
++    """
++    if W.ndim != 4 or Q.shape != W.shape or centered_codes.shape != W.shape:
++        raise ValueError(
++            "Grouped F3 expects W, Q, and centered_codes with the same "
++            f"4-D shape; got {W.shape}, {Q.shape}, {centered_codes.shape}."
++        )
++    n_heads, n_rows, n_groups, group_size = W.shape
++    expected_scale_shape = (n_heads, n_rows, n_groups, 1)
++    if tuple(scale.shape) != expected_scale_shape:
++        raise ValueError(
++            "Grouped F3 scale shape mismatch: expected "
++            f"{expected_scale_shape}, got {tuple(scale.shape)}."
++        )
++    hidden_size = n_groups * group_size
++    if H_in.ndim == 2:
++        H_in = H_in.unsqueeze(0)
++    if H_in.ndim != 3 or H_in.shape[-2:] != (hidden_size, hidden_size):
++        raise ValueError(
++            "H_in must be [heads|1, hidden, hidden]; got "
++            f"{tuple(H_in.shape)} for hidden={hidden_size}."
++        )
++    if H_in.shape[0] not in (1, n_heads):
++        raise ValueError(
++            f"H_in has {H_in.shape[0]} heads, expected 1 or {n_heads}."
++        )
++    if dXXT is not None:
++        if dXXT.ndim == 2:
++            dXXT = dXXT.unsqueeze(0)
++        if (
++            dXXT.ndim != 3
++            or dXXT.shape[-2:] != (hidden_size, hidden_size)
++            or dXXT.shape[0] not in (1, n_heads)
++        ):
++            raise ValueError(
++                "dXXT must match H_in's [heads|1, hidden, hidden] "
++                f"contract; got {tuple(dXXT.shape)}."
++            )
++    if H_out is not None:
++        if H_out.ndim == 2:
++            H_out = H_out.unsqueeze(0)
++        if tuple(H_out.shape) != (n_heads, n_rows, n_rows):
++            raise ValueError(
++                "H_out must be [heads, rows, rows]; expected "
++                f"{(n_heads, n_rows, n_rows)}, got {tuple(H_out.shape)}."
++            )
++    if not isinstance(n_iters, int) or n_iters < 1:
++        raise ValueError(f"n_iters must be a positive integer; got {n_iters}.")
++
++    W_flat = W.reshape(n_heads, n_rows, hidden_size)
++    Q_flat = Q.reshape(n_heads, n_rows, hidden_size)
++    code_flat = centered_codes.reshape(n_heads, n_rows, hidden_size)
++    for _ in range(n_iters):
++        # All heads are independent coordinates and can be updated together.
++        # H_in/dXXT may have one common head and broadcast over weight heads.
++        residual_h = (W_flat - Q_flat) @ H_in
++        weight_dx = None if dXXT is None else W_flat @ dXXT
++        h_weight_dx = (
++            None
++            if weight_dx is None or H_out is None
++            else H_out @ weight_dx
++        )
++
++        for group_idx in range(n_groups):
++            start = group_idx * group_size
++            end = start + group_size
++            codes = code_flat[:, :, start:end]
++            h_group_all = H_in[:, start:end, :]
++            h_group = H_in[:, start:end, start:end]
++            code_h_code = ((codes @ h_group) * codes).sum(dim=-1)
++
++            if H_out is None:
++                numerator = (
++                    residual_h[:, :, start:end] * codes
++                ).sum(dim=-1)
++                if weight_dx is not None:
++                    numerator = numerator + (
++                        weight_dx[:, :, start:end] * codes
++                    ).sum(dim=-1)
++                denominator = code_h_code
++                old_scale = scale[:, :, group_idx, 0]
++                delta_scale = numerator / denominator
++                valid = (
++                    torch.isfinite(numerator)
++                    & torch.isfinite(denominator)
++                    & (denominator > 0)
++                    & torch.isfinite(old_scale + delta_scale)
++                )
++                delta_scale = torch.where(
++                    valid, delta_scale, torch.zeros_like(delta_scale)
++                )
++                scale[:, :, group_idx, 0] = old_scale + delta_scale
++                delta_q = delta_scale.unsqueeze(-1) * codes
++                Q_flat[:, :, start:end] += delta_q
++                residual_h -= delta_q @ h_group_all
++                continue
++
++            # H_out couples output rows within each head, so rows remain
++            # sequential Gauss-Seidel coordinates while heads are batched.
++            for row_idx in range(n_rows):
++                code = codes[:, row_idx, :]
++                row_coupled = (
++                    residual_h[:, :, start:end]
++                    @ code.unsqueeze(-1)
++                ).squeeze(-1)
++                numerator = (
++                    row_coupled * H_out[:, :, row_idx]
++                ).sum(dim=-1)
++                if h_weight_dx is not None:
++                    numerator = numerator + (
++                        h_weight_dx[:, row_idx, start:end] * code
++                    ).sum(dim=-1)
++                denominator = (
++                    H_out[:, row_idx, row_idx]
++                    * code_h_code[:, row_idx]
++                )
++                old_scale = scale[:, row_idx, group_idx, 0]
++                delta_scale = numerator / denominator
++                valid = (
++                    torch.isfinite(numerator)
++                    & torch.isfinite(denominator)
++                    & (denominator > 0)
++                    & torch.isfinite(old_scale + delta_scale)
++                )
++                delta_scale = torch.where(
++                    valid, delta_scale, torch.zeros_like(delta_scale)
++                )
++                scale[:, row_idx, group_idx, 0] = (
++                    old_scale + delta_scale
++                )
++                delta_q = delta_scale.unsqueeze(-1) * code
++                Q_flat[:, row_idx, start:end] += delta_q
++                residual_h[:, row_idx, :] -= (
++                    delta_q.unsqueeze(1) @ h_group_all
++                ).squeeze(1)
++
++    return Q_flat.reshape_as(Q), scale
++
++
+ def compute_loss_degradation(W, Q, H_in, H_row, dXXT):
+     if len(W.shape) == 4:
+         n_heads, head_dim, n_groups, group_size = W.shape
+diff --git a/utils/utils.py b/utils/utils.py
+index 65c2510..f917b62 100644
+--- a/utils/utils.py
++++ b/utils/utils.py
+@@ -2,7 +2,29 @@ import torch
+ from torch import nn
+ 
+ 
+-def find_layers(module, layers=[nn.Conv2d, nn.Linear, nn.Embedding], name=''):
++def find_layers(
++    module,
++    layers=(nn.Conv2d, nn.Linear, nn.Embedding),
++    name="",
++):
++    """Find canonical quantized layers, treating ActQuantWrapper as a leaf.
++
++    QuaRot/A-aware setup replaces ``q_proj`` with
++    ``ActQuantWrapper(q_proj_linear)``. Descending into that wrapper would
++    relabel the layer as ``q_proj.module`` and break TurboBoA's canonical QKV
++    lookup. Returning the inner Linear under the wrapper's original name also
++    makes Hessian hooks observe the activation *after* wrapper fake quant.
++    """
++    from utils.quant_utils import ActQuantWrapper
++
++    if isinstance(module, ActQuantWrapper):
++        inner = module.module
++        if type(inner) in layers:
++            return {name: inner}
++        raise TypeError(
++            "TurboBoA only supports an ActQuantWrapper around a configured "
++            f"leaf layer; got inner type {type(inner).__name__} at {name!r}."
++        )
+     if type(module) in layers:
+         return {name: module}
+     res = {}
+diff --git a/__init__.py b/__init__.py
+new file mode 100644
+index 0000000..b014090
+--- /dev/null
++++ b/__init__.py
+@@ -0,0 +1,9 @@
++"""TurboBoA integration package.
++
++The upstream release is laid out as a script directory and imports modules
++such as ``utils`` by their top-level name.  In this workspace that name is
++owned by REAL-Q's shared utilities, so TurboBoA is intentionally a package
++and all of its internal imports are relative.  Launch it from the workspace
++root with ``python -m turboBOA.main``.
++"""
++
+diff --git a/custom_modelings/__init__.py b/custom_modelings/__init__.py
+new file mode 100644
+index 0000000..b577a0d
+--- /dev/null
++++ b/custom_modelings/__init__.py
+@@ -0,0 +1,2 @@
++"""Modeling variants required by TurboBoA covariance collection."""
++
+diff --git a/quantizers/__init__.py b/quantizers/__init__.py
+new file mode 100644
+index 0000000..b826fdc
+--- /dev/null
++++ b/quantizers/__init__.py
+@@ -0,0 +1,2 @@
++"""TurboBoA weight solvers and quantizer adapters."""
++
+diff --git a/quantizers/realq_mse.py b/quantizers/realq_mse.py
+new file mode 100644
+index 0000000..a16fcdf
+--- /dev/null
++++ b/quantizers/realq_mse.py
+@@ -0,0 +1,208 @@
++"""Adapter for REAL-Q's exact symmetric MSE weight quantizer.
++
++This module intentionally imports the quantizer from the workspace-level
++``utils`` package instead of copying its arithmetic.  The comparison protocol
++requires the two methods to share the *same implementation*, including its
++signed integer range, clipping-grid traversal, tie handling, and natural
++column grouping.
++
++TurboBoA asks a quantizer to observe tensors with extra leading head/row
++dimensions.  :class:`RealQMSEQuantizer` only reshapes those leading dimensions
++to the two-dimensional ``(rows, columns)`` contract of
++``utils.quant_utils.WeightQuantizer`` and reshapes the resulting qparams back.
++No quantization formula is reimplemented here.
++"""
++
++from __future__ import annotations
++
++import torch
++
++from utils.quant_utils import (
++    WeightQuantizer as _SharedWeightQuantizer,
++    sym_quant as _shared_sym_quant,
++    sym_quant_dequant as _shared_sym_quant_dequant,
++)
++
++
++class RealQMSEQuantizer(_SharedWeightQuantizer):
++    """TurboBoA-facing view of REAL-Q's shared ``WeightQuantizer``.
++
++    ``find_params_H*`` deliberately ignores TurboBoA's Hessian/search flags:
++    using a Hessian or TurboBoA's MMSE grid to choose scales would change the
++    quantizer and invalidate the controlled comparison.  TurboBoA still owns
++    all row/column compensation and optional F3 scale refinement after the
++    shared MSE observer has selected its starting grid.
++    """
++
++    mode_name = "realq_mse"
++
++    def configure(
++        self,
++        n_bits: int,
++        per_channel: bool = True,
++        group_size: int = -1,
++        sym: bool = True,
++        mse: bool = True,
++        norm: float = 2.4,
++        grid: int = 50,
++        maxshrink: float = 0.5,
++    ) -> None:
++        if not sym:
++            raise ValueError(
++                "RealQMSEQuantizer is symmetric-only; pass --w_sym."
++            )
++        if not mse:
++            raise ValueError(
++                "RealQMSEQuantizer always enables REAL-Q's MSE/w_clip search."
++            )
++        if norm != 2.4 or grid != 50 or maxshrink != 0.5:
++            raise ValueError(
++                "The controlled REAL-Q comparison fixes norm=2.4, grid=50, "
++                "and maxshrink=0.5."
++            )
++        if group_size != -1 and group_size <= 0:
++            raise ValueError(
++                f"group_size must be -1 or positive; got {group_size}."
++            )
++
++        self.n_bits = int(n_bits)
++        self.group_size = int(group_size)
++        super().configure(
++            bits=self.n_bits,
++            perchannel=bool(per_channel),
++            sym=True,
++            mse=True,
++            norm=norm,
++            grid=grid,
++            maxshrink=maxshrink,
++            weight_groupsize=self.group_size,
++            # Compact storage is an exact representation of the shared
++            # natural-column qparams and matches TurboBoA's one-scale-per-
++            # (output row, weight group) state shape.
++            w_group_param_layout="compact",
++        )
++
++    def _new_shared_observer(self, group_size: int) -> _SharedWeightQuantizer:
++        observer = _SharedWeightQuantizer()
++        observer.configure(
++            bits=self.n_bits,
++            perchannel=True,
++            sym=True,
++            mse=True,
++            norm=self.norm,
++            grid=self.grid,
++            maxshrink=self.maxshrink,
++            weight_groupsize=group_size,
++            w_group_param_layout="compact",
++        )
++        return observer
++
++    def _observe(
++        self,
++        weight: torch.Tensor,
++        *,
++        group_size: int,
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        if weight.ndim < 2:
++            raise ValueError(
++                "REAL-Q weight observation requires at least two dimensions; "
++                f"got shape={tuple(weight.shape)}."
++            )
++        columns = int(weight.shape[-1])
++        flat = weight.reshape(-1, columns)
++        if group_size > 0 and columns % group_size != 0:
++            raise ValueError(
++                "TurboBoA's grouped solver requires complete weight groups; "
++                f"columns={columns} is not divisible by group_size={group_size}."
++            )
++        observer = self._new_shared_observer(group_size)
++        observer.find_params(flat)
++        return observer.scale, observer.zero
++
++    def find_params_H(
++        self,
++        weight: torch.Tensor,
++        H_in: torch.Tensor | None,
++        search: bool,
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        """Observe one current TurboBoA group with REAL-Q MSE.
++
++        ``H_in`` and ``search`` are accepted only for API compatibility.
++        """
++        del H_in, search
++        leading_shape = weight.shape[:-1]
++        scale, zero = self._observe(weight, group_size=-1)
++        return (
++            scale.reshape(*leading_shape, 1),
++            zero.reshape(*leading_shape, 1),
++        )
++
++    def find_params_H_group(
++        self,
++        weight: torch.Tensor,
++        H_in: torch.Tensor | None,
++        search: bool,
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        """Observe all natural groups while preserving leading row axes."""
++        del H_in, search
++        if weight.ndim < 3:
++            raise ValueError(
++                "Grouped TurboBoA observation expects [..., groups, width]; "
++                f"got shape={tuple(weight.shape)}."
++            )
++        n_groups, group_width = map(int, weight.shape[-2:])
++        if self.group_size == -1:
++            if n_groups != 1:
++                raise ValueError(
++                    "Per-row REAL-Q quantization expects one logical group; "
++                    f"got n_groups={n_groups}."
++                )
++            observer_group_size = -1
++        else:
++            if group_width != self.group_size:
++                raise ValueError(
++                    "TurboBoA group width and configured REAL-Q group size "
++                    f"differ: {group_width} != {self.group_size}."
++                )
++            observer_group_size = self.group_size
++
++        leading_shape = weight.shape[:-2]
++        flat_weight = weight.reshape(-1, n_groups * group_width)
++        scale, zero = self._observe(
++            flat_weight,
++            group_size=observer_group_size,
++        )
++        return (
++            scale.reshape(*leading_shape, n_groups, 1),
++            zero.reshape(*leading_shape, n_groups, 1),
++        )
++
++    def quantize_int(
++        self,
++        x: torch.Tensor,
++        scale: torch.Tensor,
++        zero: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        """Return REAL-Q's signed integer codes."""
++        del zero
++        q, _ = _shared_sym_quant(x, scale, self.maxq)
++        return q
++
++    @staticmethod
++    def center_int(
++        q: torch.Tensor,
++        zero: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        del zero
++        return q
++
++    def fake_quantize_values(
++        self,
++        x: torch.Tensor,
++        scale: torch.Tensor,
++        zero: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        """Use the shared signed QDQ primitive without duplicating it."""
++        del zero
++        return _shared_sym_quant_dequant(x, scale, self.maxq)
++
+diff --git a/tests/test_controlled_entrypoint.py b/tests/test_controlled_entrypoint.py
+new file mode 100644
+index 0000000..5535be2
+--- /dev/null
++++ b/tests/test_controlled_entrypoint.py
+@@ -0,0 +1,352 @@
++from __future__ import annotations
++
++import json
++import hashlib
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++
++torch = pytest.importorskip("torch")
++
++from turboBOA import main as entrypoint
++from turboBOA.utils import experiment_utils
++from turboBOA.utils.process_args import get_turboboa_arguments
++from utils import eval_utils as shared_eval_utils
++
++
++def _args(tmp_path, *extra):
++    return get_turboboa_arguments(
++        [
++            "--llm_path",
++            "modelzoo/Llama/Llama-3.2-1B",
++            "--cache_dir",
++            str(tmp_path / "cache"),
++            "--results_path",
++            str(tmp_path / "result.json"),
++            *extra,
++        ]
++    )
++
++
++def test_controlled_cli_defaults_and_fixed_eval_surface(tmp_path):
++    args = _args(tmp_path)
++    assert args.act_quant_aware_gptq is False
++    assert args.k_cache_quant_aware_gptq is False
++    assert args.lm_eval_batch_size == 8
++    assert isinstance(args.lm_eval_batch_size, int)
++    assert args.eval_seq_len == 2048
++    assert args.quant_stop_layer is None
++    assert args.skip_eval is False
++    assert args.require_calibration_cache_hit is False
++    assert args.require_reference_cache_hit is False
++    assert not hasattr(args, "tasks")
++
++    stopped = _args(tmp_path, "--quant_stop_layer", "0", "--skip_eval")
++    assert stopped.quant_stop_layer == 0
++    assert stopped.skip_eval is True
++
++    with pytest.raises(SystemExit):
++        _args(tmp_path, "--tasks", "piqa")
++
++
++def test_prepare_args_fixes_full_vocab_and_exact_paper_tasks(tmp_path):
++    args = _args(tmp_path)
++    experiment_utils.prepare_shared_args(args)
++    assert args.kl_topk == -1
++    assert args.eval_datasets == ["wikitext2"]
++    assert args.tasks == list(shared_eval_utils.PAPER_QA_TASKS)
++    assert len(args.tasks) == 10
++
++
++def test_shared_calibration_uses_model_identity_cache(monkeypatch, tmp_path):
++    args = _args(
++        tmp_path,
++        "--nsamples",
++        "2",
++        "--seqlen",
++        "4",
++    )
++    experiment_utils.prepare_shared_args(args)
++    calls = []
++
++    def fake_get_tokens(
++        dataset,
++        split,
++        tokenizer,
++        seq_len,
++        num_samples,
++        save_path=None,
++        seed=0,
++    ):
++        calls.append(
++            (dataset, split, seq_len, num_samples, save_path, seed)
++        )
++        return [
++            torch.arange(seq_len),
++            torch.arange(seq_len) + 10,
++        ]
++
++    monkeypatch.setattr(
++        experiment_utils.shared_data_utils,
++        "get_tokens",
++        fake_get_tokens,
++    )
++    calibration = experiment_utils.load_shared_calibration(
++        args, SimpleNamespace(tokenizer=object())
++    )
++    assert len(calibration) == 2
++    assert calibration[0][0].shape == (1, 4)
++    assert calls[0][:4] == ("wikitext2", "train", 4, 2)
++    assert args.model_identity[:16] in calls[0][4]
++    assert calls[0][5] == args.seed
++
++
++def test_required_calibration_cache_hit_refuses_regeneration(
++    monkeypatch, tmp_path
++):
++    args = _args(
++        tmp_path,
++        "--nsamples",
++        "2",
++        "--seqlen",
++        "4",
++        "--require_calibration_cache_hit",
++    )
++    experiment_utils.prepare_shared_args(args)
++    monkeypatch.setattr(
++        experiment_utils.shared_data_utils,
++        "get_tokens",
++        lambda *_args, **_kwargs: pytest.fail(
++            "cache-miss path must fail before token regeneration"
++        ),
++    )
++    with pytest.raises(
++        RuntimeError, match="Required calibration-token cache hit"
++    ):
++        experiment_utils.load_shared_calibration(
++            args, SimpleNamespace(tokenizer=object())
++        )
++
++
++def test_explicit_calibration_is_loaded_by_path_and_sha(monkeypatch, tmp_path):
++    artifact = tmp_path / "tokens.pt"
++    torch.save(
++        [torch.arange(4, dtype=torch.int64), torch.arange(4, dtype=torch.int64)],
++        artifact,
++    )
++    digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
++    args = _args(
++        tmp_path,
++        "--nsamples",
++        "2",
++        "--seqlen",
++        "4",
++        "--calib_tokens_file",
++        str(artifact),
++        "--calib_tokens_sha256",
++        digest,
++    )
++    experiment_utils.prepare_shared_args(args)
++    monkeypatch.setattr(
++        experiment_utils.shared_data_utils,
++        "get_tokens",
++        lambda *_args, **_kwargs: pytest.fail("must not resample explicit tokens"),
++    )
++    calibration = experiment_utils.load_shared_calibration(
++        args, SimpleNamespace(tokenizer=object())
++    )
++    assert len(calibration) == 2
++    assert calibration[0][0].shape == (1, 4)
++    assert args.calib_tokens_file == str(artifact.resolve())
++    assert args.calib_tokens_sha256 == digest
++
++
++def test_entrypoint_orders_reference_before_transform_and_eval_last(
++    monkeypatch, tmp_path
++):
++    args = _args(tmp_path)
++    events = []
++
++    class LlamaForCausalLM:
++        def eval(self):
++            events.append("model_eval")
++            return self
++
++    model = LlamaForCausalLM()
++    analyzer = SimpleNamespace(model=model, tokenizer=object())
++    reference = object()
++    calibration = [object()]
++
++    def prepare(local_args):
++        events.append("prepare_args")
++        local_args.model_identity = "identity"
++        local_args.model_name = "model"
++        local_args.model = local_args.llm_path
++        local_args.eval_datasets = ["wikitext2"]
++        local_args.kl_topk = -1
++        local_args.tasks = list(shared_eval_utils.PAPER_QA_TASKS)
++
++    monkeypatch.setattr(entrypoint, "prepare_shared_args", prepare)
++    monkeypatch.setattr(
++        entrypoint,
++        "get_model",
++        lambda _path: events.append("load_model") or model,
++    )
++    monkeypatch.setattr(
++        entrypoint.shared_model_utils,
++        "ModelAnalyzer",
++        lambda *_args, **_kwargs: events.append("analyzer") or analyzer,
++    )
++    monkeypatch.setattr(
++        entrypoint,
++        "load_shared_calibration",
++        lambda *_args: events.append("calibration") or calibration,
++    )
++    monkeypatch.setattr(
++        entrypoint,
++        "capture_fp_reference",
++        lambda *_args: events.append("fp_reference") or reference,
++    )
++    monkeypatch.setattr(
++        entrypoint.shared_rotation_utils,
++        "prepare_model_for_rotated_quantization",
++        lambda *_args: events.append("rotate"),
++    )
++    monkeypatch.setattr(
++        entrypoint.akv,
++        "setup_aware_pre_quant",
++        lambda *_args: events.append("aware"),
++    )
++    monkeypatch.setattr(
++        entrypoint,
++        "install_post_rope_observers",
++        lambda *_args: events.append("post_rope_observers"),
++    )
++    monkeypatch.setattr(
++        entrypoint,
++        "turboboa_fwrd",
++        lambda _model, calib, *_args: (
++            pytest.fail("wrong calibration")
++            if calib is not calibration
++            else events.append("quantize")
++        ),
++    )
++    monkeypatch.setattr(
++        entrypoint.akv,
++        "setup_unaware_post_quant",
++        lambda *_args: events.append("post_quant"),
++    )
++    def evaluate(_args, _analyzer, ref):
++        if ref is not reference:
++            pytest.fail("wrong reference")
++        events.append("evaluate")
++        return {"wikitext2": {"kl_raw": 0.1, "ppl": 2.0}}
++
++    monkeypatch.setattr(entrypoint, "evaluate_shared", evaluate)
++    monkeypatch.setattr(
++        entrypoint,
++        "build_result_payload",
++        lambda *_args, **_kwargs: {"ok": True, "runtime_seconds": {}},
++    )
++    monkeypatch.setattr(
++        entrypoint,
++        "atomic_write_json",
++        lambda *_args: events.append("json"),
++    )
++
++    result = entrypoint.run(args)
++    assert result["ok"] is True
++    assert result["runtime_seconds"]["post_quant_wrapper_setup"] >= 0.0
++    assert events.index("calibration") < events.index("fp_reference")
++    assert events.index("fp_reference") < events.index("rotate")
++    assert events.index("rotate") < events.index("aware")
++    assert events.index("aware") < events.index("quantize")
++    assert events.index("quantize") < events.index("post_quant")
++    assert events.index("post_quant") < events.index("evaluate")
++    assert events.index("evaluate") < events.index("json")
++
++
++def test_fixed_qa_failure_is_not_swallowed(monkeypatch):
++    args = SimpleNamespace(
++        kl_topk=-1,
++        lm_eval=True,
++        lm_eval_batch_size=8,
++    )
++
++    class Model:
++        def cpu(self):
++            return self
++
++    analyzer = SimpleNamespace(model=Model(), tokenizer=object())
++    reference = SimpleNamespace(
++        orig_lm_head=object(),
++        test_loader=object(),
++        ref_hidden=object(),
++    )
++    monkeypatch.setattr(
++        experiment_utils.shared_eval_utils,
++        "_kl_ppl_eval",
++        lambda *_args: (3.0, 0.25),
++    )
++    monkeypatch.setattr(
++        experiment_utils.shared_dist_utils,
++        "distribute_model",
++        lambda *_args: None,
++    )
++
++    def fail_qa(*_args):
++        raise RuntimeError("task failed")
++
++    monkeypatch.setattr(
++        experiment_utils.shared_eval_utils,
++        "qa_eval",
++        fail_qa,
++    )
++    with pytest.raises(RuntimeError, match="task failed"):
++        experiment_utils.evaluate_shared(args, analyzer, reference)
++
++
++def test_atomic_json_is_strict_and_leaves_no_temporary_file(tmp_path):
++    destination = tmp_path / "nested" / "result.json"
++    payload = {
++        "schema_version": 1,
++        "metrics": {"kl_raw": 0.125, "ppl": 3.5},
++    }
++    experiment_utils.atomic_write_json(destination, payload)
++    assert json.loads(destination.read_text()) == payload
++    assert list(destination.parent.glob(f".{destination.name}.*.tmp")) == []
++
++
++def test_result_payload_is_json_serializable(tmp_path):
++    args = _args(tmp_path)
++    experiment_utils.prepare_shared_args(args)
++    payload = experiment_utils.build_result_payload(
++        args,
++        metrics={
++            "wikitext2": {
++                "kl_raw": 0.125,
++                "kl_x100": 12.5,
++                "ppl": 3.5,
++            },
++            "lm_eval": None,
++        },
++        quantization_seconds=1.25,
++        total_seconds=2.5,
++        precompute_and_rotation_seconds=0.75,
++        algorithm_seconds=2.0,
++    )
++    destination = tmp_path / "payload.json"
++    experiment_utils.atomic_write_json(destination, payload)
++    loaded = json.loads(destination.read_text())
++    assert loaded["method"] == "TurboBoA"
++    assert loaded["model"]["identity"] == args.model_identity
++    assert loaded["configuration"]["tokenizer_cls"].endswith(
++        ".AutoTokenizer"
++    )
++    assert loaded["runtime_seconds"][
++        "algorithm_including_precompute_excluding_eval"
++    ] == 2.0
++    assert loaded["gpu_hours"][
++        "algorithm_including_precompute_excluding_eval"
++    ] == pytest.approx(2.0 / 3600.0)
+diff --git a/tests/test_custom_llama_456.py b/tests/test_custom_llama_456.py
+new file mode 100644
+index 0000000..ab2af89
+--- /dev/null
++++ b/tests/test_custom_llama_456.py
+@@ -0,0 +1,108 @@
++import pytest
++
++torch = pytest.importorskip("torch")
++transformers = pytest.importorskip("transformers")
++
++
++def test_custom_llama_imports_with_pinned_transformers():
++    assert transformers.__version__ == "4.56.2"
++
++    from turboBOA.custom_modelings.modeling_llama import LlamaForCausalLM
++
++    assert LlamaForCausalLM.__name__ == "LlamaForCausalLM"
++
++
++def test_tiny_llama_forward_calls_post_rope_observers():
++    assert transformers.__version__ == "4.56.2"
++
++    from transformers.models.llama.configuration_llama import LlamaConfig
++
++    from turboBOA.custom_modelings.modeling_llama import LlamaForCausalLM
++
++    config = LlamaConfig(
++        vocab_size=32,
++        hidden_size=16,
++        intermediate_size=32,
++        num_hidden_layers=1,
++        num_attention_heads=4,
++        num_key_value_heads=2,
++        max_position_embeddings=32,
++        attention_dropout=0.0,
++        tie_word_embeddings=False,
++    )
++    config._attn_implementation = "eager"
++    model = LlamaForCausalLM(config).eval()
++    attention = model.model.layers[0].self_attn
++
++    observed = {}
++
++    def save_query(_module, _inputs, output):
++        observed["query"] = output.detach()
++
++    def save_key(_module, _inputs, output):
++        observed["key"] = output.detach()
++
++    handles = [
++        attention.rot_out_Q.register_forward_hook(save_query),
++        attention.rot_out_K.register_forward_hook(save_key),
++    ]
++    try:
++        input_ids = torch.tensor([[1, 2, 3, 4]])
++        with torch.no_grad():
++            outputs = model(
++                input_ids=input_ids,
++                use_cache=False,
++                output_attentions=True,
++            )
++    finally:
++        for handle in handles:
++            handle.remove()
++
++    assert outputs.logits.shape == (1, 4, 32)
++    assert len(outputs.attentions) == 1
++    assert outputs.attentions[0].shape == (1, 4, 4, 4)
++    assert observed["query"].shape == (1, 4, 4, 4)
++    assert observed["key"].shape == (1, 2, 4, 4)
++
++
++def test_direct_decoder_forward_keeps_turboboa_tuple_contract():
++    assert transformers.__version__ == "4.56.2"
++
++    from transformers.models.llama.configuration_llama import LlamaConfig
++
++    from turboBOA.custom_modelings.modeling_llama import LlamaForCausalLM
++
++    config = LlamaConfig(
++        vocab_size=32,
++        hidden_size=16,
++        intermediate_size=32,
++        num_hidden_layers=1,
++        num_attention_heads=4,
++        num_key_value_heads=2,
++        max_position_embeddings=32,
++        attention_dropout=0.0,
++        tie_word_embeddings=False,
++    )
++    config._attn_implementation = "eager"
++    model = LlamaForCausalLM(config).eval()
++    input_ids = torch.tensor([[1, 2, 3, 4]])
++    hidden_states = model.model.embed_tokens(input_ids)
++    position_ids = torch.arange(4).unsqueeze(0)
++    position_embeddings = model.model.rotary_emb(
++        hidden_states, position_ids
++    )
++
++    with torch.no_grad():
++        outputs = model.model.layers[0](
++            hidden_states,
++            attention_mask=None,
++            position_ids=position_ids,
++            output_attentions=True,
++            use_cache=False,
++            cache_position=torch.arange(4),
++            position_embeddings=position_embeddings,
++        )
++
++    assert isinstance(outputs, tuple)
++    assert outputs[0].shape == (1, 4, 16)
++    assert outputs[-1].shape == (1, 4, 4, 4)
+diff --git a/tests/test_grouped_refine.py b/tests/test_grouped_refine.py
+new file mode 100644
+index 0000000..6e3798c
+--- /dev/null
++++ b/tests/test_grouped_refine.py
+@@ -0,0 +1,258 @@
++import pytest
++
++torch = pytest.importorskip("torch")
++
++from turboBOA.utils.quant_utils import (
++    compute_loss_degradation,
++    refine_grouped_qparams,
++)
++
++
++def _spd(size, generator):
++    matrix = torch.randn(size, size, generator=generator)
++    return matrix @ matrix.T + 0.5 * torch.eye(size)
++
++
++@pytest.mark.parametrize("attention_aware", [False, True])
++@pytest.mark.parametrize("with_residual", [False, True])
++def test_grouped_coordinate_refine_never_increases_objective(
++    attention_aware, with_residual
++):
++    generator = torch.Generator().manual_seed(20260725)
++    n_heads = 2 if attention_aware else 1
++    n_rows, n_groups, group_width = 3, 3, 2
++    hidden = n_groups * group_width
++    weight = torch.randn(
++        n_heads, n_rows, n_groups, group_width, generator=generator
++    )
++    codes = torch.randint(
++        -3,
++        4,
++        (n_heads, n_rows, n_groups, group_width),
++        generator=generator,
++    ).float()
++    codes[..., 0] += 1
++    scale = (
++        0.1
++        + torch.rand(
++            n_heads, n_rows, n_groups, 1, generator=generator
++        )
++    )
++    quantized = scale * codes
++    h_in = torch.stack([_spd(hidden, generator) for _ in range(n_heads)])
++    h_out = (
++        torch.stack([_spd(n_rows, generator) for _ in range(n_heads)])
++        if attention_aware
++        else None
++    )
++    d_xxt = (
++        0.01
++        * torch.randn(
++            n_heads, hidden, hidden, generator=generator
++        )
++        if with_residual
++        else None
++    )
++
++    before = compute_loss_degradation(
++        weight, quantized, h_in, h_out, d_xxt
++    )
++    refined_q, refined_scale = refine_grouped_qparams(
++        weight,
++        quantized.clone(),
++        h_in,
++        h_out,
++        d_xxt,
++        scale.clone(),
++        codes,
++        n_iters=2,
++    )
++    after = compute_loss_degradation(
++        weight, refined_q, h_in, h_out, d_xxt
++    )
++
++    assert torch.isfinite(refined_q).all()
++    assert torch.isfinite(refined_scale).all()
++    assert after <= before + 2e-5 * before.abs().clamp_min(1)
++    assert torch.allclose(
++        refined_q,
++        refined_scale * codes,
++        atol=1e-6,
++        rtol=1e-6,
++    )
++
++
++def test_zero_code_coordinate_is_left_finite_and_unchanged():
++    weight = torch.randn(1, 2, 2, 2)
++    codes = torch.zeros_like(weight)
++    scale = torch.ones(1, 2, 2, 1)
++    quantized = scale * codes
++    h_in = torch.eye(4).unsqueeze(0)
++    refined_q, refined_scale = refine_grouped_qparams(
++        weight,
++        quantized.clone(),
++        h_in,
++        None,
++        None,
++        scale.clone(),
++        codes,
++    )
++    assert torch.equal(refined_q, quantized)
++    assert torch.equal(refined_scale, scale)
++
++
++def test_noncontiguous_quantized_input_is_returned_with_updates():
++    generator = torch.Generator().manual_seed(7)
++    weight = torch.randn(1, 2, 2, 2, generator=generator)
++    codes_storage = torch.randint(
++        -2, 3, (1, 2, 2, 4), generator=generator
++    ).float()
++    codes = codes_storage[..., ::2]
++    scale = torch.full((1, 2, 2, 1), 0.25)
++    q_storage = torch.zeros(1, 2, 2, 4)
++    q_storage[..., ::2] = scale * codes
++    quantized = q_storage[..., ::2]
++    assert not quantized.is_contiguous()
++    h_in = _spd(4, generator).unsqueeze(0)
++    refined_q, refined_scale = refine_grouped_qparams(
++        weight,
++        quantized,
++        h_in,
++        None,
++        None,
++        scale,
++        codes,
++    )
++    assert torch.allclose(
++        refined_q, refined_scale * codes, atol=1e-6, rtol=1e-6
++    )
++
++
++def test_attention_refine_is_invariant_to_hout_objective_scale():
++    generator = torch.Generator().manual_seed(41)
++    weight = torch.randn(1, 3, 2, 2, generator=generator)
++    codes = torch.randint(
++        -3, 4, weight.shape, generator=generator
++    ).float()
++    codes[..., 0] += 1
++    scale = 0.2 + torch.rand(1, 3, 2, 1, generator=generator)
++    quantized = scale * codes
++    h_in = _spd(4, generator).unsqueeze(0)
++    h_out = _spd(3, generator).unsqueeze(0)
++
++    _, ordinary_scale = refine_grouped_qparams(
++        weight,
++        quantized.clone(),
++        h_in,
++        h_out,
++        None,
++        scale.clone(),
++        codes,
++    )
++    _, tiny_objective_scale = refine_grouped_qparams(
++        weight,
++        quantized.clone(),
++        h_in,
++        h_out * 1e-10,
++        None,
++        scale.clone(),
++        codes,
++    )
++    assert torch.allclose(
++        tiny_objective_scale,
++        ordinary_scale,
++        atol=2e-5,
++        rtol=2e-5,
++    )
++
++
++def test_residual_term_uses_positive_realq_gptaq_sign():
++    # L(s) = (s-1)^2 - 2*.25*(s-1), whose exact minimizer is 1.25.
++    weight = torch.ones(1, 1, 1, 1)
++    codes = torch.ones_like(weight)
++    scale = torch.zeros(1, 1, 1, 1)
++    quantized = scale * codes
++    _, refined_scale = refine_grouped_qparams(
++        weight,
++        quantized,
++        torch.ones(1, 1, 1),
++        None,
++        torch.full((1, 1, 1), 0.25),
++        scale,
++        codes,
++    )
++    assert refined_scale.item() == pytest.approx(1.25)
++
++
++def test_attention_serial_coordinates_match_bruteforce_quadratics():
++    generator = torch.Generator().manual_seed(91)
++    dtype = torch.float64
++    n_rows, n_groups, width = 3, 2, 2
++    hidden = n_groups * width
++    weight = torch.randn(
++        1, n_rows, n_groups, width, generator=generator, dtype=dtype
++    )
++    codes = torch.randint(
++        -2,
++        3,
++        weight.shape,
++        generator=generator,
++    ).to(dtype)
++    codes[codes == 0] = 1
++    scale = (
++        0.2
++        + torch.rand(
++            1, n_rows, n_groups, 1, generator=generator, dtype=dtype
++        )
++    )
++    quantized = scale * codes
++    h_in = _spd(hidden, generator).to(dtype).unsqueeze(0)
++    h_out = _spd(n_rows, generator).to(dtype).unsqueeze(0)
++    # Deliberately non-symmetric: this catches D[:, support] vs D[support, :].
++    d_xxt = (
++        0.05
++        * torch.randn(
++            1, hidden, hidden, generator=generator, dtype=dtype
++        )
++    )
++
++    expected_q = quantized.clone()
++    expected_scale = scale.clone()
++    for group_idx in range(n_groups):
++        start = group_idx * width
++        end = start + width
++        for row_idx in range(n_rows):
++            old_scale = expected_scale[0, row_idx, group_idx, 0]
++
++            def objective_at(candidate):
++                candidate_q = expected_q.clone()
++                candidate_q[0, row_idx, group_idx] = (
++                    candidate * codes[0, row_idx, group_idx]
++                )
++                return compute_loss_degradation(
++                    weight, candidate_q, h_in, h_out, d_xxt
++                )
++
++            center = objective_at(old_scale)
++            minus = objective_at(old_scale - 1)
++            plus = objective_at(old_scale + 1)
++            quadratic = (plus + minus - 2 * center) / 2
++            linear = (plus - minus) / 2
++            optimum = old_scale - linear / (2 * quadratic)
++            expected_scale[0, row_idx, group_idx, 0] = optimum
++            expected_q[0, row_idx, group_idx] = (
++                optimum * codes[0, row_idx, group_idx]
++            )
++
++    actual_q, actual_scale = refine_grouped_qparams(
++        weight,
++        quantized.clone(),
++        h_in,
++        h_out,
++        d_xxt,
++        scale.clone(),
++        codes,
++        n_iters=1,
++    )
++    assert torch.allclose(actual_scale, expected_scale, atol=1e-10, rtol=1e-10)
++    assert torch.allclose(actual_q, expected_q, atol=1e-10, rtol=1e-10)
+diff --git a/tests/test_quarot_aware.py b/tests/test_quarot_aware.py
+new file mode 100644
+index 0000000..3708740
+--- /dev/null
++++ b/tests/test_quarot_aware.py
+@@ -0,0 +1,55 @@
++import pytest
++
++torch = pytest.importorskip("torch")
++
++from turboBOA.quantize import get_rotary_matrix
++from turboBOA.utils.utils import find_layers
++from utils import hadamard_utils
++from utils.quant_utils import ActQuantWrapper
++
++
++class _DummyRotary(torch.nn.Module):
++    def forward(self, _x, position_ids):
++        seq_len = position_ids.shape[-1]
++        angles = torch.linspace(0.1, 0.4, seq_len)
++        cos = torch.cos(angles)[:, None].expand(seq_len, 4).unsqueeze(0)
++        sin = torch.sin(angles)[:, None].expand(seq_len, 4).unsqueeze(0)
++        return cos, sin
++
++
++def test_k_aware_output_transform_is_hadamard_after_rope():
++    config = type(
++        "Config",
++        (),
++        {"head_dim": 4, "hidden_size": 8, "num_attention_heads": 2},
++    )()
++    position_ids = torch.tensor([[0, 1, 2]])
++    rope = get_rotary_matrix(
++        _DummyRotary(), config, position_ids, qk_hadamard=False
++    )
++    transformed = get_rotary_matrix(
++        _DummyRotary(), config, position_ids, qk_hadamard=True
++    )
++    hadamard = hadamard_utils.hadamard_matrix(4, "cpu")
++    expected = hadamard.view(1, 1, 4, 4) @ rope
++    assert torch.allclose(transformed, expected, atol=0, rtol=0)
++
++    # T is orthogonal, so pulling cov(Tx) back with T^T ... T restores
++    # cov(x). This catches both omitted-H and wrong multiplication order.
++    samples = torch.randn(1, 4, 23)
++    for transform in transformed[:, 0]:
++        observed = transform @ samples[0]
++        observed_cov = observed @ observed.T
++        pullback = transform.T @ observed_cov @ transform
++        reference = samples[0] @ samples[0].T
++        assert torch.allclose(pullback, reference, atol=2e-5, rtol=2e-5)
++
++
++def test_find_layers_preserves_wrapper_canonical_name_and_inner_hook_site():
++    inner = torch.nn.Linear(4, 3, bias=False)
++    block = torch.nn.Module()
++    block.self_attn = torch.nn.Module()
++    block.self_attn.q_proj = ActQuantWrapper(inner)
++    layers = find_layers(block)
++    assert set(layers) == {"self_attn.q_proj"}
++    assert layers["self_attn.q_proj"] is inner
+diff --git a/tests/test_realq_mse_adapter.py b/tests/test_realq_mse_adapter.py
+new file mode 100644
+index 0000000..888e0b7
+--- /dev/null
++++ b/tests/test_realq_mse_adapter.py
+@@ -0,0 +1,150 @@
++import pytest
++
++torch = pytest.importorskip("torch")
++
++from turboBOA.quantize import build_weight_quantizer
++from turboBOA.quantizers.realq_mse import RealQMSEQuantizer
++from turboBOA.quantizers.turboboa import TurboBoA
++from turboBOA.quantizers.utils import reorder_col, reverse_reorder_col
++from utils.quant_utils import WeightQuantizer
++
++
++def _shared_quantizer(bits, group_size):
++    quantizer = WeightQuantizer()
++    quantizer.configure(
++        bits=bits,
++        perchannel=True,
++        sym=True,
++        mse=True,
++        norm=2.4,
++        grid=50,
++        maxshrink=0.5,
++        weight_groupsize=group_size,
++        w_group_param_layout="compact",
++    )
++    return quantizer
++
++
++@pytest.mark.parametrize("bits", [2, 3, 4])
++@pytest.mark.parametrize("group_size", [-1, 4])
++def test_adapter_is_byte_exact_shared_weight_quantizer(bits, group_size):
++    weight = torch.tensor(
++        [
++            [-2.3, -1.1, -0.7, 0.2, 0.4, 0.9, 1.8, 3.1],
++            [1.7, -2.8, 0.1, 0.5, -0.4, 2.2, -1.4, 0.8],
++            [0.0, 0.3, -0.6, 1.2, -1.8, 2.7, -3.4, 0.2],
++        ],
++        dtype=torch.float32,
++    )
++    shared = _shared_quantizer(bits, group_size)
++    shared.find_params(weight)
++
++    adapter = RealQMSEQuantizer()
++    adapter.configure(
++        bits,
++        per_channel=True,
++        group_size=group_size,
++        sym=True,
++        mse=True,
++    )
++    adapter.find_params(weight)
++
++    assert torch.equal(adapter.maxq, shared.maxq)
++    assert torch.equal(adapter.scale, shared.scale)
++    assert torch.equal(adapter.zero, shared.zero)
++
++    shared_qdq, shared_codes, _ = shared.fake_quantize(weight)
++    n_groups = 1 if group_size == -1 else weight.shape[1] // group_size
++    width = weight.shape[1] // n_groups
++    grouped_weight = weight.reshape(weight.shape[0], n_groups, width)
++    grouped_scale = adapter.scale.reshape(weight.shape[0], n_groups, 1)
++    grouped_zero = adapter.zero.reshape(weight.shape[0], n_groups, 1)
++    adapter_codes = adapter.quantize_int(
++        grouped_weight, grouped_scale, grouped_zero
++    )
++    adapter_qdq = adapter.fake_quantize_values(
++        grouped_weight, grouped_scale, grouped_zero
++    )
++    assert torch.equal(adapter_codes.reshape_as(weight), shared_codes)
++    assert torch.equal(adapter_qdq.reshape_as(weight), shared_qdq)
++    assert int(adapter_codes.min()) >= -(int(adapter.maxq) + 1)
++    assert int(adapter_codes.max()) <= int(adapter.maxq)
++
++
++def test_factory_observes_same_fp32_tensor_as_realq():
++    weight = torch.tensor(
++        [[-2.0, -0.2, 0.7, 1.4], [1.1, -0.8, 0.3, -1.7]],
++        dtype=torch.float16,
++    )
++    configs = {
++        "weight_quantizer": "realq_mse",
++        "w_bits": 3,
++        "group_size": 2,
++        "w_sym": True,
++    }
++    actual = build_weight_quantizer(configs, weight)
++    expected = _shared_quantizer(bits=3, group_size=2)
++    expected.find_params(weight.float())
++    assert torch.equal(actual.scale, expected.scale)
++    assert torch.equal(actual.zero, expected.zero)
++
++
++def test_global_act_order_keeps_natural_group_scale_membership():
++    first_head = torch.tensor(
++        [
++            [
++                [[0.20, 0.45], [1.20, 1.55], [-0.30, -0.75], [2.10, 2.60]],
++                [[-0.15, -0.55], [0.90, 1.40], [0.35, 0.80], [-2.20, -2.75]],
++            ]
++        ],
++        dtype=torch.float32,
++    )
++    # Multiple weight heads share one input Hessian/permutation (the Q/K
++    # projection shape); this exercises natural_columns expansion.
++    weight = torch.cat([first_head, -0.7 * first_head], dim=0)
++    hidden = weight.shape[-2] * weight.shape[-1]
++    # The descending order crosses every natural two-column group.
++    hessian = torch.diag(
++        torch.tensor([1.0, 8.0, 2.0, 7.0, 3.0, 6.0, 4.0, 5.0])
++    ).unsqueeze(0)
++    ordered_w, ordered_h, _, perm, invperm = reorder_col(
++        weight, hessian, None
++    )
++
++    quantizer = RealQMSEQuantizer()
++    quantizer.configure(
++        3, per_channel=True, group_size=2, sym=True, mse=True
++    )
++    quantizer.find_params(weight.reshape(4, hidden))
++    scale = quantizer.scale.reshape(2, 2, 4, 1)
++    zero = quantizer.zero.reshape(2, 2, 4, 1)
++
++    layer = torch.nn.Linear(hidden, 4, bias=False)
++    opts = {
++        "qparam_comput": "RealQ-MSE",
++        "adaptive_qparam": False,
++        "refine_qparam": False,
++        "n_iters": 1,
++        "consider_dX": False,
++        "alpha": 0.25,
++        "n_quant_rows": 2,
++        "act_order_col": True,
++        "act_order_row": False,
++    }
++    solver = TurboBoA(layer, opts, {"replace": 1 / 32})
++    solver.quantizer = quantizer
++    ordered_q, returned_scale, _ = solver.gptq(
++        ordered_w,
++        ordered_h,
++        torch.diag_embed(
++            torch.diagonal(ordered_h, dim1=-2, dim2=-1).rsqrt()
++        ),
++        None,
++        natural_columns=perm,
++        fixed_scale=scale,
++        fixed_zero=zero,
++    )
++    restored_q = reverse_reorder_col(ordered_q, invperm)
++    expected_q = quantizer.fake_quantize_values(weight, scale, zero)
++    assert torch.equal(returned_scale, scale)
++    assert torch.equal(restored_q, expected_q)
+diff --git a/utils/__init__.py b/utils/__init__.py
+new file mode 100644
+index 0000000..ce957b0
+--- /dev/null
++++ b/utils/__init__.py
+@@ -0,0 +1,6 @@
++"""TurboBoA-local helpers.
++
++Use relative imports for this package.  The unqualified top-level ``utils``
++package deliberately continues to refer to REAL-Q's shared implementation.
++"""
++
+diff --git a/utils/experiment_utils.py b/utils/experiment_utils.py
+new file mode 100644
+index 0000000..8496a08
+--- /dev/null
++++ b/utils/experiment_utils.py
+@@ -0,0 +1,378 @@
++"""Controlled REAL-Q-compatible data, evaluation, and result helpers.
++
++The TurboBoA solver remains independent.  This module owns only the shared
++experiment protocol: exact calibration tokens, the pre-transform FP
++reference, paper evaluation, and durable machine-readable output.
++"""
++from __future__ import annotations
++
++import importlib.metadata
++import hashlib
++import json
++import os
++import random
++import tempfile
++from datetime import datetime, timezone
++from pathlib import Path
++from types import SimpleNamespace
++from typing import Any
++
++import numpy as np
++import torch
++
++from utils import data_utils as shared_data_utils
++from utils import dist_utils as shared_dist_utils
++from utils import eval_utils as shared_eval_utils
++from utils.cache_identity import artifact_cache_tag, artifact_identity
++
++
++def prepare_shared_args(args) -> None:
++    """Populate the names consumed by REAL-Q's shared helpers."""
++    args.model = args.llm_path
++    args.model_name = Path(args.llm_path.rstrip("/")).name or "model"
++    args.eval_datasets = ["wikitext2"]
++    # The controlled evaluator is deliberately full vocabulary.
++    args.kl_topk = -1
++    args.tasks = list(shared_eval_utils.PAPER_QA_TASKS)
++    args.model_identity = artifact_identity(args.llm_path)
++
++    if getattr(args, "deterministic", False):
++        seed = int(args.global_seed)
++        expected_hash_seed = str(seed)
++        if os.environ.get("PYTHONHASHSEED") != expected_hash_seed:
++            raise RuntimeError(
++                "Formal deterministic TurboBoA requires PYTHONHASHSEED="
++                f"{expected_hash_seed} before process startup."
++            )
++        workspace_config = ":4096:8"
++        current_workspace_config = os.environ.get("CUBLAS_WORKSPACE_CONFIG")
++        if current_workspace_config not in (None, workspace_config):
++            raise RuntimeError(
++                "CUBLAS_WORKSPACE_CONFIG conflicts with the formal contract: "
++                f"{current_workspace_config!r}"
++            )
++        os.environ["CUBLAS_WORKSPACE_CONFIG"] = workspace_config
++        random.seed(seed)
++        np.random.seed(seed)
++        torch.manual_seed(seed)
++        if torch.cuda.is_available():
++            torch.cuda.manual_seed_all(seed)
++        torch.use_deterministic_algorithms(True)
++        torch.backends.cudnn.benchmark = False
++        torch.backends.cudnn.deterministic = True
++        torch.backends.cuda.matmul.allow_tf32 = False
++        torch.backends.cudnn.allow_tf32 = False
++        args.determinism_contract = {
++            "enabled": True,
++            "global_seed": seed,
++            "python_hash_seed": seed,
++            "python_random_seed": seed,
++            "numpy_random_seed": seed,
++            "cublas_workspace_config": workspace_config,
++            "torch_deterministic_algorithms": True,
++            "cudnn_benchmark": False,
++            "cudnn_deterministic": True,
++            "allow_tf32": False,
++        }
++    else:
++        args.determinism_contract = {"enabled": False}
++
++    if args.results_path is None:
++        identity_tag = args.model_identity[:12]
++        filename = (
++            f"{args.model_name}-{identity_tag}"
++            f"-w{args.w_bits}a{args.a_bits}k{args.k_bits}v{args.v_bits}"
++            f"-g{args.group_size}-seed{args.seed}.json"
++        )
++        args.results_path = str(
++            Path("output") / "turboboa" / filename
++        )
++
++
++def _sha256_file(path: Path) -> str:
++    digest = hashlib.sha256()
++    with path.open("rb") as handle:
++        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
++            digest.update(chunk)
++    return digest.hexdigest()
++
++
++def _load_explicit_calibration(args) -> list[torch.Tensor] | None:
++    configured = getattr(args, "calib_tokens_file", None)
++    if configured is None:
++        return None
++    token_path = Path(configured).resolve()
++    if not token_path.is_file():
++        raise RuntimeError(
++            f"Explicit calibration-token artifact is missing: {token_path}"
++        )
++    expected_sha = str(args.calib_tokens_sha256).lower()
++    actual_sha = _sha256_file(token_path)
++    if actual_sha != expected_sha:
++        raise RuntimeError(
++            "Explicit calibration-token SHA-256 mismatch: "
++            f"{actual_sha} != {expected_sha}"
++        )
++    try:
++        tokens = torch.load(token_path, map_location="cpu", weights_only=True)
++    except TypeError:
++        tokens = torch.load(token_path, map_location="cpu")
++    if type(tokens) is not list or len(tokens) != int(args.nsamples):
++        raise RuntimeError(
++            "Explicit calibration artifact must be a list with exactly "
++            f"{args.nsamples} samples."
++        )
++    for index, token in enumerate(tokens):
++        if (
++            not isinstance(token, torch.Tensor)
++            or token.dtype != torch.int64
++            or token.device.type != "cpu"
++            or token.ndim != 1
++            or tuple(token.shape) != (int(args.seqlen),)
++        ):
++            raise RuntimeError(
++                "Invalid explicit calibration sample at index "
++                f"{index}: type={type(token).__qualname__}, "
++                f"dtype={getattr(token, 'dtype', None)}, "
++                f"shape={getattr(token, 'shape', None)}, "
++                f"device={getattr(token, 'device', None)}"
++            )
++    args.calib_tokens_file = str(token_path)
++    args.calib_tokens_sha256 = actual_sha
++    return tokens
++
++
++def load_shared_calibration(args, analyzer):
++    """Load the same model-identified WikiText-2 tokens as REAL-Q."""
++    if args.calib_data != "wikitext2":
++        raise ValueError(
++            "The controlled TurboBoA comparison fixes calibration to "
++            f"wikitext2; got {args.calib_data!r}."
++        )
++    tokens = _load_explicit_calibration(args)
++    if tokens is None:
++        identity_tag = artifact_cache_tag(args.llm_path, length=16)
++        token_path = (
++            Path(args.cache_dir)
++            / "tokens"
++            / (
++                f"{args.model_name}_{identity_tag}_wikitext2_train"
++                f"_n{args.nsamples}_sl{args.seqlen}_seed{args.seed}.pt"
++            )
++        )
++        if (
++            getattr(args, "require_calibration_cache_hit", False)
++            and not token_path.is_file()
++        ):
++            raise RuntimeError(
++                "Required calibration-token cache hit was unavailable: "
++                f"{token_path}. Run the dedicated artifact producer successfully "
++                "before formal TurboBoA consumers."
++            )
++        tokens = shared_data_utils.get_tokens(
++            "wikitext2",
++            "train",
++            analyzer.tokenizer,
++            args.seqlen,
++            args.nsamples,
++            save_path=str(token_path),
++            seed=args.seed,
++        )
++    calibration = []
++    for index, token in enumerate(tokens):
++        if token.ndim != 1 or token.numel() != args.seqlen:
++            raise RuntimeError(
++                "REAL-Q calibration cache returned an invalid token sample "
++                f"at index {index}: shape={tuple(token.shape)}, "
++                f"expected=({args.seqlen},)."
++            )
++        calibration.append((token.unsqueeze(0),))
++    if len(calibration) != args.nsamples:
++        raise RuntimeError(
++            "REAL-Q calibration cache returned the wrong sample count: "
++            f"{len(calibration)} != {args.nsamples}."
++        )
++    return calibration
++
++
++def capture_fp_reference(args, analyzer):
++    """Capture the unmodified model reference before QuaRot or fake quant."""
++    test_loader = shared_data_utils.get_loaders(
++        "wikitext2",
++        "test",
++        analyzer.tokenizer,
++        args.eval_seq_len,
++        args.nsamples,
++        args.seed,
++    )
++    ref_hidden, orig_lm_head = shared_eval_utils.get_ref_logits(
++        args,
++        analyzer,
++        "wikitext2",
++        test_loader,
++    )
++    return SimpleNamespace(
++        test_loader=test_loader,
++        ref_hidden=ref_hidden,
++        orig_lm_head=orig_lm_head,
++    )
++
++
++def evaluate_shared(args, analyzer, reference) -> dict[str, Any]:
++    """Run full-vocabulary WikiText-2 KL/PPL, then optional paper QA."""
++    if int(args.kl_topk) > 0:
++        raise ValueError(
++            "Controlled TurboBoA evaluation requires full-vocabulary KL "
++            "(kl_topk <= 0)."
++        )
++
++    # Layer-streaming KL/PPL must run before Accelerate dispatches the model.
++    analyzer.model.cpu()
++    ppl, kl_raw = shared_eval_utils._kl_ppl_eval(
++        args,
++        analyzer,
++        reference.orig_lm_head,
++        reference.test_loader,
++        reference.ref_hidden,
++    )
++    metrics: dict[str, Any] = {
++        "wikitext2": {
++            "kl_raw": float(kl_raw),
++            "kl_x100": float(kl_raw) * 100.0,
++            "ppl": float(ppl),
++        },
++        "lm_eval": None,
++    }
++
++    if args.lm_eval:
++        shared_dist_utils.distribute_model(analyzer.model)
++        qa_results = shared_eval_utils.qa_eval(
++            analyzer.model,
++            analyzer.tokenizer,
++            args.lm_eval_batch_size,
++        )
++        expected = list(shared_eval_utils.PAPER_QA_TASKS)
++        actual = [name for name in qa_results if name != "acc_avg"]
++        if actual != expected or "acc_avg" not in qa_results:
++            raise RuntimeError(
++                "qa_eval returned a result outside the fixed ten-task paper "
++                f"protocol: expected={expected!r}, actual={actual!r}."
++            )
++        metrics["lm_eval"] = {
++            "tasks": {
++                name: float(qa_results[name])
++                for name in expected
++            },
++            "acc_avg": float(qa_results["acc_avg"]),
++        }
++    return metrics
++
++
++def _package_version(distribution: str) -> str | None:
++    try:
++        return importlib.metadata.version(distribution)
++    except importlib.metadata.PackageNotFoundError:
++        return None
++
++
++def _jsonable(value: Any) -> Any:
++    if value is None or isinstance(value, (str, int, float, bool)):
++        return value
++    if isinstance(value, os.PathLike):
++        return os.fspath(value)
++    if isinstance(value, dict):
++        return {
++            str(key): _jsonable(item)
++            for key, item in value.items()
++        }
++    if isinstance(value, (list, tuple)):
++        return [_jsonable(item) for item in value]
++    if isinstance(value, type):
++        return f"{value.__module__}.{value.__qualname__}"
++    return str(value)
++
++
++def build_result_payload(
++    args,
++    *,
++    metrics: dict[str, Any] | None,
++    quantization_seconds: float,
++    total_seconds: float,
++    precompute_and_rotation_seconds: float | None = None,
++    algorithm_seconds: float | None = None,
++) -> dict[str, Any]:
++    config = {
++        key: _jsonable(value)
++        for key, value in vars(args).items()
++    }
++    runtime_seconds = {
++        "quantization": float(quantization_seconds),
++        "total": float(total_seconds),
++    }
++    gpu_hours = {}
++    if precompute_and_rotation_seconds is not None:
++        runtime_seconds["precompute_and_rotation"] = float(
++            precompute_and_rotation_seconds
++        )
++    if algorithm_seconds is not None:
++        runtime_seconds[
++            "algorithm_including_precompute_excluding_eval"
++        ] = float(algorithm_seconds)
++        # Controlled TurboBoA runs are single-GPU. This is deliberately
++        # sealed before evaluation, so lm-eval and KL/PPL are excluded.
++        gpu_hours[
++            "algorithm_including_precompute_excluding_eval"
++        ] = float(algorithm_seconds) / 3600.0
++
++    payload = {
++        "schema_version": 1,
++        "created_at": datetime.now(timezone.utc).isoformat(),
++        "method": "TurboBoA",
++        "status": "completed" if metrics is not None else "quantized_only",
++        "model": {
++            "path": args.llm_path,
++            "identity": args.model_identity,
++        },
++        "configuration": config,
++        "runtime_seconds": runtime_seconds,
++        "metrics": metrics,
++        "versions": {
++            "torch": _package_version("torch"),
++            "transformers": _package_version("transformers"),
++            "datasets": _package_version("datasets"),
++            "lm_eval": _package_version("lm-eval"),
++        },
++    }
++    if gpu_hours:
++        payload["gpu_hours"] = gpu_hours
++    return payload
++
++
++def atomic_write_json(path: str | os.PathLike, payload: dict[str, Any]) -> None:
++    """Atomically publish a strict JSON result on the target filesystem."""
++    destination = Path(path)
++    destination.parent.mkdir(parents=True, exist_ok=True)
++    fd, temporary = tempfile.mkstemp(
++        dir=destination.parent,
++        prefix=f".{destination.name}.",
++        suffix=".tmp",
++    )
++    try:
++        with os.fdopen(fd, "w", encoding="utf-8") as handle:
++            json.dump(
++                payload,
++                handle,
++                ensure_ascii=False,
++                indent=2,
++                sort_keys=True,
++                allow_nan=False,
++            )
++            handle.write("\n")
++            handle.flush()
++            os.fsync(handle.fileno())
++        os.replace(temporary, destination)
++    finally:
++        try:
++            os.unlink(temporary)
++        except FileNotFoundError:
++            pass
