@@ -6578,36 +6578,65 @@ class ModuleGradSecondMoment:
             handle.remove()
         self._handles = []
 
+    # Order of the per-rank statistics row; `rank_stats` is exposed so the
+    # caller can print every rank's contribution on one line.
+    STAT_FIELDS = ("samples", "tokens", "fwd", "grad", "skipped", "max|sum_g|")
+
     def all_reduce_(self):
         """Make the accumulator describe the global calibration set.
 
         Under DP each rank only forwards its own shard, and with
         dp_global_shuffle a rank may legitimately see none of a given refresh
-        batch. gbar and Var_s are properties of the whole set, so the sums and
-        the sample count have to be summed across ranks before build_prior
-        reads them. Returns the global sample count.
+        batch. gbar and Var_s are properties of the whole set, so the sums have
+        to be summed across ranks before build_prior reads them.
+
+        Counters are gathered per rank rather than summed into one number:
+        "the prior is zero" means something different when one rank measured
+        nothing than when all of them did, and a single total hides which.
+        Returns the global sample count.
         """
+        local = [
+            float(self.sample_count), float(self.token_count),
+            float(self.fwd_calls), float(self.grad_calls),
+            float(self.grad_skipped),
+            float(self.sum_g.abs().max().item()) if self.sum_g.numel() else 0.0,
+        ]
         if not (dist.is_available() and dist.is_initialized()):
+            self.rank_stats = [local]
             return self.sample_count
-        packed = torch.cat([
-            self.sum_g.reshape(-1),
-            self.sum_g2.reshape(-1),
-            torch.tensor(
-                [float(self.sample_count), float(self.token_count),
-                 float(self.grad_calls), float(self.grad_skipped)],
-                dtype=self.sum_g.dtype, device=self.sum_g.device,
-            ),
-        ])
+
+        world = dist_utils.get_world_size()
+        rank = dist_utils.get_rank()
+        stats = torch.zeros(
+            world, len(local), dtype=torch.float32, device=self.sum_g.device
+        )
+        stats[rank] = torch.tensor(local, dtype=torch.float32, device=self.sum_g.device)
+        dist_utils.allreduce_sum_(stats)
+        self.rank_stats = stats.tolist()
+
+        packed = torch.cat([self.sum_g.reshape(-1), self.sum_g2.reshape(-1)])
         dist_utils.allreduce_sum_(packed)
         n = self.sum_g.numel()
         self.sum_g.copy_(packed[:n].view_as(self.sum_g))
         self.sum_g2.copy_(packed[n:2 * n].view_as(self.sum_g2))
-        tail = packed[2 * n:]
-        self.sample_count = int(tail[0].item())
-        self.token_count = int(tail[1].item())
-        self.grad_calls = int(tail[2].item())
-        self.grad_skipped = int(tail[3].item())
+
+        totals = stats.sum(dim=0)
+        self.sample_count = int(totals[0].item())
+        self.token_count = int(totals[1].item())
+        self.fwd_calls = int(totals[2].item())
+        self.grad_calls = int(totals[3].item())
+        self.grad_skipped = int(totals[4].item())
         return self.sample_count
+
+    def format_rank_stats(self):
+        rows = getattr(self, "rank_stats", None)
+        if not rows:
+            return "n/a"
+        return " | ".join(
+            "r%d s=%d fwd=%d grad=%d skip=%d max|g|=%s"
+            % (r, int(v[0]), int(v[2]), int(v[3]), int(v[4]), format_log_value(v[5]))
+            for r, v in enumerate(rows)
+        )
 
     def build_prior(self, batch_size):
         """Exact value of what Adam's exp_avg_sq estimates, at batch size B.
@@ -9921,20 +9950,26 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             logging.info(
                                 "warm_adam pre-pass layer=%d module=%s samples=%d "
                                 "tokens=%d fwd=%d grad=%d skipped=%d B=%d t0=%d "
-                                "prior_median=%s prior_max=%s",
+                                "prior_median=%s prior_max=%s || per-rank: %s",
                                 i, name, _pre.sample_count, _pre.token_count,
                                 _pre.fwd_calls, _pre.grad_calls, _pre.grad_skipped,
                                 _B, warm_start_steps,
                                 format_log_value(grad_sq_full.median().item()),
                                 format_log_value(grad_sq_full.max().item()),
+                                _pre.format_rank_stats(),
                             )
-                            if _pre.grad_calls == 0:
+                            # An all-zero prior disables the preconditioner while
+                            # looking like a normal run, so treat it as fatal and
+                            # report the per-rank breakdown that tells the two
+                            # causes apart: no gradient hook ran at all, or one
+                            # ran and the gradient it saw was zero.
+                            if float(grad_sq_full.abs().max().item()) == 0.0:
                                 raise RuntimeError(
-                                    f"warm_adam pre-pass for {name}: the forward hook "
-                                    f"ran {_pre.fwd_calls} times but the gradient hook "
-                                    f"never contributed ({_pre.grad_skipped} rejected). "
-                                    "The prior would be all zeros, which silently "
-                                    "disables the preconditioner."
+                                    f"warm_adam pre-pass for {name} produced an "
+                                    f"all-zero prior (fwd={_pre.fwd_calls} "
+                                    f"grad={_pre.grad_calls} "
+                                    f"skipped={_pre.grad_skipped}). Per-rank: "
+                                    f"{_pre.format_rank_stats()}"
                                 )
 
                         gptq[name].fasterquant(
