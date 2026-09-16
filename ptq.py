@@ -42,6 +42,13 @@ def main(args):
         torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     dist_utils.init_process_group()
 
+    # Resolve every dataset this run will need before anything expensive.
+    # The eval sets are otherwise only touched after the model is prepared, so a
+    # missing one used to surface minutes into the run.
+    data_utils.ensure_datasets_available(
+        [args.dataset] + ([] if args.skip_eval else list(args.eval_datasets))
+    )
+
     # Read the manifest before preparing the model: ``rotate`` determines
     # which runtime wrappers must be installed, while A/V/K attributes are
     # otherwise absent from state_dict.  Keep the normalized payload so the

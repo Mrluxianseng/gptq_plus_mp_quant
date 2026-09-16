@@ -4,7 +4,128 @@ import logging
 from tqdm import tqdm
 
 import torch
-from datasets import load_dataset
+from datasets import load_dataset, load_from_disk
+
+
+# Where a Hub download is materialised so the next run does not repeat it.
+# Sits under datasets/, which is gitignored, next to the checked-in loaders.
+DATASET_SNAPSHOT_ROOT = os.environ.get(
+    "DATASET_SNAPSHOT_ROOT", os.path.join("datasets", "_hf_snapshots")
+)
+
+# name -> (local loader dir, Hub id, Hub config, split mapper)
+# The local dir is tried first and is authoritative when present, so a machine
+# that already has the data behaves exactly as before.
+_DATASET_SOURCES = {
+    "wikitext2": ("./datasets/wikitext", "wikitext", "wikitext-2-raw-v1"),
+    "neuralmagic": ("./datasets/LLM_compression_calibration",
+                    "neuralmagic/LLM_compression_calibration", None),
+    "ultrachat_2k": ("./datasets/ultrachat_2k", "HuggingFaceH4/ultrachat_200k", None),
+    "numinamath": ("./datasets/NuminaMath-1.5", "AI-MO/NuminaMath-1.5", None),
+}
+
+
+def _offline_reason():
+    """Non-empty when an env var would make a Hub download fail anyway."""
+    for var in ("HF_DATASETS_OFFLINE", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"):
+        if os.environ.get(var, "0") not in ("0", "", "false", "False"):
+            return var
+    return ""
+
+
+def _snapshot_dir(name, config, split):
+    parts = [p for p in (name, config, str(split).replace("/", "_")) if p]
+    return os.path.join(DATASET_SNAPSHOT_ROOT, *parts)
+
+
+def load_split(name, split, hub_split=None):
+    """Load one split, preferring the local loader directory.
+
+    Order: the checked-in local loader dir, then a previously downloaded
+    snapshot, then the Hub (which is then snapshotted so the download happens
+    once per machine).
+
+    `hub_split` overrides the split expression sent to the loader, for callers
+    that slice (e.g. "train[:256]").
+    """
+    if name not in _DATASET_SOURCES:
+        raise ValueError(f"Unknown dataset {name}")
+    local_dir, hub_id, config = _DATASET_SOURCES[name]
+    split_expr = hub_split or split
+
+    if os.path.isdir(local_dir):
+        return load_dataset(local_dir, config, split=split_expr, trust_remote_code=True)
+
+    snap = _snapshot_dir(name, config, split_expr)
+    if os.path.isdir(snap):
+        logging.info("Loading %s[%s] from snapshot %s", name, split_expr, snap)
+        return load_from_disk(snap)
+
+    blocked_by = _offline_reason()
+    if blocked_by:
+        raise RuntimeError(
+            f"Dataset '{name}' is not available locally: '{local_dir}' is missing and "
+            f"no snapshot exists at '{snap}'. A Hub download would be needed, but "
+            f"{blocked_by} is set. Either unset it (e.g. {blocked_by}=0) to allow a "
+            f"one-time download, or place the dataset at '{local_dir}'."
+        )
+
+    logging.info(
+        "Dataset '%s' not found locally; downloading %s (%s)[%s] from the Hub once.",
+        name, hub_id, config or "default", split_expr,
+    )
+    data = load_dataset(hub_id, config, split=split_expr)
+    try:
+        os.makedirs(os.path.dirname(snap) or ".", exist_ok=True)
+        tmp = f"{snap}.tmp.{os.getpid()}"
+        data.save_to_disk(tmp)
+        os.replace(tmp, snap)
+        logging.info("Snapshotted %s[%s] to %s", name, split_expr, snap)
+    except Exception as exc:  # a failed cache write must not fail the run
+        logging.warning("Could not snapshot %s to %s: %s", name, snap, exc)
+    return data
+
+
+def ensure_datasets_available(names, splits=("train", "test")):
+    """Preflight: resolve every dataset this run needs before any real work.
+
+    Loading the calibration set happens early but the eval sets are only touched
+    after the model is prepared, so without this a missing eval dataset surfaces
+    minutes in. Downloads triggered here are the same one-time downloads the
+    loaders would do.
+    """
+    for name in dict.fromkeys(n for n in names if n):
+        if name not in _DATASET_SOURCES:
+            raise ValueError(f"Unknown dataset {name}")
+        local_dir, _, _ = _DATASET_SOURCES[name]
+        ok = False
+        for split in splits:
+            try:
+                load_split(name, split)
+                ok = True
+            except RuntimeError:
+                # Genuinely unavailable: missing locally and a download is
+                # blocked. That is the case this preflight exists to surface.
+                raise
+            except Exception as exc:
+                # Split-name mismatches are expected -- ultrachat uses
+                # train_sft, numinamath slices train -- and the real loaders
+                # pass the right expression. A preflight must never fail a run
+                # that would otherwise work.
+                logging.debug(
+                    "Dataset check: %s[%s] not resolvable by plain split name (%s)",
+                    name, split, exc,
+                )
+        if not ok:
+            logging.info(
+                "Dataset check: %s could not be verified by plain split name; "
+                "deferring to its own loader.", name,
+            )
+            continue
+        logging.info(
+            "Dataset check: %s ready (%s)",
+            name, local_dir if os.path.isdir(local_dir) else "snapshot/Hub",
+        )
 
 
 def format_messages(messages: list[dict]) -> str:
@@ -32,7 +153,7 @@ def format_messages(messages: list[dict]) -> str:
 def _get_wikitext2(split):
     assert split in ['train', 'validation', 'test'], f"Unknown split {split} for wikitext2"
 
-    data = load_dataset('./datasets/wikitext', 'wikitext-2-raw-v1', split=split, trust_remote_code=True)
+    data = load_split('wikitext2', split)
     return data['text']
 
 
@@ -50,7 +171,7 @@ def _get_neuralmagic(tokenizer, split):
             text = example["text"]
         return {"text": text}
 
-    data = load_dataset("./datasets/LLM_compression_calibration", split=split, trust_remote_code=True)
+    data = load_split('neuralmagic', split)
     data = data.map(preprocess_fn, remove_columns=data.column_names)
     return data['text']
 
@@ -79,7 +200,10 @@ def _get_numinamath(tokenizer, split):
             text = format_messages(example["messages"])
         return {"text": text}
 
-    data = load_dataset("./datasets/NuminaMath-1.5", split=f"train[:256]" if split == "test" else "train[256:]", trust_remote_code=True)
+    data = load_split(
+        'numinamath', split,
+        hub_split="train[:256]" if split == "test" else "train[256:]",
+    )
     data = data.map(preprocess_fn, remove_columns=data.column_names)
     return data['text']
 
@@ -98,7 +222,10 @@ def _get_ultrachat_2k(tokenizer, split):
             text = format_messages(example["messages"])
         return {"text": text}
 
-    data = load_dataset("./datasets/ultrachat_2k", split=f"train_sft[:128]" if split == "test" else "train_sft[128:]", trust_remote_code=True)
+    data = load_split(
+        'ultrachat_2k', split,
+        hub_split="train_sft[:128]" if split == "test" else "train_sft[128:]",
+    )
     data = data.map(preprocess_fn, remove_columns=data.column_names)
     return data['text']
 

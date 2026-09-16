@@ -59,6 +59,10 @@
 #   bash scripts/formal_realq_compare.sh
 #   LR="1e-4 3e-4 1e-3" bash scripts/formal_realq_compare.sh   # LR sweep
 #
+# The sweep script defaults HF_DATASETS_OFFLINE=1. If a dataset is missing
+# locally, the run aborts up front naming that flag; pass HF_DATASETS_OFFLINE=0
+# once to let it download and snapshot, then it is local from then on.
+#
 # LR may be a space-separated list: the sweep script loops over it internally,
 # and the Stage-0 cache key does not depend on the learning rate, so a whole
 # sweep still shares the single Stage 1 precompute below.
