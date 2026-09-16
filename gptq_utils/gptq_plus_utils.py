@@ -6520,6 +6520,13 @@ class ModuleGradSecondMoment:
         self.sum_g2 = torch.zeros_like(self.sum_g)
         self.sample_count = 0
         self.token_count = 0
+        # Forward and backward fire independently: the forward hook can run
+        # while the gradient hook never does (module output off the autograd
+        # path, a no_grad forward, a shape guard rejecting). Without separate
+        # counters an all-zero prior looks the same as a genuinely zero one.
+        self.fwd_calls = 0
+        self.grad_calls = 0
+        self.grad_skipped = 0
         self._handles = []
 
     def _forward_hook(self, _module, inp, out):
@@ -6532,15 +6539,20 @@ class ModuleGradSecondMoment:
         sink = self.sink_size
         sum_g, sum_g2 = self.sum_g, self.sum_g2
 
+        accum = self
+
         def _grad_hook(grad):
             g = grad
             if g.dim() != 3:
+                accum.grad_skipped += 1
                 return None
             if sink > 0 and g.shape[1] > sink:
                 g = g[:, sink:]
             if g.shape[1] != x_f.shape[1] or g.shape[0] != x_f.shape[0]:
                 # Misalignment would silently corrupt the prior; skip instead.
+                accum.grad_skipped += 1
                 return None
+            accum.grad_calls += 1
             bsz = g.shape[0]
             # functional_call differentiates the batch MEAN loss, so the hook
             # sees (1/bsz) * d(sum of per-sample losses)/dy. Undo that to
@@ -6550,6 +6562,7 @@ class ModuleGradSecondMoment:
             sum_g2.add_(g_s.pow_(2).sum(dim=0).to(sum_g2.device))
             return None
 
+        self.fwd_calls += 1
         if isinstance(out, torch.Tensor) and out.requires_grad:
             out.register_hook(_grad_hook)
             self.sample_count += x_f.shape[0]
@@ -6564,6 +6577,37 @@ class ModuleGradSecondMoment:
         for handle in self._handles:
             handle.remove()
         self._handles = []
+
+    def all_reduce_(self):
+        """Make the accumulator describe the global calibration set.
+
+        Under DP each rank only forwards its own shard, and with
+        dp_global_shuffle a rank may legitimately see none of a given refresh
+        batch. gbar and Var_s are properties of the whole set, so the sums and
+        the sample count have to be summed across ranks before build_prior
+        reads them. Returns the global sample count.
+        """
+        if not (dist.is_available() and dist.is_initialized()):
+            return self.sample_count
+        packed = torch.cat([
+            self.sum_g.reshape(-1),
+            self.sum_g2.reshape(-1),
+            torch.tensor(
+                [float(self.sample_count), float(self.token_count),
+                 float(self.grad_calls), float(self.grad_skipped)],
+                dtype=self.sum_g.dtype, device=self.sum_g.device,
+            ),
+        ])
+        dist_utils.allreduce_sum_(packed)
+        n = self.sum_g.numel()
+        self.sum_g.copy_(packed[:n].view_as(self.sum_g))
+        self.sum_g2.copy_(packed[n:2 * n].view_as(self.sum_g2))
+        tail = packed[2 * n:]
+        self.sample_count = int(tail[0].item())
+        self.token_count = int(tail[1].item())
+        self.grad_calls = int(tail[2].item())
+        self.grad_skipped = int(tail[3].item())
+        return self.sample_count
 
     def build_prior(self, batch_size):
         """Exact value of what Adam's exp_avg_sq estimates, at batch size B.
@@ -9847,25 +9891,51 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                                     subset[name].weight.data.float()
                                 )
                             _pre = grad_sq_accums.get(name)
-                            if _pre is None or _pre.token_count == 0:
+                            if _pre is None:
                                 raise RuntimeError(
-                                    f"warm_adam pre-pass produced no tokens for {name}; "
-                                    "the module hooks never fired."
+                                    f"warm_adam pre-pass never built an accumulator "
+                                    f"for {name}."
+                                )
+                            # A rank seeing no tokens is normal under DP: with
+                            # dp_global_shuffle the refresh batch may fall
+                            # entirely inside another rank's shard. Only global
+                            # emptiness is an error, and the prior has to be the
+                            # global quantity anyway.
+                            _n_global = _pre.all_reduce_()
+                            if _n_global == 0:
+                                raise RuntimeError(
+                                    f"warm_adam pre-pass produced no tokens for {name} "
+                                    "on any rank; the module hooks never fired."
                                 )
                             grad_sq_full = _pre.build_prior(_B)
+                            # t0 is what the prior is worth in refresh-steps:
+                            # samples measured / samples per refresh. Deriving it
+                            # from nsamples instead would assume the pre-pass
+                            # covered the whole calibration set, which is only
+                            # true when backward_samples == nsamples.
                             _t0_override = int(getattr(args, "warm_start_steps", -1))
                             warm_start_steps = (
                                 _t0_override if _t0_override >= 0
-                                else max(int(round(inps.shape[0] / max(_B, 1))), 1)
+                                else max(int(round(_n_global / max(_B, 1))), 1)
                             )
                             logging.info(
                                 "warm_adam pre-pass layer=%d module=%s samples=%d "
-                                "tokens=%d B=%d t0=%d prior_median=%s prior_max=%s",
+                                "tokens=%d fwd=%d grad=%d skipped=%d B=%d t0=%d "
+                                "prior_median=%s prior_max=%s",
                                 i, name, _pre.sample_count, _pre.token_count,
+                                _pre.fwd_calls, _pre.grad_calls, _pre.grad_skipped,
                                 _B, warm_start_steps,
                                 format_log_value(grad_sq_full.median().item()),
                                 format_log_value(grad_sq_full.max().item()),
                             )
+                            if _pre.grad_calls == 0:
+                                raise RuntimeError(
+                                    f"warm_adam pre-pass for {name}: the forward hook "
+                                    f"ran {_pre.fwd_calls} times but the gradient hook "
+                                    f"never contributed ({_pre.grad_skipped} rejected). "
+                                    "The prior would be all zeros, which silently "
+                                    "disables the preconditioner."
+                                )
 
                         gptq[name].fasterquant(
                             grad_sq_full=grad_sq_full,
