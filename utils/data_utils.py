@@ -13,15 +13,19 @@ DATASET_SNAPSHOT_ROOT = os.environ.get(
     "DATASET_SNAPSHOT_ROOT", os.path.join("datasets", "_hf_snapshots")
 )
 
-# name -> (local loader dir, Hub id, Hub config, split mapper)
+# name -> (local loader dir, Hub id, Hub config, probe split)
 # The local dir is tried first and is authoritative when present, so a machine
-# that already has the data behaves exactly as before.
+# that already has the data behaves exactly as before. The probe split is one
+# expression known to exist for that dataset, used by the startup check --
+# split naming is not uniform (ultrachat uses train_sft, numinamath slices).
 _DATASET_SOURCES = {
-    "wikitext2": ("./datasets/wikitext", "wikitext", "wikitext-2-raw-v1"),
+    "wikitext2": ("./datasets/wikitext", "wikitext", "wikitext-2-raw-v1", "test"),
     "neuralmagic": ("./datasets/LLM_compression_calibration",
-                    "neuralmagic/LLM_compression_calibration", None),
-    "ultrachat_2k": ("./datasets/ultrachat_2k", "HuggingFaceH4/ultrachat_200k", None),
-    "numinamath": ("./datasets/NuminaMath-1.5", "AI-MO/NuminaMath-1.5", None),
+                    "neuralmagic/LLM_compression_calibration", None, "train[:1]"),
+    "ultrachat_2k": ("./datasets/ultrachat_2k", "HuggingFaceH4/ultrachat_200k",
+                     None, "train_sft[:1]"),
+    "numinamath": ("./datasets/NuminaMath-1.5", "AI-MO/NuminaMath-1.5",
+                   None, "train[:1]"),
 }
 
 
@@ -50,11 +54,27 @@ def load_split(name, split, hub_split=None):
     """
     if name not in _DATASET_SOURCES:
         raise ValueError(f"Unknown dataset {name}")
-    local_dir, hub_id, config = _DATASET_SOURCES[name]
+    local_dir, hub_id, config, _ = _DATASET_SOURCES[name]
     split_expr = hub_split or split
 
     if os.path.isdir(local_dir):
-        return load_dataset(local_dir, config, split=split_expr, trust_remote_code=True)
+        # A directory with a loader script takes the config as an argument; a
+        # directory holding only data files exposes a single 'default' config
+        # and rejects the name, but usually keeps the config as a subdirectory.
+        candidates = [(local_dir, config)]
+        if config and os.path.isdir(os.path.join(local_dir, config)):
+            candidates.append((os.path.join(local_dir, config), None))
+        candidates.append((local_dir, None))
+        errors = []
+        for path, cfg in candidates:
+            try:
+                return load_dataset(path, cfg, split=split_expr, trust_remote_code=True)
+            except Exception as exc:
+                errors.append(f"  {path} (config={cfg}): {type(exc).__name__}: {exc}")
+        raise RuntimeError(
+            f"Dataset '{name}' exists at '{local_dir}' but no supported layout "
+            f"loaded split '{split_expr}':\n" + "\n".join(errors)
+        )
 
     snap = _snapshot_dir(name, config, split_expr)
     if os.path.isdir(snap):
@@ -86,7 +106,7 @@ def load_split(name, split, hub_split=None):
     return data
 
 
-def ensure_datasets_available(names, splits=("train", "test")):
+def ensure_datasets_available(names):
     """Preflight: resolve every dataset this run needs before any real work.
 
     Loading the calibration set happens early but the eval sets are only touched
@@ -97,31 +117,12 @@ def ensure_datasets_available(names, splits=("train", "test")):
     for name in dict.fromkeys(n for n in names if n):
         if name not in _DATASET_SOURCES:
             raise ValueError(f"Unknown dataset {name}")
-        local_dir, _, _ = _DATASET_SOURCES[name]
-        ok = False
-        for split in splits:
-            try:
-                load_split(name, split)
-                ok = True
-            except RuntimeError:
-                # Genuinely unavailable: missing locally and a download is
-                # blocked. That is the case this preflight exists to surface.
-                raise
-            except Exception as exc:
-                # Split-name mismatches are expected -- ultrachat uses
-                # train_sft, numinamath slices train -- and the real loaders
-                # pass the right expression. A preflight must never fail a run
-                # that would otherwise work.
-                logging.debug(
-                    "Dataset check: %s[%s] not resolvable by plain split name (%s)",
-                    name, split, exc,
-                )
-        if not ok:
-            logging.info(
-                "Dataset check: %s could not be verified by plain split name; "
-                "deferring to its own loader.", name,
-            )
-            continue
+        local_dir, _, _, probe = _DATASET_SOURCES[name]
+        # One probe with a split expression known to exist for this dataset,
+        # and no exception swallowing: the first version caught everything and
+        # let a real "BuilderConfig not found" through to fail two minutes
+        # later inside the quantization loop.
+        load_split(name, probe, hub_split=probe)
         logging.info(
             "Dataset check: %s ready (%s)",
             name, local_dir if os.path.isdir(local_dir) else "snapshot/Hub",
