@@ -187,26 +187,48 @@ fi
 mkdir -p "${STATIC_CACHE_PATH}" "${OUTPUT_ROOT}"
 exec >> "${LOG}" 2>&1
 say() { echo "=== $(date '+%F %T') | $* ==="; }
-# Print every KL/PPL line, not just the last: LR may be a space-separated list,
-# in which case the sweep script loops internally and one log holds one result
-# per learning rate.
-result() { grep -aoE 'KL&PPL on .*' "${OUTPUT_ROOT}/$1.log"; }
+# Every result line, not just the last: LR may be a space-separated list, in
+# which case the sweep script loops internally and one log holds one result per
+# learning rate. Requiring a digit after the colon keeps the bare "KL&PPL on
+# <dataset>" progress line from printing as if it were a result.
+result() { grep -aoE 'KL&PPL on [a-z0-9_]+: [0-9].*' "${OUTPUT_ROOT}/$1.log"; }
+
+FAILED_ARMS=()
+# $? has to be read by the caller right after the run: capturing it inside the
+# function would report the function's own status instead.
+note_exit() {
+    local arm="$1" status="$2"
+    if [[ "${status}" -ne 0 ]]; then
+        say "FAILED ${arm} exit=${status} -- see ${OUTPUT_ROOT}/${arm}.log"
+        FAILED_ARMS+=("${arm}")
+    else
+        say "done ${arm}"
+    fi
+}
 
 # Stage 1 -- build the static saliency/Fisher cache once, then exit. Every arm
 # below runs with STAGE2_CPU_MASTER=1 (upstream's default), which REFUSES to
 # compute this inline and requires the cache to exist. Doing it once also means
 # all arms share bit-identical Stage-0 inputs.
-say "Stage 1: static precompute -> ${STATIC_CACHE_PATH}"
-common STAGE2_CPU_MASTER=0 EXIT_AFTER_PRECOMPUTE=1 \
-    GRAD_OPTIMIZER=adam FINAL_LAYER_GRAD_OPTIMIZER=adam \
-    BASE_EXP=formal_precompute \
-    bash scripts/gptq_plus_lr_sweep.sh "${MODEL}" "${NUM_GROUPS}" "${DEVICE}" \
-    --eval_seq_len "${EVAL_SEQ_LEN}" --skip_eval \
-    > "${OUTPUT_ROOT}/formal_precompute.log" 2>&1
-say "Stage 1 done exit=$?"
-if ! ls "${STATIC_CACHE_PATH}"/*.pt >/dev/null 2>&1; then
-    say "ABORT: no cache written to ${STATIC_CACHE_PATH}; see formal_precompute.log"
-    exit 1
+# The cache key covers everything Stage 1 depends on -- model, nsamples,
+# seq_len, num_groups, global_loss_bsz, world size, seed, rotation -- and none
+# of that varies across the arms below, so an existing cache is reusable and
+# rebuilding it costs minutes for nothing. FORCE_PRECOMPUTE=1 rebuilds anyway.
+if [[ "${FORCE_PRECOMPUTE:-0}" != "1" ]] && ls "${STATIC_CACHE_PATH}"/*.pt >/dev/null 2>&1; then
+    say "Stage 1: reusing the cache in ${STATIC_CACHE_PATH} (FORCE_PRECOMPUTE=1 to rebuild)"
+else
+    say "Stage 1: static precompute -> ${STATIC_CACHE_PATH}"
+    common STAGE2_CPU_MASTER=0 EXIT_AFTER_PRECOMPUTE=1 \
+        GRAD_OPTIMIZER=adam FINAL_LAYER_GRAD_OPTIMIZER=adam \
+        BASE_EXP=formal_precompute \
+        bash scripts/gptq_plus_lr_sweep.sh "${MODEL}" "${NUM_GROUPS}" "${DEVICE}" \
+        --eval_seq_len "${EVAL_SEQ_LEN}" --skip_eval \
+        > "${OUTPUT_ROOT}/formal_precompute.log" 2>&1
+    say "Stage 1 exit=$?"
+    if ! ls "${STATIC_CACHE_PATH}"/*.pt >/dev/null 2>&1; then
+        say "ABORT: no cache written to ${STATIC_CACHE_PATH}; see formal_precompute.log"
+        exit 1
+    fi
 fi
 
 say "Stage 2a: adam @ lr=${LR}  (the paper's own configuration)"
@@ -216,7 +238,7 @@ common STAGE2_CPU_MASTER=1 \
     bash scripts/gptq_plus_lr_sweep.sh "${MODEL}" "${NUM_GROUPS}" "${DEVICE}" \
     --eval_seq_len "${EVAL_SEQ_LEN}" --eval_datasets ${EVAL_DATASETS} \
     > "${OUTPUT_ROOT}/formal_adam.log" 2>&1
-say "Stage 2a done exit=$?"
+note_exit formal_adam "$?"
 result formal_adam
 
 for t0 in ${T0_LIST}; do
@@ -229,8 +251,15 @@ for t0 in ${T0_LIST}; do
         --eval_seq_len "${EVAL_SEQ_LEN}" --eval_datasets ${EVAL_DATASETS} \
         --warm_start_steps "${t0}" \
         > "${OUTPUT_ROOT}/${tag}.log" 2>&1
-    say "Stage 2b t0=${t0} done exit=$?"
+    note_exit "${tag}" "$?"
     result "${tag}"
 done
 
-say "formal comparison complete"
+# "complete" on its own hid a non-zero exit once already: the adam arm printed
+# its KL/PPL and then died in the downstream QA eval, and the run read as a
+# success for a whole round of analysis.
+if [[ ${#FAILED_ARMS[@]} -gt 0 ]]; then
+    say "formal comparison finished WITH FAILURES: ${FAILED_ARMS[*]}"
+    exit 1
+fi
+say "formal comparison complete (all arms exit=0)"
