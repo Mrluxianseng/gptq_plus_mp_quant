@@ -613,6 +613,43 @@ def parse_quant_stop_layer(spec, num_layers: int):
     return idx
 
 
+def _rtn_weight_for_prior(gptq_module, linear_module):
+    """Return (weight to measure the warm_adam prior at, a label for logging).
+
+    RTN-quantises a copy of the module's weight. Falls back to the unquantised
+    weight when the quantiser cannot produce one (bits >= 16, or find_params
+    failing), and says so, because measuring at W_fp is the degenerate case this
+    exists to avoid rather than a silent equivalent.
+
+    The quantiser is deep-copied: fasterquant runs find_params on the real one
+    afterwards and must not inherit state from this measurement.
+    """
+    weight = linear_module.weight.data.float()
+    quantizer = getattr(gptq_module, "quantizer", None)
+    if quantizer is None:
+        return weight, "W_fp (no quantizer)"
+    try:
+        if int(getattr(quantizer, "bits", 16)) >= 16:
+            return weight, "W_fp (bits>=16)"
+        probe = copy.deepcopy(quantizer)
+        with torch.no_grad():
+            if not probe.ready():
+                probe.find_params(weight)
+            if not probe.ready():
+                return weight, "W_fp (quantizer not ready)"
+            quantised = probe.quantize(weight).float().detach()
+        if not torch.isfinite(quantised).all():
+            return weight, "W_fp (quantised weight not finite)"
+        return quantised, "W_rtn"
+    except Exception as exc:  # never let the measurement break the run
+        logging.warning(
+            "warm_adam: RTN weight for the prior failed (%s: %s); "
+            "falling back to W_fp, where the refresh gradient may vanish.",
+            type(exc).__name__, exc,
+        )
+        return weight, "W_fp (RTN failed)"
+
+
 def _align_warm_prior(grad_sq_full, row_start, row_end, perm, device):
     """Put the [out, in] prior into one subgroup's row-sliced, actorder frame.
 
@@ -9915,10 +9952,18 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                                 if gradient_refresh_scheduler is not None
                                 else _NULL_CONTEXT
                             )
+                            # Measure where the loss actually has a gradient.
+                            # The refresh loss is anchored at the FP output, so
+                            # at W_fp its gradient is zero by construction --
+                            # exactly zero for layer 0's first module, where
+                            # nothing upstream is quantised either. RTN gives a
+                            # point carrying real quantisation error at the cost
+                            # of one quantise call.
+                            _measure_weight, _measure_at = (
+                                _rtn_weight_for_prior(gptq[name], subset[name])
+                            )
                             with _freeze:
-                                _refresh_fn_for_module(
-                                    subset[name].weight.data.float()
-                                )
+                                _refresh_fn_for_module(_measure_weight)
                             _pre = grad_sq_accums.get(name)
                             if _pre is None:
                                 raise RuntimeError(
@@ -9948,10 +9993,12 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                                 else max(int(round(_n_global / max(_B, 1))), 1)
                             )
                             logging.info(
-                                "warm_adam pre-pass layer=%d module=%s samples=%d "
-                                "tokens=%d fwd=%d grad=%d skipped=%d B=%d t0=%d "
-                                "prior_median=%s prior_max=%s || per-rank: %s",
-                                i, name, _pre.sample_count, _pre.token_count,
+                                "warm_adam pre-pass layer=%d module=%s at=%s "
+                                "samples=%d tokens=%d fwd=%d grad=%d skipped=%d "
+                                "B=%d t0=%d prior_median=%s prior_max=%s "
+                                "|| per-rank: %s",
+                                i, name, _measure_at,
+                                _pre.sample_count, _pre.token_count,
                                 _pre.fwd_calls, _pre.grad_calls, _pre.grad_skipped,
                                 _B, warm_start_steps,
                                 format_log_value(grad_sq_full.median().item()),
@@ -9966,7 +10013,8 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             if float(grad_sq_full.abs().max().item()) == 0.0:
                                 raise RuntimeError(
                                     f"warm_adam pre-pass for {name} produced an "
-                                    f"all-zero prior (fwd={_pre.fwd_calls} "
+                                    f"all-zero prior, measured at {_measure_at} "
+                                    f"(fwd={_pre.fwd_calls} "
                                     f"grad={_pre.grad_calls} "
                                     f"skipped={_pre.grad_skipped}). Per-rank: "
                                     f"{_pre.format_rank_stats()}"
