@@ -75,11 +75,19 @@ cd "${ROOT_DIR}"
 MODEL=${MODEL:?export MODEL=/path/to/Qwen3-0.6B}
 DEVICE=${DEVICE:-0,1,2,3}
 OUTPUT_ROOT=${OUTPUT_ROOT:-${ROOT_DIR}/outputs}
-STATIC_CACHE_PATH=${STATIC_CACHE_PATH:-${ROOT_DIR}/cache/formal_realq_qwen3_0p6b}
 LOG=${LOG:-${OUTPUT_ROOT}/formal_compare_queue.log}
 
+# --- team-standard calibration -------------------------------------------
+# 512 x 2048 WikiText-2, agreed so every experiment shares one calibration
+# set. The paper uses 2048 sequences, so absolute KL/PPL here will NOT match
+# its table -- set N_SAMPLES=2048 for a paper-comparable run.
+DATASET=${DATASET:-wikitext2}
+N_SAMPLES=${N_SAMPLES:-512}
+# The sweep script never passes --seed, so without this the argparse default
+# (42) applies silently. The paper's reported Qwen3-0.6B row is seed 1.
+SEED=${SEED:-42}
+
 # --- paper-pinned ---------------------------------------------------------
-N_SAMPLES=${N_SAMPLES:-2048}
 SEQ_LEN=${SEQ_LEN:-2048}
 EVAL_SEQ_LEN=${EVAL_SEQ_LEN:-2048}
 BLOCKSIZE=${BLOCKSIZE:-128}
@@ -94,6 +102,14 @@ GRAD_LR_LAYER_SCHEDULE=${GRAD_LR_LAYER_SCHEDULE:-cosine}
 GRAD_LR_LAYER_BASE_RATIO=${GRAD_LR_LAYER_BASE_RATIO:-0.01}
 NUM_GROUPS=${NUM_GROUPS:-4}
 W_GROUPSIZE=${W_GROUPSIZE:--1}
+
+# The Stage-0 cache key embeds nsamples / seq_len / seed / num_groups / world
+# size, so a cache built for one calibration set is useless for another. Keying
+# the directory on the same values keeps the "reuse if present" check below from
+# skipping Stage 1 on a directory whose contents belong to a different set --
+# which would then fail in Stage 2, since STAGE2_CPU_MASTER refuses to compute
+# it inline.
+STATIC_CACHE_PATH=${STATIC_CACHE_PATH:-${ROOT_DIR}/cache/formal_realq_qwen3_0p6b_s${N_SAMPLES}_l${SEQ_LEN}_seed${SEED}}
 
 # --- not stated in the paper ---------------------------------------------
 PRE_GD_STEPS=${PRE_GD_STEPS:-0}
@@ -134,7 +150,7 @@ fi
 # is the only moving part.
 common() {
     OUTPUT_ROOT="${OUTPUT_ROOT}" \
-    DATASET=wikitext2 \
+    DATASET="${DATASET}" \
     N_SAMPLES="${N_SAMPLES}" SEQ_LEN="${SEQ_LEN}" \
     BSZ="${BSZ}" FINAL_LAYER_STATS_BSZ="${FINAL_LAYER_STATS_BSZ}" \
     HESSIAN_ACCUM_BSZ="${HESSIAN_ACCUM_BSZ}" \
@@ -167,7 +183,8 @@ REAL-Q formal comparison - Qwen3-0.6B W4A16
   tree         : $(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?') @ $(git rev-parse --short HEAD 2>/dev/null || echo '?')
   model        : ${MODEL}
   gpus         : ${DEVICE}  (${N_GPUS} ranks)
-  calibration  : ${N_SAMPLES} x ${SEQ_LEN} tokens
+  calibration  : ${DATASET} ${N_SAMPLES} x ${SEQ_LEN} tokens  seed=${SEED}
+  rotation     : QuaRot (--rotate, always on in the sweep)
   block size B : ${BLOCKSIZE}    backward smp : ${BACKWARD_SAMPLES}
   refresh loss : ${GRAD_REFRESH_LOSS}  slide_window=${LOSS_SLIDE_WINDOW}
   lr           : ${LR}  (final block ${FINAL_LAYER_GRAD_LR})
@@ -175,7 +192,8 @@ REAL-Q formal comparison - Qwen3-0.6B W4A16
   topk         : kl=${KL_TOPK}  grad_hessian=${GRAD_HESSIAN_TOPK}
   arms         : adam, warm_adam t0 in { ${T0_LIST} }   (-1 => ${N_SAMPLES}/${BACKWARD_SAMPLES})
   static cache : ${STATIC_CACHE_PATH}
-  paper target : KL 6.79e-2 / PPL 21.57
+  paper target : KL 6.79e-2 / PPL 21.57 (at 2048 calibration seqs, seed 1;
+                 not comparable at the team-standard 512 -- see the header)
 ============================================================
 BANNER
 
@@ -222,7 +240,7 @@ else
         GRAD_OPTIMIZER=adam FINAL_LAYER_GRAD_OPTIMIZER=adam \
         BASE_EXP=formal_precompute \
         bash scripts/gptq_plus_lr_sweep.sh "${MODEL}" "${NUM_GROUPS}" "${DEVICE}" \
-        --eval_seq_len "${EVAL_SEQ_LEN}" --skip_eval \
+        --eval_seq_len "${EVAL_SEQ_LEN}" --seed "${SEED}" --skip_eval \
         > "${OUTPUT_ROOT}/formal_precompute.log" 2>&1
     say "Stage 1 exit=$?"
     if ! ls "${STATIC_CACHE_PATH}"/*.pt >/dev/null 2>&1; then
@@ -236,7 +254,7 @@ common STAGE2_CPU_MASTER=1 \
     GRAD_OPTIMIZER=adam FINAL_LAYER_GRAD_OPTIMIZER=adam \
     BASE_EXP=formal_adam \
     bash scripts/gptq_plus_lr_sweep.sh "${MODEL}" "${NUM_GROUPS}" "${DEVICE}" \
-    --eval_seq_len "${EVAL_SEQ_LEN}" --eval_datasets ${EVAL_DATASETS} \
+    --eval_seq_len "${EVAL_SEQ_LEN}" --seed "${SEED}" --eval_datasets ${EVAL_DATASETS} \
     > "${OUTPUT_ROOT}/formal_adam.log" 2>&1
 note_exit formal_adam "$?"
 result formal_adam
@@ -248,7 +266,7 @@ for t0 in ${T0_LIST}; do
         GRAD_OPTIMIZER=warm_adam FINAL_LAYER_GRAD_OPTIMIZER=warm_adam \
         BASE_EXP="${tag}" \
         bash scripts/gptq_plus_lr_sweep.sh "${MODEL}" "${NUM_GROUPS}" "${DEVICE}" \
-        --eval_seq_len "${EVAL_SEQ_LEN}" --eval_datasets ${EVAL_DATASETS} \
+        --eval_seq_len "${EVAL_SEQ_LEN}" --seed "${SEED}" --eval_datasets ${EVAL_DATASETS} \
         --warm_start_steps "${t0}" \
         > "${OUTPUT_ROOT}/${tag}.log" 2>&1
     note_exit "${tag}" "$?"
