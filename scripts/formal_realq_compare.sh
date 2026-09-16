@@ -77,15 +77,16 @@ DEVICE=${DEVICE:-0,1,2,3}
 OUTPUT_ROOT=${OUTPUT_ROOT:-${ROOT_DIR}/outputs}
 LOG=${LOG:-${OUTPUT_ROOT}/formal_compare_queue.log}
 
-# --- team-standard calibration -------------------------------------------
-# 1024 x 2048 WikiText-2, agreed so every experiment shares one calibration
-# set. The paper uses 2048 sequences, so absolute KL/PPL here will NOT match
-# its table -- set N_SAMPLES=2048 for a paper-comparable run.
+# --- calibration (paper-pinned) ------------------------------------------
+# 2048 WikiText-2 sequences of 2048 tokens (S6.1). Seed 1 is the calibration
+# sample behind the reported Qwen3-0.6B W4A16 row; the sweep script never
+# passes --seed, so without pinning it argparse's 42 applies silently. The
+# paper's own five-seed sweep (Table 9) spans only KL 6.79-6.92e-2, so the
+# seed is not a lever for closing a large gap -- it is pinned to match the
+# reported row, not to tune.
 DATASET=${DATASET:-wikitext2}
-N_SAMPLES=${N_SAMPLES:-1024}
-# The sweep script never passes --seed, so without this the argparse default
-# (42) applies silently. The paper's reported Qwen3-0.6B row is seed 1.
-SEED=${SEED:-42}
+N_SAMPLES=${N_SAMPLES:-2048}
+SEED=${SEED:-1}
 
 # --- paper-pinned ---------------------------------------------------------
 SEQ_LEN=${SEQ_LEN:-2048}
@@ -111,9 +112,18 @@ W_GROUPSIZE=${W_GROUPSIZE:--1}
 # it inline.
 STATIC_CACHE_PATH=${STATIC_CACHE_PATH:-${ROOT_DIR}/cache/formal_realq_qwen3_0p6b_s${N_SAMPLES}_l${SEQ_LEN}_seed${SEED}}
 
-# --- not stated in the paper ---------------------------------------------
-PRE_GD_STEPS=${PRE_GD_STEPS:-0}
+# Paper-pinned: the final block optimises "true full-vocabulary KL against
+# the LM head" (D.1), and full-vocabulary means no top-k truncation.
 KL_TOPK=${KL_TOPK:--1}
+
+# --- not stated in the paper ---------------------------------------------
+# docs/REALQ_PAPER_PROTOCOL.md lists what main.tex leaves undisclosed:
+# gradient-clipping operator and thresholds, GPTQ damping, activation order,
+# weight-clipping search, Hessian accumulation batch, backward chunk size,
+# evaluation chunk length, the populations the P95/P99 percentiles are taken
+# over, the Fisher label seed, and refresh-sample ordering. These are upstream
+# defaults, and any residual gap to the paper table lives in this list.
+PRE_GD_STEPS=${PRE_GD_STEPS:-0}
 GRAD_HESSIAN_TOPK=${GRAD_HESSIAN_TOPK:--1}
 ACT_ORDER=${ACT_ORDER:-1}
 
@@ -192,8 +202,8 @@ REAL-Q formal comparison - Qwen3-0.6B W4A16
   topk         : kl=${KL_TOPK}  grad_hessian=${GRAD_HESSIAN_TOPK}
   arms         : adam, warm_adam t0 in { ${T0_LIST} }   (-1 => ${N_SAMPLES}/${BACKWARD_SAMPLES})
   static cache : ${STATIC_CACHE_PATH}
-  paper target : KL 6.79e-2 / PPL 21.57 (at 2048 calibration seqs, seed 1;
-                 not comparable at the team-standard 1024 -- see the header)
+  paper target : KL 6.79e-2 / PPL 21.57  (Table 5, seed 1; Table 9 gives the
+                 five-seed spread 6.79-6.92)
 ============================================================
 BANNER
 
