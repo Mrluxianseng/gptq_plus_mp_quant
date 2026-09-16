@@ -78,11 +78,11 @@ OUTPUT_ROOT=${OUTPUT_ROOT:-${ROOT_DIR}/outputs}
 LOG=${LOG:-${OUTPUT_ROOT}/formal_compare_queue.log}
 
 # --- team-standard calibration -------------------------------------------
-# 512 x 2048 WikiText-2, agreed so every experiment shares one calibration
+# 1024 x 2048 WikiText-2, agreed so every experiment shares one calibration
 # set. The paper uses 2048 sequences, so absolute KL/PPL here will NOT match
 # its table -- set N_SAMPLES=2048 for a paper-comparable run.
 DATASET=${DATASET:-wikitext2}
-N_SAMPLES=${N_SAMPLES:-512}
+N_SAMPLES=${N_SAMPLES:-1024}
 # The sweep script never passes --seed, so without this the argparse default
 # (42) applies silently. The paper's reported Qwen3-0.6B row is seed 1.
 SEED=${SEED:-42}
@@ -193,7 +193,7 @@ REAL-Q formal comparison - Qwen3-0.6B W4A16
   arms         : adam, warm_adam t0 in { ${T0_LIST} }   (-1 => ${N_SAMPLES}/${BACKWARD_SAMPLES})
   static cache : ${STATIC_CACHE_PATH}
   paper target : KL 6.79e-2 / PPL 21.57 (at 2048 calibration seqs, seed 1;
-                 not comparable at the team-standard 512 -- see the header)
+                 not comparable at the team-standard 1024 -- see the header)
 ============================================================
 BANNER
 
