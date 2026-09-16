@@ -613,6 +613,40 @@ def parse_quant_stop_layer(spec, num_layers: int):
     return idx
 
 
+def _align_warm_prior(grad_sq_full, row_start, row_end, perm, device):
+    """Put the [out, in] prior into one subgroup's row-sliced, actorder frame.
+
+    Mirrors exactly what fasterquant does to `W_sub`, and nothing else. In
+    particular the dead-column fix (`W_sub[:, dead] = 0`) is deliberately NOT
+    mirrored: that zeroing exists because a dead column carries no Hessian mass,
+    whereas the prior is a variance and zeroing it would hand those columns a
+    denominator of `eps`. Their measured value is the right one to keep.
+    """
+    if grad_sq_full is None:
+        return None
+    prior = grad_sq_full[row_start:row_end, :]
+    if perm is not None:
+        prior = prior[:, perm]
+    return prior.to(device=device, dtype=torch.float32).contiguous()
+
+
+def _align_warm_prior_batched(grad_sq_full, G, R, C, perm, hessian_group_ids, device):
+    """Same, for the group-parallel path's (G, R, C) block layout.
+
+    The transform order has to match `W_sub` step for step -- reshape, then the
+    actorder permutation on the column axis, then the hessian-group shard -- or
+    the preconditioner is silently applied to the wrong weights.
+    """
+    if grad_sq_full is None:
+        return None
+    prior = grad_sq_full.reshape(G, R, C)
+    if perm is not None:
+        prior = prior[:, :, perm]
+    if hessian_group_ids is not None:
+        prior = prior.index_select(0, hessian_group_ids)
+    return prior.to(device=device, dtype=torch.float32).contiguous()
+
+
 class BackwardSampleScheduler:
     def __init__(self, total_samples: int, chunk_size: int, seed: int = 42):
         if chunk_size <= 0:
@@ -636,6 +670,31 @@ class BackwardSampleScheduler:
         indices = self.order[start:end]
         self.cursor = end
         return indices
+
+    @contextmanager
+    def frozen(self):
+        """Run a block without consuming any of the sample stream.
+
+        `next_indices()` mutates three things: the cursor, the permutation, and
+        the RNG that reshuffles it. Anything that calls a refresh for
+        *measurement* rather than for a training step -- the warm_adam pre-pass
+        -- must not advance that stream, or every subsequent refresh in the run
+        sees a different batch composition than it would have otherwise. That is
+        invisible in the logs and it changes the result: at
+        `backward_samples == nsamples` the wrap reshuffles on every call, so a
+        single extra call leaves the sample *set* identical while permuting it,
+        which was enough to move final KL by 5% (0.211 -> 0.222) once Adam sits
+        in its sign-dominated regime.
+        """
+        saved_order = list(self.order)
+        saved_cursor = self.cursor
+        saved_rng = self.rng.getstate()
+        try:
+            yield self
+        finally:
+            self.order = saved_order
+            self.cursor = saved_cursor
+            self.rng.setstate(saved_rng)
 
 
 @contextmanager
@@ -1101,20 +1160,62 @@ class GPTQPlus:
         return block
 
     @staticmethod
-    def _make_grad_optimizer_state_batched(weight_sub, grad_optimizer):
-        if grad_optimizer not in {"sgd", "adam"}:
-            raise ValueError(f"Unsupported `grad_optimizer={grad_optimizer}`. Expected one of: sgd, adam.")
+    def _make_grad_optimizer_state_batched(
+        weight_sub, grad_optimizer, curvature_full=None,
+        warm_start_steps=0, adam_beta2=0.999,
+    ):
+        if grad_optimizer not in {"sgd", "adam", "warm_adam"}:
+            raise ValueError(
+                f"Unsupported `grad_optimizer={grad_optimizer}`. "
+                "Expected one of: sgd, adam, warm_adam."
+            )
         state = {"type": grad_optimizer, "step": 0}
         if grad_optimizer == "adam":
             state["exp_avg"] = torch.zeros_like(weight_sub)
             state["exp_avg_sq"] = torch.zeros_like(weight_sub)
+        elif grad_optimizer == "warm_adam":
+            # Vanilla Adam in every respect except where exp_avg_sq starts.
+            # Adam begins at zero and needs t observations before v is worth
+            # anything; here the pre-pass supplies the exact value, and
+            # `v_offset` records how much evidence that value carries.
+            #
+            # Scaling: Adam's recursion produces v_t = P(1 - beta2^t) when every
+            # observation equals P, and the bias correction divides by
+            # (1 - beta2^t). Seeding v_0 = P raw and correcting by (1 - beta2^1)
+            # would inflate it ~1000x, so seed P(1 - beta2^t0) and let the
+            # correction read it back as exactly P.
+            #
+            # The offset belongs to v ALONE. `exp_avg` really does start from
+            # zero with no prior evidence behind it, so it needs the full,
+            # unmodified bias_correction1 of a cold start. Folding t0 into the
+            # shared `step` would tell m's correction it has t0 observations it
+            # does not have, shrinking the first update to
+            # (1 - beta1) / (1 - beta1^(t0+1)) of its intended size -- 0.53x at
+            # t0=1, 0.24x at t0=4 -- recovering only after ~10 of the ~23 steps
+            # a module gets. That trades v's cold start for a cold start in m.
+            if curvature_full is None:
+                raise ValueError(
+                    "`warm_adam` requires `curvature_full` (the pre-pass prior)."
+                )
+            prior = curvature_full.to(device=weight_sub.device, dtype=torch.float32)
+            if prior.shape != weight_sub.shape:
+                raise ValueError(
+                    f"warm_adam prior shape {tuple(prior.shape)} does not match "
+                    f"the batched weight block {tuple(weight_sub.shape)}; the "
+                    "caller must align group / row-shard / actorder layout "
+                    "before this point."
+                )
+            t0 = max(int(warm_start_steps), 0)
+            state["exp_avg"] = torch.zeros_like(weight_sub)
+            state["exp_avg_sq"] = prior * (1.0 - adam_beta2 ** t0)
+            state["v_offset"] = t0
         return state
 
     @staticmethod
     def _clear_grad_optimizer_state_batched(opt_state, col_start, col_end):
         if opt_state is None or col_end <= col_start:
             return
-        if opt_state["type"] == "adam":
+        if opt_state["type"] in ("adam", "warm_adam"):
             opt_state["exp_avg"][:, :, col_start:col_end].zero_()
             opt_state["exp_avg_sq"][:, :, col_start:col_end].zero_()
 
@@ -1143,7 +1244,13 @@ class GPTQPlus:
         exp_avg.mul_(adam_beta1).add_(grad_slice, alpha=1 - adam_beta1)
         exp_avg_sq.mul_(adam_beta2).addcmul_(grad_slice, grad_slice, value=1 - adam_beta2)
         bias_correction1 = 1 - adam_beta1 ** opt_state["step"]
-        bias_correction2 = 1 - adam_beta2 ** opt_state["step"]
+        # `v_offset` is warm_adam's prior evidence count and is absent (0) for
+        # plain adam, so this is the ordinary correction unless a prior was
+        # seeded. It must not reach bias_correction1 -- see the note in
+        # _make_grad_optimizer_state.
+        bias_correction2 = 1 - adam_beta2 ** (
+            opt_state["step"] + opt_state.get("v_offset", 0)
+        )
         denom = exp_avg_sq.sqrt() / math.sqrt(bias_correction2)
         denom.add_(adam_eps)
         step_size = lr / bias_correction1
@@ -1156,20 +1263,61 @@ class GPTQPlus:
         return base + beta_view * (current_weight - ref_weight)
 
     @staticmethod
-    def _make_grad_optimizer_state(weight_sub, grad_optimizer):
-        if grad_optimizer not in {"sgd", "adam"}:
-            raise ValueError(f"Unsupported `grad_optimizer={grad_optimizer}`. Expected one of: sgd, adam.")
+    def _make_grad_optimizer_state(
+        weight_sub, grad_optimizer, curvature_full=None,
+        warm_start_steps=0, adam_beta2=0.999,
+    ):
+        if grad_optimizer not in {"sgd", "adam", "warm_adam"}:
+            raise ValueError(
+                f"Unsupported `grad_optimizer={grad_optimizer}`. "
+                "Expected one of: sgd, adam, warm_adam."
+            )
         state = {"type": grad_optimizer, "step": 0}
         if grad_optimizer == "adam":
             state["exp_avg"] = torch.zeros_like(weight_sub)
             state["exp_avg_sq"] = torch.zeros_like(weight_sub)
+        elif grad_optimizer == "warm_adam":
+            # Vanilla Adam in every respect except where exp_avg_sq starts.
+            # Adam begins at zero and needs t observations before v is worth
+            # anything; here the pre-pass supplies the exact value, and
+            # `v_offset` records how much evidence that value carries.
+            #
+            # Scaling: Adam's recursion produces v_t = P(1 - beta2^t) when every
+            # observation equals P, and the bias correction divides by
+            # (1 - beta2^t). Seeding v_0 = P raw and correcting by (1 - beta2^1)
+            # would inflate it ~1000x, so seed P(1 - beta2^t0) and let the
+            # correction read it back as exactly P.
+            #
+            # The offset belongs to v ALONE. `exp_avg` really does start from
+            # zero with no prior evidence behind it, so it needs the full,
+            # unmodified bias_correction1 of a cold start. Folding t0 into the
+            # shared `step` would tell m's correction it has t0 observations it
+            # does not have, shrinking the first update to
+            # (1 - beta1) / (1 - beta1^(t0+1)) of its intended size -- 0.53x at
+            # t0=1, 0.24x at t0=4 -- recovering only after ~10 of the ~23 steps
+            # a module gets. That trades v's cold start for a cold start in m.
+            if curvature_full is None:
+                raise ValueError(
+                    "`warm_adam` requires `curvature_full` (the pre-pass prior)."
+                )
+            prior = curvature_full.to(device=weight_sub.device, dtype=torch.float32)
+            if prior.shape != weight_sub.shape:
+                raise ValueError(
+                    f"warm_adam prior shape {tuple(prior.shape)} does not match "
+                    f"the weight block {tuple(weight_sub.shape)}; the caller "
+                    "must align row-slice / actorder layout before this point."
+                )
+            t0 = max(int(warm_start_steps), 0)
+            state["exp_avg"] = torch.zeros_like(weight_sub)
+            state["exp_avg_sq"] = prior * (1.0 - adam_beta2 ** t0)
+            state["v_offset"] = t0
         return state
 
     @staticmethod
     def _clear_grad_optimizer_state(opt_state, col_start, col_end):
         if opt_state is None or col_end <= col_start:
             return
-        if opt_state["type"] == "adam":
+        if opt_state["type"] in ("adam", "warm_adam"):
             opt_state["exp_avg"][:, col_start:col_end].zero_()
             opt_state["exp_avg_sq"][:, col_start:col_end].zero_()
 
@@ -1198,7 +1346,13 @@ class GPTQPlus:
         exp_avg.mul_(adam_beta1).add_(grad_slice, alpha=1 - adam_beta1)
         exp_avg_sq.mul_(adam_beta2).addcmul_(grad_slice, grad_slice, value=1 - adam_beta2)
         bias_correction1 = 1 - adam_beta1 ** opt_state["step"]
-        bias_correction2 = 1 - adam_beta2 ** opt_state["step"]
+        # `v_offset` is warm_adam's prior evidence count and is absent (0) for
+        # plain adam, so this is the ordinary correction unless a prior was
+        # seeded. It must not reach bias_correction1 -- see the note in
+        # _make_grad_optimizer_state.
+        bias_correction2 = 1 - adam_beta2 ** (
+            opt_state["step"] + opt_state.get("v_offset", 0)
+        )
         denom = exp_avg_sq.sqrt() / math.sqrt(bias_correction2)
         denom.add_(adam_eps)
         step_size = lr / bias_correction1
@@ -1466,6 +1620,8 @@ class GPTQPlus:
         slide_refresh_block_total=None,
         refresh_full_metrics=False,
         group_parallel_mode="tensor",
+        grad_sq_full=None,
+        warm_start_steps=0,
     ):
         W = self.layer.weight.data.clone().float()
         block_gd_mode = g_update_mode == "block_gd"
@@ -1636,6 +1792,12 @@ class GPTQPlus:
                     self._make_grad_optimizer_state_batched(
                         W_sub.index_select(0, hessian_group_ids) if use_hessian_group_shard else W_sub,
                         grad_optimizer,
+                        curvature_full=_align_warm_prior_batched(
+                            grad_sq_full, G, R, C, perm,
+                            hessian_group_ids if use_hessian_group_shard else None,
+                            W_sub.device,
+                        ),
+                        warm_start_steps=warm_start_steps,
                     )
                     if block_gd_mode else None
                 ),
@@ -2274,6 +2436,8 @@ class GPTQPlus:
         slide_refresh_block_total=None,
         refresh_full_metrics=False,
         group_parallel_mode="none",
+        grad_sq_full=None,
+        warm_start_steps=0,
     ):
         profile_recorder = profile_recorder or self.profile_recorder
         # Alias the recorder so call sites can do `rec and rec.save_block(...)`.
@@ -2306,6 +2470,8 @@ class GPTQPlus:
                 fallback_reason = "quantization-error gate regularizers are not supported"
             if fallback_reason is None:
                 return self._fasterquant_group_parallel(
+                    grad_sq_full=grad_sq_full,
+                    warm_start_steps=warm_start_steps,
                     blocksize=blocksize,
                     percdamp=percdamp,
                     groupsize=groupsize,
@@ -2529,7 +2695,14 @@ class GPTQPlus:
                             "hessian_reg": hessian_reg,
                             "gate_scale": gate_scale,
                             "gate_zero": gate_zero,
-                            "grad_optimizer_state": self._make_grad_optimizer_state(W_sub, grad_optimizer) if block_gd_mode else None,
+                            "grad_optimizer_state": self._make_grad_optimizer_state(
+                                W_sub,
+                                grad_optimizer,
+                                curvature_full=_align_warm_prior(
+                                    grad_sq_full, row_start, row_end, perm, W_sub.device,
+                                ),
+                                warm_start_steps=warm_start_steps,
+                            ) if block_gd_mode else None,
                             "groups": groups,
                             "perm": perm,
                             "invperm": invperm,
@@ -6319,6 +6492,104 @@ def collect_layer_output_fisher_only(
     return (fisher_sum / float(total_tokens)).to(torch.bfloat16).cpu()
 
 
+class ModuleGradSecondMoment:
+    """Exact per-weight second moment of the refresh gradient, measured instead
+    of estimated by EMA.
+
+    For a linear module y = W x a single token contributes g_W = g_y x^T, so
+
+        E[g_W^2][i, j] = E_t[ g_y[t, i]^2 * x[t, j]^2 ]
+
+    which is what Adam's `exp_avg_sq` spends a whole block_gd run (~23 steps for
+    a 3072-column module) failing to warm up to. `g_y` is taken from the refresh
+    backward, so it carries the direction of the loss block_gd actually
+    optimises, not the layer-wise MSE.
+
+    This class only measures; `warm_adam` is the consumer that turns the
+    measurement into Adam's starting v.
+    """
+
+    def __init__(self, module, sink_size=0):
+        self.module = module
+        self.sink_size = int(sink_size)
+        weight = module.weight
+        self.sum_g = torch.zeros(
+            weight.shape[0], weight.shape[1],
+            dtype=torch.float32, device=weight.device,
+        )
+        self.sum_g2 = torch.zeros_like(self.sum_g)
+        self.sample_count = 0
+        self.token_count = 0
+        self._handles = []
+
+    def _forward_hook(self, _module, inp, out):
+        x = inp[0]
+        if x.dim() != 3:
+            return
+        if self.sink_size > 0 and x.shape[1] > self.sink_size:
+            x = x[:, self.sink_size:]
+        x_f = x.float()
+        sink = self.sink_size
+        sum_g, sum_g2 = self.sum_g, self.sum_g2
+
+        def _grad_hook(grad):
+            g = grad
+            if g.dim() != 3:
+                return None
+            if sink > 0 and g.shape[1] > sink:
+                g = g[:, sink:]
+            if g.shape[1] != x_f.shape[1] or g.shape[0] != x_f.shape[0]:
+                # Misalignment would silently corrupt the prior; skip instead.
+                return None
+            bsz = g.shape[0]
+            # functional_call differentiates the batch MEAN loss, so the hook
+            # sees (1/bsz) * d(sum of per-sample losses)/dy. Undo that to
+            # recover each sample's own gradient.
+            g_s = torch.einsum("bso,bsi->boi", g.float() * float(bsz), x_f)
+            sum_g.add_(g_s.sum(dim=0).to(sum_g.device))
+            sum_g2.add_(g_s.pow_(2).sum(dim=0).to(sum_g2.device))
+            return None
+
+        if isinstance(out, torch.Tensor) and out.requires_grad:
+            out.register_hook(_grad_hook)
+            self.sample_count += x_f.shape[0]
+            self.token_count += x_f.shape[0] * x_f.shape[1]
+
+    def attach(self):
+        if not self._handles:
+            self._handles.append(self.module.register_forward_hook(self._forward_hook))
+        return self
+
+    def detach(self):
+        for handle in self._handles:
+            handle.remove()
+        self._handles = []
+
+    def build_prior(self, batch_size):
+        """Exact value of what Adam's exp_avg_sq estimates, at batch size B.
+
+        A refresh gradient is the mean of B per-sample gradients drawn from the
+        calibration set, so
+
+            E[g_batch^2] = gbar^2 + Var_s(g_s) / B
+
+        Both terms come from this one pass: `gbar` from the running sum, the
+        per-sample variance from the sum of squares. B enters explicitly, so the
+        same prior is NOT valid across configurations. Note the second term is
+        information Adam structurally cannot have at B = N, where every refresh
+        sees the same full calibration set and its observed g is the
+        deterministic gbar.
+        """
+        if self.sample_count == 0:
+            return None
+        n = float(self.sample_count)
+        gbar = self.sum_g / n
+        e_g2 = self.sum_g2 / n
+        gbar_sq = gbar.pow(2)
+        var_s = (e_g2 - gbar_sq).clamp_min(0.0)
+        return gbar_sq + var_s / max(float(batch_size), 1.0)
+
+
 def collect_true_weight_gradient(
     layer,
     analyzer,
@@ -6357,6 +6628,7 @@ def collect_true_weight_gradient(
     sink_size=0,
     a_loss_ratio=1.0,
     a_loss_clip_scope="local_backward_chunk",
+    grad_sq_accum=None,
 ):
     """Compute the refresh gradient as a per-rank partial sum + count.
 
@@ -6456,6 +6728,11 @@ def collect_true_weight_gradient(
             override_weight = src.to(target_dev, dtype=target_dtype)
     override_weight.requires_grad_(True)
     partial_grad_sum = torch.zeros_like(override_weight, dtype=torch.float32)
+    # Measured second moment of this module's refresh gradient. Hooks stay
+    # attached only for the batch loop below; `functional_call` swaps the weight
+    # but still runs the module's own forward, so they fire normally.
+    if grad_sq_accum is not None:
+        grad_sq_accum.attach()
     partial_count = 0
     loss_sum = 0.0
     loss_sum_current = 0.0
@@ -6869,6 +7146,9 @@ def collect_true_weight_gradient(
                         # empty_cache on thousands of refreshes. PyTorch reuses
                         # cached blocks, so this is safe as long as no outer
                         # autograd graph leaks across the loop.
+
+    if grad_sq_accum is not None:
+        grad_sq_accum.detach()
 
     extras = {"loss_sum": loss_sum}
     if slide_active:
@@ -9215,6 +9495,15 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     )
                     accumulate_hessian_for_gptq(gptq, subset)
 
+                # module_name -> ModuleGradSecondMoment. One per module, kept across
+                # every refresh of that module so the pre-pass sees the whole
+                # calibration pass before `build_prior` reads it.
+                grad_sq_accums = {}
+                collect_grad_sq = "warm_adam" in {
+                    getattr(args, "grad_optimizer", None),
+                    getattr(args, "final_layer_grad_optimizer", None),
+                }
+
                 def make_gradient_refresh_fn(
                     module_name,
                     slide_next_layer=None,
@@ -9225,6 +9514,18 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     slide_next_refined_mse_mean_grad=None,
                 ):
                     def refresh_fn(weight_snapshot, slide_alpha=1.0):
+                        grad_sq_accum = None
+                        if collect_grad_sq:
+                            grad_sq_accum = grad_sq_accums.get(module_name)
+                            if grad_sq_accum is None:
+                                _mod = full.get(
+                                    module_name, full.get(module_name + ".module", None)
+                                )
+                                if _mod is not None:
+                                    grad_sq_accum = ModuleGradSecondMoment(
+                                        _mod, sink_size=sink_size
+                                    )
+                                    grad_sq_accums[module_name] = grad_sq_accum
                         if args.final_layer_full_backward and i == final_layer_idx:
                             sample_indices = full_refresh_sample_indices
                         else:
@@ -9268,6 +9569,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                                 sink_size=sink_size,
                                 a_loss_ratio=args.a_loss_ratio,
                                 a_loss_clip_scope=args.a_loss_clip_scope,
+                                grad_sq_accum=grad_sq_accum,
                             )
                         )
                         # DP aggregation. When world_size > 1 we pack the grad sum
@@ -9494,7 +9796,80 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                                 gptq[name].reference_loss,
                                 gptq[name].token_count, gptq[name].index,
                             )
+                        # warm_adam needs a prior before the first column block
+                        # closes, so spend one extra refresh here at the still
+                        # unquantised weight. At backward_samples == nsamples a
+                        # single refresh already covers every calibration sample;
+                        # below that the prior is built from that many samples and
+                        # is correspondingly noisier.
+                        #
+                        # The refresh function has to be hoisted out of the call
+                        # below so the pre-pass and the quant loop share one
+                        # instance (and therefore one accumulator).
+                        _refresh_fn_for_module = (
+                            make_gradient_refresh_fn(
+                                name,
+                                slide_next_layer=slide_next_layer,
+                                slide_fp_inps_next=slide_fp_inps_next,
+                                slide_next_layer_output_fisher=slide_next_layer_output_fisher,
+                                slide_next_refined_A_list=slide_next_refined_A_list,
+                                slide_next_refined_mse_grad_pool=layer_refined_mse_grad_pool_next,
+                                slide_next_refined_mse_mean_grad=layer_refined_mse_mean_grad_next,
+                            )
+                            if args.g_update_mode in {"block_backward", "block_gd"}
+                            else None
+                        )
+                        grad_sq_full = None
+                        warm_start_steps = 0
+                        if effective_grad_optimizer == "warm_adam":
+                            if _refresh_fn_for_module is None:
+                                raise ValueError(
+                                    "`grad_optimizer=warm_adam` needs a refresh "
+                                    "function; use --g_update_mode block_gd."
+                                )
+                            _B = max(
+                                int(getattr(args, "backward_samples", 0) or inps.shape[0]), 1
+                            )
+                            grad_sq_accums.pop(name, None)
+                            # The pre-pass is a measurement, not a step: freeze the
+                            # sample scheduler so the refreshes that follow see
+                            # exactly the batches they would have seen without it.
+                            # Without this, `--warm_start_steps 0` -- which is
+                            # mathematically identical to adam -- does not
+                            # reproduce adam.
+                            _freeze = (
+                                gradient_refresh_scheduler.frozen()
+                                if gradient_refresh_scheduler is not None
+                                else _NULL_CONTEXT
+                            )
+                            with _freeze:
+                                _refresh_fn_for_module(
+                                    subset[name].weight.data.float()
+                                )
+                            _pre = grad_sq_accums.get(name)
+                            if _pre is None or _pre.token_count == 0:
+                                raise RuntimeError(
+                                    f"warm_adam pre-pass produced no tokens for {name}; "
+                                    "the module hooks never fired."
+                                )
+                            grad_sq_full = _pre.build_prior(_B)
+                            _t0_override = int(getattr(args, "warm_start_steps", -1))
+                            warm_start_steps = (
+                                _t0_override if _t0_override >= 0
+                                else max(int(round(inps.shape[0] / max(_B, 1))), 1)
+                            )
+                            logging.info(
+                                "warm_adam pre-pass layer=%d module=%s samples=%d "
+                                "tokens=%d B=%d t0=%d prior_median=%s prior_max=%s",
+                                i, name, _pre.sample_count, _pre.token_count,
+                                _B, warm_start_steps,
+                                format_log_value(grad_sq_full.median().item()),
+                                format_log_value(grad_sq_full.max().item()),
+                            )
+
                         gptq[name].fasterquant(
+                            grad_sq_full=grad_sq_full,
+                            warm_start_steps=warm_start_steps,
                             blocksize=args.blocksize,
                             percdamp=args.percdamp,
                             groupsize=layer_w_groupsize,
@@ -9504,15 +9879,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             g_update_mode=args.g_update_mode,
                             export_to_et=args.export_to_et,
                             profile_recorder=module_recorder,
-                            gradient_refresh_fn=make_gradient_refresh_fn(
-                                name,
-                                slide_next_layer=slide_next_layer,
-                                slide_fp_inps_next=slide_fp_inps_next,
-                                slide_next_layer_output_fisher=slide_next_layer_output_fisher,
-                                slide_next_refined_A_list=slide_next_refined_A_list,
-                                slide_next_refined_mse_grad_pool=layer_refined_mse_grad_pool_next,
-                                slide_next_refined_mse_mean_grad=layer_refined_mse_mean_grad_next,
-                            ) if args.g_update_mode in {"block_backward", "block_gd"} else None,
+                            gradient_refresh_fn=_refresh_fn_for_module,
                             grad_lr=effective_grad_lr,
                             grad_optimizer=effective_grad_optimizer,
                             grad_reg_strategy=effective_grad_reg_strategy,

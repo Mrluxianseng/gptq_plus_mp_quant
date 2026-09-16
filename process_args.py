@@ -188,14 +188,14 @@ def parse_gen():
         "--grad_optimizer",
         type=str,
         default="adam",
-        choices=["sgd", "adam"],
+        choices=["sgd", "adam", "warm_adam"],
         help="Optimizer used for the block-wise first-order update after each refresh.",
     )
     parser.add_argument(
         "--final_layer_grad_optimizer",
         type=str,
         default=None,
-        choices=["sgd", "adam"],
+        choices=["sgd", "adam", "warm_adam"],
         help="Optional override for the block-wise first-order optimizer used only in the final transformer layer.",
     )
     parser.add_argument(
@@ -214,6 +214,19 @@ def parse_gen():
             "norm and often produces much larger gradients than earlier blocks, "
             "so a looser (or tighter) clip can help. Leave unset to reuse "
             "--grad_clip. Set negative to disable clipping on the final layer."
+        ),
+    )
+    parser.add_argument(
+        "--warm_start_steps",
+        type=int,
+        default=-1,
+        help=(
+            "t0 for `--grad_optimizer warm_adam`: how many refresh-steps' worth of "
+            "evidence the pre-pass prior carries. It offsets the SECOND-moment bias "
+            "correction only. -1 (default) derives it as nsamples/backward_samples, "
+            "the statistically equivalent value. 0 zeroes the prior and the offset, "
+            "making warm_adam mathematically identical to plain adam -- use it as a "
+            "null test of the plumbing."
         ),
     )
     parser.add_argument(
