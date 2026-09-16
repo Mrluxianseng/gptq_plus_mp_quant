@@ -15,11 +15,15 @@
 # Small config on purpose -- this tests plumbing, not quality. The numbers are
 # not comparable to the paper.
 set -u
-ROOT=/mnt/d/gptq_plus_realq
-VENV=/mnt/d/gptq_plus/.venv_wsl          # shared with the main worktree
-MODEL=${MODEL:-/mnt/d/llamaModels/Qwen3-0.6B}
+ROOT=${ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
+MODEL=${MODEL:?export MODEL=/path/to/Qwen3-0.6B}
+# Only needed where the interpreter is not already on PATH (e.g. a bare WSL
+# shell). On a server with the environment already active, leave VENV unset.
+VENV=${VENV:-}
 cd "$ROOT" || exit 1
-source "$VENV/bin/activate"
+if [[ -n "${VENV}" ]]; then
+    source "$VENV/bin/activate"
+fi
 mkdir -p "$ROOT/outputs"
 LOG="$ROOT/outputs/nulltest_queue.log"
 exec >> "$LOG" 2>&1
