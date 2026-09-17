@@ -172,6 +172,14 @@ if [[ "${WARM_PRIOR_SCALAR}" != "none" ]]; then
     WARM_EXTRA+=(--warm_prior_scalar "${WARM_PRIOR_SCALAR}")
 fi
 
+# This box hits an intermittent NCCL bug where the shared-memory transport
+# builds a garbled segment name ("/dev/shm/nccl-<mojibake> (size 0)") and every
+# rank dies at the first collective. /dev/shm is 159G and empty, so it is not a
+# capacity problem -- it is NCCL 2.28.9 / driver 580.95.05, and it appeared when
+# the container moved hosts. Disabling the shm transport is verified to fix it
+# (4/4 ranks through a DDP all-reduce). Set NCCL_SHM_DISABLE=0 to undo.
+export NCCL_SHM_DISABLE="${NCCL_SHM_DISABLE:-1}"
+
 IFS=',' read -r -a _DEVS <<< "${DEVICE}"
 N_GPUS=${#_DEVS[@]}
 if (( BACKWARD_SAMPLES % N_GPUS != 0 )); then
@@ -227,6 +235,7 @@ REAL-Q formal comparison - Qwen3-0.6B W4A16
   grad_clip    : ${GRAD_CLIP} / ${FINAL_LAYER_GRAD_CLIP}  (1.0 = off at this scale)
   arms         : adam, warm_adam   prior_batches K=${WARM_PRIOR_BATCHES} (=> t0=K)
   static cache : ${STATIC_CACHE_PATH}
+  nccl shm     : NCCL_SHM_DISABLE=${NCCL_SHM_DISABLE}
   paper target : KL 6.79e-2 / PPL 21.57  (Table 5, seed 1; Table 9 gives the
                  five-seed spread 6.79-6.92)
 ============================================================
