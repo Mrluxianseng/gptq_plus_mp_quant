@@ -238,12 +238,20 @@ note_exit() {
 # below runs with STAGE2_CPU_MASTER=1 (upstream's default), which REFUSES to
 # compute this inline and requires the cache to exist. Doing it once also means
 # all arms share bit-identical Stage-0 inputs.
-# The cache key covers everything Stage 1 depends on -- model, nsamples,
-# seq_len, num_groups, global_loss_bsz, world size, seed, rotation -- and none
-# of that varies across the arms below, so an existing cache is reusable and
-# rebuilding it costs minutes for nothing. FORCE_PRECOMPUTE=1 rebuilds anyway.
-if [[ "${FORCE_PRECOMPUTE:-0}" != "1" ]] && ls "${STATIC_CACHE_PATH}"/*.pt >/dev/null 2>&1; then
-    say "Stage 1: reusing the cache in ${STATIC_CACHE_PATH} (FORCE_PRECOMPUTE=1 to rebuild)"
+# The cache key covers everything Stage 1 depends on and none of it varies
+# across the arms below, so an existing cache is reusable and rebuilding it
+# costs minutes for nothing. FORCE_PRECOMPUTE=1 rebuilds anyway.
+#
+# Match the real filename rather than mirroring the key in the directory name:
+# mirroring means silently reusing a mismatched cache the moment a field is
+# forgotten. That is exactly what happened with GLOBAL_LOSS_BSZ -- a glbsz=16
+# run reused a glbsz=8 directory and both arms died in Stage 2, where
+# STAGE2_CPU_MASTER refuses to compute the cache inline. The pattern below
+# pins every field this script can vary; anything it cannot vary (model hash,
+# rotation id, saliency clip) is constant for a given model.
+CACHE_GLOB="${STATIC_CACHE_PATH}/*_s${N_SAMPLES}_blk${SEQ_LEN}_*_g${NUM_GROUPS}_*_ghtk${GRAD_HESSIAN_TOPK}_glbsz${GLOBAL_LOSS_BSZ}_cseed${SEED}_*_world${N_GPUS}_rank*.pt"
+if [[ "${FORCE_PRECOMPUTE:-0}" != "1" ]] && compgen -G "${CACHE_GLOB}" >/dev/null; then
+    say "Stage 1: reusing the cache matching ${CACHE_GLOB} (FORCE_PRECOMPUTE=1 to rebuild)"
 else
     say "Stage 1: static precompute -> ${STATIC_CACHE_PATH}"
     common STAGE2_CPU_MASTER=0 EXIT_AFTER_PRECOMPUTE=1 \
@@ -253,8 +261,8 @@ else
         --eval_seq_len "${EVAL_SEQ_LEN}" --seed "${SEED}" --skip_eval \
         > "${OUTPUT_ROOT}/formal_precompute.log" 2>&1
     say "Stage 1 exit=$?"
-    if ! ls "${STATIC_CACHE_PATH}"/*.pt >/dev/null 2>&1; then
-        say "ABORT: no cache written to ${STATIC_CACHE_PATH}; see formal_precompute.log"
+    if ! compgen -G "${CACHE_GLOB}" >/dev/null; then
+        say "ABORT: Stage 1 wrote no cache matching ${CACHE_GLOB}; see formal_precompute.log"
         exit 1
     fi
 fi
