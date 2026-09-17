@@ -231,13 +231,17 @@ def parse_gen():
     )
     parser.add_argument(
         "--warm_prior_scalar",
-        action="store_true",
+        type=str,
+        default="none",
+        choices=["none", "mean", "geomean"],
         help=(
             "Control for `--grad_optimizer warm_adam`: replace the measured "
-            "per-coordinate prior with a single scalar per tensor, its mean. "
-            "Keeps the magnitude, destroys the shape. If the gain survives, it "
-            "comes from the effective step scale rather than per-coordinate "
-            "preconditioning."
+            "per-coordinate prior with one scalar per tensor, destroying its "
+            "shape. 'mean' keeps the arithmetic mean, which for a heavy-tailed "
+            "prior sits well above the typical coordinate and therefore also "
+            "changes the scale most coordinates see; 'geomean' tracks the "
+            "typical coordinate instead. Run both: only if the gain disappears "
+            "under both is the per-coordinate shape doing the work."
         ),
     )
     parser.add_argument(

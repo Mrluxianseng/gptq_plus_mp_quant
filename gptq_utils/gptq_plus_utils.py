@@ -10002,14 +10002,34 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                                 )
                             grad_sq_full = _pre.build_prior(_B)
                             # Control: collapse the prior to one scalar per
-                            # tensor. Magnitude is preserved, per-coordinate
-                            # shape is destroyed. If warm_adam's gain survives
-                            # this, the gain is a step-scale effect and not the
-                            # per-coordinate preconditioning the method claims.
-                            if bool(getattr(args, "warm_prior_scalar", False)):
-                                grad_sq_full = torch.full_like(
-                                    grad_sq_full, float(grad_sq_full.mean().item())
+                            # tensor, destroying per-coordinate shape while
+                            # keeping a magnitude. Which magnitude matters: P is
+                            # heavy-tailed, so its arithmetic mean sits far above
+                            # the typical coordinate and would suppress most of
+                            # them while relaxing the few large ones -- a change
+                            # of scale on top of the change of shape. The
+                            # geometric mean tracks the typical coordinate
+                            # instead, so running both separates the two.
+                            _scalar_mode = str(
+                                getattr(args, "warm_prior_scalar", "none") or "none"
+                            )
+                            if _scalar_mode != "none":
+                                if _scalar_mode == "mean":
+                                    _c = float(grad_sq_full.mean().item())
+                                else:
+                                    _pos = grad_sq_full[grad_sq_full > 0]
+                                    _c = (
+                                        float(torch.exp(torch.log(_pos).mean()).item())
+                                        if _pos.numel() > 0 else 0.0
+                                    )
+                                logging.info(
+                                    "warm_adam prior collapsed to a %s scalar: %s "
+                                    "(was median=%s max=%s)",
+                                    _scalar_mode, format_log_value(_c),
+                                    format_log_value(grad_sq_full.median().item()),
+                                    format_log_value(grad_sq_full.max().item()),
                                 )
+                                grad_sq_full = torch.full_like(grad_sq_full, _c)
                             # t0 is what the prior is worth in refresh-steps:
                             # samples measured / samples per refresh. Deriving it
                             # from nsamples instead would assume the pre-pass

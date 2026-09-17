@@ -148,9 +148,11 @@ RDZV_PORT=${RDZV_PORT:-29500}
 # warm_adam arms. "-1" means derive t0 = nsamples / backward_samples (= 64 here).
 T0_LIST=${T0_LIST:--1}
 # Control arm: scalar prior (magnitude kept, per-coordinate shape removed).
-WARM_PRIOR_SCALAR=${WARM_PRIOR_SCALAR:-0}
+WARM_PRIOR_SCALAR=${WARM_PRIOR_SCALAR:-none}   # none | mean | geomean
 WARM_EXTRA=()
-if [[ "${WARM_PRIOR_SCALAR}" == "1" ]]; then WARM_EXTRA=(--warm_prior_scalar); fi
+if [[ "${WARM_PRIOR_SCALAR}" != "none" ]]; then
+    WARM_EXTRA=(--warm_prior_scalar "${WARM_PRIOR_SCALAR}")
+fi
 
 IFS=',' read -r -a _DEVS <<< "${DEVICE}"
 N_GPUS=${#_DEVS[@]}
