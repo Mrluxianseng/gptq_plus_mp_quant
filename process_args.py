@@ -230,6 +230,17 @@ def parse_gen():
         ),
     )
     parser.add_argument(
+        "--warm_prior_scalar",
+        action="store_true",
+        help=(
+            "Control for `--grad_optimizer warm_adam`: replace the measured "
+            "per-coordinate prior with a single scalar per tensor, its mean. "
+            "Keeps the magnitude, destroys the shape. If the gain survives, it "
+            "comes from the effective step scale rather than per-coordinate "
+            "preconditioning."
+        ),
+    )
+    parser.add_argument(
         "--grad_refresh_loss",
         type=str,
         default="fisher_diag_mse",

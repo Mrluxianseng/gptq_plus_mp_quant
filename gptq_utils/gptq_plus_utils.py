@@ -10001,6 +10001,15 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                                     "on any rank; the module hooks never fired."
                                 )
                             grad_sq_full = _pre.build_prior(_B)
+                            # Control: collapse the prior to one scalar per
+                            # tensor. Magnitude is preserved, per-coordinate
+                            # shape is destroyed. If warm_adam's gain survives
+                            # this, the gain is a step-scale effect and not the
+                            # per-coordinate preconditioning the method claims.
+                            if bool(getattr(args, "warm_prior_scalar", False)):
+                                grad_sq_full = torch.full_like(
+                                    grad_sq_full, float(grad_sq_full.mean().item())
+                                )
                             # t0 is what the prior is worth in refresh-steps:
                             # samples measured / samples per refresh. Deriving it
                             # from nsamples instead would assume the pre-pass
