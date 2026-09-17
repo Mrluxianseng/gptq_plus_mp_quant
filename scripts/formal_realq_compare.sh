@@ -41,7 +41,8 @@
 #                       10 looks like a sweep convenience.
 #   KL_TOPK / GRAD_HESSIAN_TOPK = -1 (upstream defaults, no truncation). The
 #                       paper mentions no top-k anywhere.
-#   GRAD_CLIP / FINAL_LAYER_GRAD_CLIP -- upstream defaults, left alone.
+#   GRAD_CLIP / FINAL_LAYER_GRAD_CLIP = 1.0 -- see the note at their
+#                       declaration; 1.0 never binds at this gradient scale.
 #   ACT_ORDER=1      -- upstream default.
 #
 # ON t0
@@ -123,6 +124,19 @@ KL_TOPK=${KL_TOPK:--1}
 # evaluation chunk length, the populations the P95/P99 percentiles are taken
 # over, the Fisher label seed, and refresh-sample ordering. These are upstream
 # defaults, and any residual gap to the paper table lives in this list.
+# No gradient clipping. The paper describes none: its clipping mechanisms are
+# a_clip/k_clip/v_clip (activation + KV quantisation), a_loss_clip (the
+# Fisher-MSE output delta) and the Hessian-side saliency percentile, and D.1
+# calls the last two "the auxiliary clipping mechanisms". ptq.py's own default
+# is 1.0 and so is the refactored realq template; only the legacy sweep sets
+# 5e-5, with no comment or commit message behind it. At the measured gradient
+# scale (median |g| 2.8e-6, max 7.5e-5) a 1.0 threshold never binds, so this is
+# clipping off in all but name.
+#
+# Not a free choice: adam is insensitive to the threshold (9.14 vs 8.97 at
+# lr=3e-4, inside its 0.21 spread) but warm_adam is not (8.16 vs 9.31).
+GRAD_CLIP=${GRAD_CLIP:-1.0}
+FINAL_LAYER_GRAD_CLIP=${FINAL_LAYER_GRAD_CLIP:-1.0}
 PRE_GD_STEPS=${PRE_GD_STEPS:-0}
 GRAD_HESSIAN_TOPK=${GRAD_HESSIAN_TOPK:--1}
 ACT_ORDER=${ACT_ORDER:-1}
@@ -186,7 +200,7 @@ common() {
     PRE_GRAD_OPTIMIZER=sgd PRE_FINAL_LAYER_GRAD_OPTIMIZER=none \
     GRAD_REG_STRATEGY=none \
     KL_TOPK="${KL_TOPK}" GRAD_HESSIAN_TOPK="${GRAD_HESSIAN_TOPK}" \
-    SALIENCY_CLIP_PERCENTILE="${SALIENCY_CLIP_PERCENTILE}" \
+    SALIENCY_CLIP_PERCENTILE="${SALIENCY_CLIP_PERCENTILE}"     GRAD_CLIP="${GRAD_CLIP}" FINAL_LAYER_GRAD_CLIP="${FINAL_LAYER_GRAD_CLIP}" \
     PROJ_LR_SCALE=1.0 DOWN_PROJ_LR_SCALE=1.0 SECOND_ORDER_SCALE=1.0 PRE_CLIP=0 \
     ENABLE_QA_EVAL="${ENABLE_QA_EVAL}" LM_EVAL_BATCH_SIZE="${LM_EVAL_BATCH_SIZE}" \
     STATIC_CACHE_PATH="${STATIC_CACHE_PATH}" RDZV_PORT="${RDZV_PORT}" \
@@ -206,6 +220,7 @@ REAL-Q formal comparison - Qwen3-0.6B W4A16
   lr           : ${LR}  (final block ${FINAL_LAYER_GRAD_LR})
   lr schedule  : ${GRAD_LR_LAYER_SCHEDULE}  base_ratio=${GRAD_LR_LAYER_BASE_RATIO}
   topk         : kl=${KL_TOPK}  grad_hessian=${GRAD_HESSIAN_TOPK}
+  grad_clip    : ${GRAD_CLIP} / ${FINAL_LAYER_GRAD_CLIP}  (1.0 = off at this scale)
   arms         : adam, warm_adam t0 in { ${T0_LIST} }   (-1 => ${N_SAMPLES}/${BACKWARD_SAMPLES})
   static cache : ${STATIC_CACHE_PATH}
   paper target : KL 6.79e-2 / PPL 21.57  (Table 5, seed 1; Table 9 gives the
