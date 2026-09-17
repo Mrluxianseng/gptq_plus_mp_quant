@@ -313,13 +313,13 @@ result formal_adam
 
 for t0 in ${T0_LIST}; do
     tag="formal_warm_t${t0//-/m}"
-    say "Stage 2b: warm_adam t0=${t0} @ lr=${LR}"
+    say "Stage 2b: warm_adam t0=${t0} K=${WARM_PRIOR_BATCHES} @ lr=${LR}"
     common STAGE2_CPU_MASTER=1 \
         GRAD_OPTIMIZER=warm_adam FINAL_LAYER_GRAD_OPTIMIZER=warm_adam \
         BASE_EXP="${tag}" \
         bash scripts/gptq_plus_lr_sweep.sh "${MODEL}" "${NUM_GROUPS}" "${DEVICE}" \
         --eval_seq_len "${EVAL_SEQ_LEN}" --seed "${SEED}" --eval_datasets ${EVAL_DATASETS} \
-        --warm_start_steps "${t0}" \
+        --warm_start_steps "${t0}" "${WARM_EXTRA[@]}" \
         > "${OUTPUT_ROOT}/${tag}.log" 2>&1
     note_exit "${tag}" "$?"
     result "${tag}"
