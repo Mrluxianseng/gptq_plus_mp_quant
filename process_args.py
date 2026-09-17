@@ -230,6 +230,20 @@ def parse_gen():
         ),
     )
     parser.add_argument(
+        "--warm_prior_batches",
+        type=int,
+        default=1,
+        help=(
+            "Refresh batches the `warm_adam` pre-pass measures over. The prior "
+            "then rests on K*backward_samples samples and t0 comes out as K, "
+            "since t0 is derived from the samples actually measured and is "
+            "never set by hand. K=1 measures the same batch the first real "
+            "refresh will use, so its only new content is the between-sample "
+            "variance term Var_s/B; larger K adds genuinely new samples. Cost "
+            "is K extra refreshes per module."
+        ),
+    )
+    parser.add_argument(
         "--warm_prior_scalar",
         type=str,
         default="none",

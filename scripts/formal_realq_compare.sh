@@ -163,9 +163,13 @@ RDZV_PORT=${RDZV_PORT:-29500}
 T0_LIST=${T0_LIST:--1}
 # Control arm: scalar prior (magnitude kept, per-coordinate shape removed).
 WARM_PRIOR_SCALAR=${WARM_PRIOR_SCALAR:-none}   # none | mean | geomean
-WARM_EXTRA=()
+# Refresh batches the pre-pass measures over; t0 follows from it (t0 = K) and
+# is never set by hand. K=1 reuses the batch the first real refresh will see,
+# so its only new content is Var_s/B.
+WARM_PRIOR_BATCHES=${WARM_PRIOR_BATCHES:-1}
+WARM_EXTRA=(--warm_prior_batches "${WARM_PRIOR_BATCHES}")
 if [[ "${WARM_PRIOR_SCALAR}" != "none" ]]; then
-    WARM_EXTRA=(--warm_prior_scalar "${WARM_PRIOR_SCALAR}")
+    WARM_EXTRA+=(--warm_prior_scalar "${WARM_PRIOR_SCALAR}")
 fi
 
 IFS=',' read -r -a _DEVS <<< "${DEVICE}"
@@ -221,7 +225,7 @@ REAL-Q formal comparison - Qwen3-0.6B W4A16
   lr schedule  : ${GRAD_LR_LAYER_SCHEDULE}  base_ratio=${GRAD_LR_LAYER_BASE_RATIO}
   topk         : kl=${KL_TOPK}  grad_hessian=${GRAD_HESSIAN_TOPK}
   grad_clip    : ${GRAD_CLIP} / ${FINAL_LAYER_GRAD_CLIP}  (1.0 = off at this scale)
-  arms         : adam, warm_adam t0 in { ${T0_LIST} }   (-1 => ${N_SAMPLES}/${BACKWARD_SAMPLES})
+  arms         : adam, warm_adam   prior_batches K=${WARM_PRIOR_BATCHES} (=> t0=K)
   static cache : ${STATIC_CACHE_PATH}
   paper target : KL 6.79e-2 / PPL 21.57  (Table 5, seed 1; Table 9 gives the
                  five-seed spread 6.79-6.92)

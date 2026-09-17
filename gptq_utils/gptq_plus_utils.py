@@ -9979,9 +9979,31 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             # measurement point overshot by 5.6-268x and lost
                             # most of the per-coordinate structure as well.
                             _measure_at = "W_fp"
+                            # K refresh batches, so the prior rests on K*B
+                            # samples and t0 (derived below from the samples
+                            # actually measured) comes out as K. One frozen()
+                            # block wraps the whole loop: the cursor advances
+                            # inside it, giving K distinct batches, and is
+                            # restored on exit so the training stream is
+                            # untouched. Wrapping each call separately would
+                            # hand back the same batch K times -- same cost, no
+                            # new evidence, and a t0 of K that is not earned.
+                            _K = max(int(getattr(args, "warm_prior_batches", 1) or 1), 1)
+                            _seen_batches = []
                             with _freeze:
-                                _refresh_fn_for_module(
-                                    subset[name].weight.data.float()
+                                for _k in range(_K):
+                                    _, _pre_meta = _refresh_fn_for_module(
+                                        subset[name].weight.data.float()
+                                    )
+                                    _seen_batches.append(
+                                        tuple(_pre_meta.get("sample_indices", ()))
+                                    )
+                            # t0 is only honest if the batches really differ.
+                            if _K > 1 and len(set(_seen_batches)) != _K:
+                                raise RuntimeError(
+                                    f"warm_adam pre-pass for {name} drew {_K} batches "
+                                    f"but only {len(set(_seen_batches))} distinct ones; "
+                                    "t0 would claim evidence the prior does not have."
                                 )
                             _pre = grad_sq_accums.get(name)
                             if _pre is None:
@@ -10041,11 +10063,11 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                                 else max(int(round(_n_global / max(_B, 1))), 1)
                             )
                             logging.info(
-                                "warm_adam pre-pass layer=%d module=%s at=%s "
+                                "warm_adam pre-pass layer=%d module=%s at=%s K=%d "
                                 "samples=%d tokens=%d fwd=%d grad=%d skipped=%d "
                                 "B=%d t0=%d prior_median=%s prior_max=%s "
                                 "|| per-rank: %s",
-                                i, name, _measure_at,
+                                i, name, _measure_at, _K,
                                 _pre.sample_count, _pre.token_count,
                                 _pre.fwd_calls, _pre.grad_calls, _pre.grad_skipped,
                                 _B, warm_start_steps,
