@@ -701,6 +701,51 @@ def _reach_probe_emit(layer_idx, name, lr, rows, n_groups=None):
     )
 
 
+
+_HORIZON_LOGGED = []
+
+
+def _horizon_step_weights(n_tail, blocksize, tail_first_block, p, device, dtype):
+    """Per-column step multiplier from the column's remaining update count.
+
+    See the module note on --horizon_p. Returns None for p=0 so the production
+    path stays byte-identical rather than multiplying by a tensor of ones.
+
+    The refresh only fires while i2 < C, so i2 is always a whole number of
+    blocks and `tail_first_block` = i2 // blocksize is the block index of the
+    first tail column -- which is also how many updates that column will have
+    received in total, since a column in block k is updated once after each of
+    blocks 0 .. k-1.
+    """
+    if not p:
+        return None
+    h = torch.arange(n_tail, device=device, dtype=torch.float32)
+    h.div_(blocksize).floor_()
+    k = h + float(tail_first_block)
+    kmax = int(k.max().item())
+    # sum_{i=1..k} i^-p for every k that occurs; kmax is the block count, so a
+    # table is exact and costs nothing.
+    tbl = torch.cumsum(
+        torch.arange(1, kmax + 1, device=device, dtype=torch.float32) ** (-p),
+        dim=0,
+    )
+    w = k * ((h + 1.0) ** (-p)) / tbl[k.long() - 1]
+    if not _HORIZON_LOGGED:
+        # Once per process, print the weights that were actually built. The
+        # banner only shows shell variables; WARM_PRIOR_BATCHES=8 was printed
+        # as "K=8" while the flag never reached ptq.py and the arm ran at K=1.
+        _HORIZON_LOGGED.append(1)
+        _buckets = [float(w[i * blocksize]) for i in range(int(h.max().item()) + 1)]
+        logging.info(
+            "horizon_p=%g active: tail=%d blocksize=%d first_tail_block=%d, "
+            "step multiplier per remaining-update bucket (h=0 is the column's "
+            "last update before it freezes): %s",
+            p, n_tail, blocksize, tail_first_block,
+            " ".join("h%d:%.3f" % (i, v) for i, v in enumerate(_buckets)),
+        )
+    return w.to(dtype)
+
+
 def _align_warm_prior(grad_sq_full, row_start, row_end, perm, device):
     """Put the [out, in] prior into one subgroup's row-sliced, actorder frame.
 
@@ -1317,6 +1362,7 @@ class GPTQPlus:
         adam_beta1=0.9,
         adam_beta2=0.999,
         adam_eps=1e-8,
+        step_scale=None,
     ):
         grad_slice = grad_sub[:, :, col_start:]
         if grad_slice.numel() == 0:
@@ -1324,7 +1370,8 @@ class GPTQPlus:
         if grad_clip is not None and grad_clip > 0:
             grad_slice = grad_slice.clamp(min=-grad_clip, max=grad_clip)
         if opt_state["type"] == "sgd":
-            return lr * grad_slice
+            upd = lr * grad_slice
+            return upd if step_scale is None else upd * step_scale
 
         opt_state["step"] += 1
         if (
@@ -1351,7 +1398,10 @@ class GPTQPlus:
         denom = exp_avg_sq.sqrt() / math.sqrt(bias_correction2)
         denom.add_(adam_eps)
         step_size = lr / bias_correction1
-        return step_size * (exp_avg / denom)
+        upd = step_size * (exp_avg / denom)
+        # step_scale broadcasts over the trailing (column) axis; see
+        # _horizon_step_weights. None keeps this byte-identical to production.
+        return upd if step_scale is None else upd * step_scale
 
     @staticmethod
     def _current_ghinv(base, current_weight, ref_weight, beta_view, refresh_mode):
@@ -1722,6 +1772,7 @@ class GPTQPlus:
         block_atomic_quant=False,
         block_observer=None,
         grad_clip=1.0,
+        horizon_p=0.0,
         slide_refresh_start=0,
         slide_refresh_block_total=None,
         refresh_full_metrics=False,
@@ -2314,6 +2365,14 @@ class GPTQPlus:
                                     second_order_abs_max = second_abs.max().item()
                                     second_order_abs_q99 = _quantile_large(second_abs, 0.99)
 
+                            # i2 is a whole number of blocks here (the last
+                            # block never refreshes), so i2 // blocksize is both
+                            # the first tail column's block index and the number
+                            # of updates that column receives in total.
+                            _hstep = _horizon_step_weights(
+                                C - i2, blocksize, i2 // blocksize, horizon_p,
+                                state["W_sub"].device, state["W_sub"].dtype,
+                            )
                             optimizer_update_raw = self._compute_grad_optimizer_update_batched(
                                 state["grad_optimizer_state"],
                                 (
@@ -2323,6 +2382,7 @@ class GPTQPlus:
                                 i2,
                                 grad_lr,
                                 grad_clip=grad_clip,
+                                step_scale=_hstep,
                             )
                             optimizer_update, gate_regularizer_update, sine_regularizer_update = self._apply_first_order_regularizer_batched(
                                 state,
@@ -2588,6 +2648,7 @@ class GPTQPlus:
         block_atomic_quant=False,
         block_observer=None,
         grad_clip=1.0,
+        horizon_p=0.0,
         diagnostic_recorder=None,
         slide_refresh_start=0,
         slide_refresh_block_total=None,
@@ -2612,6 +2673,12 @@ class GPTQPlus:
         # lines in it, which reads exactly like "the reach is zero" -- refuse
         # instead. This file has already produced four silent no-ops of this
         # shape (see the sweep-script overrides in the project notes).
+        if horizon_p and group_parallel_mode == "none":
+            raise ValueError(
+                "`horizon_p` is only instrumented in the group-parallel path. "
+                "Set GROUP_PARALLEL_QUANT=rank (the sweep default) or leave "
+                "--horizon_p at 0."
+            )
         if os.environ.get("REACH_PROBE") == "1" and group_parallel_mode == "none":
             raise ValueError(
                 "REACH_PROBE=1 requires group_parallel_mode != none; the probe "
@@ -2662,6 +2729,7 @@ class GPTQPlus:
                     block_atomic_quant=block_atomic_quant,
                     block_observer=block_observer,
                     grad_clip=grad_clip,
+                    horizon_p=horizon_p,
                     slide_refresh_start=slide_refresh_start,
                     slide_refresh_block_total=slide_refresh_block_total,
                     refresh_full_metrics=refresh_full_metrics,
@@ -10237,6 +10305,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             block_atomic_quant=args.block_atomic_quant,
                             block_observer=make_block_observer(name, _module_grad_optimizer) if args.g_update_mode in {"block_backward", "block_gd"} else None,
                             grad_clip=effective_main_grad_clip,
+                            horizon_p=float(getattr(args, "horizon_p", 0.0) or 0.0),
                             diagnostic_recorder=diagnostic_registry.get_or_create(i, name),
                             slide_refresh_start=slide_refresh_cursor,
                             slide_refresh_block_total=slide_refresh_block_total,

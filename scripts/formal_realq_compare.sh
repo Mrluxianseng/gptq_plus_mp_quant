@@ -167,6 +167,15 @@ WARM_PRIOR_SCALAR=${WARM_PRIOR_SCALAR:-none}   # none | mean | geomean
 # is never set by hand. K=1 reuses the batch the first real refresh will see,
 # so its only new content is Var_s/B.
 WARM_PRIOR_BATCHES=${WARM_PRIOR_BATCHES:-1}
+
+# Per-column step weighting by remaining update count. A column in block k is
+# updated k times, at horizons k-1 down to 0; the weight is
+# k*(h+1)^-p / sum_{i=1..k} i^-p, whose sum over that column's own life is
+# exactly k for every p -- so this moves a column's budget in time without
+# changing how much of it there is. 0 is production; p>0 back-loads toward the
+# final updates. Applies to EVERY arm, so compare two runs that differ only in
+# HORIZON_P.
+HORIZON_P=${HORIZON_P:-0}
 WARM_EXTRA=(--warm_prior_batches "${WARM_PRIOR_BATCHES}")
 if [[ "${WARM_PRIOR_SCALAR}" != "none" ]]; then
     WARM_EXTRA+=(--warm_prior_scalar "${WARM_PRIOR_SCALAR}")
@@ -213,6 +222,7 @@ common() {
     GRAD_REG_STRATEGY=none \
     KL_TOPK="${KL_TOPK}" GRAD_HESSIAN_TOPK="${GRAD_HESSIAN_TOPK}" \
     SALIENCY_CLIP_PERCENTILE="${SALIENCY_CLIP_PERCENTILE}"     GRAD_CLIP="${GRAD_CLIP}" FINAL_LAYER_GRAD_CLIP="${FINAL_LAYER_GRAD_CLIP}" \
+    HORIZON_P="${HORIZON_P}" \
     PROJ_LR_SCALE=1.0 DOWN_PROJ_LR_SCALE=1.0 SECOND_ORDER_SCALE=1.0 PRE_CLIP=0 \
     ENABLE_QA_EVAL="${ENABLE_QA_EVAL}" LM_EVAL_BATCH_SIZE="${LM_EVAL_BATCH_SIZE}" \
     STATIC_CACHE_PATH="${STATIC_CACHE_PATH}" RDZV_PORT="${RDZV_PORT}" \
@@ -233,6 +243,7 @@ REAL-Q formal comparison - Qwen3-0.6B W4A16
   lr schedule  : ${GRAD_LR_LAYER_SCHEDULE}  base_ratio=${GRAD_LR_LAYER_BASE_RATIO}
   topk         : kl=${KL_TOPK}  grad_hessian=${GRAD_HESSIAN_TOPK}
   grad_clip    : ${GRAD_CLIP} / ${FINAL_LAYER_GRAD_CLIP}  (1.0 = off at this scale)
+  horizon_p    : ${HORIZON_P}  (0 = production; verify in the log, not here)
   arms         : adam, warm_adam   prior_batches K=${WARM_PRIOR_BATCHES} (=> t0=K)
   static cache : ${STATIC_CACHE_PATH}
   nccl shm     : NCCL_SHM_DISABLE=${NCCL_SHM_DISABLE}

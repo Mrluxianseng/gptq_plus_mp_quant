@@ -217,6 +217,21 @@ def parse_gen():
         ),
     )
     parser.add_argument(
+        "--horizon_p",
+        type=float,
+        default=0.0,
+        help=(
+            "Scale each tail column's block-GD step by how many updates it has "
+            "left before it is quantised. A column in block k is updated k "
+            "times, at horizons k-1 down to 0; the weight is "
+            "k*(h+1)^-p / sum_{i=1..k} i^-p, whose sum over the column's own "
+            "life is exactly k for every p, so this moves budget within a "
+            "column rather than changing how much it gets. 0 (default) is "
+            "production; p>0 back-loads toward the final updates, p<0 "
+            "front-loads. Group-parallel path only."
+        ),
+    )
+    parser.add_argument(
         "--warm_start_steps",
         type=int,
         default=-1,

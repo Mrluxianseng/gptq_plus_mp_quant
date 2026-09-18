@@ -643,6 +643,7 @@ for grad_lr in "${GRAD_LRS[@]}"; do
         --grad_reg_strategy "${GRAD_REG_STRATEGY}" --grad_reg_lambda "${GRAD_REG_LAMBDA}" \
         --grad_gate_floor "${GRAD_GATE_FLOOR}" --grad_gate_sharpness "${GRAD_GATE_SHARPNESS}" --grad_gate_sine_amp "${GRAD_GATE_SINE_AMP}" \
         --second_order_scale "${SECOND_ORDER_SCALE}" \
+        --horizon_p "${HORIZON_P:-0}" \
         "${QA_EVAL_ARGS[@]}" \
         "$@" 2>&1 | tee "${RUN_LOG_PATH}"
 done
