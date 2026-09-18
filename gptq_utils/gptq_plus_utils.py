@@ -649,6 +649,58 @@ def _dbg_warm_prior_vs_gradient(prior_slice, grad_slice, t0, beta2, path):
         )
 
 
+def _reach_probe_block_row(blk, w0, q, disp, path, scale):
+    """One row of the reach table, for the columns that just froze.
+
+    Medians rather than means throughout: both |W_fp - Q| and the optimizer
+    displacement are heavy-tailed, and a handful of outlier channels would
+    otherwise set the headline number on their own.
+    """
+    dev = (w0 - q).abs().flatten().float()
+    d = disp.abs().flatten().float()
+    p = path.flatten().float()
+    sc = scale.abs().flatten().float()
+    eps = torch.finfo(torch.float32).tiny
+    med_dev = dev.median().item()
+    med_d = d.median().item()
+    return {
+        "blk": blk,
+        "med_dev": med_dev,
+        "med_disp": med_d,
+        "med_path": p.median().item(),
+        "med_grid": sc.median().item(),
+        # Ratio of medians for the headline; median of per-weight ratios
+        # alongside it, because the two disagree when dev is near zero for
+        # the weights that happen to land on a grid point.
+        "R_ratio_of_med": med_d / (med_dev + eps),
+        "R_med_of_ratio": (d / (dev + eps)).median().item(),
+        "disp_over_grid": (d / (sc + eps)).median().item(),
+    }
+
+
+def _reach_probe_emit(layer_idx, name, lr, rows):
+    if not rows:
+        return
+
+    def fmt(key):
+        return " ".join(
+            "b%d:%s" % (r["blk"], format_log_value(r[key])) for r in rows
+        )
+
+    logging.info(
+        "reach_probe layer=%s module=%s lr=%s nblk=%d\n"
+        "  |W_fp-Q|   %s\n"
+        "  |disp|     %s\n"
+        "  path       %s\n"
+        "  grid       %s\n"
+        "  R=disp/dev %s\n"
+        "  disp/grid  %s",
+        layer_idx, name, format_log_value(lr), len(rows),
+        fmt("med_dev"), fmt("med_disp"), fmt("med_path"),
+        fmt("med_grid"), fmt("R_ratio_of_med"), fmt("disp_over_grid"),
+    )
+
+
 def _align_warm_prior(grad_sq_full, row_start, row_end, perm, device):
     """Put the [out, in] prior into one subgroup's row-sliced, actorder frame.
 
@@ -1930,6 +1982,15 @@ class GPTQPlus:
             n_blocks_total = (C + blocksize - 1) // blocksize
             n_refresh_total = max(n_blocks_total - 1, 0)
 
+            # See _reach_probe_block_row. The three buffers are the size of
+            # W_sub, which is why this is opt-in rather than always on.
+            _rp_on = os.environ.get("REACH_PROBE") == "1" and enable_gradient_update
+            if _rp_on:
+                _rp_w0 = state["W_sub"].detach().clone().float()
+                _rp_disp = torch.zeros_like(_rp_w0)
+                _rp_path = torch.zeros_like(_rp_w0)
+                _rp_rows = []
+
             for i1 in range(0, C, blocksize):
                 with profile_recorder.section("fasterquant_group_parallel.block.total") if profile_recorder else _NULL_CONTEXT:
                     i2 = min(i1 + blocksize, C)
@@ -2054,6 +2115,15 @@ class GPTQPlus:
 
                     Q1, W_int1, Scale1, Err1 = sync_block_tensors(Q1, W_int1, Scale1, Err1)
                     state["Q"][:, :, i1:i2] = Q1
+                    if _rp_on:
+                        # These columns are frozen from here on, so whatever the
+                        # optimizer moved them by is final.
+                        _rp_rows.append(_reach_probe_block_row(
+                            i1 // blocksize,
+                            _rp_w0[:, :, i1:i2], Q1.detach().float(),
+                            _rp_disp[:, :, i1:i2], _rp_path[:, :, i1:i2],
+                            Scale1.detach().float(),
+                        ))
                     state["W_int_sub"][:, :, i1:i2] = W_int1
                     state["Scale_sub"][:, :, i1:i2] = Scale1
 
@@ -2259,6 +2329,17 @@ class GPTQPlus:
                                     state["W_sub"][hessian_group_ids, :, i2:] -= optimizer_update
                                 else:
                                     state["W_sub"][:, :, i2:] -= optimizer_update
+                                if _rp_on:
+                                    # W_sub -= update, so the displacement is
+                                    # -update; the sign matters for the net
+                                    # figure, which is what R is built from.
+                                    _u = optimizer_update.detach().float()
+                                    if use_hessian_group_shard:
+                                        _rp_disp[hessian_group_ids, :, i2:] -= _u
+                                        _rp_path[hessian_group_ids, :, i2:] += _u.abs()
+                                    else:
+                                        _rp_disp[:, :, i2:] -= _u
+                                        _rp_path[:, :, i2:] += _u.abs()
 
                             if refresh_full_metrics:
                                 if optimizer_update_raw.numel() > 0:
@@ -2315,6 +2396,13 @@ class GPTQPlus:
                                         "sample_indices": () if refresh_meta is None else refresh_meta.get("sample_indices", ()),
                                     }
                                 )
+
+            if _rp_on:
+                _reach_probe_emit(
+                    getattr(self, "layer_idx", "?"),
+                    getattr(self, "layer_name", "?"),
+                    grad_lr, _rp_rows,
+                )
 
             with profile_recorder.section("fasterquant_group_parallel.finalize") if profile_recorder else _NULL_CONTEXT:
                 Q_final = natural_order(state["Q"])
@@ -2504,6 +2592,18 @@ class GPTQPlus:
             grad_gate_sine_amp=grad_gate_sine_amp,
         )
         group_parallel_mode = (group_parallel_mode or "none").lower()
+        # The probe lives in _fasterquant_group_parallel only. Running it under
+        # group_parallel_mode=none would produce a clean log with no reach_probe
+        # lines in it, which reads exactly like "the reach is zero" -- refuse
+        # instead. This file has already produced four silent no-ops of this
+        # shape (see the sweep-script overrides in the project notes).
+        if os.environ.get("REACH_PROBE") == "1" and group_parallel_mode == "none":
+            raise ValueError(
+                "REACH_PROBE=1 requires group_parallel_mode != none; the probe "
+                "is only instrumented in the group-parallel path. Set "
+                "GROUP_PARALLEL_QUANT=rank (the sweep default) or unset "
+                "REACH_PROBE."
+            )
         if group_parallel_mode not in {"none", "tensor", "rank"}:
             raise ValueError(
                 f"Unsupported `group_parallel_mode={group_parallel_mode}`. "
@@ -10094,6 +10194,10 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                                 grad_sq_full = None
                                 warm_start_steps = 0
 
+                        # Identity for logging only; nothing reads it unless
+                        # a probe is enabled (see _reach_probe_emit).
+                        gptq[name].layer_idx = i
+                        gptq[name].layer_name = name
                         gptq[name].fasterquant(
                             grad_sq_full=grad_sq_full,
                             warm_start_steps=warm_start_steps,
