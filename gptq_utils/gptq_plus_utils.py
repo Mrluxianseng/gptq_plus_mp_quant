@@ -678,7 +678,7 @@ def _reach_probe_block_row(blk, w0, q, disp, path, scale):
     }
 
 
-def _reach_probe_emit(layer_idx, name, lr, rows):
+def _reach_probe_emit(layer_idx, name, lr, rows, n_groups=None):
     if not rows:
         return
 
@@ -688,14 +688,14 @@ def _reach_probe_emit(layer_idx, name, lr, rows):
         )
 
     logging.info(
-        "reach_probe layer=%s module=%s lr=%s nblk=%d\n"
+        "reach_probe layer=%s module=%s lr=%s nblk=%d ngrp=%s\n"
         "  |W_fp-Q|   %s\n"
         "  |disp|     %s\n"
         "  path       %s\n"
         "  grid       %s\n"
         "  R=disp/dev %s\n"
         "  disp/grid  %s",
-        layer_idx, name, format_log_value(lr), len(rows),
+        layer_idx, name, format_log_value(lr), len(rows), n_groups,
         fmt("med_dev"), fmt("med_disp"), fmt("med_path"),
         fmt("med_grid"), fmt("R_ratio_of_med"), fmt("disp_over_grid"),
     )
@@ -2118,11 +2118,26 @@ class GPTQPlus:
                     if _rp_on:
                         # These columns are frozen from here on, so whatever the
                         # optimizer moved them by is final.
+                        #
+                        # Statistics cover this rank's own groups only. Under
+                        # group_parallel_quant=rank each rank writes the
+                        # optimizer update for its shard alone, so the other
+                        # groups' entries in _rp_disp stay at zero -- with 4
+                        # groups across 4 ranks that is 3/4 of the tensor, which
+                        # drags every median to exactly 0 and reads as "the
+                        # optimizer moved nothing". Q1 and Scale1 come back full
+                        # from sync_block_tensors, which is why those rows
+                        # looked healthy while |disp| did not.
+                        # hessian_group_ids is arange(G) when unsharded, so this
+                        # is a no-op in that case.
+                        _g = hessian_group_ids
                         _rp_rows.append(_reach_probe_block_row(
                             i1 // blocksize,
-                            _rp_w0[:, :, i1:i2], Q1.detach().float(),
-                            _rp_disp[:, :, i1:i2], _rp_path[:, :, i1:i2],
-                            Scale1.detach().float(),
+                            _rp_w0[:, :, i1:i2].index_select(0, _g),
+                            Q1.detach().float().index_select(0, _g),
+                            _rp_disp[:, :, i1:i2].index_select(0, _g),
+                            _rp_path[:, :, i1:i2].index_select(0, _g),
+                            Scale1.detach().float().index_select(0, _g),
                         ))
                     state["W_int_sub"][:, :, i1:i2] = W_int1
                     state["Scale_sub"][:, :, i1:i2] = Scale1
@@ -2401,7 +2416,7 @@ class GPTQPlus:
                 _reach_probe_emit(
                     getattr(self, "layer_idx", "?"),
                     getattr(self, "layer_name", "?"),
-                    grad_lr, _rp_rows,
+                    grad_lr, _rp_rows, int(hessian_group_ids.numel()),
                 )
 
             with profile_recorder.section("fasterquant_group_parallel.finalize") if profile_recorder else _NULL_CONTEXT:
