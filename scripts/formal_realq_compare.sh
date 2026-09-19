@@ -111,7 +111,12 @@ W_GROUPSIZE=${W_GROUPSIZE:--1}
 # skipping Stage 1 on a directory whose contents belong to a different set --
 # which would then fail in Stage 2, since STAGE2_CPU_MASTER refuses to compute
 # it inline.
-STATIC_CACHE_PATH=${STATIC_CACHE_PATH:-${ROOT_DIR}/cache/formal_realq_qwen3_0p6b_s${N_SAMPLES}_l${SEQ_LEN}_seed${SEED}}
+# The cache is model-specific: the files carry the model name and a hash of
+# its weights. Keeping the model out of the directory name let a Qwen3-1.7B
+# run match the Qwen3-0.6B cache, skip Stage 1, and then fail in Stage 2 on
+# the missing 1.7B filename. Derive the name from the model instead.
+MODEL_TAG=$(basename "${MODEL}" | tr "[:upper:]" "[:lower:]" | tr -c "a-z0-9" "_" | sed "s/_*$//")
+STATIC_CACHE_PATH=${STATIC_CACHE_PATH:-${ROOT_DIR}/cache/formal_realq_${MODEL_TAG}_s${N_SAMPLES}_l${SEQ_LEN}_seed${SEED}}
 
 # Paper-pinned: the final block optimises "true full-vocabulary KL against
 # the LM head" (D.1), and full-vocabulary means no top-k truncation.
@@ -294,7 +299,10 @@ note_exit() {
 # STAGE2_CPU_MASTER refuses to compute the cache inline. The pattern below
 # pins every field this script can vary; anything it cannot vary (model hash,
 # rotation id, saliency clip) is constant for a given model.
-CACHE_GLOB="${STATIC_CACHE_PATH}/*_s${N_SAMPLES}_blk${SEQ_LEN}_*_g${NUM_GROUPS}_*_ghtk${GRAD_HESSIAN_TOPK}_glbsz${GLOBAL_LOSS_BSZ}_cseed${SEED}_*_world${N_GPUS}_rank*.pt"
+# Anchored on the model basename, which is the real filename's prefix, so a
+# cache built for another model cannot satisfy this check even if someone
+# points STATIC_CACHE_PATH at a shared directory.
+CACHE_GLOB="${STATIC_CACHE_PATH}/$(basename "${MODEL}")_*_s${N_SAMPLES}_blk${SEQ_LEN}_*_g${NUM_GROUPS}_*_ghtk${GRAD_HESSIAN_TOPK}_glbsz${GLOBAL_LOSS_BSZ}_cseed${SEED}_*_world${N_GPUS}_rank*.pt"
 if [[ "${FORCE_PRECOMPUTE:-0}" != "1" ]] && compgen -G "${CACHE_GLOB}" >/dev/null; then
     say "Stage 1: reusing the cache matching ${CACHE_GLOB} (FORCE_PRECOMPUTE=1 to rebuild)"
 else
