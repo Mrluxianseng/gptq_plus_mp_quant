@@ -851,7 +851,8 @@ def _resolve_horizon_p(layer_idx, layer_name, fallback):
     return p
 
 
-def _horizon_trace_step(layer_idx, layer_name, refresh_idx, opt_state, col_start):
+def _horizon_trace_step(layer_idx, layer_name, refresh_idx, opt_state,
+                        col_start, blocksize):
     """Record the refresh gradient's signal and noise over the live tail.
 
     b^2 = mean(mhat^2) and sigma^2 = mean(vhat) - mean(mhat^2): Adam already
@@ -862,6 +863,21 @@ def _horizon_trace_step(layer_idx, layer_name, refresh_idx, opt_state, col_start
     sigma^2 is what makes the trace worth keeping beyond the fit: the p=alpha
     argument assumes sigma_n is roughly flat in n, and that assumption has
     never been checked against anything.
+
+    Recorded twice. The whole-tail mean is what the first version recorded and
+    it is confounded: the tail shrinks by a block per refresh, and with
+    --act_order the columns are sorted by descending activation energy, so a
+    later refresh averages over strictly less salient columns. Signal falling
+    with n then says nothing about error accumulation -- it says the surviving
+    columns are quieter. Measured that way alpha came out negative almost
+    everywhere (median -0.47) with 56% of fits railed against the grid.
+
+    So the per-block arrays are the real measurement: at refresh n, one mean
+    per still-live block rather than one over all of them. For a fixed block g
+    the series over n = 1..g is the same set of elements throughout, which is
+    what an exponent in n is supposed to be about. It also gives b_n/sigma_n^2
+    for that block directly, so whether the schedule's power-law shape fits is
+    something the trace can answer instead of assume.
     """
     global _HORIZON_TRACE_CUR
     if _HORIZON_TRACE_FH is None:
@@ -875,18 +891,35 @@ def _horizon_trace_step(layer_idx, layer_name, refresh_idx, opt_state, col_start
     step = opt_state["step"]
     bc1 = 1.0 - 0.9 ** step
     bc2 = 1.0 - 0.999 ** (step + opt_state.get("v_offset", 0))
-    b2 = float(m.float().pow(2).mean().item()) / (bc1 * bc1)
-    vv = float(v.float().mean().item()) / bc2
+    mf = m.float()
+    vf = v.float()
+    b2 = float(mf.pow(2).mean().item()) / (bc1 * bc1)
+    vv = float(vf.mean().item()) / bc2
+
+    # Per still-live block. The tail starts on a block boundary, so only a
+    # ragged final block (C not a multiple of blocksize) has to be dropped.
+    n_full = mf.shape[-1] // blocksize if blocksize else 0
+    blk_b2, blk_v = [], []
+    if n_full > 0:
+        cut = n_full * blocksize
+        mb = mf[:, :, :cut].reshape(mf.shape[0], mf.shape[1], n_full, blocksize)
+        vb = vf[:, :, :cut].reshape(vf.shape[0], vf.shape[1], n_full, blocksize)
+        blk_b2 = (mb.pow(2).mean(dim=(0, 1, 3)) / (bc1 * bc1)).tolist()
+        blk_v = (vb.mean(dim=(0, 1, 3)) / bc2).tolist()
+
     key = (layer_idx, layer_name)
     if _HORIZON_TRACE_CUR is None or _HORIZON_TRACE_CUR["key"] != key:
         _HORIZON_TRACE_CUR = {
             "key": key, "n": [], "b2": [], "v": [], "step": [],
+            "blk_b2": [], "blk_v": [],
             "opt": opt_state["type"],
         }
     _HORIZON_TRACE_CUR["n"].append(int(refresh_idx))
     _HORIZON_TRACE_CUR["step"].append(int(step))
     _HORIZON_TRACE_CUR["b2"].append(b2)
     _HORIZON_TRACE_CUR["v"].append(vv)
+    _HORIZON_TRACE_CUR["blk_b2"].append(blk_b2)
+    _HORIZON_TRACE_CUR["blk_v"].append(blk_v)
 
 
 def _horizon_trace_flush(blocksize, n_cols, rank=0):
@@ -914,6 +947,8 @@ def _horizon_trace_flush(blocksize, n_cols, rank=0):
                 "opt": cur["opt"],
                 "b2": cur["b2"],
                 "v": cur["v"],
+                "blk_b2": cur["blk_b2"],
+                "blk_v": cur["blk_v"],
             }
         )
         + "\n"
@@ -2608,6 +2643,7 @@ class GPTQPlus:
                                 i2 // blocksize,
                                 state["grad_optimizer_state"],
                                 i2,
+                                blocksize,
                             )
                             optimizer_update, gate_regularizer_update, sine_regularizer_update = self._apply_first_order_regularizer_batched(
                                 state,

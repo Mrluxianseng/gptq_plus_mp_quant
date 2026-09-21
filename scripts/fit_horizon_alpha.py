@@ -102,6 +102,7 @@ def load(prefix):
     if not paths:
         raise SystemExit("no trace files matching %r" % (prefix + ".rank*.jsonl"))
     pooled = defaultdict(lambda: defaultdict(list))
+    blk = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
     warn = set()
     meta = {}
     for path in paths:
@@ -127,6 +128,15 @@ def load(prefix):
                 meta[key] = rec
                 for n, b2, v in zip(rec["n"], rec["b2"], rec["v"]):
                     pooled[key][n].append((b2, v))
+                # Fixed-population series. At refresh n the tail starts at
+                # block n, so entry j of that row is global block n + j;
+                # block g therefore appears at every n = 1..g, always as
+                # the same set of columns.
+                bb, bv = rec.get("blk_b2"), rec.get("blk_v")
+                if bb:
+                    for row_i, n in enumerate(rec["n"]):
+                        for j, (mb, vb) in enumerate(zip(bb[row_i], bv[row_i])):
+                            blk[key][n + j][n].append((mb, vb))
     out = {}
     for key, per_n in pooled.items():
         ns, ms, vs = [], [], []
@@ -135,8 +145,18 @@ def load(prefix):
             ns.append(n)
             ms.append(sum(r[0] for r in rows) / len(rows))
             vs.append(sum(r[1] for r in rows) / len(rows))
+        per_block = {}
+        for g, per_n2 in blk.get(key, {}).items():
+            gn, gm, gv = [], [], []
+            for n in sorted(per_n2):
+                rows = per_n2[n]
+                gn.append(n)
+                gm.append(sum(r[0] for r in rows) / len(rows))
+                gv.append(sum(r[1] for r in rows) / len(rows))
+            per_block[g] = (np.array(gn, float), np.array(gm, float),
+                            np.array(gv, float))
         out[key] = (np.array(ns, float), np.array(ms, float),
-                    np.array(vs, float), meta[key])
+                    np.array(vs, float), meta[key], per_block)
     if "truncated" in warn:
         print("NOTE: dropped a truncated final line (interrupted run); the"
               + NL_S + "  completed modules are unaffected.")
@@ -304,6 +324,20 @@ def main():
             "reported alongside either way."
         ),
     )
+    ap.add_argument(
+        "--population", default="block", choices=("block", "tail"),
+        help=(
+            "block (default): fit each fixed column block's own series, "
+            "so the elements being averaged do not change with n. tail: "
+            "the whole live tail, which shrinks by a block per refresh -- "
+            "and since --act_order sorts columns by descending activation "
+            "energy, a later refresh averages over less salient columns, "
+            "so the exponent picks up that change too. Kept for comparison."
+        ),
+    )
+    ap.add_argument(
+        "--min_series", type=int, default=5,
+        help="skip a block whose series is shorter than this")
     ap.add_argument("--n_min", type=int, default=1,
                     help="drop refreshes below this index (model fit handles "
                          "n=1 correctly, so the default keeps everything)")
@@ -315,21 +349,55 @@ def main():
     data, paths = load(args.prefix)
     print("read %d shard(s), %d module instance(s)" % (len(paths), len(data)))
 
-    nmax = max(int(ns.max()) for ns, _, _, _ in data.values())
+    nmax = max(int(ns.max()) for ns, _, _, _, _ in data.values())
     grid = np.arange(args.grid_lo, args.grid_hi + 1e-9, args.grid_step)
     print("building design over %d grid nodes x n<=%d ..." % (len(grid), nmax))
     design = _design(nmax, grid)
 
     fits, ratios = {}, {}
-    for key, (ns, Ms, Vs, meta) in sorted(data.items()):
-        f = fit_model(ns, Ms, Vs, grid, design, args.n_min)
-        if f is None:
-            continue
+    n_block_series = 0
+    for key, (ns, Ms, Vs, meta, per_block) in sorted(data.items()):
+        if args.population == "block" and not per_block:
+            raise SystemExit(
+                "--population block needs the per-block arrays and this "
+                "trace has none (it predates that recording). Falling "
+                "back to the whole tail would silently reintroduce the "
+                "act_order confound, so re-run the calibration instead, "
+                "or pass --population tail to accept it knowingly."
+            )
+        if args.population == "block":
+            # One fit per fixed column block, then the module's own value
+            # is the median over its blocks. Block g has exactly g
+            # refreshes, so short blocks carry no exponent and are cut.
+            sub = []
+            for g, (gn, gm, gv) in sorted(per_block.items()):
+                if len(gn) < args.min_series:
+                    continue
+                fg = fit_model(gn, gm, gv, grid, design, args.n_min)
+                if fg is not None:
+                    fg["block"] = g
+                    sub.append(fg)
+            if not sub:
+                continue
+            n_block_series += len(sub)
+            f = {
+                k: float(np.median([x[k] for x in sub]))
+                for k in ("alpha", "s", "gamma", "rel_rms")
+            }
+            f["nsub"] = len(sub)
+            f["npts"] = int(np.median([x["npts"] for x in sub]))
+        else:
+            f = fit_model(ns, Ms, Vs, grid, design, args.n_min)
+            if f is None:
+                continue
         f["nblk"] = meta.get("nblk")
         fits[key] = f
         r = fit_ratio(ns, Ms, Vs)
         if r:
             ratios[key] = r
+    if args.population == "block":
+        print("fixed-block population: %d series over %d module instances"
+              % (n_block_series, len(fits)))
     if not fits:
         raise SystemExit("no module produced a usable fit")
 
