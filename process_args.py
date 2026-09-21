@@ -232,6 +232,32 @@ def parse_gen():
         ),
     )
     parser.add_argument(
+        "--horizon_trace",
+        type=str,
+        default="",
+        help=(
+            "Write a per-module, per-refresh trace of the block-GD gradient's "
+            "signal (b^2 = mean of the bias-corrected first moment squared) "
+            "and noise (sigma^2 = second moment - b^2) to "
+            "<path>.rank<r>.jsonl. Feed it to scripts/fit_horizon_alpha.py to "
+            "get a measured per-module exponent. Must be taken with "
+            "--horizon_p 0 and no --horizon_alpha, i.e. under production "
+            "numerics. Group-parallel path only."
+        ),
+    )
+    parser.add_argument(
+        "--horizon_alpha",
+        type=str,
+        default="",
+        help=(
+            "JSON produced by scripts/fit_horizon_alpha.py: use the measured "
+            "per-module exponent in place of the constant --horizon_p. Keys "
+            "are tried as '<layer>.<module>', then '<module>', then "
+            "'__default__'; a module matching none of them is an error rather "
+            "than a silent p=0. Mutually exclusive with --horizon_p."
+        ),
+    )
+    parser.add_argument(
         "--warm_start_steps",
         type=int,
         default=-1,

@@ -181,6 +181,24 @@ WARM_PRIOR_BATCHES=${WARM_PRIOR_BATCHES:-1}
 # final updates. Applies to EVERY arm, so compare two runs that differ only in
 # HORIZON_P.
 HORIZON_P=${HORIZON_P:-0}
+# Measured, per-module exponent (scripts/fit_horizon_alpha.py).
+#   HORIZON_TRACE=<path>  calibration run: emits <path>.rankN.jsonl.
+#                         Requires HORIZON_P=0 and no HORIZON_ALPHA --
+#                         a trace taken under an active schedule measures
+#                         that schedule, not production.
+#   HORIZON_ALPHA=<json>  apply run: per-module p, replaces HORIZON_P.
+HORIZON_TRACE=${HORIZON_TRACE:-}
+HORIZON_ALPHA=${HORIZON_ALPHA:-}
+if [[ -n "${HORIZON_ALPHA}" && "${HORIZON_P}" != "0" ]]; then
+    echo "HORIZON_ALPHA and HORIZON_P are mutually exclusive." >&2; exit 1
+fi
+if [[ -n "${HORIZON_TRACE}" ]] && [[ -n "${HORIZON_ALPHA}" || "${HORIZON_P}" != "0" ]]; then
+    echo "HORIZON_TRACE must be taken at HORIZON_P=0 with no HORIZON_ALPHA." >&2; exit 1
+fi
+if [[ -n "${HORIZON_ALPHA}" && ! -f "${HORIZON_ALPHA}" ]]; then
+    echo "HORIZON_ALPHA=${HORIZON_ALPHA} does not exist." >&2; exit 1
+fi
+
 WARM_EXTRA=(--warm_prior_batches "${WARM_PRIOR_BATCHES}")
 if [[ "${WARM_PRIOR_SCALAR}" != "none" ]]; then
     WARM_EXTRA+=(--warm_prior_scalar "${WARM_PRIOR_SCALAR}")
@@ -228,6 +246,7 @@ common() {
     KL_TOPK="${KL_TOPK}" GRAD_HESSIAN_TOPK="${GRAD_HESSIAN_TOPK}" \
     SALIENCY_CLIP_PERCENTILE="${SALIENCY_CLIP_PERCENTILE}"     GRAD_CLIP="${GRAD_CLIP}" FINAL_LAYER_GRAD_CLIP="${FINAL_LAYER_GRAD_CLIP}" \
     HORIZON_P="${HORIZON_P}" \
+    HORIZON_TRACE="${HORIZON_TRACE}" HORIZON_ALPHA="${HORIZON_ALPHA}" \
     PROJ_LR_SCALE=1.0 DOWN_PROJ_LR_SCALE=1.0 SECOND_ORDER_SCALE=1.0 PRE_CLIP=0 \
     ENABLE_QA_EVAL="${ENABLE_QA_EVAL}" LM_EVAL_BATCH_SIZE="${LM_EVAL_BATCH_SIZE}" \
     STATIC_CACHE_PATH="${STATIC_CACHE_PATH}" RDZV_PORT="${RDZV_PORT}" \
@@ -249,6 +268,9 @@ REAL-Q formal comparison - Qwen3-0.6B W4A16
   topk         : kl=${KL_TOPK}  grad_hessian=${GRAD_HESSIAN_TOPK}
   grad_clip    : ${GRAD_CLIP} / ${FINAL_LAYER_GRAD_CLIP}  (1.0 = off at this scale)
   horizon_p    : ${HORIZON_P}  (0 = production; verify in the log, not here)
+  horizon meas : trace=${HORIZON_TRACE:-off}  alpha=${HORIZON_ALPHA:-off}
+                 (the measured p is logged per module as "horizon p resolved")
+
   arms         : adam, warm_adam   prior_batches K=${WARM_PRIOR_BATCHES} (=> t0=K)
   static cache : ${STATIC_CACHE_PATH}
   nccl shm     : NCCL_SHM_DISABLE=${NCCL_SHM_DISABLE}

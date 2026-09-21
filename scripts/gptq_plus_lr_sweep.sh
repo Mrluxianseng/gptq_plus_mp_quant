@@ -205,6 +205,18 @@ if [[ "${BLOCK_ATOMIC_QUANT}" == "1" ]]; then
     BLOCK_ATOMIC_TAG="_batomic"
 fi
 
+# Measured horizon exponent. HORIZON_TRACE writes the per-module signal /
+# noise trace and must be taken at HORIZON_P=0; HORIZON_ALPHA feeds the
+# fitted per-module exponent back in place of the constant. See
+# scripts/fit_horizon_alpha.py.
+HORIZON_MEASURED_ARGS=()
+if [[ -n "${HORIZON_TRACE:-}" ]]; then
+    HORIZON_MEASURED_ARGS+=(--horizon_trace "${HORIZON_TRACE}")
+fi
+if [[ -n "${HORIZON_ALPHA:-}" ]]; then
+    HORIZON_MEASURED_ARGS+=(--horizon_alpha "${HORIZON_ALPHA}")
+fi
+
 GROUP_PARALLEL_ARGS=()
 GROUP_PARALLEL_TAG=""
 if [[ "${GROUP_PARALLEL_QUANT}" != "none" ]]; then
@@ -644,6 +656,7 @@ for grad_lr in "${GRAD_LRS[@]}"; do
         --grad_gate_floor "${GRAD_GATE_FLOOR}" --grad_gate_sharpness "${GRAD_GATE_SHARPNESS}" --grad_gate_sine_amp "${GRAD_GATE_SINE_AMP}" \
         --second_order_scale "${SECOND_ORDER_SCALE}" \
         --horizon_p "${HORIZON_P:-0}" \
+        "${HORIZON_MEASURED_ARGS[@]}" \
         "${QA_EVAL_ARGS[@]}" \
         "$@" 2>&1 | tee "${RUN_LOG_PATH}"
 done

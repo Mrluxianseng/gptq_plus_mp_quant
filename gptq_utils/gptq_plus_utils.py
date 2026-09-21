@@ -1,4 +1,5 @@
 import copy
+import json
 import logging
 import os
 import sys
@@ -744,6 +745,218 @@ def _horizon_step_weights(n_tail, blocksize, tail_first_block, p, device, dtype)
             " ".join("h%d:%.3f" % (i, v) for i, v in enumerate(_buckets)),
         )
     return w.to(dtype)
+
+
+
+# ---------------------------------------------------------------------------
+# Measured horizon exponent.
+#
+# --horizon_p takes the schedule exponent as a hand-set constant. The argument
+# behind the schedule does not: it says the weight on refresh n should go as
+# w_n ~ b_n / sigma_n^2, with b_n the consistent part of the refresh gradient
+# and sigma_n its noise. If b_n grows as a power of the refresh index,
+# b_n ~ n^alpha, then matching the schedule's dynamic range (k^p) to the
+# signal's (k^alpha) gives p = alpha -- and alpha is a property of the module,
+# measurable, not a knob.
+#
+# So: --horizon_trace writes b_n and sigma_n^2 per module per refresh (the run
+# is otherwise p=0, i.e. production numerics), scripts/fit_horizon_alpha.py
+# turns that trace into a per-module alpha, and --horizon_alpha feeds it back
+# in place of the constant.
+#
+# Nothing is fitted online. The estimate used at refresh n would have to come
+# from refreshes < n, and the early refreshes are exactly where it is least
+# determined -- an online fit would be noisiest precisely where the schedule
+# puts the most leverage.
+# ---------------------------------------------------------------------------
+
+_HORIZON_ALPHA_MAP = None
+_HORIZON_TRACE_FH = None
+_HORIZON_TRACE_CUR = None
+_HORIZON_P_LOGGED = {}
+
+
+def _horizon_configure(trace_path, alpha_path, rank=0):
+    """Open the trace sink and load the fitted exponents. Once per process."""
+    global _HORIZON_ALPHA_MAP, _HORIZON_TRACE_FH
+    if trace_path:
+        parent = os.path.dirname(os.path.abspath(trace_path))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        # One file per rank. Under group_parallel_quant=rank each rank owns a
+        # different row shard of the same module, so the module key collides
+        # across ranks by design; the fitter pools them instead of any rank
+        # pretending to speak for the whole tensor.
+        path = "%s.rank%d.jsonl" % (trace_path, int(rank))
+        _HORIZON_TRACE_FH = open(path, "w")
+        logging.info("horizon trace -> %s", path)
+    if alpha_path:
+        with open(alpha_path) as fh:
+            raw = json.load(fh)
+        table = raw.get("alpha", raw)
+        out = {}
+        clamped = {}
+        for key, val in table.items():
+            v = float(val)
+            if v < -1.5 or v > 1.5:
+                clamped[key] = v
+                v = min(max(v, -1.5), 1.5)
+            out[key] = v
+        if not out:
+            raise ValueError("horizon alpha table %s is empty" % alpha_path)
+        _HORIZON_ALPHA_MAP = out
+        vals = sorted(out.values())
+        logging.info(
+            "horizon alpha loaded from %s: %d keys, default=%s, "
+            "min=%.4f median=%.4f max=%.4f",
+            alpha_path, len(out), out.get("__default__"),
+            vals[0], vals[len(vals) // 2], vals[-1],
+        )
+        if clamped:
+            logging.warning(
+                "horizon alpha clamped into [-1.5, 1.5] for %d key(s): %s",
+                len(clamped),
+                " ".join(
+                    "%s=%.3f" % kv for kv in sorted(clamped.items())[:8]
+                ),
+            )
+
+
+def _resolve_horizon_p(layer_idx, layer_name, fallback):
+    """Per-module exponent: the measured one when loaded, else the constant."""
+    if _HORIZON_ALPHA_MAP is None:
+        return fallback
+    for key in (
+        "%s.%s" % (layer_idx, layer_name),
+        str(layer_name),
+        "__default__",
+    ):
+        if key in _HORIZON_ALPHA_MAP:
+            p = _HORIZON_ALPHA_MAP[key]
+            break
+    else:
+        # Falling through to p=0 here would quietly turn the schedule off for
+        # whichever modules the fit happened to miss, and the run would still
+        # look like a clean horizon_alpha run in the log.
+        raise KeyError(
+            "horizon alpha table has no entry for layer=%s module=%s and no "
+            "__default__ key" % (layer_idx, layer_name)
+        )
+    if str(layer_name) not in _HORIZON_P_LOGGED:
+        _HORIZON_P_LOGGED[str(layer_name)] = p
+        logging.info(
+            "horizon p resolved (measured): module=%s first_layer=%s p=%.4f",
+            layer_name, layer_idx, p,
+        )
+    return p
+
+
+def _horizon_trace_step(layer_idx, layer_name, refresh_idx, opt_state, col_start):
+    """Record the refresh gradient's signal and noise over the live tail.
+
+    b^2 = mean(mhat^2) and sigma^2 = mean(vhat) - mean(mhat^2): Adam already
+    carries both moments, so this is two reductions and no extra gradient.
+    Per-element means, not norms -- the tail shrinks by one block per refresh,
+    so norms would fall for a reason that has nothing to do with the signal.
+
+    sigma^2 is what makes the trace worth keeping beyond the fit: the p=alpha
+    argument assumes sigma_n is roughly flat in n, and that assumption has
+    never been checked against anything.
+    """
+    global _HORIZON_TRACE_CUR
+    if _HORIZON_TRACE_FH is None:
+        return
+    if opt_state.get("type") not in ("adam", "warm_adam"):
+        return
+    m = opt_state["exp_avg"][:, :, col_start:]
+    v = opt_state["exp_avg_sq"][:, :, col_start:]
+    if m.numel() == 0:
+        return
+    step = opt_state["step"]
+    bc1 = 1.0 - 0.9 ** step
+    bc2 = 1.0 - 0.999 ** (step + opt_state.get("v_offset", 0))
+    b2 = float(m.float().pow(2).mean().item()) / (bc1 * bc1)
+    vv = float(v.float().mean().item()) / bc2
+    key = (layer_idx, layer_name)
+    if _HORIZON_TRACE_CUR is None or _HORIZON_TRACE_CUR["key"] != key:
+        _HORIZON_TRACE_CUR = {
+            "key": key, "n": [], "b2": [], "v": [], "step": [],
+            "opt": opt_state["type"],
+        }
+    _HORIZON_TRACE_CUR["n"].append(int(refresh_idx))
+    _HORIZON_TRACE_CUR["step"].append(int(step))
+    _HORIZON_TRACE_CUR["b2"].append(b2)
+    _HORIZON_TRACE_CUR["v"].append(vv)
+
+
+def _horizon_trace_flush(blocksize, n_cols, rank=0):
+    """Write one line for the module that just finished."""
+    global _HORIZON_TRACE_CUR
+    cur = _HORIZON_TRACE_CUR
+    _HORIZON_TRACE_CUR = None
+    if _HORIZON_TRACE_FH is None or cur is None:
+        return
+    if len(cur["n"]) < 3:
+        # A 3-point log-log fit is already thin; below that there is nothing.
+        return
+    layer_idx, layer_name = cur["key"]
+    _HORIZON_TRACE_FH.write(
+        json.dumps(
+            {
+                "layer": layer_idx,
+                "module": layer_name,
+                "rank": int(rank),
+                "blocksize": int(blocksize),
+                "ncols": int(n_cols),
+                "nblk": int(n_cols // blocksize) if blocksize else 0,
+                "n": cur["n"],
+                "step": cur["step"],
+                "opt": cur["opt"],
+                "b2": cur["b2"],
+                "v": cur["v"],
+            }
+        )
+        + "\n"
+    )
+    _HORIZON_TRACE_FH.flush()
+
+
+
+_HORIZON_BOOTED = []
+
+
+def _horizon_boot(args):
+    """Idempotent one-time setup from argparse, safe to call per module."""
+    if _HORIZON_BOOTED:
+        return
+    _HORIZON_BOOTED.append(1)
+    trace = getattr(args, "horizon_trace", "") or ""
+    alpha = getattr(args, "horizon_alpha", "") or ""
+    const = float(getattr(args, "horizon_p", 0.0) or 0.0)
+    if alpha and const:
+        raise ValueError(
+            "--horizon_alpha (measured, per module) and --horizon_p "
+            "(constant) both set; pick one."
+        )
+    if trace and (alpha or const):
+        # A trace taken while the schedule is already on measures the signal
+        # under that schedule, not under production -- fine as a follow-up,
+        # but it is not the thing the fitter is calibrating against, and
+        # mixing the two silently is how a fixed point gets mistaken for a
+        # measurement.
+        raise ValueError(
+            "--horizon_trace must be taken at p=0 (production numerics): "
+            "clear --horizon_p / --horizon_alpha."
+        )
+    if (trace or alpha or const) and getattr(args, "g_update_mode", None) != "block_gd":
+        raise ValueError(
+            "horizon step weighting acts on the block-GD gradient "
+            "refresh, which only runs under --g_update_mode block_gd "
+            "(got %r). Nothing would be weighted and the trace would be "
+            "empty." % (getattr(args, "g_update_mode", None),)
+        )
+    if trace or alpha:
+        _horizon_configure(trace, alpha, dist_utils.get_rank())
 
 
 def _align_warm_prior(grad_sq_full, row_start, row_end, perm, device):
@@ -2369,8 +2582,13 @@ class GPTQPlus:
                             # block never refreshes), so i2 // blocksize is both
                             # the first tail column's block index and the number
                             # of updates that column receives in total.
+                            _hp = _resolve_horizon_p(
+                                getattr(self, "layer_idx", "?"),
+                                getattr(self, "layer_name", "?"),
+                                horizon_p,
+                            )
                             _hstep = _horizon_step_weights(
-                                C - i2, blocksize, i2 // blocksize, horizon_p,
+                                C - i2, blocksize, i2 // blocksize, _hp,
                                 state["W_sub"].device, state["W_sub"].dtype,
                             )
                             optimizer_update_raw = self._compute_grad_optimizer_update_batched(
@@ -2383,6 +2601,13 @@ class GPTQPlus:
                                 grad_lr,
                                 grad_clip=grad_clip,
                                 step_scale=_hstep,
+                            )
+                            _horizon_trace_step(
+                                getattr(self, "layer_idx", "?"),
+                                getattr(self, "layer_name", "?"),
+                                i2 // blocksize,
+                                state["grad_optimizer_state"],
+                                i2,
                             )
                             optimizer_update, gate_regularizer_update, sine_regularizer_update = self._apply_first_order_regularizer_batched(
                                 state,
@@ -2471,6 +2696,8 @@ class GPTQPlus:
                                         "sample_indices": () if refresh_meta is None else refresh_meta.get("sample_indices", ()),
                                     }
                                 )
+
+            _horizon_trace_flush(blocksize, C, dist_utils.get_rank())
 
             if _rp_on:
                 _reach_probe_emit(
@@ -2673,6 +2900,13 @@ class GPTQPlus:
         # lines in it, which reads exactly like "the reach is zero" -- refuse
         # instead. This file has already produced four silent no-ops of this
         # shape (see the sweep-script overrides in the project notes).
+        if (
+            _HORIZON_TRACE_FH is not None or _HORIZON_ALPHA_MAP is not None
+        ) and group_parallel_mode == "none":
+            raise ValueError(
+                "--horizon_trace / --horizon_alpha are only instrumented in "
+                "the group-parallel path. Set GROUP_PARALLEL_QUANT=rank."
+            )
         if horizon_p and group_parallel_mode == "none":
             raise ValueError(
                 "`horizon_p` is only instrumented in the group-parallel path. "
@@ -2734,6 +2968,15 @@ class GPTQPlus:
                     slide_refresh_block_total=slide_refresh_block_total,
                     refresh_full_metrics=refresh_full_metrics,
                     group_parallel_mode=group_parallel_mode,
+                )
+            if horizon_p or _HORIZON_TRACE_FH is not None or _HORIZON_ALPHA_MAP is not None:
+                raise RuntimeError(
+                    "horizon step weighting is instrumented only in the "
+                    "group-parallel path, and this call is falling back "
+                    f"to legacy fasterquant: {fallback_reason}. The run "
+                    "would silently produce an unweighted result (or an "
+                    "empty trace). Remove the fallback trigger or clear "
+                    "--horizon_p / --horizon_trace / --horizon_alpha."
                 )
             if self.hessian_group_sharded:
                 raise RuntimeError(
@@ -10281,6 +10524,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         # a probe is enabled (see _reach_probe_emit).
                         gptq[name].layer_idx = i
                         gptq[name].layer_name = name
+                        _horizon_boot(args)
                         gptq[name].fasterquant(
                             grad_sq_full=grad_sq_full,
                             warm_start_steps=warm_start_steps,
