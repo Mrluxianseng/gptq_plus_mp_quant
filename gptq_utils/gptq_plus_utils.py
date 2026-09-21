@@ -852,7 +852,7 @@ def _resolve_horizon_p(layer_idx, layer_name, fallback):
 
 
 def _horizon_trace_step(layer_idx, layer_name, refresh_idx, opt_state,
-                        col_start, blocksize):
+                        col_start, blocksize, grad=None, grad_ids=None):
     """Record the refresh gradient's signal and noise over the live tail.
 
     b^2 = mean(mhat^2) and sigma^2 = mean(vhat) - mean(mhat^2): Adam already
@@ -878,6 +878,16 @@ def _horizon_trace_step(layer_idx, layer_name, refresh_idx, opt_state,
     what an exponent in n is supposed to be about. It also gives b_n/sigma_n^2
     for that block directly, so whether the schedule's power-law shape fits is
     something the trace can answer instead of assume.
+
+    `grad` adds the one thing the moments cannot show. b and sigma split the
+    gradient by what survives an EMA with beta1 = 0.9, i.e. a memory of about
+    nine refreshes. A gradient direction that DRIFTS slowly over twenty
+    refreshes is tracked by that EMA, not charged to sigma -- so b stays high
+    while alignment with the weight's final destination decays, and b/sigma^2
+    is blind to exactly the effect that would justify back-loading. Recording
+    cos(g_1, g_n) and cos(g_{n-1}, g_n) per block separates the two: fast
+    decorrelation shows up in the lag-1 term, slow drift only in the lag-n one.
+    Two extra buffers, both the size of one the optimiser already carries.
     """
     global _HORIZON_TRACE_CUR
     if _HORIZON_TRACE_FH is None:
@@ -907,11 +917,40 @@ def _horizon_trace_step(layer_idx, layer_name, refresh_idx, opt_state,
         blk_b2 = (mb.pow(2).mean(dim=(0, 1, 3)) / (bc1 * bc1)).tolist()
         blk_v = (vb.mean(dim=(0, 1, 3)) / bc2).tolist()
 
+    # cos(g_1, g_n) and cos(g_{n-1}, g_n), per still-live block
+    cos_first, cos_prev = [], []
+    if grad is not None and n_full > 0:
+        # The row-shard select happens here, not at the call site, so the
+        # production path pays nothing for a probe that is switched off.
+        g_sel = grad if grad_ids is None else grad.index_select(0, grad_ids)
+        gf = g_sel[:, :, col_start:].float()
+        cut2 = n_full * blocksize
+        gb = gf[:, :, :cut2].reshape(gf.shape[0], gf.shape[1], n_full, blocksize)
+        first = opt_state.get("_hz_g1")
+        prev = opt_state.get("_hz_gp")
+
+        def _cos(ref, off):
+            # ref was stored over a longer tail; align it to the live blocks
+            r = ref[:, :, off:off + cut2].reshape(
+                gb.shape[0], gb.shape[1], n_full, blocksize)
+            num = (r * gb).sum(dim=(0, 1, 3))
+            den = (r.pow(2).sum(dim=(0, 1, 3)).sqrt()
+                   * gb.pow(2).sum(dim=(0, 1, 3)).sqrt())
+            return (num / den.clamp_min(torch.finfo(torch.float32).tiny)).tolist()
+
+        if first is not None:
+            cos_first = _cos(first["g"], col_start - first["col"])
+        if prev is not None:
+            cos_prev = _cos(prev["g"], col_start - prev["col"])
+        if first is None:
+            opt_state["_hz_g1"] = {"g": gf.clone(), "col": col_start}
+        opt_state["_hz_gp"] = {"g": gf.clone(), "col": col_start}
+
     key = (layer_idx, layer_name)
     if _HORIZON_TRACE_CUR is None or _HORIZON_TRACE_CUR["key"] != key:
         _HORIZON_TRACE_CUR = {
             "key": key, "n": [], "b2": [], "v": [], "step": [],
-            "blk_b2": [], "blk_v": [],
+            "blk_b2": [], "blk_v": [], "cos_first": [], "cos_prev": [],
             "opt": opt_state["type"],
         }
     _HORIZON_TRACE_CUR["n"].append(int(refresh_idx))
@@ -920,6 +959,8 @@ def _horizon_trace_step(layer_idx, layer_name, refresh_idx, opt_state,
     _HORIZON_TRACE_CUR["v"].append(vv)
     _HORIZON_TRACE_CUR["blk_b2"].append(blk_b2)
     _HORIZON_TRACE_CUR["blk_v"].append(blk_v)
+    _HORIZON_TRACE_CUR["cos_first"].append(cos_first)
+    _HORIZON_TRACE_CUR["cos_prev"].append(cos_prev)
 
 
 def _horizon_trace_flush(blocksize, n_cols, rank=0):
@@ -949,6 +990,8 @@ def _horizon_trace_flush(blocksize, n_cols, rank=0):
                 "v": cur["v"],
                 "blk_b2": cur["blk_b2"],
                 "blk_v": cur["blk_v"],
+                "cos_first": cur["cos_first"],
+                "cos_prev": cur["cos_prev"],
             }
         )
         + "\n"
@@ -2644,6 +2687,8 @@ class GPTQPlus:
                                 state["grad_optimizer_state"],
                                 i2,
                                 blocksize,
+                                refreshed_grad,
+                                hessian_group_ids if use_hessian_group_shard else None,
                             )
                             optimizer_update, gate_regularizer_update, sine_regularizer_update = self._apply_first_order_regularizer_batched(
                                 state,
