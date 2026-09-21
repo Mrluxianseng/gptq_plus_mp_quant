@@ -84,6 +84,8 @@ import numpy as np
 BETA1 = 0.9
 BETA2 = 0.999
 NL_S = chr(10)
+# Minimum (V - M)/V for the signal/noise split to be conditioned.
+COND_MIN = 0.05
 
 
 # ---------------------------------------------------------------- loading
@@ -301,6 +303,148 @@ def quartiles(xs):
     return (float(np.percentile(xs, 25)), float(np.percentile(xs, 75)))
 
 
+
+def _c_n(n, beta1=BETA1):
+    """Noise still carried by mhat_n after averaging n gradients.
+
+    1.0 at n=1 (mhat IS the raw gradient) down to (1-b)/(1+b) asymptotically.
+    """
+    return ((1 - beta1) * (1 + beta1 ** n)) / ((1 + beta1) * (1 - beta1 ** n))
+
+
+def weight_profile(per_block, min_series, ill=None, narrow=None):
+    """Per column block: the p whose schedule best matches the measurement.
+
+    The schedule applies w(h) = k (h+1)^-p / sum, so log w is linear in
+    log(h+1) with slope -p. The measured optimum is w_n ~ b_n / sigma_n^2 with
+    no assumed form at all. Regressing one on the other per block therefore
+    answers two separate questions at once: which p comes closest, and how
+    much of the measured curve that form can reach (R^2).
+
+    They are not the same shape and were never claimed to be. If b_n ~ n^a
+    then the optimum goes as (g-h)^a while the schedule goes as (h+1)^-p --
+    the p = alpha argument matched their dynamic range over a module, k^p
+    against k^a, not their curves. R^2 here is what says whether that
+    approximation is good enough to be worth applying.
+
+    Returns (list of (p, r2) per block, {h: [normalised weights]}).
+    """
+    out, by_h = [], defaultdict(list)
+    ill = ill if ill is not None else [0]
+    narrow = narrow if narrow is not None else [0]
+    for g, (gn, gm, gv) in per_block.items():
+        if len(gn) < min_series:
+            continue
+        hs, ws = [], []
+        for n, M, V in zip(gn, gm, gv):
+            n = int(n)
+            if n < 2:          # c_1 = 1 exactly: b and sigma are not separable
+                continue
+            c = _c_n(n)
+            b2 = (M - c * V) / (1 - c)
+            s2 = (V - M) / (1 - c)
+            if b2 <= 0 or s2 <= 0:
+                continue
+            # sigma^2 is a difference of two nearly equal quantities once the
+            # SNR is high, and w = b/sigma^2 then swings on sampling noise
+            # rather than on anything real. At SNR 7 the difference is under
+            # 2% of V and a planted alpha=0.80 reads back as p=2.0 while the
+            # profile it came from says 0.47. Drop those points and say how
+            # many; the measured SNR here is ~0.6, where (V-M)/V is ~0.7.
+            if (V - M) / V < COND_MIN:
+                ill[0] += 1
+                continue
+            hs.append(g - n)
+            ws.append(math.sqrt(b2) / s2)
+        if len(ws) < 3:
+            continue
+        mean = sum(ws) / len(ws)
+        if mean <= 0:
+            continue
+        ws = [w / mean for w in ws]
+        for h, w in zip(hs, ws):
+            by_h[h].append(w)
+        x = np.log(np.array(hs, float) + 1.0)
+        y = np.log(np.array(ws, float))
+        # A slope needs leverage. Once the ill-conditioned late refreshes are
+        # dropped, a long block can be left with only large-h points, whose
+        # log(h+1) barely varies -- and a steep slope through them is an
+        # artefact of the compressed range, not a measurement. Require the
+        # surviving horizons to span at least 3x.
+        if np.ptp(x) < math.log(3.0):
+            narrow[0] += 1
+            continue
+        slope, icept = np.polyfit(x, y, 1)
+        res = y - (slope * x + icept)
+        ss_tot = float(np.sum((y - y.mean()) ** 2))
+        r2 = 1 - float(np.sum(res ** 2)) / ss_tot if ss_tot > 0 else float("nan")
+        out.append((-float(slope), r2))
+    return out, by_h
+
+
+def profile_report(fits_data, args):
+    """Per module: the best-matching p, how well it matches, and the shape."""
+    per_mod = defaultdict(list)
+    shape = defaultdict(lambda: defaultdict(list))
+    ill = [0]
+    narrow = [0]
+    for (layer, module), (_, _, _, _, per_block) in fits_data.items():
+        got, by_h = weight_profile(per_block, args.min_series, ill, narrow)
+        per_mod[module].extend(got)
+        for h, ws in by_h.items():
+            shape[module][h].extend(ws)
+
+    cols = (0, 1, 2, 4, 8, 16)
+    hdr = ("%-26s %5s %7s %7s   %s"
+           % ("module", "blks", "best p", "R^2",
+              "  ".join("h=%-4d" % h for h in cols)))
+    print(hdr)
+    print("-" * len(hdr))
+    for module in sorted(per_mod):
+        vals = per_mod[module]
+        if not vals:
+            continue
+        ps = [v[0] for v in vals]
+        r2 = [v[1] for v in vals]
+        cells = ["%-6.3f" % float(np.median(shape[module][h]))
+                 if h in shape[module] else "%-6s" % "-" for h in cols]
+        print("%-26s %5d %7.3f %7.3f   %s"
+              % (module, len(vals), float(np.median(ps)),
+                 float(np.median(r2)), "  ".join(cells)))
+    allv = [v for vs in per_mod.values() for v in vs]
+    allh = defaultdict(list)
+    for m, by_h in shape.items():
+        for h, ws in by_h.items():
+            allh[h].extend(ws)
+    print("-" * len(hdr))
+    cells = ["%-6.3f" % float(np.median(allh[h])) if h in allh else "%-6s" % "-"
+             for h in cols]
+    print("%-26s %5d %7.3f %7.3f   %s"
+          % ("ALL", len(allv), float(np.median([v[0] for v in allv])),
+             float(np.median([v[1] for v in allv])), "  ".join(cells)))
+    print()
+    print("best p : the schedule exponent closest to the measured optimum")
+    print("         w ~ b_n/sigma_n^2, fitted per column block.")
+    print("R^2    : how much of the measured curve that form reaches. The two")
+    print("         shapes differ by construction ((g-h)^a vs (h+1)^-p), so")
+    print("         even perfect data does not give 1.0 -- what matters is")
+    print("         whether it is high enough for the approximation to be")
+    print("         worth applying, and whether best p is consistent.")
+    if narrow[0]:
+        print("NOTE   : %d blocks skipped -- surviving horizons spanned "
+              "under 3x," % narrow[0] + NL_S +
+              "         so their slope would come from the compressed "
+              "range, not the data.")
+    if ill[0]:
+        print("NOTE   : %d refresh points dropped as ill-conditioned "
+              "((V-M)/V < %.2f);" % (ill[0], COND_MIN) + NL_S +
+              "         at high SNR the signal/noise split is a difference of "
+              "near-equal" + NL_S +
+              "         numbers and the weight it implies is sampling noise.")
+    print("h=0    : a column's LAST update before it freezes. Weight falling")
+    print("         with h means back-loading, i.e. p > 0.")
+
+
 def main():
     ap = argparse.ArgumentParser(
         description=__doc__,
@@ -347,6 +491,15 @@ def main():
     ap.add_argument("--n_min", type=int, default=1,
                     help="drop refreshes below this index (model fit handles "
                          "n=1 correctly, so the default keeps everything)")
+    ap.add_argument(
+        "--profile", action="store_true",
+        help=(
+            "Print the measured optimal weight b_n/sigma_n^2 against "
+            "remaining horizon, with no functional form assumed, and the "
+            "best power law through it. Answers whether the schedule's "
+            "shape is right, separately from whether an exponent fits."
+        ),
+    )
     ap.add_argument("--grid_step", type=float, default=0.02)
     ap.add_argument("--grid_lo", type=float, default=-1.0)
     ap.add_argument("--grid_hi", type=float, default=1.5)
@@ -361,6 +514,10 @@ def main():
         )
     data, paths = load(args.prefix)
     print("read %d shard(s), %d module instance(s)" % (len(paths), len(data)))
+
+    if args.profile:
+        profile_report(data, args)
+        return
 
     nmax = max(int(ns.max()) for ns, _, _, _, _ in data.values())
     grid = np.arange(args.grid_lo, args.grid_hi + 1e-9, args.grid_step)
