@@ -378,7 +378,7 @@ def weight_profile(per_block, min_series, ill=None, narrow=None):
         res = y - (slope * x + icept)
         ss_tot = float(np.sum((y - y.mean()) ** 2))
         r2 = 1 - float(np.sum(res ** 2)) / ss_tot if ss_tot > 0 else float("nan")
-        out.append((-float(slope), r2))
+        out.append((-float(slope), r2, g))
     return out, by_h
 
 
@@ -443,6 +443,42 @@ def profile_report(fits_data, args):
               "         numbers and the weight it implies is sampling noise.")
     print("h=0    : a column's LAST update before it freezes. Weight falling")
     print("         with h means back-loading, i.e. p > 0.")
+
+    # Does p depend on the block, or only on the module? If it drifts with the
+    # block index there is something for a per-column exponent to capture; if
+    # it only scatters, per-module is already the right granularity and a
+    # finer one would be fitting noise.
+    print()
+    print("best p by column block (does a per-column exponent have anything")
+    print("to capture?)  -- block g is a column updated g times")
+    bins = [(1, 3), (4, 6), (7, 10), (11, 15), (16, 23)]
+    hdr2 = "%-26s %s" % ("module", "  ".join("g=%d-%-2d" % b for b in bins))
+    print(hdr2)
+    print("-" * len(hdr2))
+    for module in sorted(per_mod):
+        cells = []
+        for lo, hi in bins:
+            got = [v[0] for v in per_mod[module] if lo <= v[2] <= hi]
+            cells.append("%-7.3f" % float(np.median(got)) if len(got) >= 4
+                         else "%-7s" % "-")
+        print("%-26s %s" % (module, "  ".join(cells)))
+    allv2 = [v for vs in per_mod.values() for v in vs]
+    cells = []
+    for lo, hi in bins:
+        got = [v[0] for v in allv2 if lo <= v[2] <= hi]
+        cells.append("%-7.3f" % float(np.median(got)) if len(got) >= 4
+                     else "%-7s" % "-")
+    print("-" * len(hdr2))
+    print("%-26s %s" % ("ALL", "  ".join(cells)))
+
+    print()
+    print("full measured profile, ALL modules (normalised to mean 1 per block):")
+    hs = sorted(allh)
+    for i in range(0, len(hs), 12):
+        chunk = hs[i:i + 12]
+        print("  h   " + " ".join("%6d" % h for h in chunk))
+        print("  w   " + " ".join("%6.3f" % float(np.median(allh[h]))
+                                  for h in chunk))
 
 
 def main():
