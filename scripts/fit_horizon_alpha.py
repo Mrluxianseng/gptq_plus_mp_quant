@@ -110,7 +110,15 @@ def load(prefix):
                 line = line.strip()
                 if not line:
                     continue
-                rec = json.loads(line)
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    # A run stopped with Ctrl+C can leave the final line half
+                    # written. Every earlier line is complete (one flush per
+                    # module), so drop it and keep the rest rather than
+                    # refusing to read a trace that is 99% there.
+                    warn.add("truncated")
+                    continue
                 if rec.get("step") and rec["step"] != rec["n"]:
                     warn.add("step_ne_block")
                 if rec.get("opt") not in (None, "adam"):
@@ -129,6 +137,10 @@ def load(prefix):
             vs.append(sum(r[1] for r in rows) / len(rows))
         out[key] = (np.array(ns, float), np.array(ms, float),
                     np.array(vs, float), meta[key])
+    if "truncated" in warn:
+        print("NOTE: dropped a truncated final line (interrupted run); the"
+              + NL_S + "  completed modules are unaffected.")
+        warn.discard("truncated")
     if "step_ne_block" in warn:
         print("WARNING: optimiser step count and block index disagree; the"
               + NL_S + "  refresh loop is not one step per block and the fit"
