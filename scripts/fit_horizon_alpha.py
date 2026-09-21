@@ -285,6 +285,12 @@ def fit_ratio(ns, Ms, Vs, n_min=2):
 
 
 # ----------------------------------------------------------------- helpers
+def _railed(f, args):
+    """Did this fit land on the edge of the search grid?"""
+    return min(abs(f["alpha"] - args.grid_lo), abs(f["alpha"] - args.grid_hi),
+               abs(f["s"] - args.grid_lo), abs(f["s"] - args.grid_hi)) < args.grid_step
+
+
 def median(xs):
     return float(np.median(xs)) if len(xs) else float("nan")
 
@@ -346,6 +352,13 @@ def main():
     ap.add_argument("--grid_hi", type=float, default=1.5)
     args = ap.parse_args()
 
+    if args.estimator == "ratio" and args.population == "block":
+        raise SystemExit(
+            "--estimator ratio is computed from the whole-tail series "
+            "only, so pairing it with --population block would report "
+            "tail numbers under a block heading. Use --population tail "
+            "with it; the ratio estimator exists for comparison, not use."
+        )
     data, paths = load(args.prefix)
     print("read %d shard(s), %d module instance(s)" % (len(paths), len(data)))
 
@@ -385,6 +398,7 @@ def main():
                 for k in ("alpha", "s", "gamma", "rel_rms")
             }
             f["nsub"] = len(sub)
+            f["railed"] = sum(1 for x in sub if _railed(x, args))
             f["npts"] = int(np.median([x["npts"] for x in sub]))
         else:
             f = fit_model(ns, Ms, Vs, grid, design, args.n_min)
@@ -408,8 +422,12 @@ def main():
     print()
     hdr = ("%-26s %4s %4s  %-17s %-17s %-17s %6s  %s"
            % ("module", "inst", "nblk", "alpha (signal)", "s (noise)",
-              "gamma=alpha-2s", "relerr", "naive gamma"))
+              "gamma (applied)", "relerr", "naive gamma"))
     print(hdr)
+    if args.population == "block":
+        print("(each column is its own median over the module's column "
+              "blocks, so gamma != alpha - 2s exactly; gamma is the one "
+              "that gets applied)")
     print("-" * len(hdr))
     rows = []
     for module in sorted(by_name):
@@ -438,16 +456,24 @@ def main():
     print()
     print("sigma exponent s: median %.3f  (the p = alpha derivation assumed 0)"
           % med_s)
-    edge = [k for k, f in fits.items()
-            if min(abs(f["alpha"] - args.grid_lo), abs(f["alpha"] - args.grid_hi),
-                   abs(f["s"] - args.grid_lo), abs(f["s"] - args.grid_hi))
-            < args.grid_step]
-    if edge:
-        print("WARNING: %d/%d fits landed on a grid edge -- the power-law form"
-              % (len(edge), len(fits)) + NL_S +
-              "  does not describe those traces and their exponent is a bound,"
-              + NL_S + "  not an estimate: " +
-              " ".join("%s.%s" % k for k in sorted(edge)[:6]))
+    if args.population == "block":
+        # Per sub-fit, not per module: see _railed.
+        n_railed = sum(f.get("railed", 0) for f in allf)
+        n_total = sum(f.get("nsub", 1) for f in allf)
+        worst = sorted(((f.get("railed", 0) / max(f.get("nsub", 1), 1), k)
+                        for k, f in fits.items()), reverse=True)[:6]
+        names = " ".join("%s.%s(%.0f%%)" % (k[0], k[1], 100 * r)
+                          for r, k in worst if r > 0)
+    else:
+        railed_keys = [k for k, f in fits.items() if _railed(f, args)]
+        n_railed, n_total = len(railed_keys), len(fits)
+        names = " ".join("%s.%s" % k for k in sorted(railed_keys)[:6])
+    if n_railed:
+        print("WARNING: %d/%d fits (%.0f%%) landed on a grid edge -- the"
+              % (n_railed, n_total, 100.0 * n_railed / max(n_total, 1))
+              + NL_S +
+              "  power-law form does not describe those series and their"
+              + NL_S + "  exponent is a bound, not an estimate: " + names)
     relerr = median([f["rel_rms"] for f in allf])
     print("model relative RMS residual: %.1f%%%s" % (
         100 * relerr,
