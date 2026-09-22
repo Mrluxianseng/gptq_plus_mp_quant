@@ -650,6 +650,56 @@ def _dbg_warm_prior_vs_gradient(prior_slice, grad_slice, t0, beta2, path):
         )
 
 
+
+def _flip_probe_row(blk, w_q, q_int, disp, scale, q_lo, maxq):
+    """Did the optimiser's accumulated push change this column's grid point?
+
+    The optimiser moves the weight in continuous space, but what survives into
+    the model is a grid point. So its effect on a column's OWN final value is
+    binary: either the rounding decision changed, or the displacement left no
+    trace in that value at all. `disp/grid` says how far it pushed in grid
+    units; this says how often that was enough.
+
+    The counterfactual is first-order: w_q - disp is where this weight would
+    sit had the optimiser not pushed it, holding everything else fixed. It is
+    not "the run without the branch" -- that would also change the residuals
+    propagated by every earlier column -- but it is exactly the question of
+    whether the push that did happen crossed a boundary.
+
+    A push that does not flip is not wasted in general: the residual w - q
+    changes, and GPTQ propagates that to the columns after this one. The one
+    place it is wasted is the last block, which has nothing after it -- so the
+    per-block breakdown is the interesting part, not the average.
+    """
+    cf = torch.clamp(torch.round((w_q - disp) / scale), q_lo, maxq)
+    flipped = (cf != q_int)
+    n = flipped.numel()
+    push = (disp.abs() / scale.abs().clamp_min(torch.finfo(torch.float32).tiny))
+    return {
+        "blk": blk,
+        "flip_rate": float(flipped.float().mean().item()),
+        "med_push_grid": float(push.median().item()),
+        "p90_push_grid": float(push.flatten().float().kthvalue(
+            max(1, int(0.9 * n)))[0].item()),
+        "n": n,
+    }
+
+
+def _flip_probe_emit(layer_idx, name, rows):
+    if not rows:
+        return
+    logging.info(
+        "flip_probe layer=%s module=%s nblk=%d\n"
+        "  flip_rate  %s\n"
+        "  |disp|/grid med %s\n"
+        "  |disp|/grid p90 %s",
+        layer_idx, name, len(rows),
+        " ".join("b%d:%.4f" % (r["blk"], r["flip_rate"]) for r in rows),
+        " ".join("b%d:%.4f" % (r["blk"], r["med_push_grid"]) for r in rows),
+        " ".join("b%d:%.4f" % (r["blk"], r["p90_push_grid"]) for r in rows),
+    )
+
+
 def _reach_probe_block_row(blk, w0, q, disp, path, scale):
     """One row of the reach table, for the columns that just froze.
 
@@ -676,6 +726,10 @@ def _reach_probe_block_row(blk, w0, q, disp, path, scale):
         "R_ratio_of_med": med_d / (med_dev + eps),
         "R_med_of_ratio": (d / (dev + eps)).median().item(),
         "disp_over_grid": (d / (sc + eps)).median().item(),
+        # > 1 means the optimizer walked further than it got: the steps
+        # partly cancel. This is the number that separates "the budget is
+        # too small" from "the budget is being spent oscillating".
+        "path_over_disp": p.median().item() / (med_d + eps),
     }
 
 
@@ -695,10 +749,12 @@ def _reach_probe_emit(layer_idx, name, lr, rows, n_groups=None):
         "  path       %s\n"
         "  grid       %s\n"
         "  R=disp/dev %s\n"
+        "  path/disp  %s\n"
         "  disp/grid  %s",
         layer_idx, name, format_log_value(lr), len(rows), n_groups,
         fmt("med_dev"), fmt("med_disp"), fmt("med_path"),
-        fmt("med_grid"), fmt("R_ratio_of_med"), fmt("disp_over_grid"),
+        fmt("med_grid"), fmt("R_ratio_of_med"), fmt("path_over_disp"),
+        fmt("disp_over_grid"),
     )
 
 
@@ -1128,6 +1184,60 @@ def _horizon_exact_weights(n_tail, blocksize, tail_first_block, beta1,
             beta1, n,
             " ".join("k%d:%.3f" % (kk, tbl[kk][n])
                      for kk in range(n, min(k_max, n + 8) + 1)),
+        )
+    return w.to(dtype)
+
+
+
+_BUDGET_LOGGED = []
+
+
+def _column_budget_weights(n_tail, blocksize, tail_first_block, q, nblk,
+                           device, dtype):
+    """Per-column multiplier on the TOTAL budget, by the column's lifetime.
+
+    A different axis from --horizon_p. That one moves a column's own budget
+    around in time and deliberately leaves the total alone: the weights sum to
+    k over the column's life whatever p is. This one changes the total itself.
+
+    The current totals are not a choice anyone made -- they fall out of "every
+    live column takes one step per refresh", which gives a column in block k a
+    total of exactly k. So the columns quantised last get the most, and those
+    are precisely the ones with the fewest columns left behind them to carry a
+    modified residual forward. The last block has none at all: its push either
+    flips its own grid point or leaves no trace.
+
+    q = 1 reproduces that (total proportional to k). q < 1 moves budget toward
+    the short-lived early columns, q = 0 gives every column the same total.
+    Normalised so the module's grand total is unchanged, so q is a pure
+    redistribution and does not double as a learning-rate change.
+
+    Whether early or late columns deserve more is genuinely open -- the last
+    block is also the only one with no second chance, which argues the other
+    way. That is why this is a knob and not a default.
+    """
+    if q == 1.0:
+        return None
+    # Lifetimes that actually occur are 1..nblk-1: block 0 is quantised before
+    # the first refresh and receives nothing, and no column lives through nblk
+    # refreshes. Normalising over 1..nblk would include a lifetime that never
+    # happens and the grand total would drift with q, turning this into a
+    # learning-rate change in disguise.
+    ks = torch.arange(1, nblk, device=device, dtype=torch.float32)
+    tot = ks ** float(q)
+    tot = tot * (ks.sum() / tot.sum())          # preserve the grand total
+    ratio = tot / ks                             # multiplier vs the current
+    h = torch.arange(n_tail, device=device, dtype=torch.long) // blocksize
+    k = (h + int(tail_first_block)).clamp_(1, nblk - 1)
+    w = ratio[k - 1]
+    if not _BUDGET_LOGGED:
+        _BUDGET_LOGGED.append(1)
+        logging.info(
+            "column_budget_q=%g active (nblk=%d): total-budget multiplier by "
+            "the column's lifetime k is %s",
+            q, nblk,
+            " ".join("k%d:%.3f" % (i + 1, float(ratio[i]))
+                     for i in range(0, nblk - 1, max(1, nblk // 6))),
         )
     return w.to(dtype)
 
@@ -2160,6 +2270,7 @@ class GPTQPlus:
         grad_clip=1.0,
         horizon_p=0.0,
         adam_beta1=0.9,
+        column_budget_q=1.0,
         horizon_exact=False,
         slide_refresh_start=0,
         slide_refresh_block_total=None,
@@ -2429,6 +2540,7 @@ class GPTQPlus:
                 _rp_disp = torch.zeros_like(_rp_w0)
                 _rp_path = torch.zeros_like(_rp_w0)
                 _rp_rows = []
+                _fp_rows = []
 
             for i1 in range(0, C, blocksize):
                 with profile_recorder.section("fasterquant_group_parallel.block.total") if profile_recorder else _NULL_CONTEXT:
@@ -2515,8 +2627,14 @@ class GPTQPlus:
                                 Q1_l = torch.zeros_like(W1_l)
                                 W_int1_l = torch.zeros_like(W1_l)
                                 Err1_l = torch.zeros_like(W1_l)
+                                Wq_l = torch.zeros_like(W1_l) if _rp_on else None
                                 for i in range(count):
                                     w = W1_l[:, i]
+                                    if Wq_l is not None:
+                                        # the value actually rounded, after
+                                        # this block's own intra-block
+                                        # propagation -- not W1 at entry
+                                        Wq_l[:, i] = w
                                     q_int = torch.clamp(
                                         torch.round(w / scale_l[:, i]),
                                         q_lo,
@@ -2551,6 +2669,18 @@ class GPTQPlus:
                                 Q1[local_group_idx, local_row_idx, :] = Q1_l
                                 W_int1[local_group_idx, local_row_idx, :] = W_int1_l
                                 Err1[local_group_idx, local_row_idx, :] = Err1_l
+                                if Wq_l is not None:
+                                    # Computed on the local rows only: Wq is
+                                    # never synced, and the rows this rank
+                                    # does not own were never filled.
+                                    _fp_rows.append(_flip_probe_row(
+                                        i1 // blocksize,
+                                        Wq_l.detach().float(),
+                                        W_int1_l.detach().float(),
+                                        _rp_disp[local_group_idx, local_row_idx, i1:i2],
+                                        scale_l.detach().float(),
+                                        q_lo, maxq,
+                                    ))
 
                     Q1, W_int1, Scale1, Err1 = sync_block_tensors(Q1, W_int1, Scale1, Err1)
                     state["Q"][:, :, i1:i2] = Q1
@@ -2775,6 +2905,14 @@ class GPTQPlus:
                                     state["W_sub"].device,
                                     state["W_sub"].dtype,
                                 )
+                            _bstep = _column_budget_weights(
+                                C - i2, blocksize, i2 // blocksize,
+                                column_budget_q, C // blocksize,
+                                state["W_sub"].device,
+                                state["W_sub"].dtype,
+                            )
+                            if _bstep is not None:
+                                _hstep = _bstep if _hstep is None else _hstep * _bstep
                             optimizer_update_raw = self._compute_grad_optimizer_update_batched(
                                 state["grad_optimizer_state"],
                                 (
@@ -2889,6 +3027,10 @@ class GPTQPlus:
             _horizon_trace_flush(blocksize, C, dist_utils.get_rank())
 
             if _rp_on:
+                _flip_probe_emit(
+                    getattr(self, "layer_idx", "?"),
+                    getattr(self, "layer_name", "?"), _fp_rows,
+                )
                 _reach_probe_emit(
                     getattr(self, "layer_idx", "?"),
                     getattr(self, "layer_name", "?"),
@@ -3066,6 +3208,7 @@ class GPTQPlus:
         grad_clip=1.0,
         horizon_p=0.0,
         adam_beta1=0.9,
+        column_budget_q=1.0,
         horizon_exact=False,
         diagnostic_recorder=None,
         slide_refresh_start=0,
@@ -3097,6 +3240,11 @@ class GPTQPlus:
             raise ValueError(
                 "--horizon_trace / --horizon_alpha are only instrumented in "
                 "the group-parallel path. Set GROUP_PARALLEL_QUANT=rank."
+            )
+        if column_budget_q != 1.0 and group_parallel_mode == "none":
+            raise ValueError(
+                "--column_budget_q is only instrumented in the group-parallel "
+                "path. Set GROUP_PARALLEL_QUANT=rank."
             )
         if horizon_exact and horizon_p:
             raise ValueError(
@@ -3172,6 +3320,7 @@ class GPTQPlus:
                     grad_clip=grad_clip,
                     horizon_p=horizon_p,
                     adam_beta1=adam_beta1,
+                    column_budget_q=column_budget_q,
                     horizon_exact=horizon_exact,
                     slide_refresh_start=slide_refresh_start,
                     slide_refresh_block_total=slide_refresh_block_total,
@@ -10760,6 +10909,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             grad_clip=effective_main_grad_clip,
                             horizon_p=float(getattr(args, "horizon_p", 0.0) or 0.0),
                             adam_beta1=float(getattr(args, "adam_beta1", 0.9)),
+                            column_budget_q=float(getattr(args, "column_budget_q", 1.0)),
                             horizon_exact=bool(getattr(args, "horizon_exact", False)),
                             diagnostic_recorder=diagnostic_registry.get_or_create(i, name),
                             slide_refresh_start=slide_refresh_cursor,

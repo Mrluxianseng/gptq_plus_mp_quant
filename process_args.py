@@ -232,6 +232,23 @@ def parse_gen():
         ),
     )
     parser.add_argument(
+        "--column_budget_q",
+        type=float,
+        default=1.0,
+        help=(
+            "Total block-GD budget a column receives, as k^q where k is how "
+            "many refreshes it lives through. A different axis from "
+            "--horizon_p, which redistributes a column's budget in time and "
+            "leaves the total at exactly k. That total is not a design "
+            "choice -- it falls out of every live column taking one step per "
+            "refresh -- and it gives the most to the columns quantised last, "
+            "which have the fewest columns behind them to carry a modified "
+            "residual forward. q = 1 keeps it; q < 1 shifts toward the early "
+            "columns; q = 0 gives every column the same total. Normalised so "
+            "the module's grand total is unchanged."
+        ),
+    )
+    parser.add_argument(
         "--horizon_exact",
         action="store_true",
         help=(
