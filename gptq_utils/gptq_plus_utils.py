@@ -1039,6 +1039,87 @@ def _horizon_boot(args):
         _horizon_configure(trace, alpha, dist_utils.get_rank())
 
 
+
+_HORIZON_EXACT_CACHE = {}
+_HORIZON_EXACT_LOGGED = []
+
+
+def _horizon_exact_table(k_max, beta1):
+    """Row k = the schedule that gives a k-update column a flat effective
+    weight on every raw gradient it sees.
+
+    The first moment mixes past gradients, so the multiplier applied at
+    refresh n is not what raw gradient n ends up contributing. Writing the
+    displacement in terms of the raw gradients,
+
+        W_i = sum_{n>=i} A[n,i] w_n,   A[n,i] = (1-b)b^(n-i) / (1-b^n)
+
+    a column that freezes after k refreshes wants W_i equal for i = 1..k, so
+    its schedule solves A^T w = 1 over its own k. A^T is upper triangular, so
+    this is back-substitution, not an inverse. Each k gets its own row because
+    columns in different blocks live for different numbers of refreshes.
+
+    Normalised to sum to k, the same budget the unweighted path spends, so
+    this changes when a column moves and not how far in total.
+    """
+    key = (int(k_max), round(float(beta1), 6))
+    if key in _HORIZON_EXACT_CACHE:
+        return _HORIZON_EXACT_CACHE[key]
+    tbl = [None] * (k_max + 1)
+    for k in range(1, k_max + 1):
+        w = [0.0] * (k + 1)                      # 1-based over n
+        for i in range(k, 0, -1):
+            acc = 0.0
+            for n in range(i + 1, k + 1):
+                acc += (1.0 - beta1) * beta1 ** (n - i) / (1.0 - beta1 ** n) * w[n]
+            diag = (1.0 - beta1) / (1.0 - beta1 ** i)
+            w[i] = (1.0 - acc) / diag
+        tot = sum(w[1:])
+        tbl[k] = [0.0] + [x * k / tot for x in w[1:]] if tot > 0 else [0.0] * (k + 1)
+    _HORIZON_EXACT_CACHE[key] = tbl
+    return tbl
+
+
+def _horizon_exact_weights(n_tail, blocksize, tail_first_block, beta1,
+                           device, dtype):
+    """Per-tail-column multiplier at this refresh, from the exact table.
+
+    A tail column at offset o belongs to block k = tail_first_block + o//B and
+    is receiving its refresh number n = tail_first_block, so its multiplier is
+    row k, entry n.
+    """
+    if beta1 <= 0.0:
+        # A = I: the raw weights are already the effective ones and the exact
+        # schedule is uniform. Return None so the path stays byte-identical to
+        # production rather than multiplying by ones.
+        return None
+    n = int(tail_first_block)
+    if n < 1:
+        return None
+    h = torch.arange(n_tail, device=device, dtype=torch.long) // blocksize
+    k = h + n
+    k_max = int(k.max().item())
+    tbl = _horizon_exact_table(k_max, beta1)
+    # Rows below n are never reached -- a column of lifetime k < n cannot be
+    # receiving refresh n -- and they are shorter than n, so pad instead of
+    # indexing past their end.
+    vals = torch.tensor(
+        [tbl[kk][n] if kk >= n else 0.0 for kk in range(1, k_max + 1)],
+        device=device, dtype=torch.float32,
+    )
+    w = vals[k - 1]
+    if not _HORIZON_EXACT_LOGGED:
+        _HORIZON_EXACT_LOGGED.append(1)
+        logging.info(
+            "horizon_exact active (beta1=%g): at refresh n=%d the multiplier "
+            "by the column's total update count k is %s",
+            beta1, n,
+            " ".join("k%d:%.3f" % (kk, tbl[kk][n])
+                     for kk in range(n, min(k_max, n + 8) + 1)),
+        )
+    return w.to(dtype)
+
+
 def _align_warm_prior(grad_sq_full, row_start, row_end, perm, device):
     """Put the [out, in] prior into one subgroup's row-sliced, actorder frame.
 
@@ -2067,6 +2148,7 @@ class GPTQPlus:
         grad_clip=1.0,
         horizon_p=0.0,
         adam_beta1=0.9,
+        horizon_exact=False,
         slide_refresh_start=0,
         slide_refresh_block_total=None,
         refresh_full_metrics=False,
@@ -2668,10 +2750,19 @@ class GPTQPlus:
                                 getattr(self, "layer_name", "?"),
                                 horizon_p,
                             )
-                            _hstep = _horizon_step_weights(
-                                C - i2, blocksize, i2 // blocksize, _hp,
-                                state["W_sub"].device, state["W_sub"].dtype,
-                            )
+                            if horizon_exact:
+                                _hstep = _horizon_exact_weights(
+                                    C - i2, blocksize, i2 // blocksize,
+                                    adam_beta1,
+                                    state["W_sub"].device,
+                                    state["W_sub"].dtype,
+                                )
+                            else:
+                                _hstep = _horizon_step_weights(
+                                    C - i2, blocksize, i2 // blocksize, _hp,
+                                    state["W_sub"].device,
+                                    state["W_sub"].dtype,
+                                )
                             optimizer_update_raw = self._compute_grad_optimizer_update_batched(
                                 state["grad_optimizer_state"],
                                 (
@@ -2963,6 +3054,7 @@ class GPTQPlus:
         grad_clip=1.0,
         horizon_p=0.0,
         adam_beta1=0.9,
+        horizon_exact=False,
         diagnostic_recorder=None,
         slide_refresh_start=0,
         slide_refresh_block_total=None,
@@ -2993,6 +3085,16 @@ class GPTQPlus:
             raise ValueError(
                 "--horizon_trace / --horizon_alpha are only instrumented in "
                 "the group-parallel path. Set GROUP_PARALLEL_QUANT=rank."
+            )
+        if horizon_exact and horizon_p:
+            raise ValueError(
+                "--horizon_exact solves for the schedule outright; it cannot "
+                "be combined with the --horizon_p power law."
+            )
+        if horizon_exact and group_parallel_mode == "none":
+            raise ValueError(
+                "--horizon_exact is only instrumented in the group-parallel "
+                "path. Set GROUP_PARALLEL_QUANT=rank."
             )
         if adam_beta1 != 0.9 and group_parallel_mode == "none":
             raise ValueError(
@@ -3058,6 +3160,7 @@ class GPTQPlus:
                     grad_clip=grad_clip,
                     horizon_p=horizon_p,
                     adam_beta1=adam_beta1,
+                    horizon_exact=horizon_exact,
                     slide_refresh_start=slide_refresh_start,
                     slide_refresh_block_total=slide_refresh_block_total,
                     refresh_full_metrics=refresh_full_metrics,
@@ -10645,6 +10748,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             grad_clip=effective_main_grad_clip,
                             horizon_p=float(getattr(args, "horizon_p", 0.0) or 0.0),
                             adam_beta1=float(getattr(args, "adam_beta1", 0.9)),
+                            horizon_exact=bool(getattr(args, "horizon_exact", False)),
                             diagnostic_recorder=diagnostic_registry.get_or_create(i, name),
                             slide_refresh_start=slide_refresh_cursor,
                             slide_refresh_block_total=slide_refresh_block_total,

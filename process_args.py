@@ -232,6 +232,21 @@ def parse_gen():
         ),
     )
     parser.add_argument(
+        "--horizon_exact",
+        action="store_true",
+        help=(
+            "Instead of the --horizon_p power law, solve for the schedule "
+            "that makes every raw gradient's effective weight equal: A^T w = "
+            "1 per column-lifetime k, by back-substitution. No exponent and "
+            "no fitted parameter -- it depends only on --adam_beta1 and the "
+            "block count. This is a control, not a tuning knob: if it loses "
+            "to the best power law, what that shows is that equalising the "
+            "effective weights is not the right target, i.e. the raw "
+            "gradients do not have equal marginal value for the quantised "
+            "loss. Mutually exclusive with --horizon_p."
+        ),
+    )
+    parser.add_argument(
         "--adam_beta1",
         type=float,
         default=0.9,
