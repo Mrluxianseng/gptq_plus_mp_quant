@@ -232,6 +232,21 @@ def parse_gen():
         ),
     )
     parser.add_argument(
+        "--adam_beta1",
+        type=float,
+        default=0.9,
+        help=(
+            "First-moment decay for the block-GD Adam. Exposed because it is "
+            "the decisive control for --horizon_p: the schedule exists to "
+            "undo the momentum EMA's truncated tail (a column freezes before "
+            "the EMA has delivered its last gradients' full weight), and the "
+            "exponent that flattens the effective weight is 0 at beta1=0, "
+            "0.17-0.49 at 0.5, and 0.78-1.6 at 0.9 depending on block length. "
+            "So at --adam_beta1 0 the benefit of --horizon_p should vanish; "
+            "if it does not, that account is wrong."
+        ),
+    )
+    parser.add_argument(
         "--horizon_trace",
         type=str,
         default="",

@@ -852,7 +852,8 @@ def _resolve_horizon_p(layer_idx, layer_name, fallback):
 
 
 def _horizon_trace_step(layer_idx, layer_name, refresh_idx, opt_state,
-                        col_start, blocksize, grad=None, grad_ids=None):
+                        col_start, blocksize, grad=None, grad_ids=None,
+                        beta1=0.9):
     """Record the refresh gradient's signal and noise over the live tail.
 
     b^2 = mean(mhat^2) and sigma^2 = mean(vhat) - mean(mhat^2): Adam already
@@ -899,7 +900,7 @@ def _horizon_trace_step(layer_idx, layer_name, refresh_idx, opt_state,
     if m.numel() == 0:
         return
     step = opt_state["step"]
-    bc1 = 1.0 - 0.9 ** step
+    bc1 = 1.0 - beta1 ** step
     bc2 = 1.0 - 0.999 ** (step + opt_state.get("v_offset", 0))
     mf = m.float()
     vf = v.float()
@@ -951,7 +952,7 @@ def _horizon_trace_step(layer_idx, layer_name, refresh_idx, opt_state,
         _HORIZON_TRACE_CUR = {
             "key": key, "n": [], "b2": [], "v": [], "step": [],
             "blk_b2": [], "blk_v": [], "cos_first": [], "cos_prev": [],
-            "opt": opt_state["type"],
+            "opt": opt_state["type"], "beta1": float(beta1),
         }
     _HORIZON_TRACE_CUR["n"].append(int(refresh_idx))
     _HORIZON_TRACE_CUR["step"].append(int(step))
@@ -986,6 +987,7 @@ def _horizon_trace_flush(blocksize, n_cols, rank=0):
                 "n": cur["n"],
                 "step": cur["step"],
                 "opt": cur["opt"],
+                "beta1": cur["beta1"],
                 "b2": cur["b2"],
                 "v": cur["v"],
                 "blk_b2": cur["blk_b2"],
@@ -2064,6 +2066,7 @@ class GPTQPlus:
         block_observer=None,
         grad_clip=1.0,
         horizon_p=0.0,
+        adam_beta1=0.9,
         slide_refresh_start=0,
         slide_refresh_block_total=None,
         refresh_full_metrics=False,
@@ -2678,6 +2681,7 @@ class GPTQPlus:
                                 i2,
                                 grad_lr,
                                 grad_clip=grad_clip,
+                                adam_beta1=adam_beta1,
                                 step_scale=_hstep,
                             )
                             _horizon_trace_step(
@@ -2689,6 +2693,7 @@ class GPTQPlus:
                                 blocksize,
                                 refreshed_grad,
                                 hessian_group_ids if use_hessian_group_shard else None,
+                                adam_beta1,
                             )
                             optimizer_update, gate_regularizer_update, sine_regularizer_update = self._apply_first_order_regularizer_batched(
                                 state,
@@ -2957,6 +2962,7 @@ class GPTQPlus:
         block_observer=None,
         grad_clip=1.0,
         horizon_p=0.0,
+        adam_beta1=0.9,
         diagnostic_recorder=None,
         slide_refresh_start=0,
         slide_refresh_block_total=None,
@@ -2987,6 +2993,12 @@ class GPTQPlus:
             raise ValueError(
                 "--horizon_trace / --horizon_alpha are only instrumented in "
                 "the group-parallel path. Set GROUP_PARALLEL_QUANT=rank."
+            )
+        if adam_beta1 != 0.9 and group_parallel_mode == "none":
+            raise ValueError(
+                "--adam_beta1 is only threaded through the group-parallel path; "
+                "the legacy path would keep its own 0.9 and the run would look "
+                "like it honoured the flag. Set GROUP_PARALLEL_QUANT=rank."
             )
         if horizon_p and group_parallel_mode == "none":
             raise ValueError(
@@ -3045,6 +3057,7 @@ class GPTQPlus:
                     block_observer=block_observer,
                     grad_clip=grad_clip,
                     horizon_p=horizon_p,
+                    adam_beta1=adam_beta1,
                     slide_refresh_start=slide_refresh_start,
                     slide_refresh_block_total=slide_refresh_block_total,
                     refresh_full_metrics=refresh_full_metrics,
@@ -10631,6 +10644,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             block_observer=make_block_observer(name, _module_grad_optimizer) if args.g_update_mode in {"block_backward", "block_gd"} else None,
                             grad_clip=effective_main_grad_clip,
                             horizon_p=float(getattr(args, "horizon_p", 0.0) or 0.0),
+                            adam_beta1=float(getattr(args, "adam_beta1", 0.9)),
                             diagnostic_recorder=diagnostic_registry.get_or_create(i, name),
                             slide_refresh_start=slide_refresh_cursor,
                             slide_refresh_block_total=slide_refresh_block_total,
