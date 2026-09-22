@@ -798,9 +798,13 @@ def _horizon_configure(trace_path, alpha_path, rank=0):
         clamped = {}
         for key, val in table.items():
             v = float(val)
-            if v < -1.5 or v > 1.5:
+            # The transfer-matrix solve asks for exponents up to ~1.9 on the
+            # shortest modules (g=8 at beta1=0.9), so a +-1.5 clamp would
+            # silently truncate the theory's own prediction. Kept wide enough
+            # to pass those through and still catch a fit that has run away.
+            if v < -2.5 or v > 2.5:
                 clamped[key] = v
-                v = min(max(v, -1.5), 1.5)
+                v = min(max(v, -2.5), 2.5)
             out[key] = v
         if not out:
             raise ValueError("horizon alpha table %s is empty" % alpha_path)
@@ -814,7 +818,7 @@ def _horizon_configure(trace_path, alpha_path, rank=0):
         )
         if clamped:
             logging.warning(
-                "horizon alpha clamped into [-1.5, 1.5] for %d key(s): %s",
+                "horizon alpha clamped into [-2.5, 2.5] for %d key(s): %s",
                 len(clamped),
                 " ".join(
                     "%s=%.3f" % kv for kv in sorted(clamped.items())[:8]
