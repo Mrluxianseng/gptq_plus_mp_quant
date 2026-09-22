@@ -210,6 +210,12 @@ fi
 # fitted per-module exponent back in place of the constant. See
 # scripts/fit_horizon_alpha.py.
 HORIZON_MEASURED_ARGS=()
+if [[ -n "${ADAM_BETA1:-}" ]]; then
+    HORIZON_MEASURED_ARGS+=(--adam_beta1 "${ADAM_BETA1}")
+fi
+if [[ "${HORIZON_EXACT:-0}" == "1" ]]; then
+    HORIZON_MEASURED_ARGS+=(--horizon_exact)
+fi
 if [[ -n "${HORIZON_TRACE:-}" ]]; then
     HORIZON_MEASURED_ARGS+=(--horizon_trace "${HORIZON_TRACE}")
 fi

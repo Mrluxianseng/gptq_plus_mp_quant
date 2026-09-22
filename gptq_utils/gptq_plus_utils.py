@@ -1035,6 +1035,14 @@ def _horizon_boot(args):
             "(got %r). Nothing would be weighted and the trace would be "
             "empty." % (getattr(args, "g_update_mode", None),)
         )
+    if trace and float(getattr(args, "adam_beta1", 0.9)) <= 0.0:
+        raise ValueError(
+            "--horizon_trace cannot be read at --adam_beta1 0: with no "
+            "momentum mhat is the raw gradient, the residual-noise factor "
+            "c_n is identically 1, and the signal/noise split divides by "
+            "1 - c_n = 0. The trace would be written and the fitter would "
+            "then refuse every point in it."
+        )
     if trace or alpha:
         _horizon_configure(trace, alpha, dist_utils.get_rank())
 

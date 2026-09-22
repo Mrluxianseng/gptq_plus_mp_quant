@@ -187,6 +187,11 @@ HORIZON_P=${HORIZON_P:-0}
 #                         a trace taken under an active schedule measures
 #                         that schedule, not production.
 #   HORIZON_ALPHA=<json>  apply run: per-module p, replaces HORIZON_P.
+# beta1 is the control this whole line now turns on: the schedule exists to
+# undo the momentum EMA's truncated tail, so at ADAM_BETA1=0 there is no
+# tail and HORIZON_P should buy nothing.
+ADAM_BETA1=${ADAM_BETA1:-0.9}
+HORIZON_EXACT=${HORIZON_EXACT:-0}
 HORIZON_TRACE=${HORIZON_TRACE:-}
 HORIZON_ALPHA=${HORIZON_ALPHA:-}
 if [[ -n "${HORIZON_ALPHA}" && "${HORIZON_P}" != "0" ]]; then
@@ -194,6 +199,12 @@ if [[ -n "${HORIZON_ALPHA}" && "${HORIZON_P}" != "0" ]]; then
 fi
 if [[ -n "${HORIZON_TRACE}" ]] && [[ -n "${HORIZON_ALPHA}" || "${HORIZON_P}" != "0" ]]; then
     echo "HORIZON_TRACE must be taken at HORIZON_P=0 with no HORIZON_ALPHA." >&2; exit 1
+fi
+if [[ "${HORIZON_EXACT}" == "1" && "${HORIZON_P}" != "0" ]]; then
+    echo "HORIZON_EXACT and HORIZON_P are mutually exclusive." >&2; exit 1
+fi
+if [[ -n "${HORIZON_TRACE}" && "${ADAM_BETA1}" == "0" ]]; then
+    echo "HORIZON_TRACE is unreadable at ADAM_BETA1=0 (c_n == 1)." >&2; exit 1
 fi
 if [[ -n "${HORIZON_ALPHA}" && ! -f "${HORIZON_ALPHA}" ]]; then
     echo "HORIZON_ALPHA=${HORIZON_ALPHA} does not exist." >&2; exit 1
@@ -247,6 +258,7 @@ common() {
     SALIENCY_CLIP_PERCENTILE="${SALIENCY_CLIP_PERCENTILE}"     GRAD_CLIP="${GRAD_CLIP}" FINAL_LAYER_GRAD_CLIP="${FINAL_LAYER_GRAD_CLIP}" \
     HORIZON_P="${HORIZON_P}" \
     HORIZON_TRACE="${HORIZON_TRACE}" HORIZON_ALPHA="${HORIZON_ALPHA}" \
+    ADAM_BETA1="${ADAM_BETA1}" HORIZON_EXACT="${HORIZON_EXACT}" \
     PROJ_LR_SCALE=1.0 DOWN_PROJ_LR_SCALE=1.0 SECOND_ORDER_SCALE=1.0 PRE_CLIP=0 \
     ENABLE_QA_EVAL="${ENABLE_QA_EVAL}" LM_EVAL_BATCH_SIZE="${LM_EVAL_BATCH_SIZE}" \
     STATIC_CACHE_PATH="${STATIC_CACHE_PATH}" RDZV_PORT="${RDZV_PORT}" \
@@ -268,6 +280,7 @@ REAL-Q formal comparison - Qwen3-0.6B W4A16
   topk         : kl=${KL_TOPK}  grad_hessian=${GRAD_HESSIAN_TOPK}
   grad_clip    : ${GRAD_CLIP} / ${FINAL_LAYER_GRAD_CLIP}  (1.0 = off at this scale)
   horizon_p    : ${HORIZON_P}  (0 = production; verify in the log, not here)
+  adam beta1   : ${ADAM_BETA1}   horizon_exact: ${HORIZON_EXACT}
   horizon meas : trace=${HORIZON_TRACE:-off}  alpha=${HORIZON_ALPHA:-off}
                  (the measured p is logged per module as "horizon p resolved")
 
