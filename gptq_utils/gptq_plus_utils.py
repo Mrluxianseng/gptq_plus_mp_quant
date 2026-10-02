@@ -2274,6 +2274,7 @@ class GPTQPlus:
         slide_refresh_block_total=None,
         refresh_full_metrics=False,
         group_parallel_mode="none",
+        inner_kernel_impl="torch",
     ):
         profile_recorder = profile_recorder or self.profile_recorder
         # Alias the recorder so call sites can do `rec and rec.save_block(...)`.
@@ -2286,6 +2287,27 @@ class GPTQPlus:
             grad_gate_sine_amp=grad_gate_sine_amp,
         )
         group_parallel_mode = (group_parallel_mode or "none").lower()
+        inner_kernel_impl = (inner_kernel_impl or "torch").lower()
+        if inner_kernel_impl not in {"torch", "triton_fused"}:
+            raise ValueError(
+                f"Unsupported inner_kernel_impl={inner_kernel_impl!r}; "
+                "expected 'torch' or 'triton_fused'."
+            )
+        fused_gptq_column = None
+        if inner_kernel_impl == "triton_fused":
+            if group_parallel_mode != "none":
+                raise ValueError("triton_fused requires group_parallel_mode='none'.")
+            if g_update_mode != "block_gd":
+                raise ValueError("triton_fused requires g_update_mode='block_gd'.")
+            if block_atomic_quant:
+                raise ValueError("triton_fused is incompatible with block_atomic_quant.")
+            try:
+                from gptq_utils.triton_gptq_kernels import fused_gptq_column_
+            except ImportError as exc:
+                raise RuntimeError(
+                    "triton_fused requested, but Triton could not be imported."
+                ) from exc
+            fused_gptq_column = fused_gptq_column_
         if group_parallel_mode not in {"none", "tensor", "rank"}:
             raise ValueError(
                 f"Unsupported `group_parallel_mode={group_parallel_mode}`. "
@@ -2415,6 +2437,16 @@ class GPTQPlus:
                 fast_quant_scale_full = None
                 fast_quant_maxq = None
                 fast_quant_lo = None
+            if inner_kernel_impl == "triton_fused":
+                if not fast_quant_enabled or not getattr(self.quantizer, "sym", True):
+                    raise ValueError(
+                        "triton_fused requires ready per-row symmetric quantization "
+                        "(groupsize=-1 and weight bits < 16)."
+                    )
+                if blocksize > 128:
+                    raise ValueError(
+                        f"triton_fused supports blocksize <= 128; got {blocksize}."
+                    )
 
             rows_per_sub = self.rows // self.num_groups
             subgroup_states = []
@@ -2674,78 +2706,90 @@ class GPTQPlus:
                             # per block at zero benefit when profiling is disabled (the
                             # block-level `fasterquant.block.total` range already bounds
                             # the inner loop for Nsight).
-                            for i in range(count):
-                                w = W1[:, i]
-                                d = Hinv1[i, i]
+                            with profile_recorder.section("fasterquant.block.inner_column_loop") if profile_recorder else _NULL_CONTEXT:
+                                for i in range(count):
+                                    if inner_kernel_impl == "triton_fused":
+                                        if not is_frozen_inner:
+                                            raise RuntimeError(
+                                                "triton_fused requires the frozen block_gd inner GHinv path."
+                                            )
+                                        fused_gptq_column(
+                                            W1,
+                                            GHinv1_eff,
+                                            Z1,
+                                            Hinv1,
+                                            fast_quant_scale,
+                                            Q1,
+                                            W_int1,
+                                            Err1,
+                                            i,
+                                            maxq=fast_quant_maxq,
+                                            qlo=fast_quant_lo,
+                                            second_order_scale=second_order_scale,
+                                        )
+                                        continue
+                                    w = W1[:, i]
+                                    d = Hinv1[i, i]
+                                    w_col = w.unsqueeze(1)
+                                    if fast_quant_scale is not None:
+                                        int_weight = torch.clamp(
+                                            torch.round(w_col / fast_quant_scale),
+                                            fast_quant_lo,
+                                            fast_quant_maxq,
+                                        )
+                                        q_fake = (fast_quant_scale * int_weight).to(w_col.dtype)
+                                        scale = fast_quant_scale
+                                    else:
+                                        quantizer = self.quantizer
+                                        quant_st_idx = state["row_start"]
+                                        quant_end_idx = state["row_end"]
+                                        if dynamic_quantizer is not None:
+                                            quantizer = dynamic_quantizer
+                                            quant_st_idx = None
+                                            quant_end_idx = None
+                                        elif groupsize != -1:
+                                            idx = i1 + i
+                                            if actorder:
+                                                idx = state["perm"][idx]
+                                            quantizer = state["groups"][idx // groupsize]
+                                        q_fake, int_weight, scale = quantizer.fake_quantize(
+                                            w_col,
+                                            st_idx=quant_st_idx,
+                                            end_idx=quant_end_idx,
+                                        )
+                                    q_flat = q_fake.flatten()
+                                    Q1[:, i] = q_flat
+                                    q = q_flat
+                                    W_int1[:, i] = int_weight.flatten()
+                                    if fast_quant_scale is None:
+                                        Scale1[:, i] = scale.flatten()
 
-                                w_col = w.unsqueeze(1)
-                                if fast_quant_scale is not None:
-                                    # Inline of WeightQuantizer.fake_quantize for the
-                                    # symmetric per-row, groupsize == -1 case. Same
-                                    # operations and dtypes as the original call, so
-                                    # the output is bit-identical.
-                                    int_weight = torch.clamp(
-                                        torch.round(w_col / fast_quant_scale),
-                                        fast_quant_lo,
-                                        fast_quant_maxq,
-                                    )
-                                    q_fake = (fast_quant_scale * int_weight).to(w_col.dtype)
-                                    scale = fast_quant_scale
-                                else:
-                                    quantizer = self.quantizer
-                                    quant_st_idx = state["row_start"]
-                                    quant_end_idx = state["row_end"]
-                                    if dynamic_quantizer is not None:
-                                        quantizer = dynamic_quantizer
-                                        quant_st_idx = None
-                                        quant_end_idx = None
-                                    elif groupsize != -1:
-                                        idx = i1 + i
-                                        if actorder:
-                                            idx = state["perm"][idx]
-                                        quantizer = state["groups"][idx // groupsize]
-                                    q_fake, int_weight, scale = quantizer.fake_quantize(
-                                        w_col,
-                                        st_idx=quant_st_idx,
-                                        end_idx=quant_end_idx,
-                                    )
-                                q_flat = q_fake.flatten()
-                                Q1[:, i] = q_flat
-                                q = q_flat
-                                W_int1[:, i] = int_weight.flatten()
-                                if fast_quant_scale is None:
-                                    # In the groupsize != -1 path scale varies per
-                                    # column group, so we still need the per-column
-                                    # write. With fast_quant_scale active the block
-                                    # setup pre-filled Scale1.
-                                    Scale1[:, i] = scale.flatten()
+                                    err1 = (w - q - GHinv1_eff[:, i]) / d
+                                    second_order_inner_update = err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
+                                    if block_gd_mode:
+                                        W1[:, i:] -= second_order_scale * (
+                                            second_order_inner_update + GHinv1_eff[:, i:]
+                                        )
+                                    else:
+                                        W1[:, i:] -= second_order_inner_update + GHinv1_eff[:, i:]
+                                    Err1[:, i] = err1
 
-                                err1 = (w - q - GHinv1_eff[:, i]) / d
-                                second_order_inner_update = err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
-                                if block_gd_mode:
-                                    W1[:, i:] -= second_order_scale * (
-                                        second_order_inner_update + GHinv1_eff[:, i:]
+                                    # In-place subtract avoids one tensor allocation
+                                    # per column compared to `GHinv1[:, i:] = GHinv1[:, i:] - ...`.
+                                    GHinv1[:, i:].sub_(
+                                        Z1[:, i].unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
                                     )
-                                else:
-                                    W1[:, i:] -= second_order_inner_update + GHinv1_eff[:, i:]
-                                Err1[:, i] = err1
-
-                                # In-place subtract avoids one tensor allocation
-                                # per column compared to `GHinv1[:, i:] = GHinv1[:, i:] - ...`.
-                                GHinv1[:, i:].sub_(
-                                    Z1[:, i].unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
-                                )
-                                # For frozen inner mode `_current_ghinv` just returns
-                                # `GHinv1`, so `GHinv1_eff` aliases it already and
-                                # sees the in-place mutation automatically.
-                                if not is_frozen_inner:
-                                    GHinv1_eff = self._current_ghinv(
-                                        GHinv1,
-                                        W1 if is_surrogate_online else W_block_start,
-                                        W_ref1,
-                                        state["beta_view"],
-                                        inner_update_mode,
-                                    )
+                                    # For frozen inner mode `_current_ghinv` just returns
+                                    # `GHinv1`, so `GHinv1_eff` aliases it already and
+                                    # sees the in-place mutation automatically.
+                                    if not is_frozen_inner:
+                                        GHinv1_eff = self._current_ghinv(
+                                            GHinv1,
+                                            W1 if is_surrogate_online else W_block_start,
+                                            W_ref1,
+                                            state["beta_view"],
+                                            inner_update_mode,
+                                        )
 
                         with profile_recorder.section("fasterquant.block.writeback_inner") if profile_recorder else _NULL_CONTEXT:
                             state["Q"][:, i1:i2] = Q1
@@ -9529,6 +9573,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             slide_refresh_block_total=slide_refresh_block_total,
                             refresh_full_metrics=bool(getattr(args, "refresh_full_metrics", False)),
                             group_parallel_mode=getattr(args, "group_parallel_quant", "none"),
+                            inner_kernel_impl=getattr(args, "gptq_inner_kernel", "torch"),
                         )
                         slide_refresh_cursor += slide_refreshes_per_module[name]
                         # DP correctness check (debug only): fasterquant is meant

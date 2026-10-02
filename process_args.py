@@ -652,6 +652,15 @@ def parse_gen():
     parser.add_argument("--quant_profile_target_layers", type=str, default="all", help="Layer ids to profile in detail when quant profiling is enabled.")
     parser.add_argument("--quant_profile_target_modules", type=str, default="all", help="Comma-separated module names to profile in detail when quant profiling is enabled.")
     parser.add_argument("--quant_stop_layer", type=str, default=None, help="Inclusive transformer layer index to stop after; intended for short profiling/debug runs.")
+    parser.add_argument(
+        "--gptq_inner_kernel",
+        choices=("torch", "triton_fused"),
+        default="torch",
+        help=(
+            "Backend for the sequential GPTQ column update. triton_fused is "
+            "experimental and supports block_gd with symmetric per-row quantization."
+        ),
+    )
     # Eval
     parser.add_argument("--skip_eval", action="store_true", help="Skip KL/PPL and QA evaluation")
     parser.add_argument("--lm_eval", action="store_true", help="Enable QA eval")
