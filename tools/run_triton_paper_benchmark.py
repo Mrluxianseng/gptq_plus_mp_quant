@@ -336,9 +336,19 @@ def summarize(campaign_dir: Path, tag_prefix: str, pairs: list[dict[str, Any]],
     integrity_ok = len(records) == len(pairs)
     for index, pair in enumerate(records, start=1):
         control, candidate = pair["control"], pair["candidate"]
-        exact = all(control[key] == candidate[key] for key in (
+        state_and_eval_exact = all(control[key] == candidate[key] for key in (
             "state_sha256", "state_tensors", "kl", "ppl"
         ))
+        traces = pair.get("layer_output_fingerprints") or {}
+        control_trace = traces.get(control["tag"])
+        candidate_trace = traces.get(candidate["tag"])
+        layer_outputs_exact = (
+            control_trace is not None
+            and candidate_trace is not None
+            and control_trace == candidate_trace
+            and [row.get("layer") for row in control_trace] == list(range(28))
+        )
+        exact = state_and_eval_exact and layer_outputs_exact
         integrity_ok &= exact and control["state_tensors"] == 507
         rows.append({
             "pair": index,
@@ -357,6 +367,15 @@ def summarize(campaign_dir: Path, tag_prefix: str, pairs: list[dict[str, Any]],
             "peak_reserved_bytes_control": control["peak_reserved_bytes"],
             "peak_reserved_bytes_candidate": candidate["peak_reserved_bytes"],
             "exact_output_match": exact,
+            "layer_outputs_exact_match": layer_outputs_exact,
+            "per_layer_quantization_ms_control": control["per_layer_quantization_ms"],
+            "per_layer_quantization_ms_candidate": candidate["per_layer_quantization_ms"],
+            "gptq_inner_column_compensation_ms_control": control["gptq_inner_column_compensation_ms"],
+            "gptq_inner_column_compensation_ms_candidate": candidate["gptq_inner_column_compensation_ms"],
+            "gptq_compensation_path_ms_control": control["gptq_compensation_path_ms"],
+            "gptq_compensation_path_ms_candidate": candidate["gptq_compensation_path_ms"],
+            "gradient_update_total_ms_control": control["gradient_update_total_ms"],
+            "gradient_update_total_ms_candidate": candidate["gradient_update_total_ms"],
             "profile_control_ms": control["profile_section_totals_ms"],
             "profile_candidate_ms": candidate["profile_section_totals_ms"],
         })
@@ -407,7 +426,7 @@ def summarize(campaign_dir: Path, tag_prefix: str, pairs: list[dict[str, Any]],
         "Wikitext-2 calibration/evaluation (256 x 2048 tokens)", "",
         f"- Distributed execution: {config['world_size']} ranks on GPUs "
         f"{','.join(config['gpu_indices'])}", "",
-        "| Pair | Control quant (s) | Triton quant (s) | Quant speedup | Control total (s) | Triton total (s) | Total speedup | Hash/KL/PPL exact |",
+        "| Pair | Control quant (s) | Triton quant (s) | Quant speedup | Control total (s) | Triton total (s) | Total speedup | State/layers/KL/PPL exact |",
         "|---:|---:|---:|---:|---:|---:|---:|:---:|",
     ]
     for row in rows:
@@ -431,6 +450,14 @@ def summarize(campaign_dir: Path, tag_prefix: str, pairs: list[dict[str, Any]],
             f"(mean {summary['end_to_end_speedup']['mean']:.3f}×; one pair, SD unavailable).",
             "- Exactness is checked after each pair using all 507 tensor-state hashes, KL, and PPL; the driver stops on the first mismatch.",
             "- Raw paired data: `paired_repetitions.json`; per-run manifests, logs, profile metrics, and source hashes: `outputs/phase_profile_<tag>/`; GPU samples: `gpu_telemetry.csv`.",
+        ])
+        report.extend([
+            "",
+            "Per-pair JSON also records all 28 per-layer GPU times, GPTQ inner-column and outer "
+            "compensation-path sections, the true-gradient-refresh plus Adam-application time, "
+            "and the raw section breakdown. "
+            "Distributed section totals use the slowest rank. Layer activations are compared by "
+            "SHA-256 fingerprints (shape/dtype/forward-count included); full activation tensors are not stored.",
         ])
     if telemetry.get("util_gpu_pct"):
         temp_range = telemetry.get("temp_c")
@@ -597,6 +624,7 @@ def main() -> None:
         "--pairs", str(args.pairs),
         "--tag-prefix", tag_prefix,
         "--timeout-seconds", str(args.timeout_seconds),
+        "--trace-layer-outputs",
     ]
     returncode = 1
     try:

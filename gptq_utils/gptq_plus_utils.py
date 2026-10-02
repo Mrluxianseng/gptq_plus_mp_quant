@@ -8262,6 +8262,13 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
             layer = layer_manager.materialize_layer(i)
             full = analyzer.get_quantizable_modules(layer)
             layer_recorder = QuantProfileRecorder(dev, prefix=f"layers.{i}") if quant_profile_enabled else None
+            # A single CUDA-event interval for each Transformer layer makes
+            # per-layer quantization time directly reportable. Keep it out of
+            # normal runs; the formal profile runner enables wall profiling.
+            layer_total_start = None
+            if layer_recorder is not None and QuantProfileRecorder._WALL_ENABLED:
+                layer_total_start = torch.cuda.Event(enable_timing=True)
+                layer_total_start.record()
             analysis_is_target = False
             analysis_fp_weights = None
             if analysis_hook is not None:
@@ -9683,6 +9690,12 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     if _dyn_layers is not None and i < len(_dyn_layers):
                         _dyn_layers[i] = None
                 memory_utils.cleanup_memory(trim_cpu=True)
+            if layer_total_start is not None:
+                layer_total_end = torch.cuda.Event(enable_timing=True)
+                layer_total_end.record()
+                QuantProfileRecorder._WALL_STATS.setdefault(
+                    f"layers.{i}.layer.total", []
+                ).append((layer_total_start, layer_total_end))
             if analysis_hook is not None:
                 dist_utils.barrier()
 

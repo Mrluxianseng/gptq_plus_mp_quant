@@ -34,10 +34,10 @@ python tools/run_triton_paper_benchmark.py \
 结果会写入 `outputs/<tag-prefix>-campaign/`，并在控制台逐组打印进度。关键文件如下：
 
 - `summary.md`、`summary.json`：每组 control/candidate 耗时、配对加速比中位数/均值/标准差、state/KL/PPL 一致性及有效状态。
-- `paired_repetitions.json`：每组原始量化与端到端秒数、完整权重 state SHA-256、507 个张量计数、KL/PPL、峰值 allocated/reserved 显存、列循环和梯度刷新 profile 分项。
+- `paired_repetitions.json`：每组原始量化与端到端秒数、完整权重 state SHA-256、507 个张量计数、KL/PPL、峰值 allocated/reserved 显存、逐层量化 GPU 时间、GPTQ 补偿路径及其分项、梯度刷新加 Adam 更新总时间，以及逐层输出指纹。补偿路径汇总包含列内循环、writeback 和外层更新；外层 `delta-W` 与 `block_gd` 梯度校正共用代码区，因此也保留各分项，不把总数误称为纯闭式求解时间。逐层输出以形状、dtype、SHA-256 和前向次数记录，不保存完整激活张量；任一层指纹不同会立即停止后续实验。
 - `config.json`、`environment.json`：固定配置、模型 config 哈希、Git commit/工作区状态、Python/PyTorch/CUDA/Triton 版本、GPU/驱动及启动前可见计算进程。
 - `campaign.log`：配对驱动的实时完整输出。
 - `gpu_telemetry.csv`、`gpu_processes.log`：约每 5 秒的 GPU 利用率、显存、时钟、功耗、温度采样；约每 30 秒记录一次可见 CUDA 计算进程。
-- `control-current-source.json`、`candidate-current-source.json` 及 `outputs/phase_profile_<tag>/`：逐次运行命令、源码哈希、status、详细日志、profile 指标和 entry wrapper。
+- `control-current-source.json`、`candidate-current-source.json` 及 `outputs/phase_profile_<tag>/`：逐次运行命令、源码哈希、status、详细日志、profile 指标、逐层 `layer_output_fingerprints.json` 和 entry wrapper。
 
-启动预检要求选定的虚拟环境可用 CUDA 与 Triton，GPU 上没有可见的竞争 CUDA 计算进程，模型结构为 28 层 Qwen3，且本地数据路径存在。每组比较都会要求 state hash、张量数、KL 和 PPL 完全相等，且 state tensor 数为 507；失败时配对驱动会立即中止。整体成功还要求完成指定的全部配对。运行结束请检查 `status.json` 中 `valid: true`，再将 `summary.md` 和原始 JSON 一并归档。该脚本测量的是 REAL-Q **量化/校准过程**的工程耗时，不测模型推理吞吐。
+启动预检要求选定的虚拟环境可用 CUDA 与 Triton，GPU 上没有可见的竞争 CUDA 计算进程，模型结构为 28 层 Qwen3，且本地数据路径存在。每组比较都会要求 state hash、507 个张量计数、KL、PPL 和全部 28 层输出指纹完全相等；任一输出不一致或记录缺失都会立即停止。整体成功还要求完成指定的全部配对。运行结束请检查 campaign `summary.json` 中 `valid: true`，再将 `summary.md` 和原始 JSON 一并归档。该脚本测量的是 REAL-Q **量化/校准过程**的工程耗时，不测模型推理吞吐。

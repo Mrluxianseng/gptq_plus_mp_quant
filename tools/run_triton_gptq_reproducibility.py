@@ -141,28 +141,70 @@ def run(manifest: Path, tag: str, timeout: int) -> dict:
     tables = log_path.read_text(errors="replace").split("Wall-clock section summary")
     if len(tables) < 2:
         raise RuntimeError(f"missing detailed wall-clock section table: {log_path}")
-    section_totals_ms = {}
+    rank_sections = []
     import re
-
-    for line in tables[-1].splitlines():
-        match = re.match(
-            r"\s*(\S+)\s+(\d+)\s+([0-9.]+)\s+([0-9.]+%)\s+([0-9.]+)\s*$",
-            line,
-        )
-        if not match:
-            continue
-        name, total_ms = match.group(1), float(match.group(3))
-        for suffix in (
-            "fasterquant.block.inner_column_loop",
-            "fasterquant.block.outer_update_delta_w",
-            "fasterquant.block.outer_update_ghinv",
-            "fasterquant.block.true_gradient_refresh",
-        ):
-            if name.endswith(suffix):
-                section_totals_ms[suffix] = section_totals_ms.get(suffix, 0.0) + total_ms
-    closed_form_ms = section_totals_ms.get(
-        "fasterquant.block.inner_column_loop", 0.0
+    row_pattern = re.compile(
+        r"\s*(\S+)\s+(\d+)\s+([0-9.]+)\s+([0-9.]+%)\s+([0-9.]+)\s*$"
     )
+    for table in tables[1:]:
+        per_rank = {}
+        for line in table.splitlines():
+            match = row_pattern.match(line)
+            if match:
+                per_rank[match.group(1)] = float(match.group(3))
+        if per_rank:
+            rank_sections.append(per_rank)
+    if not rank_sections:
+        raise RuntimeError(f"could not parse detailed wall-clock section table: {log_path}")
+
+    # torchrun can concatenate one profile table per rank. Sum repeated work
+    # within each rank, then use the slowest rank as the distributed critical
+    # path; summing the rank tables would incorrectly multiply timings by 4.
+    def max_rank_total(suffix):
+        return max(
+            sum(value for name, value in sections.items() if name.endswith(suffix))
+            for sections in rank_sections
+        )
+
+    section_suffixes = (
+        "fasterquant.block.inner_column_loop",
+        "fasterquant.block.writeback_inner",
+        "fasterquant.block.outer_update_delta_w",
+        "fasterquant.block.outer_update_ghinv",
+        "fasterquant.block.true_gradient_refresh",
+        "fasterquant.block.outer_update_grad_descent",
+    )
+    section_totals_ms = {
+        suffix: max_rank_total(suffix) for suffix in section_suffixes
+    }
+    closed_form_ms = section_totals_ms["fasterquant.block.inner_column_loop"]
+    # The outer delta-W phase is shared with block_gd's gradient correction,
+    # so expose its pieces as well as the aggregate instead of claiming the
+    # aggregate is a mathematically pure closed-form solve.
+    compensation_path_ms = sum(section_totals_ms[key] for key in (
+        "fasterquant.block.inner_column_loop",
+        "fasterquant.block.writeback_inner",
+        "fasterquant.block.outer_update_delta_w",
+        "fasterquant.block.outer_update_ghinv",
+    ))
+    gradient_update_ms = (
+        section_totals_ms["fasterquant.block.true_gradient_refresh"]
+        + section_totals_ms["fasterquant.block.outer_update_grad_descent"]
+    )
+    per_layer_quantization_ms = {}
+    for sections in rank_sections:
+        for name, value in sections.items():
+            match = re.fullmatch(r"layers\.(\d+)\.layer\.total", name)
+            if match:
+                layer = int(match.group(1))
+                per_layer_quantization_ms[str(layer)] = max(
+                    per_layer_quantization_ms.get(str(layer), 0.0), value
+                )
+    if set(per_layer_quantization_ms) != {str(i) for i in range(28)}:
+        raise RuntimeError(
+            "incomplete per-layer quantization timings; expected layers 0-27, got "
+            f"{sorted(per_layer_quantization_ms, key=int)} in {log_path}"
+        )
     return {
         "tag": tag,
         "wall_seconds": status["wall_seconds"],
@@ -174,10 +216,10 @@ def run(manifest: Path, tag: str, timeout: int) -> dict:
         "kl": status["partial_prefix_kl"],
         "ppl": status["partial_prefix_ppl"],
         "profile_section_totals_ms": section_totals_ms,
+        "per_layer_quantization_ms": per_layer_quantization_ms,
         "gptq_inner_column_compensation_ms": closed_form_ms,
-        "block_gradient_refresh_ms": section_totals_ms.get(
-            "fasterquant.block.true_gradient_refresh", 0.0
-        ),
+        "gptq_compensation_path_ms": compensation_path_ms,
+        "gradient_update_total_ms": gradient_update_ms,
     }
 
 
@@ -244,6 +286,13 @@ def main() -> None:
                 layer_outputs[side["tag"]] = json.loads(trace_path.read_text())
             control_trace = layer_outputs[control["tag"]]
             candidate_trace = layer_outputs[candidate["tag"]]
+            expected_layers = list(range(28))
+            if (
+                [row.get("layer") for row in control_trace] != expected_layers
+                or [row.get("layer") for row in candidate_trace] != expected_layers
+                or any(row.get("forward_count", 0) <= 0 for row in control_trace + candidate_trace)
+            ):
+                raise RuntimeError("per-layer evaluation trace is incomplete; expected outputs from all 28 layers")
             if control_trace != candidate_trace:
                 first = next(
                     (i for i, (a, b) in enumerate(zip(control_trace, candidate_trace)) if a != b),
