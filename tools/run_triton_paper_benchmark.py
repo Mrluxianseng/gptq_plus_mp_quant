@@ -331,7 +331,8 @@ def mean_std(values: list[float]) -> dict[str, float | None]:
 
 def summarize(campaign_dir: Path, tag_prefix: str, pairs: list[dict[str, Any]],
               environment: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
-    records = json.loads((campaign_dir / "paired_repetitions.json").read_text())
+    records_path = campaign_dir / "paired_repetitions.json"
+    records = json.loads(records_path.read_text()) if records_path.is_file() else pairs
     rows = []
     integrity_ok = len(records) == len(pairs)
     for index, pair in enumerate(records, start=1):
