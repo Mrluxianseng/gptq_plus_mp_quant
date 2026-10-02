@@ -8394,6 +8394,17 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                 )
             layer_backward_bsz = layer_backward_bsz_global // dp_world
             layer_stats_bsz = layer_stats_bsz_global // dp_world
+            hessian_accum_bsz_global = (
+                args.hessian_accum_bsz
+                if args.hessian_accum_bsz is not None
+                else args.bsz
+            )
+            if hessian_accum_bsz_global % dp_world != 0:
+                raise ValueError(
+                    f"hessian_accum_bsz ({hessian_accum_bsz_global}) must be divisible "
+                    f"by world_size ({dp_world})."
+                )
+            hessian_accum_bsz = max(1, hessian_accum_bsz_global // dp_world)
 
             # refined_mse: before this layer's quant/refresh loop opens, capture
             # ∂KL/∂(layer_i output) on a fresh per-layer random pool. The pool
@@ -8705,11 +8716,11 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     "is_target": analysis_is_target,
                 })
 
-            batch_attention_mask = attention_mask.expand(args.bsz, -1, -1, -1)
-            batch_position_ids = position_ids.expand(args.bsz, -1)
+            batch_attention_mask = attention_mask.expand(layer_stats_bsz, -1, -1, -1)
+            batch_position_ids = position_ids.expand(layer_stats_bsz, -1)
             batch_position_embeddings = (
-                position_embeddings[0].expand(args.bsz, -1, -1),
-                position_embeddings[1].expand(args.bsz, -1, -1),
+                position_embeddings[0].expand(layer_stats_bsz, -1, -1),
+                position_embeddings[1].expand(layer_stats_bsz, -1, -1),
             )
 
             layer_output_fisher = None
@@ -8740,7 +8751,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             batch_attention_mask=batch_attention_mask,
                             batch_position_ids=batch_position_ids,
                             batch_position_embeddings=batch_position_embeddings,
-                            bsz=args.bsz,
+                            bsz=layer_stats_bsz,
                             kl_topk=args.kl_topk,
                             grad_hessian_topk=args.grad_hessian_topk,
                             dev=dev,
@@ -8878,7 +8889,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
             precomputed_S_new_by_canonical = None
             if dynsal_enabled:
                 with layer_recorder.section("layer.dynsal.fp_forward") if layer_recorder else _NULL_CONTEXT:
-                    _fp_fwd_bsz = args.hessian_accum_bsz if args.hessian_accum_bsz is not None else args.bsz
+                    _fp_fwd_bsz = hessian_accum_bsz
                     _fp_fwd_bsz = max(1, min(_fp_fwd_bsz, fp_inps.shape[0]))
                     # Key everything by CANONICAL module name (the
                     # `.module`-stripped form that `module_dicts` used during
@@ -8920,7 +8931,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                 # per-module S_new and let each boundary just pull from it.
                 if dynsal_refresh_mode == "per_layer":
                     with layer_recorder.section("layer.dynsal.per_layer_refresh") if layer_recorder else _NULL_CONTEXT:
-                        _cur_fwd_bsz = args.hessian_accum_bsz if args.hessian_accum_bsz is not None else args.bsz
+                        _cur_fwd_bsz = hessian_accum_bsz
                         _cur_fwd_bsz = max(1, min(_cur_fwd_bsz, inps.shape[0]))
                         P_cur_by_canonical = _collect_module_output_projections(
                             layer=layer,
@@ -9041,7 +9052,6 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     # kernel-launch tax. `add_batch` already handles arbitrary
                     # batch sizes (it reshapes to [bsz*seq, dim] internally), so
                     # the math is bit-exact regardless of bsz.
-                    hessian_accum_bsz = args.hessian_accum_bsz if args.hessian_accum_bsz is not None else args.bsz
                     hessian_accum_bsz = max(1, min(hessian_accum_bsz, hessian_local_samples))
                     for j in tqdm(
                         range(0, hessian_local_samples, hessian_accum_bsz),
@@ -9144,7 +9154,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                 dynsal_refresh_overrides = None
                 if dynsal_enabled and dynsal_refresh_mode == "per_boundary":
                     with layer_recorder.section("layer.dynsal.boundary_refresh") if layer_recorder else _NULL_CONTEXT:
-                        _cur_fwd_bsz = args.hessian_accum_bsz if args.hessian_accum_bsz is not None else args.bsz
+                        _cur_fwd_bsz = hessian_accum_bsz
                         _cur_fwd_bsz = max(1, min(_cur_fwd_bsz, inps.shape[0]))
                         V_for_group = {
                             name: dynsal_V_dev_for_layer[name] for name in subset.keys()
