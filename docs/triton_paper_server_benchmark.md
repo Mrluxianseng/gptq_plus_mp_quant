@@ -4,18 +4,26 @@
 
 ## 运行
 
-在项目虚拟环境中执行。模型必须是本地 28 层 Qwen3 Hugging Face 目录，至少含 `config.json` 和权重文件。数据集不会提交到 Git；项目需要在 `datasets/wikitext` 找到本地 Wikitext 文件。如果数据集放在别处，先建立链接，例如 `ln -s /data/realq-datasets datasets`（目标目录内应有 `wikitext/`）。评测和校准使用本地数据，运行时设置离线模式：
+先从私人仓库检出这个干净分支，再进入项目虚拟环境。模型必须是本地 28 层 Qwen3 Hugging Face 目录，至少含 `config.json` 和权重文件。数据集不会提交到 Git；项目需要在 `datasets/wikitext` 找到本地 Wikitext 文件。如果数据集放在别处，先建立链接，例如 `mkdir -p datasets && ln -s /data/wikitext datasets/wikitext`。运行前确认模型、数据和虚拟环境都位于服务器本地：
 
 ```bash
-cd /path/to/gptq_plus_realq
-source .venv/bin/activate
+git clone --branch codex/triton-paper-benchmark \
+  git@github.com:Mrluxianseng/gptq_plus_mp_quant.git gptq_plus_triton_bench
+cd gptq_plus_triton_bench
+source /path/to/venv/bin/activate
+python -c 'import torch, triton; print(torch.cuda.is_available(), torch.cuda.get_device_name(0), triton.__version__)'
+nvidia-smi
+CUDA_VISIBLE_DEVICES=0 \
 python tools/run_triton_paper_benchmark.py \
   --model-path /path/to/Qwen3-0.6B \
+  --gpu-index 0 \
   --pairs 3 \
   --tag-prefix triton-thesis-server-20261002
 ```
 
-`--tag-prefix` 每轮必须唯一。省略时脚本按本地时间自动生成。默认每个 arm 超时 4 小时，可用 `--timeout-seconds` 调整；`--python` 可指定虚拟环境解释器。脚本预检 CUDA、模型配置和可见的 CUDA 计算进程。如果 GPU 已有计算进程，默认停止；只有确认可以接受竞争时才传入 `--allow-gpu-contention`。
+如果选择物理 GPU 1 等其他卡，应同时将 `CUDA_VISIBLE_DEVICES` 和 `--gpu-index` 改成该卡的物理编号。`--tag-prefix` 每轮必须唯一。省略时脚本按本地时间自动生成。默认每个 arm 超时 4 小时；`--python` 可指定虚拟环境解释器。脚本预检 CUDA、模型配置和可见的 CUDA 计算进程。如果 GPU 已有计算进程，默认停止；只有确认可以接受竞争时才传入 `--allow-gpu-contention`。
+
+正式规模有明显显存要求：项目既往正式运行在最后一层全词表 KL 路径上曾尝试约 37 GiB 的单次分配，而本分支没有集成 KL 投影分块优化。不要在 8 GB 卡上启动这组正式配置；建议使用至少 48 GB 空闲显存，最好是 80/96 GB 卡。脚本保留正式样本和 batch 数，不会自动降档。
 
 ## 固定实验条件
 
