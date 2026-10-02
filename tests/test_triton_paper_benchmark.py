@@ -37,7 +37,7 @@ class TritonPaperBenchmarkTest(unittest.TestCase):
             ("--backward_samples", "32"),
             ("--backward_bsz", "32"),
             ("--global_loss_bsz", "32"),
-            ("--static_fisher_microbatch_bsz", "4"),
+            ("--static_fisher_microbatch_bsz", "8"),
             ("--bsz", "128"),
             ("--group_parallel_quant", "rank"),
         ):
@@ -59,7 +59,7 @@ class TritonPaperBenchmarkTest(unittest.TestCase):
             "--grad_lr", "5e-7", "--grad_optimizer", "adam",
             "--grad_refresh_loss", "fisher_diag_mse", "--global_loss",
             "--loss_slide_window", "--global_loss_bsz", "32",
-            "--static_fisher_microbatch_bsz", "4",
+            "--static_fisher_microbatch_bsz", "8",
             "--grad_clip", "5e-5", "--final_layer_grad_clip", "5e-4",
             "--final_layer_grad_lr", "1e-6", "--group_parallel_quant", "rank",
             "--eval_seq_len", "2048", "--eval_datasets", "wikitext2", "--seed", "1",
@@ -72,7 +72,7 @@ class TritonPaperBenchmarkTest(unittest.TestCase):
         self.assertEqual(parsed.nsamples, 256)
         self.assertEqual(parsed.backward_samples, 32)
         self.assertEqual(parsed.global_loss_bsz, 32)
-        self.assertEqual(parsed.static_fisher_microbatch_bsz, 4)
+        self.assertEqual(parsed.static_fisher_microbatch_bsz, 8)
         self.assertEqual(parsed.group_parallel_quant, "rank")
 
 

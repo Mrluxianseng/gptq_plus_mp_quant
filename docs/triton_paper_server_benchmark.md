@@ -27,7 +27,7 @@ python tools/run_triton_paper_benchmark.py \
 
 ## 固定实验条件
 
-正式规模沿用项目四卡 REAL-Q full-run profile：Qwen3-0.6B W4A16 全 28 层、WikiText-2 校准 256×2048 tokens、seed 1、W4 group size 128、GPTQ block size 128；全局 Hessian batch 128、Hessian accumulation batch 128、全局 loss batch 32、每次梯度刷新 32 个样本，均分到四个 rank。每卡的 Hessian accumulation microbatch 为 32；它只控制前向分块，所有 256 个校准样本仍参与 Hessian 累积。静态端到端 Fisher/saliency 预计算单独用全局 microbatch 4（每卡 1 条），避免一次物化 4.6 GiB 的全词表 logits；它只拆分预计算批次，不减少样本，也不改变梯度刷新 batch。评估使用 WikiText-2 测试集 256×2048 tokens。设置包括 act-order、QuaRot、4 个 Hessian/saliency groups、rank-sharded group quantization、`block_gd`、Adam、`loss_slide_window` 和 REAL-Q `fisher_diag_mse` refresh，学习率为项目 W4A16 正式行的 `5e-7`。Control 使用 PyTorch 列循环，candidate 使用 `triton_fused`。此配置对齐项目既有四卡 campaign 的样本和分块规模，不宣称逐项复现论文表格。脚本固定配置，只开放模型路径、四卡编号、重复数、唯一标签、解释器和 timeout。
+正式规模沿用项目四卡 REAL-Q full-run profile：Qwen3-0.6B W4A16 全 28 层、WikiText-2 校准 256×2048 tokens、seed 1、W4 group size 128、GPTQ block size 128；全局 Hessian batch 128、Hessian accumulation batch 128、全局 loss batch 32、每次梯度刷新 32 个样本，均分到四个 rank。每卡的 Hessian accumulation microbatch 为 32；它只控制前向分块，所有 256 个校准样本仍参与 Hessian 累积。静态端到端 Fisher/saliency 预计算单独用全局 microbatch 8（每卡 2 条），将全词表 logits 张量从约 4.64 GiB 降至约 1.16 GiB；它只拆分预计算批次，不减少样本，也不改变梯度刷新 batch。评估使用 WikiText-2 测试集 256×2048 tokens。设置包括 act-order、QuaRot、4 个 Hessian/saliency groups、rank-sharded group quantization、`block_gd`、Adam、`loss_slide_window` 和 REAL-Q `fisher_diag_mse` refresh，学习率为项目 W4A16 正式行的 `5e-7`。Control 使用 PyTorch 列循环，candidate 使用 `triton_fused`。此配置对齐项目既有四卡 campaign 的样本和分块规模，不宣称逐项复现论文表格。脚本固定配置，只开放模型路径、四卡编号、重复数、唯一标签、解释器和 timeout。
 
 ## 输出与停止条件
 
