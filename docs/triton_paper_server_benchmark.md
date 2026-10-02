@@ -19,7 +19,7 @@ python tools/run_triton_paper_benchmark.py \
 
 ## 固定实验条件
 
-默认正式配置为 Qwen3-0.6B/W4 全模型：28 层、Wikitext-2 校准 32×256 token、W4、4 groups、GPTQ block size 128、act-order、`block_gd`、Adam、REAL-Q `fisher_diag_mse` refresh、seed 44；评估使用 Wikitext-2 的 32 个样本、序列长度 1024（上游入口以 `--nsamples` 控制评估样本数）。Control 使用 PyTorch 列循环，candidate 使用 `triton_fused`。搜索与其他 REAL-Q 设置继承干净锚点 `origin/zq` 的默认值。配置故意固定，脚本只暴露模型路径、重复数、唯一标签、解释器和 timeout，避免无意把参数扫点混入正式速度对比。
+正式规模对齐项目已完成的 Qwen3-0.6B W4A16 REAL-Q 量化实验：校准 256×2048 tokens、seed 1、W4 权重 group size 128、GPTQ block size 128、Hessian accumulation batch 64；每次梯度刷新使用 32 个样本、反向 batch size 32。评估使用 WikiText-2 测试集 256×2048 tokens。设置包含 act-order、QuaRot、4 个 Hessian/saliency groups、`block_gd`、Adam、`loss_slide_window` 和 REAL-Q `fisher_diag_mse` refresh；学习率使用该正式行的 `5e-7`，旋转与 refresh seed 固定为 0。Control 使用 PyTorch 列循环，candidate 使用 `triton_fused`。这是把内核对照的样本规模和分块规格与项目正式 campaign 对齐；未在该 campaign 冻结的实现参数继续由干净锚点 `origin/zq` 提供，并记录在逐次运行命令及环境清单中，因此不将其宣称为论文表格的逐项复现。脚本固定配置，只开放模型路径、重复数、唯一标签、解释器和 timeout，不做参数扫描。
 
 ## 输出与停止条件
 
