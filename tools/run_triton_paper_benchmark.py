@@ -135,7 +135,8 @@ def benchmark_command(python: str, model_path: Path, entry: Path, exp: str,
         "--hessian_accum_bsz", "128",
         "--alpha", "0.0", "--enable_gptq_plus", "0",
         "--backward_samples", "32", "--backward_bsz", "32",
-        "--final_layer_backward_bsz", "32", "--g_update_mode", "block_gd",
+        "--final_layer_backward_bsz", "32", "--refresh_mb", "2",
+        "--g_update_mode", "block_gd",
         "--grad_lr", "5e-7", "--grad_optimizer", "adam",
         "--grad_refresh_loss", "fisher_diag_mse", "--global_loss", "--loss_slide_window",
         "--global_loss_bsz", "32", "--static_fisher_microbatch_bsz", "8",
@@ -272,6 +273,7 @@ class GpuMonitor:
         self.out_dir = out_dir
         self.gpu_indices = gpu_indices
         self.interval = interval
+        self.active_run_path = out_dir / "active_run.json"
         self.stop_event = threading.Event()
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.telemetry_path = out_dir / "gpu_telemetry.csv"
@@ -289,7 +291,7 @@ class GpuMonitor:
             "utilization.gpu,utilization.memory,memory.used,memory.total,"
             "clocks.gr,power.draw,temperature.gpu"
         )
-        header = "timestamp,gpu_index,util_gpu_pct,util_mem_pct,memory_used_mib,memory_total_mib,"
+        header = "timestamp,run_tag,gpu_index,util_gpu_pct,util_mem_pct,memory_used_mib,memory_total_mib,"
         header += "graphics_clock_mhz,power_w,temp_c\n"
         self.telemetry_path.write_text(header, encoding="utf-8")
         self.process_path.write_text(
@@ -297,7 +299,12 @@ class GpuMonitor:
         )
         last_process_sample = 0.0
         while not self.stop_event.is_set():
-            now = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+            now = dt.datetime.now().astimezone().isoformat(timespec="milliseconds")
+            try:
+                active = json.loads(self.active_run_path.read_text(encoding="utf-8"))
+                run_tag = active.get("tag") or "idle"
+            except (OSError, json.JSONDecodeError):
+                run_tag = "unknown"
             row = command_output([
                 "nvidia-smi", "-i", ",".join(self.gpu_indices),
                 f"--query-gpu=index,{fields}", "--format=csv,noheader,nounits",
@@ -305,7 +312,7 @@ class GpuMonitor:
             if row:
                 with self.telemetry_path.open("a", encoding="utf-8") as stream:
                     for gpu_row in row.splitlines():
-                        stream.write(f"{now},{gpu_row}\n")
+                        stream.write(f"{now},{run_tag},{gpu_row}\n")
             monotonic_now = time.monotonic()
             if monotonic_now - last_process_sample >= 30:
                 apps = command_output([
@@ -336,8 +343,33 @@ def summarize(campaign_dir: Path, tag_prefix: str, pairs: list[dict[str, Any]],
     records = json.loads(records_path.read_text()) if records_path.is_file() else pairs
     rows = []
     integrity_ok = len(records) == len(pairs)
+    sampled_memory_by_run: dict[str, dict[str, float]] = {}
+    telemetry_path = campaign_dir / "gpu_telemetry.csv"
+    if telemetry_path.is_file():
+        with telemetry_path.open(newline="", encoding="utf-8") as stream:
+            for sample in csv.DictReader(stream):
+                try:
+                    tag = sample["run_tag"].strip()
+                    gpu = sample["gpu_index"].strip()
+                    used_mib = float(sample["memory_used_mib"].strip())
+                except (KeyError, ValueError, AttributeError):
+                    continue
+                if tag in ("", "idle", "unknown"):
+                    continue
+                gpu_peaks = sampled_memory_by_run.setdefault(tag, {})
+                gpu_peaks[gpu] = max(gpu_peaks.get(gpu, 0.0), used_mib)
     for index, pair in enumerate(records, start=1):
         control, candidate = pair["control"], pair["candidate"]
+        control_memory = sampled_memory_by_run.get(control["tag"], {})
+        candidate_memory = sampled_memory_by_run.get(candidate["tag"], {})
+        comparable_gpus = sorted(set(control_memory) & set(candidate_memory))
+        sampled_peak_lower_on_every_gpu = (
+            bool(comparable_gpus)
+            and all(candidate_memory[gpu] < control_memory[gpu] for gpu in comparable_gpus)
+        )
+        allocated_peak_lower = (
+            candidate["peak_allocated_bytes"] < control["peak_allocated_bytes"]
+        )
         state_and_eval_exact = all(control[key] == candidate[key] for key in (
             "state_sha256", "state_tensors", "kl", "ppl"
         ))
@@ -368,6 +400,13 @@ def summarize(campaign_dir: Path, tag_prefix: str, pairs: list[dict[str, Any]],
             "peak_allocated_bytes_candidate": candidate["peak_allocated_bytes"],
             "peak_reserved_bytes_control": control["peak_reserved_bytes"],
             "peak_reserved_bytes_candidate": candidate["peak_reserved_bytes"],
+            "sampled_gpu_peak_memory_mib_control": control_memory,
+            "sampled_gpu_peak_memory_mib_candidate": candidate_memory,
+            "sampled_gpu_peak_lower_on_every_comparable_gpu": sampled_peak_lower_on_every_gpu,
+            "torch_peak_allocated_lower": allocated_peak_lower,
+            "candidate_peak_below_control_on_sampled_and_torch_metrics": (
+                sampled_peak_lower_on_every_gpu and allocated_peak_lower
+            ),
             "exact_output_match": exact,
             "layer_outputs_exact_match": layer_outputs_exact,
             "per_layer_quantization_ms_control": control["per_layer_quantization_ms"],
@@ -384,7 +423,6 @@ def summarize(campaign_dir: Path, tag_prefix: str, pairs: list[dict[str, Any]],
     quant_speedups = [row["quantization_speedup"] for row in rows]
     wall_speedups = [row["end_to_end_speedup"] for row in rows]
     telemetry: dict[str, Any] = {"samples": 0}
-    telemetry_path = campaign_dir / "gpu_telemetry.csv"
     if telemetry_path.is_file():
         values: dict[str, list[float]] = {
             "util_gpu_pct": [], "util_mem_pct": [], "memory_used_mib": [],
@@ -410,6 +448,10 @@ def summarize(campaign_dir: Path, tag_prefix: str, pairs: list[dict[str, Any]],
         "campaign": tag_prefix,
         "completed_at_local": dt.datetime.now().astimezone().isoformat(),
         "valid": integrity_ok and len(rows) == config["pairs"],
+        "candidate_memory_peaks_below_control": (
+            len(rows) == config["pairs"]
+            and all(row["candidate_peak_below_control_on_sampled_and_torch_metrics"] for row in rows)
+        ),
         "completed_pairs": len(rows),
         "configuration": config,
         "environment": environment,
@@ -422,6 +464,7 @@ def summarize(campaign_dir: Path, tag_prefix: str, pairs: list[dict[str, Any]],
     report = [
         f"# REAL-Q Triton formal benchmark: {tag_prefix}", "",
         f"- Valid: **{summary['valid']}**; completed pairs: {len(rows)}/{config['pairs']}",
+        f"- Candidate whole-run memory peaks below control on all GPUs: **{summary['candidate_memory_peaks_below_control']}**",
         f"- Host/GPU: {environment['host']} / {environment['nvidia_smi_gpu_query'] or environment['torch_device_names']}",
         f"- Commit: `{environment['git_commit']}`",
         f"- Model: `{config['model_path']}`; Qwen3-0.6B W4A16, 28 layers, "
@@ -451,7 +494,8 @@ def summarize(campaign_dir: Path, tag_prefix: str, pairs: list[dict[str, Any]],
             f"{wall_sd:.3f}×)." if wall_sd is not None else
             f"(mean {summary['end_to_end_speedup']['mean']:.3f}×; one pair, SD unavailable).",
             "- Exactness is checked after each pair using all 507 tensor-state hashes, KL, and PPL; the driver stops on the first mismatch.",
-            "- Raw paired data: `paired_repetitions.json`; per-run manifests, logs, profile metrics, and source hashes: `outputs/phase_profile_<tag>/`; GPU samples: `gpu_telemetry.csv`.",
+            "- GPU memory is sampled once per second and tagged by control/candidate run. The recorded-peak memory check is separate from `valid`; passing it does not prove memory is lower at every instant or at phase-aligned peaks. PyTorch whole-run peak allocated/reserved counters are also recorded.",
+            "- Raw paired data: `paired_repetitions.json`; per-run manifests, logs, profile metrics, and source hashes: `outputs/phase_profile_<tag>/`; tagged GPU samples: `gpu_telemetry.csv`.",
         ])
         report.extend([
             "",
@@ -494,7 +538,10 @@ def main() -> None:
         default=os.environ.get("NVIDIA_SMI_INDICES", os.environ.get("CUDA_VISIBLE_DEVICES", "0,1,2,3")),
         help="Exactly four distinct physical GPU indices, e.g. 0,1,2,3",
     )
-    parser.add_argument("--monitor-interval", type=float, default=5.0)
+    parser.add_argument(
+        "--monitor-interval", type=float, default=1.0,
+        help="GPU memory/utilization sampling interval in seconds (default: 1).",
+    )
     parser.add_argument("--allow-gpu-contention", action="store_true",
                         help="Proceed even when a CUDA compute process is visible at preflight")
     args = parser.parse_args()
@@ -597,6 +644,7 @@ def main() -> None:
         "global_loss_batch_size": 32,
         "backward_samples_per_refresh": 32,
         "backward_batch_size": 32,
+        "refresh_microbatch_size_per_rank": 2,
         "group_parallel_quant": "rank",
         "act_order": True,
         "rotation": True,

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -263,9 +264,27 @@ def main() -> None:
     )
 
     results = []
+    active_run_path = campaign_dir / "active_run.json"
+
+    def set_active_run(tag: str | None) -> None:
+        payload = {"tag": tag}
+        temporary = active_run_path.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(payload), encoding="utf-8")
+        os.replace(temporary, active_run_path)
+
     for i in range(2, 2 + args.pairs):
-        control = run(control_manifest, f"{args.tag_prefix}-r{i}-control", args.timeout_seconds)
-        candidate = run(candidate_manifest, f"{args.tag_prefix}-r{i}-triton", args.timeout_seconds)
+        control_tag = f"{args.tag_prefix}-r{i}-control"
+        candidate_tag = f"{args.tag_prefix}-r{i}-triton"
+        set_active_run(control_tag)
+        try:
+            control = run(control_manifest, control_tag, args.timeout_seconds)
+        finally:
+            set_active_run(None)
+        set_active_run(candidate_tag)
+        try:
+            candidate = run(candidate_manifest, candidate_tag, args.timeout_seconds)
+        finally:
+            set_active_run(None)
         check_keys = ("state_sha256", "state_tensors", "kl", "ppl")
         mismatches = {
             key: (control[key], candidate[key])

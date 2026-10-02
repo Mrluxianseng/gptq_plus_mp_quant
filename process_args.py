@@ -633,6 +633,18 @@ def parse_gen():
         ),
     )
     parser.add_argument(
+        "--refresh_mb",
+        type=int,
+        default=None,
+        help=(
+            "Optional per-rank microbatch cap for refresh losses that pass "
+            "through the final norm/LM head (KL and residual-KL variants). "
+            "Their gradients are accumulated before the single optimizer "
+            "update, so this does not reduce --backward_samples or the refresh "
+            "batch. None uses the full local refresh chunk."
+        ),
+    )
+    parser.add_argument(
         "--final_layer_backward_bsz",
         type=int,
         default=None,
@@ -1008,6 +1020,8 @@ def parse_gen():
         args.backward_bsz = args.bsz
     if args.backward_bsz <= 0:
         raise ValueError(f"`backward_bsz` must be positive or -1. Got {args.backward_bsz}.")
+    if args.refresh_mb is not None and args.refresh_mb <= 0:
+        raise ValueError(f"`refresh_mb` must be positive when provided. Got {args.refresh_mb}.")
     if not (0.0 < args.a_loss_ratio <= 1.0):
         raise ValueError(f"`a_loss_ratio` must be in (0, 1]. Got {args.a_loss_ratio}.")
     if args.a_loss_clip_scope not in (
