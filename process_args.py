@@ -324,6 +324,17 @@ def parse_gen():
         ),
     )
     parser.add_argument(
+        "--static_fisher_microbatch_bsz",
+        type=int,
+        default=None,
+        help=(
+            "Global microbatch size used only by the frozen static end-to-end "
+            "saliency/Fisher precompute. Defaults to --global_loss_bsz; reducing "
+            "it lowers peak full-vocabulary logits memory without changing the "
+            "sample pool or gradient-refresh batch sizes. Must divide WORLD_SIZE."
+        ),
+    )
+    parser.add_argument(
         "--fisher_rademacher_k",
         type=int,
         default=0,
@@ -978,6 +989,15 @@ def parse_gen():
             raise ValueError(
                 f"DP requires global_loss_bsz ({args.global_loss_bsz}) divisible by WORLD_SIZE ({_dp_world})."
             )
+        if (
+            args.static_fisher_microbatch_bsz is not None
+            and args.static_fisher_microbatch_bsz > 0
+            and args.static_fisher_microbatch_bsz % _dp_world != 0
+        ):
+            raise ValueError(
+                "DP requires static_fisher_microbatch_bsz "
+                f"({args.static_fisher_microbatch_bsz}) divisible by WORLD_SIZE ({_dp_world})."
+            )
     if args.final_layer_stats_bsz is None:
         args.final_layer_stats_bsz = args.bsz
     if args.final_layer_stats_bsz <= 0:
@@ -1034,6 +1054,13 @@ def parse_gen():
         args.global_loss_bsz = args.bsz
     if args.global_loss_bsz <= 0:
         raise ValueError(f"`global_loss_bsz` must be positive when provided. Got {args.global_loss_bsz}.")
+    if args.static_fisher_microbatch_bsz is None:
+        args.static_fisher_microbatch_bsz = args.global_loss_bsz
+    if args.static_fisher_microbatch_bsz <= 0:
+        raise ValueError(
+            "`static_fisher_microbatch_bsz` must be positive when provided. "
+            f"Got {args.static_fisher_microbatch_bsz}."
+        )
     if args.fisher_rademacher_k < 0:
         raise ValueError(
             f"`fisher_rademacher_k` must be non-negative. Got {args.fisher_rademacher_k}."

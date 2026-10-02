@@ -4038,6 +4038,7 @@ def collect_static_end_to_end_saliency_and_fisher(
     saliency_num_groups,
     grad_hessian_topk,
     batch_size,
+    static_fisher_microbatch_bsz=None,
     collect_fisher=True,
     collect_legacy_fisher_diag=False,
     collect_refined_rkl=False,
@@ -4618,11 +4619,22 @@ def collect_static_end_to_end_saliency_and_fisher(
             raise ValueError(
                 f"static saliency: nsamples ({nsamples_total}) must be divisible by world_size ({world})."
             )
-        if batch_size % world != 0:
+        static_fisher_microbatch_bsz = (
+            batch_size
+            if static_fisher_microbatch_bsz is None
+            else int(static_fisher_microbatch_bsz)
+        )
+        if static_fisher_microbatch_bsz <= 0:
             raise ValueError(
-                f"static saliency: global_loss_bsz ({batch_size}) must be divisible by world_size ({world})."
+                "static_fisher_microbatch_bsz must be positive, got "
+                f"{static_fisher_microbatch_bsz}."
             )
-        local_batch_size = batch_size // world
+        if static_fisher_microbatch_bsz % world != 0:
+            raise ValueError(
+                "static saliency: static_fisher_microbatch_bsz "
+                f"({static_fisher_microbatch_bsz}) must be divisible by world_size ({world})."
+            )
+        local_batch_size = static_fisher_microbatch_bsz // world
         if use_grad_sample_limit:
             if num_samples_for_grad > nsamples_total:
                 raise ValueError(
@@ -4643,7 +4655,7 @@ def collect_static_end_to_end_saliency_and_fisher(
             if local_grad_samples % local_batch_size != 0:
                 raise ValueError(
                     f"num_samples_for_grad // world ({local_grad_samples}) must be "
-                    f"divisible by per-rank global_loss_bsz ({local_batch_size})."
+                    f"divisible by per-rank static_fisher_microbatch_bsz ({local_batch_size})."
                 )
         else:
             local_grad_samples = None
@@ -4660,10 +4672,11 @@ def collect_static_end_to_end_saliency_and_fisher(
                     f"refined_rkl_num_A ({refined_rkl_num_A})."
                 )
             refined_rkl_samples_per_A = nsamples_total // refined_rkl_num_A
-            if refined_rkl_samples_per_A % batch_size != 0:
+            if refined_rkl_samples_per_A % static_fisher_microbatch_bsz != 0:
                 raise ValueError(
                     f"refined_rkl: samples_per_A ({refined_rkl_samples_per_A}) must be divisible by "
-                    f"global_loss_bsz ({batch_size}) so each batch lands in one sub-A bucket."
+                    "static_fisher_microbatch_bsz "
+                    f"({static_fisher_microbatch_bsz}) so each batch lands in one sub-A bucket."
                 )
         # Contiguous shard of sample ids; each rank only does forward/backward on
         # its own slice and keeps the collected saliency/fisher rank-local. These
@@ -7686,7 +7699,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
             # Optional disk cache. The precompute result depends only on:
             #   model / dataset / nsamples / seq_len / concrete rotation /
             #   num_groups / grad_hessian_topk /
-            #   global_loss_bsz / calibration seed. Optional Rademacher
+            #   global_loss_bsz / static-fisher microbatch / calibration seed. Optional Rademacher
             #   statistics additionally depend on refresh_seed.
             # Use `--static_cache_path DIR` to persist. Each rank writes/reads
             # its own shard file since saliency/fisher are rank-local.
@@ -7761,7 +7774,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     f"blk{args.seq_len}_rot{rotate_flag}_rotid{rotation_identity_tag}_"
                     f"g{args.num_groups}_"
                     f"fisherfull_ghtk{args.grad_hessian_topk}_"
-                    f"glbsz{args.global_loss_bsz}_cseed{args.seed}_"
+                    f"glbsz{args.global_loss_bsz}_sfmb{args.static_fisher_microbatch_bsz}_cseed{args.seed}_"
                     f"salclip{sal_clip_tag}_salglobalv1_"
                     f"{_STATIC_SALIENCY_SCHEMA_TAG}_"
                     f"rklNA{rkl_na}_fpfinal{fpfinal_tag}"
@@ -7965,6 +7978,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             saliency_num_groups=args.num_groups,
                             grad_hessian_topk=args.grad_hessian_topk,
                             batch_size=args.global_loss_bsz,
+                            static_fisher_microbatch_bsz=args.static_fisher_microbatch_bsz,
                             use_fsdp=bool(getattr(args, "fsdp_precompute", False)),
                             fsdp_cpu_offload=bool(getattr(args, "fsdp_cpu_offload", False)),
                             saliency_clip_percentile=getattr(args, "saliency_clip_percentile", 0.99),
@@ -8017,9 +8031,11 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                                 os.remove(tmp_cache_file)
                         del _to_save
             logging.info(
-                "Collected frozen end-to-end saliency/Fisher caches before quantization with global_loss_bsz=%d. "
+                "Collected frozen end-to-end saliency/Fisher caches before quantization with global_loss_bsz=%d, "
+                "static_fisher_microbatch_bsz=%d. "
                 "These cached coefficients will be reused for Hessian estimation and Fisher-backed MSE losses throughout quantization.",
                 args.global_loss_bsz,
+                args.static_fisher_microbatch_bsz,
             )
             # Exit right after persisting the cache — the FSDP-wrapped model
             # can't gracefully drop into the per-layer quant phase, so the
