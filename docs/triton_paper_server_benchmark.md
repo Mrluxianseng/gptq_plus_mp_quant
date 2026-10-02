@@ -13,21 +13,21 @@ cd gptq_plus_triton_bench
 source /path/to/venv/bin/activate
 python -c 'import torch, triton; print(torch.cuda.is_available(), torch.cuda.get_device_name(0), triton.__version__)'
 nvidia-smi
-CUDA_VISIBLE_DEVICES=0 \
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
 python tools/run_triton_paper_benchmark.py \
   --model-path /path/to/Qwen3-0.6B \
-  --gpu-index 0 \
+  --gpu-indices 0,1,2,3 \
   --pairs 3 \
   --tag-prefix triton-thesis-server-20261002
 ```
 
-如果选择物理 GPU 1 等其他卡，应同时将 `CUDA_VISIBLE_DEVICES` 和 `--gpu-index` 改成该卡的物理编号。`--tag-prefix` 每轮必须唯一。省略时脚本按本地时间自动生成。默认每个 arm 超时 4 小时；`--python` 可指定虚拟环境解释器。脚本预检 CUDA、模型配置和可见的 CUDA 计算进程。如果 GPU 已有计算进程，默认停止；只有确认可以接受竞争时才传入 `--allow-gpu-contention`。
+这里会以单机 4-rank `torchrun` 启动每个 arm，control 跑完后再跑 candidate；四张卡同时参与各自的量化 run。脚本要求 PyTorch 恰好看到四张 CUDA 卡，并将 `--gpu-indices` 同时用于设备选择、遥测和竞争进程预检。如果四张卡的物理编号不是 `0,1,2,3`，两处都替换为实际编号。`--tag-prefix` 每轮必须唯一。省略时脚本按本地时间自动生成。默认每个 arm 超时 4 小时；`--python` 可指定虚拟环境解释器。如果任一卡已被其他 CUDA 进程占用，默认停止。
 
-正式规模有明显显存要求：项目既往正式运行在最后一层全词表 KL 路径上曾尝试约 37 GiB 的单次分配，而本分支没有集成 KL 投影分块优化。不要在 8 GB 卡上启动这组正式配置；建议使用至少 48 GB 空闲显存，最好是 80/96 GB 卡。脚本保留正式样本和 batch 数，不会自动降档。
+四卡以数据并行分 shard 处理样本，梯度刷新仍合计使用 32 个样本；每个 rank 都会各自加载模型，显存不会跨卡合并。项目既往单卡正式运行在末层全词表 KL 路径上曾遇到约 37 GiB 的分配；四卡后该 batch 沿 rank 切分，但 5090 的 32 GB 单卡显存是否足够仍需由真实 canary 确认。本分支没有集成 KL 投影分块优化，运行时也不会自动降低正式 batch。先确保四张卡都空闲，并保留充足余量；如果首个 control 因 OOM 失败，保存产物和日志后再诊断，不要直接缩小样本或 batch 后把结果当正式配置。
 
 ## 固定实验条件
 
-正式规模对齐项目已完成的 Qwen3-0.6B W4A16 REAL-Q 量化实验：校准 256×2048 tokens、seed 1、W4 权重 group size 128、GPTQ block size 128、Hessian accumulation batch 64；每次梯度刷新使用 32 个样本、反向 batch size 32。评估使用 WikiText-2 测试集 256×2048 tokens。设置包含 act-order、QuaRot、4 个 Hessian/saliency groups、`block_gd`、Adam、`loss_slide_window` 和 REAL-Q `fisher_diag_mse` refresh；学习率使用该正式行的 `5e-7`，旋转与 refresh seed 固定为 0。Control 使用 PyTorch 列循环，candidate 使用 `triton_fused`。这是把内核对照的样本规模和分块规格与项目正式 campaign 对齐；未在该 campaign 冻结的实现参数继续由干净锚点 `origin/zq` 提供，并记录在逐次运行命令及环境清单中，因此不将其宣称为论文表格的逐项复现。脚本固定配置，只开放模型路径、重复数、唯一标签、解释器和 timeout，不做参数扫描。
+正式规模沿用项目四卡 REAL-Q full-run profile：Qwen3-0.6B W4A16 全 28 层、WikiText-2 校准 256×2048 tokens、seed 1、W4 group size 128、GPTQ block size 128；全局 Hessian batch 128、Hessian accumulation batch 128、全局 loss batch 32、每次梯度刷新 32 个样本，均分到四个 rank。评估使用 WikiText-2 测试集 256×2048 tokens。设置包括 act-order、QuaRot、4 个 Hessian/saliency groups、rank-sharded group quantization、`block_gd`、Adam、`loss_slide_window` 和 REAL-Q `fisher_diag_mse` refresh，学习率为项目 W4A16 正式行的 `5e-7`。Control 使用 PyTorch 列循环，candidate 使用 `triton_fused`。此配置对齐项目既有四卡 campaign 的样本和分块规模，不宣称逐项复现论文表格。脚本固定配置，只开放模型路径、四卡编号、重复数、唯一标签、解释器和 timeout。
 
 ## 输出与停止条件
 

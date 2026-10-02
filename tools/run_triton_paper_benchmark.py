@@ -25,6 +25,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 PAIR_RUNNER = ROOT / "tools" / "run_triton_gptq_reproducibility.py"
+WORLD_SIZE = 4
 
 
 ENTRY_TEMPLATE = '''"""Minimal metrics wrapper for the formal paired benchmark."""
@@ -53,27 +54,46 @@ def measured_fwrd(args, analyzer, dataloader, dev):
     result = original_fwrd(args, analyzer, dataloader, dev)
     torch.cuda.synchronize()
     elapsed = time.monotonic() - started
+    elapsed_tensor = torch.tensor(elapsed, device=torch.cuda.current_device(), dtype=torch.float64)
+    peak_allocated = torch.tensor(
+        torch.cuda.max_memory_allocated(), device=torch.cuda.current_device(), dtype=torch.int64
+    )
+    peak_reserved = torch.tensor(
+        torch.cuda.max_memory_reserved(), device=torch.cuda.current_device(), dtype=torch.int64
+    )
+    distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
+    if distributed:
+        torch.distributed.all_reduce(elapsed_tensor, op=torch.distributed.ReduceOp.MAX)
+        torch.distributed.all_reduce(peak_allocated, op=torch.distributed.ReduceOp.MAX)
+        torch.distributed.all_reduce(peak_reserved, op=torch.distributed.ReduceOp.MAX)
+        is_main = torch.distributed.get_rank() == 0
+    else:
+        is_main = True
     digest = hashlib.sha256()
     tensor_count = 0
-    for name, tensor in sorted(analyzer.model.state_dict().items()):
-        digest.update(name.encode())
-        digest.update(str((tuple(tensor.shape), tensor.dtype)).encode())
-        digest.update(
-            tensor.detach().cpu().contiguous().reshape(-1).view(torch.uint8)
-            .numpy().tobytes()
+    if is_main:
+        for name, tensor in sorted(analyzer.model.state_dict().items()):
+            digest.update(name.encode())
+            digest.update(str((tuple(tensor.shape), tensor.dtype)).encode())
+            digest.update(
+                tensor.detach().cpu().contiguous().reshape(-1).view(torch.uint8)
+                .numpy().tobytes()
+            )
+            tensor_count += 1
+        row = {
+            "mode": mode,
+            "world_size": torch.distributed.get_world_size() if distributed else 1,
+            "quantization_seconds": float(elapsed_tensor.item()),
+            "state_sha256": digest.hexdigest(),
+            "state_tensors": tensor_count,
+            "peak_allocated": int(peak_allocated.item()),
+            "peak_reserved": int(peak_reserved.item()),
+        }
+        (run_dir / "baseline-profile_metrics.json").write_text(
+            json.dumps(row, indent=2)
         )
-        tensor_count += 1
-    row = {
-        "mode": mode,
-        "quantization_seconds": elapsed,
-        "state_sha256": digest.hexdigest(),
-        "state_tensors": tensor_count,
-        "peak_allocated": torch.cuda.max_memory_allocated(),
-        "peak_reserved": torch.cuda.max_memory_reserved(),
-    }
-    (run_dir / "baseline-profile_metrics.json").write_text(
-        json.dumps(row, indent=2)
-    )
+    if distributed:
+        torch.distributed.barrier()
     return result
 
 impl.gptq_fwrd=measured_fwrd
@@ -111,22 +131,22 @@ def benchmark_command(python: str, model_path: Path, entry: Path, exp: str,
         "--w_method", "gptq_plus", "--w_bits", "4", "--w_clip",
         "--w_groupsize", "128", "--num_groups", "4", "--blocksize", "128",
         "--act_order", "--rotate", "--rotation_seed", "0", "--refresh_seed", "0",
-        "--kl_topk", "-1", "--bsz", "1", "--final_layer_stats_bsz", "16",
-        "--hessian_accum_bsz", "64",
+        "--kl_topk", "-1", "--bsz", "128", "--final_layer_stats_bsz", "16",
+        "--hessian_accum_bsz", "128",
         "--alpha", "0.0", "--enable_gptq_plus", "0",
         "--backward_samples", "32", "--backward_bsz", "32",
         "--final_layer_backward_bsz", "32", "--g_update_mode", "block_gd",
         "--grad_lr", "5e-7", "--grad_optimizer", "adam",
         "--grad_refresh_loss", "fisher_diag_mse", "--global_loss", "--loss_slide_window",
-        "--global_loss_bsz", "1", "--grad_clip", "5e-5",
+        "--global_loss_bsz", "32", "--grad_clip", "5e-5",
         "--final_layer_grad_clip", "5e-4", "--final_layer_grad_lr", "1e-6",
-        "--group_parallel_quant", "none", "--eval_seq_len", "2048",
+        "--group_parallel_quant", "rank", "--eval_seq_len", "2048",
         "--eval_datasets", "wikitext2", "--seed", "1",
         "--gptq_inner_kernel", kernel,
     ]
     return [
         python, "-u", "-m", "torch.distributed.run", "--nnodes=1",
-        "--nproc_per_node=1", "--standalone", str(entry), *args,
+        f"--nproc_per_node={WORLD_SIZE}", "--standalone", str(entry), *args,
     ]
 
 
@@ -154,7 +174,19 @@ def write_manifests(campaign_dir: Path, model_path: Path, python: str,
     return paths[0], paths[1]
 
 
-def collect_environment(model_path: Path, python: str, gpu_index: str) -> dict[str, Any]:
+def parse_gpu_indices(raw: str) -> list[str]:
+    indices = [part.strip() for part in raw.split(",") if part.strip()]
+    if len(indices) != WORLD_SIZE or any(not part.isdigit() for part in indices):
+        raise ValueError(
+            f"expected exactly {WORLD_SIZE} comma-separated physical GPU indices, got {raw!r}"
+        )
+    if len(set(indices)) != WORLD_SIZE:
+        raise ValueError(f"GPU indices must be distinct, got {raw!r}")
+    return indices
+
+
+def collect_environment(model_path: Path, python: str,
+                        gpu_indices: list[str]) -> dict[str, Any]:
     probe = (
         "import json, torch; "
         "import importlib.util; "
@@ -164,12 +196,14 @@ def collect_environment(model_path: Path, python: str, gpu_index: str) -> dict[s
         "'torch_cuda_version':torch.version.cuda,"
         "'cuda_available':torch.cuda.is_available(),"
         "'visible_cuda_devices':torch.cuda.device_count(),"
-        "'torch_device_0':torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,"
+        "'torch_device_names':[torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())] if torch.cuda.is_available() else [],"
         "'triton_version':triton_version}))"
     )
+    probe_env = os.environ.copy()
+    probe_env["CUDA_VISIBLE_DEVICES"] = ",".join(gpu_indices)
     probe_result = subprocess.run(
         [python, "-c", probe], cwd=ROOT, text=True, stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT, check=False,
+        stderr=subprocess.STDOUT, check=False, env=probe_env,
     )
     if probe_result.returncode:
         raise RuntimeError(
@@ -185,12 +219,12 @@ def collect_environment(model_path: Path, python: str, gpu_index: str) -> dict[s
         git_commit, git_status = None, None
 
     gpu_query = command_output([
-        "nvidia-smi", "-i", gpu_index,
+        "nvidia-smi", "-i", ",".join(gpu_indices),
         "--query-gpu=name,uuid,driver_version,memory.total",
         "--format=csv,noheader,nounits",
     ])
     compute_apps = command_output([
-        "nvidia-smi", "-i", gpu_index,
+        "nvidia-smi", "-i", ",".join(gpu_indices),
         "--query-compute-apps=pid,process_name,used_gpu_memory",
         "--format=csv,noheader,nounits",
     ])
@@ -220,7 +254,7 @@ def collect_environment(model_path: Path, python: str, gpu_index: str) -> dict[s
         **runtime,
         "nvidia_smi_gpu_query": gpu_query,
         "nvidia_smi_compute_apps_preflight": compute_apps,
-        "nvidia_smi_index": gpu_index,
+        "nvidia_smi_indices": gpu_indices,
         "model_path": str(model_path),
         "model_config_sha256": sha256(model_path / "config.json"),
         "model_artifacts": model_artifacts,
@@ -233,9 +267,9 @@ def collect_environment(model_path: Path, python: str, gpu_index: str) -> dict[s
 
 
 class GpuMonitor:
-    def __init__(self, out_dir: Path, gpu_index: str, interval: float) -> None:
+    def __init__(self, out_dir: Path, gpu_indices: list[str], interval: float) -> None:
         self.out_dir = out_dir
-        self.gpu_index = gpu_index
+        self.gpu_indices = gpu_indices
         self.interval = interval
         self.stop_event = threading.Event()
         self.thread = threading.Thread(target=self._run, daemon=True)
@@ -254,7 +288,7 @@ class GpuMonitor:
             "utilization.gpu,utilization.memory,memory.used,memory.total,"
             "clocks.gr,power.draw,temperature.gpu"
         )
-        header = "timestamp,util_gpu_pct,util_mem_pct,memory_used_mib,memory_total_mib,"
+        header = "timestamp,gpu_index,util_gpu_pct,util_mem_pct,memory_used_mib,memory_total_mib,"
         header += "graphics_clock_mhz,power_w,temp_c\n"
         self.telemetry_path.write_text(header, encoding="utf-8")
         self.process_path.write_text(
@@ -264,8 +298,8 @@ class GpuMonitor:
         while not self.stop_event.is_set():
             now = dt.datetime.now().astimezone().isoformat(timespec="seconds")
             row = command_output([
-                "nvidia-smi", "-i", self.gpu_index,
-                f"--query-gpu={fields}", "--format=csv,noheader,nounits",
+                "nvidia-smi", "-i", ",".join(self.gpu_indices),
+                f"--query-gpu=index,{fields}", "--format=csv,noheader,nounits",
             ])
             if row:
                 with self.telemetry_path.open("a", encoding="utf-8") as stream:
@@ -274,8 +308,8 @@ class GpuMonitor:
             monotonic_now = time.monotonic()
             if monotonic_now - last_process_sample >= 30:
                 apps = command_output([
-                    "nvidia-smi", "-i", self.gpu_index,
-                    "--query-compute-apps=pid,process_name,used_gpu_memory",
+                    "nvidia-smi", "-i", ",".join(self.gpu_indices),
+                    "--query-compute-apps=gpu_uuid,pid,process_name,used_gpu_memory",
                     "--format=csv,noheader,nounits",
                 ])
                 with self.process_path.open("a", encoding="utf-8") as stream:
@@ -367,10 +401,12 @@ def summarize(campaign_dir: Path, tag_prefix: str, pairs: list[dict[str, Any]],
     report = [
         f"# REAL-Q Triton formal benchmark: {tag_prefix}", "",
         f"- Valid: **{summary['valid']}**; completed pairs: {len(rows)}/{config['pairs']}",
-        f"- Host/GPU: {environment['host']} / {environment['nvidia_smi_gpu_query'] or environment['torch_device_0']}",
+        f"- Host/GPU: {environment['host']} / {environment['nvidia_smi_gpu_query'] or environment['torch_device_names']}",
         f"- Commit: `{environment['git_commit']}`",
         f"- Model: `{config['model_path']}`; Qwen3-0.6B W4A16, 28 layers, "
         "Wikitext-2 calibration/evaluation (256 x 2048 tokens)", "",
+        f"- Distributed execution: {config['world_size']} ranks on GPUs "
+        f"{','.join(config['gpu_indices'])}", "",
         "| Pair | Control quant (s) | Triton quant (s) | Quant speedup | Control total (s) | Triton total (s) | Total speedup | Hash/KL/PPL exact |",
         "|---:|---:|---:|---:|---:|---:|---:|:---:|",
     ]
@@ -403,7 +439,8 @@ def summarize(campaign_dir: Path, tag_prefix: str, pairs: list[dict[str, Any]],
             if temp_range else "temperature unavailable."
         )
         report.append(
-            f"- GPU telemetry ({telemetry['samples']} samples): mean utilization "
+            f"- GPU telemetry ({telemetry['samples']} per-GPU samples across "
+            f"{config['world_size']} GPUs): mean utilization "
             f"{telemetry['util_gpu_pct']['mean']:.1f}%, peak "
             f"{telemetry['util_gpu_pct']['max']:.0f}%; {temp_text}"
         )
@@ -423,8 +460,11 @@ def main() -> None:
                         help="Unique artifact tag; generated from local time by default")
     parser.add_argument("--timeout-seconds", type=int, default=14400,
                         help="Timeout for each arm, default four hours")
-    parser.add_argument("--gpu-index", default=os.environ.get("NVIDIA_SMI_INDEX", "0"),
-                        help="nvidia-smi index used for telemetry")
+    parser.add_argument(
+        "--gpu-indices",
+        default=os.environ.get("NVIDIA_SMI_INDICES", os.environ.get("CUDA_VISIBLE_DEVICES", "0,1,2,3")),
+        help="Exactly four distinct physical GPU indices, e.g. 0,1,2,3",
+    )
     parser.add_argument("--monitor-interval", type=float, default=5.0)
     parser.add_argument("--allow-gpu-contention", action="store_true",
                         help="Proceed even when a CUDA compute process is visible at preflight")
@@ -433,6 +473,13 @@ def main() -> None:
         parser.error("pairs, timeout, and monitor interval must be positive")
     if not args.model_path:
         parser.error("provide --model-path or set REALQ_MODEL_PATH")
+    try:
+        gpu_indices = parse_gpu_indices(args.gpu_indices)
+    except ValueError as error:
+        parser.error(str(error))
+    # Apply the same explicit four-device mask to environment probes and every
+    # torchrun child; --gpu-indices selects execution as well as telemetry.
+    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(gpu_indices)
 
     model_path = Path(args.model_path).expanduser().resolve()
     if not model_path.is_dir() or not (model_path / "config.json").is_file():
@@ -464,15 +511,23 @@ def main() -> None:
     if campaign_dir.exists():
         parser.error(f"campaign output already exists; choose a new --tag-prefix: {campaign_dir}")
     try:
-        environment = collect_environment(model_path, python, args.gpu_index)
+        environment = collect_environment(model_path, python, gpu_indices)
     except RuntimeError as error:
         parser.error(str(error))
     if not environment["cuda_available"]:
         parser.error("PyTorch cannot access CUDA; activate the intended project virtual environment")
     if environment["triton_version"] == "not-installed":
         parser.error("Triton is not installed in the selected Python environment")
-    if environment["visible_cuda_devices"] != 1:
-        print(f"WARNING: PyTorch sees {environment['visible_cuda_devices']} CUDA devices; the command uses device 0.", flush=True)
+    if environment["visible_cuda_devices"] != WORLD_SIZE:
+        parser.error(
+            f"the benchmark requires {WORLD_SIZE} visible CUDA devices, "
+            f"but PyTorch sees {environment['visible_cuda_devices']}"
+        )
+    if len((environment["nvidia_smi_gpu_query"] or "").splitlines()) != WORLD_SIZE:
+        parser.error(
+            f"nvidia-smi did not report {WORLD_SIZE} selected physical GPUs: "
+            f"{environment['nvidia_smi_gpu_query']}"
+        )
     visible_apps = environment["nvidia_smi_compute_apps_preflight"]
     has_compute_app = bool(visible_apps) and any(
         line.strip().split(",", 1)[0].strip().isdigit()
@@ -489,6 +544,8 @@ def main() -> None:
     config = {
         "model_path": str(model_path),
         "model_family": "Qwen3-0.6B",
+        "world_size": WORLD_SIZE,
+        "gpu_indices": gpu_indices,
         "model_type": model_config.get("model_type"),
         "num_hidden_layers": model_config.get("num_hidden_layers"),
         "layers_quantized": "0-27 inclusive",
@@ -505,9 +562,13 @@ def main() -> None:
         "gptq_blocksize": 128,
         "weight_group_size": 128,
         "groups": 4,
-        "hessian_accumulation_batch_size": 64,
+        "calibration_forward_batch_size": 128,
+        "hessian_accumulation_batch_size": 128,
+        "final_layer_stats_batch_size": 16,
+        "global_loss_batch_size": 32,
         "backward_samples_per_refresh": 32,
         "backward_batch_size": 32,
+        "group_parallel_quant": "rank",
         "act_order": True,
         "rotation": True,
         "loss_slide_window": True,
@@ -526,7 +587,7 @@ def main() -> None:
     control_manifest, candidate_manifest = write_manifests(
         campaign_dir, model_path, python, tag_prefix
     )
-    monitor = GpuMonitor(campaign_dir, args.gpu_index, args.monitor_interval)
+    monitor = GpuMonitor(campaign_dir, gpu_indices, args.monitor_interval)
     monitor.start()
 
     runner_command = [
