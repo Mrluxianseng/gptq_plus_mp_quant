@@ -4,7 +4,7 @@
 
 ## 运行
 
-先从私人仓库检出这个干净分支，再进入项目虚拟环境。模型必须是本地 28 层 Qwen3 Hugging Face 目录，至少含 `config.json` 和权重文件。数据集不会提交到 Git；项目需要在 `datasets/wikitext` 找到本地 Wikitext 文件。如果数据集放在别处，先建立链接，例如 `mkdir -p datasets && ln -s /data/wikitext datasets/wikitext`。运行前确认模型、数据和虚拟环境都位于服务器本地：
+先从私人仓库检出这个干净分支，再进入项目虚拟环境。模型必须是本地 28 层 Qwen3 Hugging Face 目录，至少含 `config.json` 和权重文件。数据集不会提交到 Git；项目需要在 `datasets/wikitext` 找到本地 Wikitext 文件。支持旧式本地 `wikitext.py` builder，也支持 `datasets/wikitext/wikitext-2-raw-v1/` 下按 split 保存的 Parquet 文件。如果数据集放在别处，先建立链接，例如 `mkdir -p datasets && ln -s /data/wikitext datasets/wikitext`。运行前确认模型、数据和虚拟环境都位于服务器本地：
 
 ```bash
 git clone --branch codex/triton-paper-benchmark \

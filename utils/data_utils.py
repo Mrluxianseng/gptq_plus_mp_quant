@@ -1,6 +1,7 @@
 import os
 import random
 import logging
+from pathlib import Path
 from tqdm import tqdm
 
 import torch
@@ -31,6 +32,20 @@ def format_messages(messages: list[dict]) -> str:
 
 def _get_wikitext2(split):
     assert split in ['train', 'validation', 'test'], f"Unknown split {split} for wikitext2"
+
+    # Hugging Face's converted WikiText mirror stores the raw-v1 splits as
+    # Parquet files, not as the legacy wikitext.py dataset builder. Prefer
+    # those local files when present so offline runs do not try to resolve a
+    # builder config from a directory that only contains Parquet payloads.
+    parquet_root = Path("./datasets/wikitext/wikitext-2-raw-v1")
+    parquet_files = sorted(parquet_root.glob(f"{split}-*.parquet"))
+    if parquet_files:
+        data = load_dataset(
+            "parquet",
+            data_files={split: [str(path.resolve()) for path in parquet_files]},
+            split=split,
+        )
+        return data["text"]
 
     data = load_dataset('./datasets/wikitext', 'wikitext-2-raw-v1', split=split, trust_remote_code=True)
     return data['text']
