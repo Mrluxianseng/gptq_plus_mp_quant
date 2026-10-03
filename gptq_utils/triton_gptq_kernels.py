@@ -24,6 +24,7 @@ def _fused_gptq_column_kernel(
     STRIDE_Z: tl.constexpr,
     STRIDE_H0: tl.constexpr,
     STRIDE_H1: tl.constexpr,
+    STRIDE_HB: tl.constexpr,
     STRIDE_Q: tl.constexpr,
     STRIDE_WINT: tl.constexpr,
     STRIDE_ERR: tl.constexpr,
@@ -45,7 +46,11 @@ def _fused_gptq_column_kernel(
     w_col = tl.load(W_ptr + rows * STRIDE_W + COL, row_mask, other=0).to(tl.float32)
     scale = tl.load(Scale_ptr + rows, row_mask, other=1).to(tl.float32)
     gh_col = tl.load(GH_ptr + rows * STRIDE_GH + COL, row_mask, other=0).to(tl.float32)
-    d = tl.load(H_ptr + COL * STRIDE_H0 + COL * STRIDE_H1).to(tl.float32)
+    d = tl.load(
+        H_ptr + rows * STRIDE_HB + COL * STRIDE_H0 + COL * STRIDE_H1,
+        row_mask,
+        other=1,
+    ).to(tl.float32)
 
     # PyTorch torch.round and / use round-to-nearest-even FP32 semantics here.
     # Use explicit div_rn so iterative error propagation remains bit-identical.
@@ -55,8 +60,8 @@ def _fused_gptq_column_kernel(
     err = libdevice.div_rn((w_col - q_col) - gh_col, d)
 
     h_row = tl.load(
-        H_ptr + COL * STRIDE_H0 + cols * STRIDE_H1,
-        col_mask,
+        H_ptr + rows[:, None] * STRIDE_HB + COL * STRIDE_H0 + cols[None, :] * STRIDE_H1,
+        row_mask[:, None] & col_mask[None, :],
         other=0,
     ).to(tl.float32)
     gh_tail = tl.load(
@@ -111,8 +116,8 @@ def fused_gptq_column_(
 ):
     """Apply one sequential GPTQ column update in-place with one kernel launch.
 
-    This exact prototype supports FP32 tensors, a shared per-row symmetric
-    quantization scale, and block widths up to 128.
+    This exact prototype supports FP32 tensors, per-row symmetric scales,
+    shared or row-batched inverse-Hessian blocks, and widths up to 128.
     """
     rows, cols = W.shape
     if W.dtype != torch.float32 or GH.dtype != torch.float32:
@@ -121,6 +126,12 @@ def fused_gptq_column_(
         raise ValueError(f"fused GPTQ column kernel supports at most 128 columns; got {cols}")
     if not (W.is_cuda and GH.is_cuda and Z.is_cuda and H.is_cuda and scale.is_cuda):
         raise ValueError("fused GPTQ column kernel requires CUDA tensors")
+    if H.ndim == 2:
+        h_stride0, h_stride1, h_strideb = H.stride(0), H.stride(1), 0
+    elif H.ndim == 3 and H.shape[0] == rows:
+        h_stride0, h_stride1, h_strideb = H.stride(1), H.stride(2), H.stride(0)
+    else:
+        raise ValueError("H must have shape [cols, cols] or [rows, cols, cols]")
     _fused_gptq_column_kernel[(triton.cdiv(rows, 8),)](
         W,
         GH,
@@ -135,8 +146,9 @@ def fused_gptq_column_(
         W.stride(0),
         GH.stride(0),
         Z.stride(0),
-        H.stride(0),
-        H.stride(1),
+        h_stride0,
+        h_stride1,
+        h_strideb,
         Q.stride(0),
         W_int.stride(0),
         Err.stride(0),

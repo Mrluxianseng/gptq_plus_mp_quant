@@ -54,40 +54,58 @@ def measured_fwrd(args, analyzer, dataloader, dev):
     result = original_fwrd(args, analyzer, dataloader, dev)
     torch.cuda.synchronize()
     elapsed = time.monotonic() - started
-    elapsed_tensor = torch.tensor(elapsed, device=torch.cuda.current_device(), dtype=torch.float64)
-    peak_allocated = torch.tensor(
-        torch.cuda.max_memory_allocated(), device=torch.cuda.current_device(), dtype=torch.int64
-    )
-    peak_reserved = torch.tensor(
-        torch.cuda.max_memory_reserved(), device=torch.cuda.current_device(), dtype=torch.int64
-    )
     distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
     if distributed:
-        torch.distributed.all_reduce(elapsed_tensor, op=torch.distributed.ReduceOp.MAX)
-        torch.distributed.all_reduce(peak_allocated, op=torch.distributed.ReduceOp.MAX)
-        torch.distributed.all_reduce(peak_reserved, op=torch.distributed.ReduceOp.MAX)
+        rank = torch.distributed.get_rank()
+        world_size = torch.distributed.get_world_size()
         is_main = torch.distributed.get_rank() == 0
     else:
+        rank = 0
+        world_size = 1
         is_main = True
+    local_stats = torch.tensor(
+        [elapsed, torch.cuda.max_memory_allocated(), torch.cuda.max_memory_reserved()],
+        device=torch.cuda.current_device(), dtype=torch.float64,
+    )
+    if distributed:
+        gathered_stats = [torch.empty_like(local_stats) for _ in range(world_size)]
+        torch.distributed.all_gather(gathered_stats, local_stats)
+    else:
+        gathered_stats = [local_stats]
+    stats_by_rank = [[float(value) for value in row.tolist()] for row in gathered_stats]
+    elapsed_max = max(row[0] for row in stats_by_rank)
+    peak_allocated_max = max(row[1] for row in stats_by_rank)
+    peak_reserved_max = max(row[2] for row in stats_by_rank)
     digest = hashlib.sha256()
     tensor_count = 0
+    for name, tensor in sorted(analyzer.model.state_dict().items()):
+        digest.update(name.encode())
+        digest.update(str((tuple(tensor.shape), tensor.dtype)).encode())
+        digest.update(
+            tensor.detach().cpu().contiguous().reshape(-1).view(torch.uint8)
+            .numpy().tobytes()
+        )
+        tensor_count += 1
+    state_hash = digest.hexdigest()
+    rank_hashes = [state_hash]
+    if distributed:
+        rank_hashes = [None] * world_size
+        torch.distributed.all_gather_object(rank_hashes, state_hash)
+        if len(set(rank_hashes)) != 1:
+            raise RuntimeError(f"quantized state differs across ranks: {rank_hashes}")
     if is_main:
-        for name, tensor in sorted(analyzer.model.state_dict().items()):
-            digest.update(name.encode())
-            digest.update(str((tuple(tensor.shape), tensor.dtype)).encode())
-            digest.update(
-                tensor.detach().cpu().contiguous().reshape(-1).view(torch.uint8)
-                .numpy().tobytes()
-            )
-            tensor_count += 1
         row = {
             "mode": mode,
-            "world_size": torch.distributed.get_world_size() if distributed else 1,
-            "quantization_seconds": float(elapsed_tensor.item()),
-            "state_sha256": digest.hexdigest(),
+            "world_size": world_size,
+            "quantization_seconds": elapsed_max,
+            "quantization_seconds_by_rank": [item[0] for item in stats_by_rank],
+            "state_sha256": state_hash,
+            "state_sha256_by_rank": rank_hashes,
             "state_tensors": tensor_count,
-            "peak_allocated": int(peak_allocated.item()),
-            "peak_reserved": int(peak_reserved.item()),
+            "peak_allocated": int(peak_allocated_max),
+            "peak_reserved": int(peak_reserved_max),
+            "peak_allocated_by_rank": [int(item[1]) for item in stats_by_rank],
+            "peak_reserved_by_rank": [int(item[2]) for item in stats_by_rank],
         }
         (run_dir / "baseline-profile_metrics.json").write_text(
             json.dumps(row, indent=2)
@@ -142,10 +160,7 @@ def benchmark_command(python: str, model_path: Path, entry: Path, exp: str,
         "--global_loss_bsz", "32", "--static_fisher_microbatch_bsz", "8",
         "--grad_clip", "5e-5", "--a_loss_ratio", "0.95",
         "--final_layer_grad_clip", "5e-4", "--final_layer_grad_lr", "1e-5",
-        # triton_fused currently supports only group_parallel_mode='none'.
-        # Keep control/candidate identical; distributed calibration statistics
-        # still use all four ranks, while each rank quantizes the full rows.
-        "--group_parallel_quant", "none", "--eval_seq_len", "2048",
+        "--group_parallel_quant", "rank", "--eval_seq_len", "2048",
         "--eval_datasets", "wikitext2", "--seed", "1",
         "--gptq_inner_kernel", kernel,
     ]
@@ -648,8 +663,8 @@ def main() -> None:
         "backward_samples_per_refresh": 32,
         "backward_batch_size": 32,
         "refresh_microbatch_size_per_rank": 2,
-        "group_parallel_quant": "none",
-        "quantization_work_sharing": "full rows replicated per rank; calibration statistics distributed",
+        "group_parallel_quant": "rank",
+        "quantization_work_sharing": "output rows sharded across ranks; rank-local Hessian batches",
         "act_order": True,
         "rotation": True,
         "loss_slide_window": True,

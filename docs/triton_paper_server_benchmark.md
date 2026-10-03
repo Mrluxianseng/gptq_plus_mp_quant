@@ -35,7 +35,7 @@ tail -n 50 -F "logs/${TAG}.log"
 
 量化设置现已按论文明确给出的 Qwen3-0.6B W4A16 条件对齐：全 28 层、WikiText-2 校准 2048×2048 tokens、对称 per-row 权重量化（`w_groupsize=-1`）、seed 1、Adam 每次使用 32 个校准样本、block size 128、reverse-cosine 层学习率（base ratio 0.01）、非末层表列 LR `3e-4`、末层 LR `1e-5`、小型 Qwen 的 activation-loss clipping `0.95`、QuaRot，以及 4 个 saliency groups。论文明确 W4A16 使用 per-row 且通常用 2048 个 WikiText-2 校准样本；Qwen3-0.6B 的学习率来自论文表 6。全局 Hessian batch、Hessian accumulation batch、Fisher microbatch、KL refresh microbatch、梯度裁剪阈值等论文未完整指定的项目仍是工程实现选择，因此不能声称严格复现论文的全部环境与细节。四卡 RTX 5090 也与论文使用的 RTX Pro 6000 不同。
 
-完整 2048 样本会比此前 256 样本配置显著增加运行时间；四卡按数据并行分 shard，每个 rank 处理校准集的一部分，但总计仍覆盖全部 2048 个样本。Hessian accumulation microbatch、静态 Fisher microbatch、真实 KL refresh microbatch 只限制单次计算分块，不减少校准样本总量或 32 样本梯度更新。由于 `triton_fused` 当前不支持 `group_parallel_quant=rank`，配对两侧都设为 `none`：统计量仍由四卡分布式累计，但每个 rank 量化完整输出行，保证 kernel 是唯一变量；这会增加重复量化计算，耗时只代表此兼容配置。Control 使用 PyTorch 列循环，candidate 使用 `triton_fused`，两臂除 kernel 外使用相同配置和数据顺序。
+完整 2048 样本会比此前 256 样本配置显著增加运行时间；四卡按数据并行分 shard，每个 rank 处理校准集的一部分，但总计仍覆盖全部 2048 个样本。Hessian accumulation microbatch、静态 Fisher microbatch、真实 KL refresh microbatch 只限制单次计算分块，不减少校准样本总量或 32 样本梯度更新。早期候选内核不支持 `group_parallel_quant=rank`，当时用 `none` 运行的 campaign 会让每个 rank 重复量化完整输出行，因此不能作为有效的四卡量化加速结论。当前代码已接入 rank 行切分和每行独立 Hessian 的 Triton 路径；新 campaign 的 control/candidate 都设为 `rank`，但应先通过 `tools/test_triton_rank_kernel.py` 的四卡 CUDA parity smoke，再开始正式重复实验。旧 `none` 配置结果仍只代表兼容路径，不能与新 `rank` 结果配对比较。
 
 这是一组对论文明确披露的量化设置进行对齐的 kernel 对照实验，并非完整论文复现：目前自动核对 held-out WikiText-2 KL/PPL 和逐层输出，不运行论文报告的十项 zero-shot 任务；梯度裁剪和若干内部计算 batch 也未由论文完整披露。论文报告的硬件为 RTX Pro 6000，本实验使用服务器的 RTX 5090。
 

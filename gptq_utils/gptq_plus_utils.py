@@ -1466,6 +1466,8 @@ class GPTQPlus:
         slide_refresh_block_total=None,
         refresh_full_metrics=False,
         group_parallel_mode="tensor",
+        inner_kernel_impl="torch",
+        fused_gptq_column=None,
     ):
         W = self.layer.weight.data.clone().float()
         block_gd_mode = g_update_mode == "block_gd"
@@ -1800,6 +1802,33 @@ class GPTQPlus:
                                 W_int1_l = torch.zeros_like(W1_l)
                                 Err1_l = torch.zeros_like(W1_l)
                                 for i in range(count):
+                                    if inner_kernel_impl == "triton_fused":
+                                        if not is_frozen_inner:
+                                            raise RuntimeError(
+                                                "triton_fused requires the frozen block_gd inner GHinv path."
+                                            )
+                                        if fused_gptq_column is None:
+                                            raise RuntimeError("triton_fused kernel was not initialized")
+                                        if groupsize != -1:
+                                            raise RuntimeError(
+                                                "triton_fused rank path requires per-row weights "
+                                                "(--w_groupsize=-1)."
+                                            )
+                                        fused_gptq_column(
+                                            W1_l,
+                                            GHinv1_l,
+                                            Z1_l,
+                                            Hinv1_l,
+                                            scale_l[:, 0].contiguous(),
+                                            Q1_l,
+                                            W_int1_l,
+                                            Err1_l,
+                                            i,
+                                            maxq=maxq,
+                                            qlo=q_lo,
+                                            second_order_scale=second_order_scale,
+                                        )
+                                        continue
                                     w = W1_l[:, i]
                                     q_int = torch.clamp(
                                         torch.round(w / scale_l[:, i]),
@@ -2295,12 +2324,16 @@ class GPTQPlus:
             )
         fused_gptq_column = None
         if inner_kernel_impl == "triton_fused":
-            if group_parallel_mode != "none":
-                raise ValueError("triton_fused requires group_parallel_mode='none'.")
             if g_update_mode != "block_gd":
                 raise ValueError("triton_fused requires g_update_mode='block_gd'.")
             if block_atomic_quant:
                 raise ValueError("triton_fused is incompatible with block_atomic_quant.")
+            if two_sided_metric is not None:
+                raise ValueError("triton_fused does not support two-sided rounding.")
+            if groupsize != -1:
+                raise ValueError("triton_fused requires per-row weight quantization (--w_groupsize=-1).")
+            if blocksize > 128:
+                raise ValueError(f"triton_fused supports blocksize <= 128; got {blocksize}.")
             try:
                 from gptq_utils.triton_gptq_kernels import fused_gptq_column_
             except ImportError as exc:
@@ -2353,6 +2386,8 @@ class GPTQPlus:
                     slide_refresh_block_total=slide_refresh_block_total,
                     refresh_full_metrics=refresh_full_metrics,
                     group_parallel_mode=group_parallel_mode,
+                    inner_kernel_impl=inner_kernel_impl,
+                    fused_gptq_column=fused_gptq_column,
                 )
             if self.hessian_group_sharded:
                 raise RuntimeError(
