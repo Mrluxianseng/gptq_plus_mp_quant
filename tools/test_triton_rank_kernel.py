@@ -11,7 +11,6 @@ import sys
 from pathlib import Path
 
 import torch
-import torch.distributed as dist
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -41,11 +40,11 @@ def reference(W, GH, Z, H, scale, maxq, qlo, second_order_scale):
 
 
 def main():
-    distributed = int(os.environ.get("WORLD_SIZE", "1")) > 1
-    if distributed:
-        dist.init_process_group("nccl")
-    rank = dist.get_rank() if distributed else 0
-    world = dist.get_world_size() if distributed else 1
+    # Every rank runs an independent local kernel/reference comparison. Use
+    # torchrun's environment instead of initializing NCCL: no collective is
+    # needed here, and some containers cannot create NCCL shared-memory files.
+    rank = int(os.environ.get("RANK", "0"))
+    world = int(os.environ.get("WORLD_SIZE", "1"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
@@ -89,9 +88,6 @@ def main():
             error = (got - want).abs().max().item()
             raise AssertionError(f"rank {rank}: {name} max_abs_diff={error:.3e}")
     print(f"rank={rank}/{world}: batched-Hessian Triton parity passed", flush=True)
-    if distributed:
-        dist.barrier()
-        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
