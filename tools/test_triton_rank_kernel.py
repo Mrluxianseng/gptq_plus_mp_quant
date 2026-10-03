@@ -7,9 +7,14 @@ Run with four GPUs:
 from __future__ import annotations
 
 import os
+import sys
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 
 from gptq_utils.triton_gptq_kernels import fused_gptq_column_
 
