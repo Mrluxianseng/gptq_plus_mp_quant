@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import logging
 import os
 import sys
@@ -9643,6 +9644,24 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             group_parallel_mode=getattr(args, "group_parallel_quant", "none"),
                             inner_kernel_impl=getattr(args, "gptq_inner_kernel", "torch"),
                         )
+                        trace_hash_layer = os.environ.get("REALQ_TRACE_MODULE_WEIGHT_HASH_LAYER")
+                        if (
+                            os.environ.get("REALQ_TRACE_MODULE_WEIGHT_HASH") == "1"
+                            and dist_utils.is_main()
+                            and (trace_hash_layer is None or trace_hash_layer == str(i))
+                        ):
+                            traced_weight = subset[name].weight.detach().contiguous()
+                            weight_digest = hashlib.sha256(
+                                traced_weight.view(torch.uint8).cpu().numpy().tobytes()
+                            ).hexdigest()
+                            logging.info(
+                                "[module-weight-sha256] layer=%d module=%s shape=%s dtype=%s sha256=%s",
+                                i,
+                                name,
+                                tuple(traced_weight.shape),
+                                traced_weight.dtype,
+                                weight_digest,
+                            )
                         slide_refresh_cursor += slide_refreshes_per_module[name]
                         # DP correctness check (debug only): fasterquant is meant
                         # to be deterministic given identical inputs, and since H /
