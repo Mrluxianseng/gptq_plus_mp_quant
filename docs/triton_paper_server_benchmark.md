@@ -21,7 +21,13 @@ python tools/run_triton_paper_benchmark.py \
   --tag-prefix triton-thesis-server-20261002
 ```
 
-这里会以单机 4-rank `torchrun` 启动每个 arm，control 跑完后再跑 candidate；四张卡同时参与各自的量化 run。脚本要求 PyTorch 恰好看到四张 CUDA 卡，并将 `--gpu-indices` 同时用于设备选择、遥测和竞争进程预检。如果四张卡的物理编号不是 `0,1,2,3`，两处都替换为实际编号。`--tag-prefix` 每轮必须唯一。省略时脚本按本地时间自动生成。默认每个 arm 超时 4 小时；`--python` 可指定虚拟环境解释器。如果任一卡已被其他 CUDA 进程占用，默认停止。
+这里会以单机 4-rank `torchrun` 启动每个 arm，control 跑完后再跑 candidate；四张卡同时参与各自的量化 run。脚本要求 PyTorch 恰好看到四张 CUDA 卡，并将 `--gpu-indices` 同时用于设备选择、遥测和竞争进程预检。如果四张卡的物理编号不是 `0,1,2,3`，两处都替换为实际编号。`--tag-prefix` 每轮必须唯一。省略时脚本按本地时间自动生成。默认每个 arm 超时 4 小时；`--python` 可指定虚拟环境解释器。如果任一卡已被其他 CUDA 计算进程占用，默认停止。启动时记下 tag 后，实时只需追踪外层日志：
+
+```bash
+tail -n 50 -F "logs/${TAG}.log"
+```
+
+内层 `run.log` 会保留逐 rank 的完整原始输出；现在它也会实时转发到外层日志。只有外层出现错误、需要查看某个 rank 的上下文时，才直接检查 `outputs/phase_profile_<run-tag>/run.log`。`campaign.log` 是配对调度器输出的归档副本，无需另行追踪。
 
 四卡以数据并行分 shard 处理样本，梯度刷新仍合计使用 32 个样本；每个 rank 都会各自加载模型，显存不会跨卡合并。正式命令对真实 KL 刷新设置每卡 refresh microbatch=2，梯度按样本数累积后仍对完整 32 个全局样本执行一次梯度/Adam 更新，不降低样本数或更新次数。静态 Fisher 预计算另用全局 microbatch=8。两项分块针对不同显存热点；服务器完整复跑前，不宣称全流程已通过，也不宣称候选在每个测量时刻都低于原始 base。
 

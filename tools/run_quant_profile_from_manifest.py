@@ -140,13 +140,22 @@ def main() -> None:
         ])
     launch.extend(command)
     with (out / "run.log").open("w", encoding="utf-8") as log:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             launch,
             cwd=ROOT,
             env=env,
-            stdout=log,
+            stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
         )
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            log.write(line)
+            log.flush()
+            print(line, end="", flush=True)
+        proc.stdout.close()
+        proc.wait()
     elapsed = time.monotonic() - started
     unchanged = all(sha256(p) == h for p, h in checked_sources.items())
     metrics_path = out / "baseline-profile_metrics.json"
