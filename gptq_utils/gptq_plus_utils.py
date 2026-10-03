@@ -2328,8 +2328,6 @@ class GPTQPlus:
                 raise ValueError("triton_fused requires g_update_mode='block_gd'.")
             if block_atomic_quant:
                 raise ValueError("triton_fused is incompatible with block_atomic_quant.")
-            if two_sided_metric is not None:
-                raise ValueError("triton_fused does not support two-sided rounding.")
             if groupsize != -1:
                 raise ValueError("triton_fused requires per-row weight quantization (--w_groupsize=-1).")
             if blocksize > 128:
