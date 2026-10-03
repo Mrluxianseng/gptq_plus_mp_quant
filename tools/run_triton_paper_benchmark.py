@@ -142,7 +142,10 @@ def benchmark_command(python: str, model_path: Path, entry: Path, exp: str,
         "--global_loss_bsz", "32", "--static_fisher_microbatch_bsz", "8",
         "--grad_clip", "5e-5", "--a_loss_ratio", "0.95",
         "--final_layer_grad_clip", "5e-4", "--final_layer_grad_lr", "1e-5",
-        "--group_parallel_quant", "rank", "--eval_seq_len", "2048",
+        # triton_fused currently supports only group_parallel_mode='none'.
+        # Keep control/candidate identical; distributed calibration statistics
+        # still use all four ranks, while each rank quantizes the full rows.
+        "--group_parallel_quant", "none", "--eval_seq_len", "2048",
         "--eval_datasets", "wikitext2", "--seed", "1",
         "--gptq_inner_kernel", kernel,
     ]
@@ -645,7 +648,8 @@ def main() -> None:
         "backward_samples_per_refresh": 32,
         "backward_batch_size": 32,
         "refresh_microbatch_size_per_rank": 2,
-        "group_parallel_quant": "rank",
+        "group_parallel_quant": "none",
+        "quantization_work_sharing": "full rows replicated per rank; calibration statistics distributed",
         "act_order": True,
         "rotation": True,
         "loss_slide_window": True,
