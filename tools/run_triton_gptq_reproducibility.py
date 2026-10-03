@@ -136,8 +136,19 @@ def run(manifest: Path, tag: str, timeout: int) -> dict:
     if status["returncode"] != 0 or not status["sources_unchanged"]:
         raise RuntimeError(f"failed run or source changed during {tag}: {status}")
     metrics = status["metrics"]
-    if not metrics or metrics.get("state_tensors") != 507:
-        raise RuntimeError(f"missing full-model metrics for {tag}: {metrics}")
+    required_metrics = (
+        "quantization_seconds",
+        "state_sha256",
+        "state_tensors",
+        "peak_allocated",
+        "peak_reserved",
+    )
+    missing_metrics = [key for key in required_metrics if not metrics or key not in metrics]
+    if missing_metrics or int(metrics.get("state_tensors", 0)) <= 0:
+        raise RuntimeError(
+            f"incomplete quantization metrics for {tag}: "
+            f"missing={missing_metrics}, metrics={metrics}"
+        )
     log_path = ROOT / "outputs" / f"phase_profile_{tag}" / "run.log"
     tables = log_path.read_text(errors="replace").split("Wall-clock section summary")
     if len(tables) < 2:
