@@ -84,7 +84,7 @@ def _fused_gptq_column_kernel(
     w_delta = second_order + gh_tail
     w_delta = SECOND_ORDER_SCALE * w_delta
     w_new = w_tail - w_delta
-    gh_new = gh_tail - z_col[:, None] * h_row[None, :]
+    gh_new = gh_tail - z_col[:, None] * h_row
 
     tl.store(
         W_ptr + rows[:, None] * STRIDE_W + cols[None, :],
