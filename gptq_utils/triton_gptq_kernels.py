@@ -77,7 +77,10 @@ def _fused_gptq_column_kernel(
     ).to(tl.float32)
 
     # Match the reference's sequence: outer product, add GHinv, scale, subtract.
-    second_order = err[:, None] * h_row[None, :]
+    # ``h_row`` is row-batched for both H layouts: with a shared 2-D H the
+    # zero batch stride broadcasts the same row to every output row; with a
+    # 3-D H each row loads its own Hessian row.
+    second_order = err[:, None] * h_row
     w_delta = second_order + gh_tail
     w_delta = SECOND_ORDER_SCALE * w_delta
     w_new = w_tail - w_delta
