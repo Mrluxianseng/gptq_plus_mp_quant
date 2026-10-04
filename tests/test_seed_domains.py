@@ -15,6 +15,7 @@ from realq.config import Config, parse_cli
 from realq.precompute import cache as cache_mod
 from realq.refresh.block_gd import _SharedSampleScheduler
 from utils import data_utils, model_utils, rotation_utils
+from utils import reproducibility as reproducibility_mod
 from utils.reproducibility import configure_reproducibility
 
 
@@ -344,6 +345,23 @@ def test_reproducibility_helper_replays_python_numpy_and_torch_rngs():
     assert first[1] == second[1]
     assert torch.equal(first[2], second[2])
     assert os.environ["CUBLAS_WORKSPACE_CONFIG"] in {":4096:8", ":16:8"}
+
+
+def test_reproducibility_can_opt_into_deterministic_sdpa(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        reproducibility_mod,
+        "configure_deterministic_sdpa",
+        lambda: calls.append(True),
+    )
+    monkeypatch.setenv("REALQ_DETERMINISTIC_SDPA", "1")
+    configure_reproducibility(11, deterministic=True)
+    assert calls == [True]
+
+    calls.clear()
+    monkeypatch.delenv("REALQ_DETERMINISTIC_SDPA")
+    configure_reproducibility(11, deterministic=True)
+    assert calls == []
 
 
 def test_entrypoints_set_cublas_workspace_before_importing_torch():

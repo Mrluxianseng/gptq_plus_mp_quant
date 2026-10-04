@@ -47,6 +47,13 @@ def configure_reproducibility(seed: int, *, deterministic: bool = True) -> None:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
+    # The legacy REAL-Q entrypoint can opt into deterministic SDPA backward
+    # through the same switch used by realq.ptq. This matters for paired
+    # exactness checks: PyTorch's memory-efficient attention backward may use
+    # atomics even when deterministic algorithms are requested with warn_only.
+    if deterministic and os.environ.get("REALQ_DETERMINISTIC_SDPA") == "1":
+        configure_deterministic_sdpa()
+
     torch.backends.cuda.matmul.allow_tf32 = False
     if hasattr(torch.backends, "cudnn"):
         torch.backends.cudnn.benchmark = False
@@ -62,8 +69,10 @@ def configure_reproducibility(seed: int, *, deterministic: bool = True) -> None:
         torch.use_deterministic_algorithms(False)
 
     logging.info(
-        "[reproducibility] seed=%d deterministic=%s CUBLAS_WORKSPACE_CONFIG=%s",
+        "[reproducibility] seed=%d deterministic=%s deterministic_sdpa=%s "
+        "CUBLAS_WORKSPACE_CONFIG=%s",
         seed,
         deterministic,
+        deterministic and os.environ.get("REALQ_DETERMINISTIC_SDPA") == "1",
         os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
     )

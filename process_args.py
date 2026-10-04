@@ -96,6 +96,16 @@ def parse_gen():
     )
     parser.set_defaults(pre_clip=True)
     parser.add_argument(
+        "--pre_clip_search_impl",
+        choices=("cartesian_legacy", "symmetric_union_exact"),
+        default="cartesian_legacy",
+        help=(
+            "Candidate enumeration used by the manual pre-quantization weight "
+            "clip search. symmetric_union_exact preserves the symmetric MSE "
+            "candidate set and legacy tie order while reducing evaluations."
+        ),
+    )
+    parser.add_argument(
         "--a_clip_ratio",
         type=float,
         default=None,
@@ -332,6 +342,33 @@ def parse_gen():
             "saliency/Fisher precompute. Defaults to --global_loss_bsz; reducing "
             "it lowers peak full-vocabulary logits memory without changing the "
             "sample pool or gradient-refresh batch sizes. Must divide WORLD_SIZE."
+        ),
+    )
+    parser.add_argument(
+        "--static_fisher_activation_offload",
+        action="store_true",
+        help=(
+            "During the static end-to-end Fisher/saliency backward, keep autograd-saved "
+            "forward tensors in pinned CPU memory and copy them back as backward consumes "
+            "them. This trades PCIe traffic for lower GPU activation memory."
+        ),
+    )
+    parser.add_argument(
+        "--static_fisher_activation_checkpointing",
+        action="store_true",
+        help=(
+            "During the static end-to-end Fisher/saliency backward, checkpoint "
+            "each transformer block and recompute its internal activations "
+            "during backward to reduce GPU activation memory."
+        ),
+    )
+    parser.add_argument(
+        "--offload_unused_runtime_modules",
+        action="store_true",
+        help=(
+            "With global Fisher loss, keep input-embedding/pre-block modules on "
+            "CPU after calibration-input capture and materialize final norm/lm_head "
+            "only for the last transformer block."
         ),
     )
     parser.add_argument(

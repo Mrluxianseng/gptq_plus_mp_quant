@@ -1,10 +1,10 @@
 # REAL-Q Triton 正式配置服务器复测
 
-脚本 `tools/run_triton_paper_benchmark.py` 用于在 Linux/WSL 服务器上复跑完整的 PyTorch control 与 Triton 候选配对。它调用项目现有的 profile/reproducibility runner，不改变待测 kernel；每组先 control、再 candidate，并在每一组后核对完整量化 state 哈希、KL 和 PPL。发现不一致会立即停止后续配对。
+脚本 `tools/run_triton_paper_benchmark.py` 用于在 Linux/WSL 服务器上复跑完整的 PyTorch control 与优化候选配对。它调用项目现有的 profile/reproducibility runner；每组先 control、再 candidate，并在每一组后核对完整量化 state 哈希、KL 和 PPL。发现不一致会立即停止后续配对。
 
 ## 运行
 
-先从私人仓库检出这个干净分支，再进入项目虚拟环境。模型必须是本地 28 层 Qwen3 Hugging Face 目录，至少含 `config.json` 和权重文件。数据集不会提交到 Git；项目需要在 `datasets/wikitext` 找到本地 Wikitext 文件。支持旧式本地 `wikitext.py` builder，也支持 `datasets/wikitext/wikitext-2-raw-v1/` 下按 split 保存的 Parquet 文件。如果数据集放在别处，先建立链接，例如 `mkdir -p datasets && ln -s /data/wikitext datasets/wikitext`。运行前确认模型、数据和虚拟环境都位于服务器本地：
+先进入服务器上的项目与虚拟环境。模型必须是本地 28 层 Qwen3 Hugging Face 目录，至少含 `config.json` 和权重文件。数据集不会提交到 Git；项目需要在 `datasets/wikitext` 找到本地 Wikitext 文件。支持旧式本地 `wikitext.py` builder，也支持 `datasets/wikitext/wikitext-2-raw-v1/` 下按 split 保存的 Parquet 文件。如果数据集放在别处，先建立链接，例如 `mkdir -p datasets && ln -s /data/wikitext datasets/wikitext`。运行前确认模型、数据和虚拟环境都位于服务器本地：
 
 ```bash
 git clone --branch codex/triton-paper-benchmark \
@@ -13,21 +13,34 @@ cd gptq_plus_triton_bench
 source /path/to/venv/bin/activate
 python -c 'import torch, triton; print(torch.cuda.is_available(), torch.cuda.get_device_name(0), triton.__version__)'
 nvidia-smi
-CUDA_VISIBLE_DEVICES=0,1,2,3 \
-python tools/run_triton_paper_benchmark.py \
-  --model-path /path/to/Qwen3-0.6B \
-  --gpu-indices 0,1,2,3 \
-  --pairs 3 \
-  --tag-prefix triton-thesis-server-20261002
+MODEL_PATH=/openbayes/home/llmModels/Qwen3-0.6B \
+GPU_INDICES=0,1,2,3 \
+TAG_PREFIX=realq-memory-speed-server-20261004 \
+bash scripts/run_memory_speed_server.sh
 ```
 
-这里会以单机 4-rank `torchrun` 启动每个 arm，control 跑完后再跑 candidate；四张卡同时参与各自的量化 run。脚本要求 PyTorch 恰好看到四张 CUDA 卡，并将 `--gpu-indices` 同时用于设备选择、遥测和竞争进程预检。如果四张卡的物理编号不是 `0,1,2,3`，两处都替换为实际编号。`--tag-prefix` 每轮必须唯一。省略时脚本按本地时间自动生成。默认每个 arm 超时 4 小时；`--python` 可指定虚拟环境解释器。如果任一卡已被其他 CUDA 计算进程占用，默认停止。启动时记下 tag 后，实时只需追踪外层日志：
+启动脚本先打印 PyTorch/CUDA/Triton 与四张卡名称，运行 4-rank NCCL all-reduce，再运行 4-rank Triton kernel parity smoke；任一 rank 失败就停止，不进入昂贵实验。通过后以单机 4-rank `torchrun` 启动配对实验，四张卡同时参与每个量化 run。`--gpu-indices` 同时用于设备选择、遥测和竞争进程预检。默认每个 arm 超时 4 小时，默认运行三对。启动脚本支持 `MODEL_PATH`、`GPU_INDICES`、`PYTHON`、`PAIRS`、`TAG_PREFIX`、`OMP_NUM_THREADS`、`NCCL_SHM_DISABLE` 环境变量；默认 `NCCL_SHM_DISABLE=1`，以规避该服务器之前遇到的 NCCL shared-memory 初始化卡死，且会在日志中明示。
+
+配对 runner 会为 control 和 candidate 同时设置 `REALQ_DETERMINISTIC_SDPA=1`，避免 memory-efficient SDPA 反向的原子累加差异污染逐层精确性比较。该设置切换到确定性的 math SDPA，可能提高静态 Fisher 预计算的峰值显存和耗时；两臂使用同一路径，结果才可公平比较。正式报告应注明此运行条件，且不能把它与关闭该设置的旧 campaign 直接比较。候选额外启用 `--static_fisher_activation_checkpointing` 和 `--offload_unused_runtime_modules`，以降低 Stage-0 反向激活和无用运行模块的驻留显存；control 保留原始路径。这两项组合在本地三对全模型确定性对照通过后，才纳入服务器候选。
 
 ```bash
-tail -n 50 -F "logs/${TAG}.log"
+tail -n 50 -F "logs/${TAG_PREFIX}.log"
 ```
 
-内层 `run.log` 会保留逐 rank 的完整原始输出；现在它也会实时转发到外层日志。只有外层出现错误、需要查看某个 rank 的上下文时，才直接检查 `outputs/phase_profile_<run-tag>/run.log`。`campaign.log` 是配对调度器输出的归档副本，无需另行追踪。
+外层日志 `logs/<TAG_PREFIX>.log` 是实时总日志：启动预检、每个 rank 的 stdout/stderr、tqdm 进度更新、GPU 遥测、配对结果、错误栈都会转发到这里。回车型进度条会转换成单独日志行，避免 nohup 下长时间看不到刷新。配对 runner 的输出另存到 `outputs/<TAG_PREFIX>-campaign/campaign.log`；逐次运行的完整副本在 `outputs/phase_profile_<run-tag>/run.log`。正常追踪只看外层日志；排查具体 rank 时再看相应的内层文件。为避免密集刷屏，tqdm 默认每秒更新，可通过 `TQDM_MININTERVAL` 调整。
+
+服务器上后台运行时，用下面这组命令；启动脚本会把 4 卡 parity smoke 和完整 campaign 的输出都留在同一份 nohup 总日志：
+
+```bash
+mkdir -p logs
+TAG_PREFIX=realq-memory-speed-server-$(date +%Y%m%d-%H%M%S)
+nohup env MODEL_PATH=/openbayes/home/llmModels/Qwen3-0.6B \
+  GPU_INDICES=0,1,2,3 TAG_PREFIX="$TAG_PREFIX" OMP_NUM_THREADS=8 NCCL_SHM_DISABLE=1 \
+  bash scripts/run_memory_speed_server.sh \
+  > "logs/${TAG_PREFIX}.log" 2>&1 < /dev/null &
+echo $! | tee "logs/${TAG_PREFIX}.pid"
+tail -n 50 -F "logs/${TAG_PREFIX}.log"
+```
 
 四卡以数据并行分 shard 处理样本，梯度刷新仍合计使用 32 个样本；每个 rank 都会各自加载模型，显存不会跨卡合并。正式命令对真实 KL 刷新设置每卡 refresh microbatch=2，梯度按样本数累积后仍对完整 32 个全局样本执行一次梯度/Adam 更新，不降低样本数或更新次数。静态 Fisher 预计算另用全局 microbatch=8。两项分块针对不同显存热点；服务器完整复跑前，不宣称全流程已通过，也不宣称候选在每个测量时刻都低于原始 base。
 
@@ -35,9 +48,11 @@ tail -n 50 -F "logs/${TAG}.log"
 
 量化设置现已按论文明确给出的 Qwen3-0.6B W4A16 条件对齐：全 28 层、WikiText-2 校准 2048×2048 tokens、对称 per-row 权重量化（`w_groupsize=-1`）、seed 1、Adam 每次使用 32 个校准样本、block size 128、reverse-cosine 层学习率（base ratio 0.01）、非末层表列 LR `3e-4`、末层 LR `1e-5`、小型 Qwen 的 activation-loss clipping `0.95`、QuaRot，以及 4 个 saliency groups。论文明确 W4A16 使用 per-row 且通常用 2048 个 WikiText-2 校准样本；Qwen3-0.6B 的学习率来自论文表 6。全局 Hessian batch、Hessian accumulation batch、Fisher microbatch、KL refresh microbatch、梯度裁剪阈值等论文未完整指定的项目仍是工程实现选择，因此不能声称严格复现论文的全部环境与细节。四卡 RTX 5090 也与论文使用的 RTX Pro 6000 不同。
 
-完整 2048 样本会比此前 256 样本配置显著增加运行时间；四卡按数据并行分 shard，每个 rank 处理校准集的一部分，但总计仍覆盖全部 2048 个样本。Hessian accumulation microbatch、静态 Fisher microbatch、真实 KL refresh microbatch 只限制单次计算分块，不减少校准样本总量或 32 样本梯度更新。早期候选内核不支持 `group_parallel_quant=rank`，当时用 `none` 运行的 campaign 会让每个 rank 重复量化完整输出行，因此不能作为有效的四卡量化加速结论。当前代码已接入 rank 行切分和每行独立 Hessian 的 Triton 路径；新 campaign 的 control/candidate 都设为 `rank`，但应先通过 `tools/test_triton_rank_kernel.py` 的四卡 CUDA parity smoke，再开始正式重复实验。旧 `none` 配置结果仍只代表兼容路径，不能与新 `rank` 结果配对比较。
+完整 2048 样本会比此前 256 样本配置显著增加运行时间；四卡按数据并行分 shard，每个 rank 处理校准集的一部分，但总计仍覆盖全部 2048 个样本。Hessian accumulation microbatch、静态 Fisher microbatch、真实 KL refresh microbatch 只限制单次计算分块，不减少校准样本总量或 32 个样本梯度更新。早期候选内核不支持 `group_parallel_quant=rank`，当时用 `none` 运行的 campaign 会让每个 rank 重复量化完整输出行，因此不能作为有效的四卡量化加速结论。当前代码已接入 rank 行切分和每行独立 Hessian 的 Triton 路径；新 campaign 的 control/candidate 都设为 `rank`，但应先通过 `tools/test_triton_rank_kernel.py` 的四卡 CUDA parity smoke，再开始正式重复实验。旧 `none` 配置结果仍只代表兼容路径，不能与新 `rank` 结果配对比较。
 
-这是一组对论文明确披露的量化设置进行对齐的 kernel 对照实验，并非完整论文复现：目前自动核对 held-out WikiText-2 KL/PPL 和逐层输出，不运行论文报告的十项 zero-shot 任务；梯度裁剪和若干内部计算 batch 也未由论文完整披露。论文报告的硬件为 RTX Pro 6000，本实验使用服务器的 RTX 5090。
+candidate 臂还会选择 `--pre_clip_search_impl symmetric_union_exact`，control 臂保留 `cartesian_legacy`。这是手动预裁剪阶段的精确实现优化：利用对称裁剪范围由两侧端点之一决定，将每行 MSE 搜索从 (M^2) 个组合候选化简为至多 (2M) 个端点候选，并保留旧版候选集合和并列最优时的首次命中顺序；不修改权重裁剪目标或梯度更新。Qwen3-0.6B、本地 32×512 校准的小配置全 28 层配对初测中，预裁剪搜索的量化时间从 428.27 秒降至 284.68 秒（快 33.5%）；535 个状态张量哈希、KL/PPL（0.294845/45.254898）及峰值 allocated/reserved 显存完全一致。该结果是单次本地小样本验证，不是论文配置结论；服务器的 2048×2048 三组配对仍需实测。candidate 同时包含 Triton kernel 与预裁剪优化，campaign 耗时代表整体方案；本轮还叠加已在本地三对全模型校验过的 Stage-0 激活 checkpoint 与运行模块按需驻留，衡量整体内存/速度方案。
+
+这是一组对论文明确披露的量化设置进行对齐的工程优化对照实验，并非完整论文复现：目前自动核对 held-out WikiText-2 KL/PPL 和逐层输出，不运行论文报告的十项 zero-shot 任务；梯度裁剪和若干内部计算 batch 也未由论文完整披露。论文报告的硬件为 RTX Pro 6000，本实验使用服务器的 RTX 5090。
 
 ## 输出与停止条件
 

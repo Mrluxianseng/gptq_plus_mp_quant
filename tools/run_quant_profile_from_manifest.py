@@ -8,13 +8,17 @@ change during the run.
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import statistics
 import subprocess
 import time
+
+from subprocess_log_stream import iter_output_chunks
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -40,6 +44,14 @@ def main() -> None:
         help="Skip evaluation after quantization to keep the GPU trace focused on the selected quantization prefix.",
     )
     parser.add_argument("--timeout-seconds", type=int, default=3600)
+    parser.add_argument(
+        "--allocator-conf",
+        default="expandable_segments:True",
+        help=(
+            "PyTorch CUDA caching-allocator configuration for the child process; "
+            "defaults to the original REAL-Q profile setting."
+        ),
+    )
     args = parser.parse_args()
     if not args.tag.replace("-", "").isalnum():
         raise ValueError("tag may contain only letters, digits, and hyphens")
@@ -89,6 +101,36 @@ def main() -> None:
         "_original_dump_wall_summary = impl.QuantProfileRecorder.dump_wall_summary\n"
         "impl.QuantProfileRecorder.dump_wall_summary = classmethod("
         "lambda cls, top_k=60: _original_dump_wall_summary(top_k=1000))\n"
+        "import threading as _memory_sample_threading\n"
+        "import csv as _memory_sample_csv\n"
+        "import atexit as _memory_sample_atexit\n"
+        "_memory_sample_rank = int(os.environ.get('RANK', '0') or 0)\n"
+        "_memory_sample_local_rank = int(os.environ.get('LOCAL_RANK', '0') or 0)\n"
+        "_memory_sample_path = run_dir / f'cuda_allocator_telemetry_rank{_memory_sample_rank}.csv'\n"
+        "_memory_sample_values = []\n"
+        "_memory_sample_stop = _memory_sample_threading.Event()\n"
+        "def _memory_sample_loop():\n"
+        "    while not _memory_sample_stop.is_set():\n"
+        "        _now = time.monotonic()\n"
+        "        try:\n"
+        "            if torch.cuda.is_initialized():\n"
+        "                _allocated = torch.cuda.memory_allocated(_memory_sample_local_rank)\n"
+        "                _reserved = torch.cuda.memory_reserved(_memory_sample_local_rank)\n"
+        "                _memory_sample_values.append((_now, int(_allocated), int(_reserved)))\n"
+        "        except Exception:\n"
+        "            pass\n"
+        "        _memory_sample_stop.wait(1.0)\n"
+        "def _memory_sample_flush():\n"
+        "    _memory_sample_stop.set()\n"
+        "    if _memory_sample_thread.is_alive():\n"
+        "        _memory_sample_thread.join(timeout=3.0)\n"
+        "    with _memory_sample_path.open('w', newline='', encoding='utf-8') as _stream:\n"
+        "        _writer = _memory_sample_csv.writer(_stream)\n"
+        "        _writer.writerow(['monotonic_seconds', 'allocated_bytes', 'reserved_bytes'])\n"
+        "        _writer.writerows(_memory_sample_values)\n"
+        "_memory_sample_thread = _memory_sample_threading.Thread(target=_memory_sample_loop, daemon=True)\n"
+        "_memory_sample_thread.start()\n"
+        "_memory_sample_atexit.register(_memory_sample_flush)\n"
         "sys.argv[0]='ptq.py'"
     )
     if entry_text.count(needle) != 1:
@@ -117,8 +159,9 @@ def main() -> None:
         HF_HUB_OFFLINE="1",
         HF_DATASETS_OFFLINE="1",
         TRANSFORMERS_OFFLINE="1",
-        PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True",
+        PYTORCH_ALLOC_CONF=args.allocator_conf,
     )
+    env.pop("PYTORCH_CUDA_ALLOC_CONF", None)
     started = time.monotonic()
     launch = [
         "timeout", "--signal=TERM", "--kill-after=30s",
@@ -150,16 +193,61 @@ def main() -> None:
             bufsize=1,
         )
         assert proc.stdout is not None
-        for line in proc.stdout:
-            log.write(line)
+        for chunk in iter_output_chunks(proc.stdout):
+            log.write(chunk)
             log.flush()
-            print(line, end="", flush=True)
+            print(chunk, end="", flush=True)
         proc.stdout.close()
         proc.wait()
     elapsed = time.monotonic() - started
     unchanged = all(sha256(p) == h for p, h in checked_sources.items())
     metrics_path = out / "baseline-profile_metrics.json"
     metrics = json.loads(metrics_path.read_text()) if metrics_path.exists() else None
+    if metrics is not None:
+        allocator_rows_by_rank: dict[str, list[tuple[int, int]]] = {}
+        for telemetry_path in sorted(out.glob("cuda_allocator_telemetry_rank*.csv")):
+            rank_match = re.search(r"rank(\d+)\.csv$", telemetry_path.name)
+            if not rank_match:
+                continue
+            rank = rank_match.group(1)
+            with telemetry_path.open(newline="", encoding="utf-8") as stream:
+                for row in csv.DictReader(stream):
+                    try:
+                        allocated = int(row["allocated_bytes"])
+                        reserved = int(row["reserved_bytes"])
+                    except (KeyError, ValueError):
+                        continue
+                    if allocated >= 0 and reserved >= 0:
+                        allocator_rows_by_rank.setdefault(rank, []).append((allocated, reserved))
+        if allocator_rows_by_rank:
+            rank_summaries = {}
+            for rank, values in sorted(allocator_rows_by_rank.items(), key=lambda item: int(item[0])):
+                allocated_values = [value[0] for value in values]
+                reserved_values = [value[1] for value in values]
+                rank_summaries[rank] = {
+                    "samples": len(values),
+                    "mean_allocated_bytes": statistics.mean(allocated_values),
+                    "mean_reserved_bytes": statistics.mean(reserved_values),
+                    "max_sampled_allocated_bytes": max(allocated_values),
+                    "max_sampled_reserved_bytes": max(reserved_values),
+                }
+            metrics["cuda_allocator_memory_telemetry"] = {
+                "sample_interval_seconds": 1.0,
+                "per_rank": rank_summaries,
+                "mean_allocated_bytes_across_ranks": statistics.mean(
+                    row["mean_allocated_bytes"] for row in rank_summaries.values()
+                ),
+                "mean_reserved_bytes_across_ranks": statistics.mean(
+                    row["mean_reserved_bytes"] for row in rank_summaries.values()
+                ),
+                "sample_count_total": sum(row["samples"] for row in rank_summaries.values()),
+            }
+        else:
+            metrics["cuda_allocator_memory_telemetry"] = {
+                "sample_interval_seconds": 1.0,
+                "per_rank": {},
+                "sample_count_total": 0,
+            }
     log_text = (out / "run.log").read_text(errors="replace")
     klppl = re.search(r"Exact KL&PPL on wikitext2: ([0-9.eE+-]+), ([0-9.eE+-]+)", log_text)
     status = {

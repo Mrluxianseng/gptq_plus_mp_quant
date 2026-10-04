@@ -485,11 +485,24 @@ def clip_tensor_to_quant_bounds(weight, clip_min, clip_max):
     return torch.minimum(torch.maximum(weight, clip_min), clip_max)
 
 
-def clip_module_weight_to_quant_bounds_(module, bits, sym, mse):
+def clip_module_weight_to_quant_bounds_(
+    module, bits, sym, mse, search_impl="cartesian_legacy"
+):
     if bits >= 16 or not mse:
         return
     quantizer = quant_utils.WeightQuantizer()
-    quantizer.configure(bits, perchannel=True, sym=sym, mse=mse)
+    quantizer.configure(
+        bits,
+        perchannel=True,
+        sym=sym,
+        mse=mse,
+        w_clip_search_impl=search_impl,
+        w_clip_update_impl=(
+            "where_out"
+            if search_impl == "symmetric_union_exact"
+            else "guarded"
+        ),
+    )
     weight = module.weight.data.float()
     quantizer.find_params(weight)
     clip_min, clip_max = compute_quant_clip_bounds(
@@ -4097,6 +4110,8 @@ def collect_static_end_to_end_saliency_and_fisher(
     fisher_rademacher_k=0,
     rademacher_seed=0,
     num_samples_for_grad=0,
+    static_fisher_activation_offload=False,
+    static_fisher_activation_checkpointing=False,
 ):
     fisher_rademacher_k = int(fisher_rademacher_k)
     num_samples_for_grad = int(num_samples_for_grad)
@@ -4138,6 +4153,21 @@ def collect_static_end_to_end_saliency_and_fisher(
         "Collecting static end-to-end saliency/fisher caches from a single pre-quantization full-model backward pass. "
         "Using sampled end-to-end NLL / empirical Fisher because literal KL-to-self before quantization would be zero."
     )
+    if static_fisher_activation_offload:
+        logging.info(
+            "Static Fisher activation offload enabled: autograd-saved full-model forward tensors "
+            "are staged on pinned CPU memory and copied back during backward."
+        )
+    if static_fisher_activation_checkpointing:
+        if use_fsdp:
+            raise ValueError(
+                "static_fisher_activation_checkpointing is currently supported "
+                "only by the non-FSDP static precompute path."
+            )
+        logging.info(
+            "Static Fisher activation checkpointing enabled: transformer-block "
+            "internals will be recomputed during backward."
+        )
     if use_rademacher_stats:
         logging.info(
             "Static Fisher/saliency uses Rademacher token signs: k=%d repeated "
@@ -4350,6 +4380,7 @@ def collect_static_end_to_end_saliency_and_fisher(
         h = _zlib.crc32(_module_name.encode()) ^ (_layer_idx * 0x9E3779B1)
         return ((int(getattr(profile_recorder, "_dynsal_seed_base", 0xC0FFEE)) + h) & 0x7FFFFFFF)
     handles = []
+    checkpointed_layer_forwards = []
     stat_repeats = max(1, int(fisher_rademacher_k))
     current_saliency_accum = {"data": None}
     current_backward_role = {"saliency_fisher": True, "refined": True}
@@ -4861,7 +4892,32 @@ def collect_static_end_to_end_saliency_and_fisher(
                             refined_diag_H[layer_idx][a_idx] = None
 
     try:
-        with torch.enable_grad():
+        if static_fisher_activation_checkpointing:
+            from torch.utils.checkpoint import checkpoint
+
+            for _layer in layers:
+                _original_forward = _layer.forward
+
+                def _make_checkpointed_forward(original_forward):
+                    def _checkpointed_forward(*args, **kwargs):
+                        return checkpoint(
+                            original_forward,
+                            *args,
+                            use_reentrant=False,
+                            preserve_rng_state=True,
+                            **kwargs,
+                        )
+                    return _checkpointed_forward
+
+                checkpointed_layer_forwards.append(
+                    (_layer, _layer.__dict__.get("forward"), _original_forward)
+                )
+                _layer.forward = _make_checkpointed_forward(_original_forward)
+        with torch.enable_grad(), (
+            torch.autograd.graph.save_on_cpu(pin_memory=True)
+            if static_fisher_activation_offload
+            else nullcontext()
+        ):
             refined_prev_a = None
             for local_start in tqdm(
                 range(0, len(loop_local_batches), local_batch_size),
@@ -5309,6 +5365,11 @@ def collect_static_end_to_end_saliency_and_fisher(
                     memory_utils.cleanup_memory()
     finally:
         with profile_recorder.section("pipeline.static_fisher.teardown") if profile_recorder else _NULL_CONTEXT:
+            for _layer, _instance_forward, _original_forward in reversed(checkpointed_layer_forwards):
+                if _instance_forward is None:
+                    del _layer.forward
+                else:
+                    _layer.forward = _instance_forward
             for handle in handles:
                 handle.remove()
             _kick_off_handle.remove()
@@ -8038,6 +8099,12 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                                 int(getattr(args, "refresh_seed", 0)) + 1701
                             ),
                             num_samples_for_grad=int(getattr(args, "num_samples_for_grad", 0)),
+                            static_fisher_activation_offload=bool(
+                                getattr(args, "static_fisher_activation_offload", False)
+                            ),
+                            static_fisher_activation_checkpointing=bool(
+                                getattr(args, "static_fisher_activation_checkpointing", False)
+                            ),
                         )
                 if static_cache_file is not None:
                     with pipeline_recorder.section("pipeline.static_cache.save") if pipeline_recorder else _NULL_CONTEXT:
@@ -8096,15 +8163,26 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                 "and GPTQ+ second-order terms will use layerwise KL."
             )
 
-        per_layer_runtime_modules = list(analyzer.get_pre_block_modules())
-        per_layer_runtime_modules.extend(
-            [
-                analyzer.get_layernorm_before_head(),
-                analyzer.get_lm_head(),
-            ]
+        pre_block_runtime_modules = list(analyzer.get_pre_block_modules())
+        final_runtime_modules = [
+            analyzer.get_layernorm_before_head(),
+            analyzer.get_lm_head(),
+        ]
+        per_layer_runtime_modules = pre_block_runtime_modules + final_runtime_modules
+        lazy_runtime_modules = bool(
+            getattr(args, "offload_unused_runtime_modules", False)
+            and global_loss_enabled
+            and args.grad_refresh_loss == "fisher_diag_mse"
         )
+        if getattr(args, "offload_unused_runtime_modules", False) and not lazy_runtime_modules:
+            raise ValueError(
+                "--offload_unused_runtime_modules currently requires "
+                "--global_loss and --grad_refresh_loss fisher_diag_mse."
+            )
         with pipeline_recorder.section("pipeline.move_to_device") if pipeline_recorder else _NULL_CONTEXT:
-            layer_manager.materialize_runtime_modules(per_layer_runtime_modules)
+            layer_manager.materialize_runtime_modules(
+                pre_block_runtime_modules + ([] if lazy_runtime_modules else final_runtime_modules)
+            )
             layers[0] = layer_manager.materialize_layer(0)
 
         dtype = next(iter(model.parameters())).dtype
@@ -8152,6 +8230,14 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
         layers[0] = layers[0].module
 
         layer_manager.release_layer(0, layers[0], update_master=False, orig_device=orig_device)
+        if lazy_runtime_modules:
+            # The embeddings / rotary pre-block modules are needed to capture
+            # calibration inputs only. The output norm/head are only used by
+            # the final block's true-KL gradient path, so leave both groups on
+            # their original device until needed.
+            layer_manager.release_runtime_modules(
+                pre_block_runtime_modules, orig_device
+            )
         memory_utils.cleanup_memory(False)
 
         attention_mask = cache["attention_mask"]
@@ -8309,6 +8395,8 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
         refined_mse_d2h_event = None
         pbar = tqdm(layer_indices, ncols=120, desc="Quantizing Layers", position=0)
         for i in pbar:
+            if lazy_runtime_modules and i == final_layer_idx:
+                layer_manager.materialize_runtime_modules(final_runtime_modules)
             layer = layer_manager.materialize_layer(i)
             full = analyzer.get_quantizable_modules(layer)
             layer_recorder = QuantProfileRecorder(dev, prefix=f"layers.{i}") if quant_profile_enabled else None
@@ -8739,6 +8827,11 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             bits=args.w_bits,
                             sym=not args.w_asym,
                             mse=args.w_clip,
+                            search_impl=getattr(
+                                args,
+                                "pre_clip_search_impl",
+                                "cartesian_legacy",
+                            ),
                         )
 
             if analysis_hook is not None:

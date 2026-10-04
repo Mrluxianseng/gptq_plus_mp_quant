@@ -5,6 +5,10 @@ import torch
 import triton
 import triton.language as tl
 from triton.language.extra.cuda import libdevice
+import os
+
+
+_COMPARE_ONCE_DONE = False
 
 
 @triton.jit
@@ -135,7 +139,22 @@ def fused_gptq_column_(
         h_stride0, h_stride1, h_strideb = H.stride(1), H.stride(2), H.stride(0)
     else:
         raise ValueError("H must have shape [cols, cols] or [rows, cols, cols]")
-    _fused_gptq_column_kernel[(triton.cdiv(rows, 8),)](
+    global _COMPARE_ONCE_DONE
+    compare_once = (
+        os.environ.get("REALQ_TRITON_COMPARE_ONCE") == "1"
+        and not _COMPARE_ONCE_DONE
+    )
+    if compare_once:
+        before = {
+            "W": W.clone(),
+            "GH": GH.clone(),
+            "Q": Q.clone(),
+            "W_int": W_int.clone(),
+            "Err": Err.clone(),
+        }
+
+    block_m = 8
+    _fused_gptq_column_kernel[(triton.cdiv(rows, block_m),)](
         W,
         GH,
         Z,
@@ -159,8 +178,56 @@ def fused_gptq_column_(
         maxq,
         qlo,
         float(second_order_scale),
-        8,
+        block_m,
         triton.next_power_of_2(cols),
         num_warps=4,
         enable_fp_fusion=False,
     )
+
+    if compare_once:
+        # Debug the first real invocation against the reference PyTorch
+        # arithmetic using the exact tensors seen by the fused kernel.
+        row_ids = torch.arange(rows, device=W.device)
+        w_col = before["W"][:, col]
+        scale_col = scale
+        q_int = torch.clamp(torch.round(w_col / scale_col), qlo, maxq)
+        q_col = (scale_col * q_int).to(w_col.dtype)
+        if H.ndim == 2:
+            d = H[col, col].expand(rows)
+            h_row = H[col, col:]
+        else:
+            d = H[row_ids, col, col]
+            h_row = H[row_ids, col, col:]
+        err = (w_col - q_col - before["GH"][:, col]) / d
+        expected_w = before["W"].clone()
+        expected_w[:, col:] -= second_order_scale * (
+            err.unsqueeze(1) * h_row + before["GH"][:, col:]
+        )
+        expected_gh = before["GH"].clone()
+        z_col = Z[:, col]
+        expected_gh[:, col:] -= z_col.unsqueeze(1) * h_row
+        expected = {
+            "W": expected_w,
+            "GH": expected_gh,
+            "Q": q_col,
+            "W_int": q_int,
+            "Err": err,
+        }
+        actual = {
+            "W": W,
+            "GH": GH,
+            "Q": Q[:, col],
+            "W_int": W_int[:, col],
+            "Err": Err[:, col],
+        }
+        for name, ref in expected.items():
+            got = actual[name]
+            delta = (got - ref).abs() if got.is_floating_point() else (got != ref)
+            count = int((delta != 0).sum().item())
+            maximum = float(delta.max().item()) if delta.numel() else 0.0
+            print(
+                f"[triton-compare-once] col={col} tensor={name} "
+                f"mismatches={count}/{delta.numel()} max_abs={maximum}",
+                flush=True,
+            )
+        _COMPARE_ONCE_DONE = True

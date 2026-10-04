@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import sys
 
 import pytest
 
@@ -33,6 +34,20 @@ from utils.saliency_utils import (  # noqa: E402
     grouped_channel_gram,
     grouped_gradient_norm_squared,
 )
+import process_args  # noqa: E402
+
+
+def test_manual_preclip_search_backend_is_explicitly_selectable(monkeypatch):
+    argv = ["ptq.py", "--model", "dummy", "--exp", "test"]
+    monkeypatch.setattr(sys, "argv", argv)
+    assert process_args.parse_gen().pre_clip_search_impl == "cartesian_legacy"
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        argv + ["--pre_clip_search_impl", "symmetric_union_exact"],
+    )
+    assert process_args.parse_gen().pre_clip_search_impl == "symmetric_union_exact"
 
 
 def test_old_and_new_reverse_cosine_match_paper_equation():
