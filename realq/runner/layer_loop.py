@@ -705,6 +705,11 @@ def quantize_one_layer(
                                         a_loss_ratio=cfg.a_loss_ratio,
                                         a_loss_clip_scope=cfg.a_loss_clip_scope,
                                     )
+                        if grad_refresh_fn is not None and os.environ.get("REALQ_ADAM_TRANSITION_DIR"):
+                            from realq.refresh.adam_transition_probe import make_transition_probe
+                            grad_refresh_fn._adam_transition_observer = make_transition_probe(
+                                cfg, analyzer, layer_idx, name,
+                            )
                         initial_weight_fp32 = (
                             block_state.begin_quantization(name)
                             if block_state is not None

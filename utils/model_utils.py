@@ -418,6 +418,31 @@ def load_model_fsdp_meta_for_precompute(args):
     from accelerate.utils import load_checkpoint_in_model
 
     checkpoint_path, checkpoint_is_rotated = _get_fsdp_meta_checkpoint_path(args)
+    # Accelerate's checkpoint loader currently cannot assign CPU-mapped values
+    # into the DTensor Parameter objects created by FSDP2. On a single rank,
+    # avoid that unsupported path by materializing the checkpoint on CPU first,
+    # then wrapping the CPU-resident model with CPUOffloadPolicy. The full-model
+    # CPU copy is bounded to this one-rank fallback; multi-rank meta loading
+    # continues through the sharded checkpoint path below.
+    if (
+        bool(getattr(args, "fsdp_cpu_offload", False))
+        and dist_utils.get_world_size() == 1
+        and not bool(getattr(args, "rotate", False))
+        and not checkpoint_is_rotated
+    ):
+        analyzer = ModelAnalyzer(args.model, args.seq_len)
+        _fsdp_shard_model_for_precompute(
+            analyzer.model,
+            analyzer,
+            fsdp_cpu_offload=True,
+        )
+        analyzer.model._gptqplus_fsdp_meta_init = False
+        logging.info(
+            "fsdp_meta_init: single-rank CPU-offload fallback loaded the model on CPU "
+            "before FSDP2 wrapping (model CPU offload enabled)."
+        )
+        return analyzer
+
     config, process_word_embeddings = _prepare_config_for_untied_lm_head(checkpoint_path)
     with init_empty_weights():
         model = AutoModelForCausalLM.from_config(
@@ -448,6 +473,12 @@ def load_model_fsdp_meta_for_precompute(args):
     load_checkpoint_in_model(
         model,
         checkpoint_path,
+        # FSDP2's CPUOffloadPolicy requires every managed parameter shard,
+        # including parameters managed by the root FSDP group (embedding,
+        # final norm and lm_head), to start on CPU. Without an explicit map,
+        # Accelerate places the root group's direct parameters on the current
+        # CUDA device while the transformer-layer groups remain sharded; the
+        # first root pre-forward then fails FSDP's CPU-offload validation.
         dtype=torch.bfloat16,
         strict=False,
         full_state_dict=True,

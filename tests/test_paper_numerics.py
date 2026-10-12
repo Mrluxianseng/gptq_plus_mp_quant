@@ -409,6 +409,52 @@ def test_legacy_batched_hessian_retry_does_not_accumulate_damping():
     assert fallback.tolist() == [False, False]
 
 
+def test_batched_hessian_normal_path_does_not_allocate_fallback_identity(monkeypatch):
+    solver = object.__new__(GPTQPlus)
+    eye_calls = []
+    original_eye = torch.eye
+
+    def counted_eye(*args, **kwargs):
+        eye_calls.append((args, kwargs))
+        return original_eye(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "eye", counted_eye)
+    hessians = torch.tensor([[[2.0, 0.25], [0.25, 1.5]]])
+    _initial, inverse_chol, _damp, fallback = (
+        solver._compute_hessian_inverse_batched_with_fallback(hessians)
+    )
+    assert not eye_calls
+    assert fallback.tolist() == [False]
+    assert torch.isfinite(inverse_chol).all()
+
+
+def test_batched_hessian_allocates_identity_only_on_fallback(monkeypatch):
+    solver = object.__new__(GPTQPlus)
+    eye_calls = []
+    original_eye = torch.eye
+
+    def counted_eye(*args, **kwargs):
+        eye_calls.append((args, kwargs))
+        return original_eye(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "eye", counted_eye)
+    # A negative-definite Hessian cannot be repaired before the configured
+    # damping retry reaches the identity fallback.
+    hessians = torch.tensor([[[-1.0, 0.0], [0.0, -1.0]]])
+    initial, inverse_chol, _damp, fallback = (
+        solver._compute_hessian_inverse_batched_with_fallback(
+            hessians,
+            percdamp=0.01,
+            damp_auto_increment=1.0,
+            need_hinv_init=False,
+        )
+    )
+    assert len(eye_calls) == 1
+    assert initial is None
+    assert fallback.tolist() == [True]
+    torch.testing.assert_close(inverse_chol, torch.eye(2).unsqueeze(0))
+
+
 def test_refactored_batched_hessian_is_operation_exact_with_legacy():
     torch.manual_seed(17)
     base = torch.randn(4, 8, 8)
@@ -601,3 +647,21 @@ def test_old_new_final_kl_use_same_fp32_value_and_gradient():
     assert old_loss.item() >= 0
     torch.testing.assert_close(old_loss, new_loss, rtol=0, atol=0)
     torch.testing.assert_close(old_grad, new_grad, rtol=0, atol=0)
+
+
+def test_hessian_inverse_can_skip_unused_dense_inverse_storage():
+    solver = object.__new__(GPTQPlus)
+    hessian = torch.tensor(
+        [[4.0, 1.0, 0.25], [1.0, 3.0, 0.5], [0.25, 0.5, 2.0]],
+        dtype=torch.float32,
+    )
+    full_inverse, full_factor, *_ = solver._compute_hessian_inverse_with_fallback(
+        hessian, need_hinv_init=True
+    )
+    omitted_inverse, omitted_factor, *_ = solver._compute_hessian_inverse_with_fallback(
+        hessian, need_hinv_init=False
+    )
+
+    assert full_inverse is not None
+    assert omitted_inverse is None
+    torch.testing.assert_close(omitted_factor, full_factor, rtol=0, atol=0)

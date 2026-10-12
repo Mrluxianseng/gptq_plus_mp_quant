@@ -1245,6 +1245,7 @@ class RealQLayer:
             # H_per_group[g] for its inner block compensation; the column-level
             # quant (find_params + fake_quantize) is still per-row and uniform.
             rpg = self.rows_per_group
+            transition_observer = getattr(grad_refresh_fn, "_adam_transition_observer", None)
             for i1 in range(0, self.columns, blocksize):
                 with nvtx.nvtx_range(f"block_{i1 // blocksize}"):
                     i2 = min(i1 + blocksize, self.columns)
@@ -1337,6 +1338,10 @@ class RealQLayer:
                             W_g = W.view(self.num_groups, rpg, self.columns)
                             W_g[:, :, i2:].sub_(outer_update_g)
 
+                    if transition_observer is not None:
+                        transition_observer.before_block_refresh(
+                            i1 // blocksize, W, Q, perm, i2, Hinv_per_group, self.quantizer,
+                        )
                     if grad_refresh_fn is not None and i2 < self.columns:
                         with nvtx.nvtx_range("block.refresh"):
                             if invperm is None:
@@ -1368,6 +1373,11 @@ class RealQLayer:
                                         else update
                                     )
                                     W[:, i2:].sub_(update_trailing)
+
+                    if (transition_observer is not None
+                            and i1 // blocksize == transition_observer.block
+                            and transition_observer.started):
+                        transition_observer.capture_weight("after_update", W, Q, perm, i2)
 
         if invperm is not None:
             with nvtx.nvtx_range("quant.invperm"):

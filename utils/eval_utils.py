@@ -334,6 +334,113 @@ def get_ref_logits(args, analyzer, dataset, dataloader):
 
 
 @torch.no_grad()
+def _causal_nll_from_logits(student_logits, input_ids, chunk_tokens=0):
+    """Compute causal NLL, optionally limiting the FP32 logit working set.
+
+    `student_logits` is [tokens, vocab].  Chunking preserves the full-sequence
+    LM-head GEMM and only changes the independent per-token CE evaluation.
+    Keep the reference FP32 mean over ordered per-token losses. On Torch 2.11
+    CUDA, the spatial log-softmax kernel changes its vocabulary reduction at
+    64 token rows. Preserve that branch and merge short tails: physical tiles
+    are bounded by max(chunk_tokens, 65) + 64 rows. This is a version-specific
+    numerical compatibility rule, not a guarantee for other backends.
+    """
+    token_count = int(student_logits.shape[0]) - 1
+    if token_count <= 0:
+        raise ValueError("causal NLL requires at least two token logits")
+    chunk_tokens = int(chunk_tokens or 0)
+    if chunk_tokens < 0:
+        raise ValueError("chunk_tokens must be nonnegative")
+    if chunk_tokens == 0:
+        shift_logits = student_logits.float()[None, :-1, :]
+        shift_labels = input_ids[None, 1:].to(student_logits.device)
+        return F.cross_entropy(
+            shift_logits.permute(0, 2, 1),
+            shift_labels,
+            reduction="none",
+        ).float().mean(dim=1)[0]
+
+    labels = input_ids[1:].to(student_logits.device)
+    physical_size = max(chunk_tokens, 65) if token_count > 64 else token_count
+    token_losses = []
+    start = 0
+    while start < token_count:
+        end = min(start + physical_size, token_count)
+        if token_count > 64 and 0 < token_count - end <= 64:
+            end = token_count
+        per_token = F.cross_entropy(
+            student_logits[start:end].float().unsqueeze(0).permute(0, 2, 1),
+            labels[start:end].unsqueeze(0),
+            reduction="none",
+        )
+        token_losses.append(per_token)
+        start = end
+    return torch.cat(token_losses, dim=1).float().mean(dim=1)[0]
+
+
+@torch.no_grad()
+def _chunked_eval_sample_metrics(
+    student_head,
+    teacher_head,
+    student_hidden,
+    teacher_hidden,
+    input_ids,
+    device,
+    chunk_tokens,
+    kl_topk=-1,
+    ce_chunk_tokens=0,
+):
+    """Compute one sequence's full-vocabulary KL/PPL with bounded FP32 rows.
+
+    Run each LM head once on the original full sequence so BF16 GEMM shape and
+    rounding match the reference path. Compute the original full-sequence CE
+    reduction for PPL by default, or optionally bound its FP32 working set by
+    token rows. Keep teacher logits on CPU and stream FP32 KL intermediates.
+    """
+    token_count = int(student_hidden.shape[-2])
+    chunk_tokens = int(chunk_tokens)
+    if chunk_tokens <= 0:
+        raise ValueError("chunk_tokens must be positive")
+    if teacher_hidden.shape[-2] != token_count:
+        raise ValueError("student/teacher hidden sequences must have equal length")
+
+    teacher_logits_cpu = teacher_head(
+        teacher_hidden.to(device)
+    ).cpu()
+    student_logits = student_head(student_hidden.to(device))
+
+    nll = _causal_nll_from_logits(
+        student_logits, input_ids, chunk_tokens=ce_chunk_tokens
+    )
+
+    kl_parts = []
+    for start in range(0, token_count, chunk_tokens):
+        end = min(start + chunk_tokens, token_count)
+        student_chunk = student_logits[start:end].float()
+        teacher_chunk = teacher_logits_cpu[start:end].to(device).float()
+
+        if kl_topk > 0:
+            teacher_support, indices = teacher_chunk.topk(
+                int(kl_topk), dim=-1, sorted=False
+            )
+            student_support = student_chunk.gather(-1, indices)
+        else:
+            teacher_support = teacher_chunk
+            student_support = student_chunk
+        kl_parts.append(
+            tokenwise_kl_from_logits(student_support, teacher_support)
+        )
+
+        del student_chunk, teacher_chunk, student_support, teacher_support
+        if kl_topk > 0:
+            del indices
+
+    kl_mean = torch.cat(kl_parts).mean()
+    del student_logits, teacher_logits_cpu
+    return nll, kl_mean
+
+
+@torch.no_grad()
 def _kl_ppl_eval(args, analyzer: model_utils.ModelAnalyzer, orig_lm_head, dataloader, ref_logits_list):
     model = analyzer.model
     orig_device = next(model.parameters()).device
@@ -348,10 +455,28 @@ def _kl_ppl_eval(args, analyzer: model_utils.ModelAnalyzer, orig_lm_head, datalo
     nlls = []
     for logits, ref_logits, input_ids in tqdm(zip(logits_list, ref_logits_list, input_ids_list), ncols=80,
                                               total=len(ref_logits_list), desc="Computing PPL & KL"):
+        eval_chunk_tokens = int(getattr(args, "eval_logit_chunk_tokens", 0) or 0)
+        if eval_chunk_tokens > 0:
+            sample_nll, sample_kl = _chunked_eval_sample_metrics(
+                model.lm_head,
+                orig_lm_head,
+                logits,
+                ref_logits,
+                input_ids,
+                dev,
+                eval_chunk_tokens,
+                kl_topk=int(getattr(args, "kl_topk", -1)),
+                ce_chunk_tokens=int(getattr(args, "eval_ce_chunk_tokens", 0) or 0),
+            )
+            nlls.append(sample_nll.reshape(1))
+            kl_loss += sample_kl
+            continue
+
         # The paper evaluates full-vocabulary distribution shift.  Cast the
         # LM-head outputs before CE/softmax/KL so bf16 rounding does not erase
         # small quantisation differences or create a negative reported KL.
-        logits = model.lm_head(logits.to(dev)).float()
+        logits = model.lm_head(logits.to(dev))
+        logits = logits.float()
         ref_logits = orig_lm_head(ref_logits.to(dev)).float()
 
         # NLL loss

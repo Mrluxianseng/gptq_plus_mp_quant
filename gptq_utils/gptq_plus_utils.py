@@ -2,6 +2,7 @@ import copy
 import json
 import logging
 import os
+import time
 import sys
 import math
 import pprint
@@ -26,13 +27,24 @@ from utils.saliency_utils import (
     grouped_channel_gram,
     grouped_gradient_norm_squared,
 )
-from utils.loss_utils import tokenwise_kl_from_logits
+from utils.loss_utils import (
+    chunked_tokenwise_kl_from_logits,
+    recomputed_linear_head_tokenwise_kl,
+    tokenwise_kl_from_logits,
+)
 from realq.alignment import (
     RefreshTraceWriter,
     default_refresh_trace_config,
     refresh_step_from_metrics,
 )
 from gptq_utils.diagnostics import DiagnosticRegistry, parse_diagnose_targets
+from gptq_utils.fisher_storage import (
+    lower_triangle_indices,
+    pack_symmetric_lower,
+    unpack_symmetric_lower,
+)
+from gptq_utils.sequence_fisher import SequenceFisherCache
+from utils.saved_tensor_offload import SavedTensorCpuCache
 from gptq_utils.quant_aware_utils import (
     configure_activation_quantizers_for_gptq,
     configure_k_cache_quantizers_for_gptq,
@@ -485,11 +497,19 @@ def clip_tensor_to_quant_bounds(weight, clip_min, clip_max):
     return torch.minimum(torch.maximum(weight, clip_min), clip_max)
 
 
-def clip_module_weight_to_quant_bounds_(module, bits, sym, mse):
+def clip_module_weight_to_quant_bounds_(
+    module, bits, sym, mse, *, w_clip_search_impl="cartesian_legacy"
+):
     if bits >= 16 or not mse:
         return
     quantizer = quant_utils.WeightQuantizer()
-    quantizer.configure(bits, perchannel=True, sym=sym, mse=mse)
+    quantizer.configure(
+        bits,
+        perchannel=True,
+        sym=sym,
+        mse=mse,
+        w_clip_search_impl=w_clip_search_impl,
+    )
     weight = module.weight.data.float()
     quantizer.find_params(weight)
     clip_min, clip_max = compute_quant_clip_bounds(
@@ -551,6 +571,29 @@ class QuantProfileRecorder:
             rows.append((name, elapsed_ms, len(events)))
         rows.sort(key=lambda r: -r[1])
         total = sum(r[1] for r in rows) or 1.0
+        json_path = os.environ.get("GPTQ_PLUS_WALL_PROFILE_JSON")
+        if json_path:
+            payload = {
+                "schema_version": 1,
+                "total_ms": total,
+                "sections": [
+                    {
+                        "name": name,
+                        "calls": int(n),
+                        "total_ms": float(ms),
+                        "percent": 100.0 * ms / total,
+                        "mean_ms": float(ms) / max(n, 1),
+                    }
+                    for name, ms, n in rows
+                ],
+            }
+            parent = os.path.dirname(os.path.abspath(json_path))
+            os.makedirs(parent, exist_ok=True)
+            temp_path = json_path + ".tmp"
+            with open(temp_path, "w", encoding="utf-8") as stream:
+                json.dump(payload, stream, indent=2)
+                stream.write("\n")
+            os.replace(temp_path, json_path)
         lines = ["", "=" * 80, f"Wall-clock section summary (top {top_k} by total ms)", "=" * 80]
         header = f"{'section':<70} {'calls':>6} {'total_ms':>12} {'pct':>6} {'mean_ms':>10}"
         lines.append(header)
@@ -651,7 +694,7 @@ def _dbg_warm_prior_vs_gradient(prior_slice, grad_slice, t0, beta2, path):
 
 
 
-def _flip_probe_row(blk, w_q, q_int, disp, scale, q_lo, maxq):
+def _flip_probe_row(blk, w_q, q_int, disp, scale, q_lo, maxq, w0=None):
     """Did the optimiser's accumulated push change this column's grid point?
 
     The optimiser moves the weight in continuous space, but what survives into
@@ -671,11 +714,28 @@ def _flip_probe_row(blk, w_q, q_int, disp, scale, q_lo, maxq):
     place it is wasted is the last block, which has nothing after it -- so the
     per-block breakdown is the interesting part, not the average.
     """
+    # The closed form and the optimiser both write additively into the same
+    # weight, so w_q - w0 - disp is exactly what the closed form contributed.
+    # Nothing had measured that: the reach probe only tracked the optimiser's
+    # share and the closed form's was inferred from R.
+    cf_mag = nn_mag = None
+    if w0 is not None:
+        d = scale.abs().clamp_min(torch.finfo(torch.float32).tiny)
+        cf_mag = ((w_q - w0 - disp).abs() / d).flatten().float()
+        # How many grid steps the final value sits from the full-precision
+        # one. 0.5 is the most pure rounding can give; past that the weight
+        # was carried beyond its own nearest level to absorb another
+        # column's error, so it is no longer one of the two neighbours.
+        nn_mag = ((w0 - scale * q_int).abs() / d).flatten().float()
     cf = torch.clamp(torch.round((w_q - disp) / scale), q_lo, maxq)
     flipped = (cf != q_int)
     n = flipped.numel()
     push = (disp.abs() / scale.abs().clamp_min(torch.finfo(torch.float32).tiny))
-    return {
+    def _pct(t, q):
+        m = t.numel()
+        return float(t.kthvalue(max(1, min(m, int(q * m))))[0].item())
+
+    out = {
         "blk": blk,
         "flip_rate": float(flipped.float().mean().item()),
         "med_push_grid": float(push.median().item()),
@@ -683,6 +743,15 @@ def _flip_probe_row(blk, w_q, q_int, disp, scale, q_lo, maxq):
             max(1, int(0.9 * n)))[0].item()),
         "n": n,
     }
+    if cf_mag is not None:
+        out["cf_grid"] = _pct(cf_mag, 0.5)
+        out["cf_p90"] = _pct(cf_mag, 0.9)
+        out["dev_p50"] = _pct(nn_mag, 0.5)
+        out["dev_p90"] = _pct(nn_mag, 0.9)
+        out["dev_p99"] = _pct(nn_mag, 0.99)
+        out["beyond_half"] = float((nn_mag > 0.5).float().mean().item())
+        out["beyond_1p5"] = float((nn_mag > 1.5).float().mean().item())
+    return out
 
 
 def _flip_probe_emit(layer_idx, name, rows):
@@ -698,6 +767,823 @@ def _flip_probe_emit(layer_idx, name, rows):
         " ".join("b%d:%.4f" % (r["blk"], r["med_push_grid"]) for r in rows),
         " ".join("b%d:%.4f" % (r["blk"], r["p90_push_grid"]) for r in rows),
     )
+    if rows and "cf_grid" in rows[0]:
+        logging.info(
+            "cf_probe layer=%s module=%s\n"
+            "  |closed-form|/grid med %s\n"
+            "  |closed-form|/grid p90 %s\n"
+            "  |W_fp-Q|/grid  p50     %s\n"
+            "  |W_fp-Q|/grid  p90     %s\n"
+            "  |W_fp-Q|/grid  p99     %s\n"
+            "  frac > 0.5 grid        %s\n"
+            "  frac > 1.5 grid        %s",
+            layer_idx, name,
+            " ".join("b%d:%.4f" % (r["blk"], r["cf_grid"]) for r in rows),
+            " ".join("b%d:%.4f" % (r["blk"], r["cf_p90"]) for r in rows),
+            " ".join("b%d:%.4f" % (r["blk"], r["dev_p50"]) for r in rows),
+            " ".join("b%d:%.4f" % (r["blk"], r["dev_p90"]) for r in rows),
+            " ".join("b%d:%.4f" % (r["blk"], r["dev_p99"]) for r in rows),
+            " ".join("b%d:%.4f" % (r["blk"], r["beyond_half"]) for r in rows),
+            " ".join("b%d:%.4f" % (r["blk"], r["beyond_1p5"]) for r in rows),
+        )
+
+
+def _multistep_enabled(layer_idx, refresh_idx, n_refresh_total):
+    """Gate for the multi-step probe: one layer, each module's LAST refresh."""
+    if os.environ.get("MULTISTEP_PROBE") != "1":
+        return False
+    if refresh_idx != n_refresh_total - 1:
+        return False
+    want = os.environ.get("MULTISTEP_LAYER", "13")
+    return str(layer_idx) in {t.strip() for t in want.split(",") if t.strip()}
+
+
+def _multistep_probe(
+    layer_idx, layer_name, refresh_idx, gradient_refresh_fn, natural_order,
+    current_sub_weight, opt_state, i2, perm, actorder, G, R, C, dev,
+    grad_lr, grad_clip, adam_beta1, compute_update,
+    horizon_p, column_budget_q, horizon_exact,
+):
+    """Does one Adam step per block boundary actually minimise the refresh loss?
+
+    The paper takes exactly one step at each boundary, which leaves a column at
+    most 7-23 updates over its whole life. Whether that is a budget or a
+    converged optimum has only ever been argued from path/disp, which is
+    suggestive and not decisive. This walks the SAME refresh objective for K
+    extra steps and records the loss after each one, so the question is read
+    off a curve instead of inferred.
+
+    Two curves, not one. `train` is the minibatch the real step is about to
+    use; K steps on an 8-sample estimate will drive that down whether or not
+    the true objective is still falling, so it cannot answer the question
+    alone. `eval` is the next batch in the stream, drawn the same way and never
+    stepped on. If eval keeps falling, the budget binds. If eval bottoms out
+    early and turns up, one step was already past the useful point and the
+    limit is the minibatch, not the step count.
+
+    Nothing here is applied: the walk runs on clones of the weight and the
+    optimiser state, and every refresh is drawn inside
+    `BackwardSampleScheduler.frozen()` so the sample stream is not consumed --
+    see the docstring there for what consuming it silently costs.
+    """
+    if horizon_p or horizon_exact or (column_budget_q is not None and column_budget_q != 1.0):
+        raise RuntimeError(
+            "MULTISTEP_PROBE runs without a step_scale, so it is only "
+            "meaningful at horizon_p=0 / column_budget_q=1 / no horizon_exact. "
+            "Got horizon_p=%r column_budget_q=%r horizon_exact=%r."
+            % (horizon_p, column_budget_q, horizon_exact)
+        )
+    K = int(os.environ.get("MULTISTEP_K", "56"))
+    W = current_sub_weight.clone()
+    opt = {"type": opt_state["type"], "step": int(opt_state["step"])}
+    for k in ("exp_avg", "exp_avg_sq"):
+        if k in opt_state:
+            opt[k] = opt_state[k].clone()
+    if "v_offset" in opt_state:
+        opt["v_offset"] = opt_state["v_offset"]
+
+    def _probe(w, off):
+        g, meta = gradient_refresh_fn(
+            natural_order(w), slide_alpha=1.0, frozen=True, batch_offset=off
+        )
+        return g, float(meta.get("mean_refresh_loss", float("nan")))
+
+    tr, ev, disp = [], [], []
+    for k in range(K + 1):
+        g, l_tr = _probe(W, 0)
+        _, l_ev = _probe(W, 1)
+        tr.append(l_tr)
+        ev.append(l_ev)
+        disp.append(float((W - current_sub_weight)[:, :, i2:].abs().median().item()))
+        if k == K:
+            break
+        g = g.to(dev).float().reshape(G, R, C)
+        if actorder:
+            g = g[:, :, perm]
+        W[:, :, i2:] -= compute_update(
+            opt, g, i2, grad_lr, grad_clip=grad_clip, adam_beta1=adam_beta1,
+        )
+
+    def _fmt(v):
+        return " ".join("s%d:%.6g" % (i, x) for i, x in enumerate(v))
+
+    logging.info(
+        "multistep_probe layer=%s module=%s refresh=%d K=%d lr=%.3e" + chr(10) +
+        "  train_loss %s" + chr(10) +
+        "  eval_loss  %s" + chr(10) +
+        "  |disp|/med %s",
+        layer_idx, layer_name, refresh_idx, K, grad_lr,
+        _fmt(tr), _fmt(ev), _fmt(disp),
+    )
+
+
+@torch.no_grad()
+def _group_energy_probe(layer_idx, fisher, weight, groups=(1, 2, 4, 8),
+                        n_cols=32, sweeps=3):
+    """Can the output metric be split into row blocks, to keep row parallelism?
+
+    The quantiser splits rows into num_groups contiguous blocks and, under
+    --group_parallel_quant rank, gives each block to a different rank. A full
+    output metric M couples ALL rows, so two-sided feedback over the whole
+    matrix breaks that partition. Restricting M to its diagonal blocks keeps
+    the partition -- this measures what that costs, at three levels.
+
+    STRUCTURE. Share of OFF-DIAGONAL energy landing inside the blocks,
+
+        rho = sum_g ||M_gg - diag(M_gg)||_F^2  /  ||M - diag(M)||_F^2 .
+
+    The diagonal is excluded deliberately: it always falls inside a block, and
+    it is exactly what GPTQ and GuidedQuant already use (GuidedQuant folds it
+    into H as a per-token weight), so counting it would credit the block
+    approximation with information that is not new. Chance level is 1/G.
+
+    Four row orderings: `contiguous` is what the code does today (a plain
+    reshape); `random` is an explicit chance control; `by |diag|` groups rows
+    of similar importance, the GuidedQuant-style criterion; `spectral` sorts by
+    the leading eigenvector of |M_off| to put strongly-coupled rows together,
+    and is the ordering that would justify reordering rows as a design change.
+
+    LOSS. Frobenius energy is a property of the matrix, not of the loss. For
+    random error vectors e drawn as nearest rounding leaves them, the relative
+    misstatement |e'(M - M_block)e| / |e'Me| says how wrong the block metric is
+    about an actual column's cost.
+
+    DECISION. What the algorithm would really do: run the rounding search under
+    the BLOCK metric, then score the result under the TRUE M, and compare
+    against searching under the true M. This is the number that decides whether
+    block-diagonalising is acceptable, because a metric can be structurally
+    incomplete yet still lead the search to the right place.
+    """
+    M = fisher.float()
+    R = M.shape[0]
+    dev = M.device
+    d = torch.diagonal(M)
+    off = M - torch.diag(d)
+    tot = float((off * off).sum().item())
+    if tot <= 0:
+        logging.info("group_energy layer=%s SKIPPED: zero off-diagonal", layer_idx)
+        return
+
+    A = off.abs()
+    v = torch.ones(R, device=dev, dtype=A.dtype) / (R ** 0.5)
+    for _ in range(50):
+        v = A @ v
+        n = torch.linalg.vector_norm(v)
+        if n <= 0:
+            break
+        v = v / n
+    gen = torch.Generator(device="cpu").manual_seed(7 + int(layer_idx))
+    ORD = {
+        "contiguous": torch.arange(R, device=dev),
+        "random": torch.randperm(R, generator=gen).to(dev),
+        "by |diag|": torch.argsort(d, descending=True),
+        "spectral": torch.argsort(v),
+    }
+
+    def block_mask(G):
+        rpg = R // G
+        idx = torch.arange(R, device=dev) // rpg
+        return idx[:, None] == idx[None, :]
+
+    def rho(perm, G):
+        if G <= 1:
+            return 100.0
+        o = off.index_select(0, perm).index_select(1, perm)
+        keep = o * block_mask(G)
+        return 100.0 * float((keep * keep).sum().item()) / tot
+
+    lines = ["group_energy layer=%s R=%d  rho_off = off-diagonal energy kept "
+             "by block-diagonal M (%%)" % (layer_idx, R),
+             "  ordering      " + "".join("G=%-7d" % g for g in groups)]
+    for name, perm in ORD.items():
+        lines.append("  %-13s" % name + "".join("%-9.1f" % rho(perm, g) for g in groups))
+    lines.append("  chance        " + "".join("%-9.1f" % (100.0 / g) for g in groups))
+
+    if weight is not None and weight.shape[0] == R:
+        maxq = 7
+        delta = (weight.float().abs().amax(dim=1) / maxq).to(dev).clamp_min(1e-12)
+        E = ((torch.rand((R, n_cols), generator=gen) - 0.5) * delta.cpu()[:, None]).to(dev)
+
+        def quad(Mx, X):
+            return (X * (Mx @ X)).sum(0)
+
+        L_true = quad(M, E)
+        for G in (g for g in groups if g > 1):
+            Mb = M * block_mask(G)
+            rel = ((quad(Mb, E) - L_true).abs() / L_true.abs().clamp_min(1e-30))
+            q = torch.quantile(rel, torch.tensor([0.5, 0.9], device=dev))
+            lines.append("  loss misstatement G=%d (contiguous): med %.1f%%  p90 %.1f%%"
+                         % (G, 100 * q[0].item(), 100 * q[1].item()))
+
+        def descend(metric):
+            X = E.clone()
+            MX = metric @ X
+            dg = torch.diagonal(metric)
+            for _ in range(sweeps):
+                for r in range(R):
+                    best = None
+                    for sgn in (-1.0, 1.0):
+                        dd = sgn * delta[r]
+                        dL = dg[r] * dd * dd + 2 * dd * MX[r]
+                        if best is None:
+                            best = (dL, torch.full_like(dL, dd))
+                        else:
+                            t = dL < best[0]
+                            best = (torch.where(t, dL, best[0]),
+                                    torch.where(t, torch.full_like(dL, dd), best[1]))
+                    mv = torch.where(best[0] < 0, best[1], torch.zeros_like(best[1]))
+                    if not bool((mv != 0).any()):
+                        continue
+                    X[r] += mv
+                    MX += metric[:, r:r + 1] * mv[None, :]
+            return X
+
+        def gain(X):
+            return 100.0 * float((1.0 - quad(M, X) / L_true.clamp_min(1e-30)).median().item())
+
+        g_full = gain(descend(M))
+        lines.append("  TRUE-M gain, search under full M      %+.2f%%" % g_full)
+        for G in (g for g in groups if g > 1):
+            g_blk = gain(descend(M * block_mask(G)))
+            lines.append("  TRUE-M gain, search under block G=%d   %+.2f%%  (%.0f%% of full)"
+                         % (G, g_blk, 100.0 * g_blk / g_full if g_full else float("nan")))
+
+    logging.info(chr(10).join(lines))
+
+
+@torch.no_grad()
+def _cvp_headroom_probe(layer_idx, fisher, weight, bits=4, n_cols=64, sweeps=4):
+    """How much of the rounding loss is reachable by using F's off-diagonal?
+
+    After a column is quantised, GPTQ's compensation of the remaining columns is
+    optimal for ANY positive-definite output metric M -- M cancels out of the
+    stationarity condition, leaving delta_rest = -H_rr^-1 H_rj e exactly as in
+    the diagonal case. What M does change is the residual it leaves behind,
+
+        L_j = (e^T M e) / [H^-1]_jj ,    e = w_j - q_j ,
+
+    so the off-diagonal of M can only ever enter through the CHOICE of grid
+    point. With M diagonal that choice is separable and per-row nearest
+    rounding is optimal; with M full the rows couple and nearest rounding is
+    not. This measures how much that coupling is worth before anything is
+    built, because a 1% answer and a 20% answer call for different work.
+
+    Nearest rounding leaves e_r spread over [-delta_r/2, delta_r/2] almost
+    independently of the weight, so the headroom is a property of M and the
+    per-row scales rather than of the specific columns -- which is why this can
+    be answered without reproducing the quantisation loop.
+
+    Reports three numbers per layer:
+      offdiag_share  how much of e^T M e the off-diagonal carries at all. If
+                     this is ~0 the rest is moot.
+      cd_gain        reduction from coordinate descent over single-level moves.
+      diag_gain      the same search driven by the DIAGONAL of M only, i.e.
+                     what a method with no cross-channel information could get.
+                     The difference cd_gain - diag_gain is what is actually new
+                     here; without this control a gain could just be "moving a
+                     weight one level sometimes helps", which needs no F.
+    """
+    F = fisher.float()
+    R = F.shape[0]
+    if weight.shape[0] != R:
+        logging.info(
+            "cvp_probe layer=%s SKIPPED: weight rows %d != fisher dim %d",
+            layer_idx, weight.shape[0], R,
+        )
+        return
+    dev = F.device
+    maxq = 2 ** (bits - 1) - 1
+    delta = (weight.float().abs().amax(dim=1) / maxq).to(dev).clamp_min(1e-12)
+
+    gen = torch.Generator(device="cpu").manual_seed(1234 + int(layer_idx))
+    E0 = ((torch.rand((R, n_cols), generator=gen) - 0.5) * delta.cpu()[:, None])
+    E0 = E0.to(dev)
+
+    def quad(E):
+        return (E * (F @ E)).sum(0)
+
+    d2 = torch.diagonal(F)
+    L_full = quad(E0)
+    L_diag = (d2[:, None] * E0 * E0).sum(0)
+    offdiag_share = ((L_full - L_diag).abs() / L_full.abs().clamp_min(1e-30)).median()
+
+    def descend(metric_diag_only, budget=None):
+        E = E0.clone()
+        moved = torch.zeros_like(E, dtype=torch.bool)
+        FE = (d2[:, None] * E) if metric_diag_only else (F @ E)
+        for _ in range(sweeps):
+            for r in range(R):
+                best = None
+                for sgn in (-1.0, 1.0):
+                    d = sgn * delta[r]
+                    dL = d2[r] * d * d + 2 * d * FE[r]
+                    if best is None:
+                        best = (dL, torch.full_like(dL, d))
+                    else:
+                        take = dL < best[0]
+                        best = (torch.where(take, dL, best[0]),
+                                torch.where(take, torch.full_like(dL, d), best[1]))
+                ok = best[0] < 0
+                if budget is not None:
+                    ok = ok & (moved.sum(0) < max(1, int(budget * R)))
+                mv = torch.where(ok, best[1], torch.zeros_like(best[1]))
+                if not bool((mv != 0).any()):
+                    continue
+                E[r] += mv
+                moved[r] |= mv != 0
+                if metric_diag_only:
+                    FE[r] += d2[r] * mv
+                else:
+                    FE += F[:, r:r + 1] * mv[None, :]
+        return quad(E), moved.float().mean().item()
+
+    L_cd, flips_cd = descend(False)
+    L_dg, _ = descend(True)
+    # A cheap surrogate can be driven down by brute force: if this needs
+    # half the rows moved a full level away from their own value, it is
+    # overfitting a proxy whose cosine against the true KL gradient is only
+    # 0.2-0.6, and the real loss would likely get worse. A budgeted variant
+    # says how much of the gain survives when only the most profitable few
+    # percent of rows may move.
+    L_b02, _ = descend(False, budget=0.02)
+    L_b05, _ = descend(False, budget=0.05)
+
+    def gain(after):
+        return float((1.0 - (after / L_full.clamp_min(1e-30))).median().item()) * 100.0
+
+    logging.info(
+        "cvp_probe layer=%s R=%d cols=%d sweeps=%d" + chr(10) +
+        "  offdiag share of e^T M e   %+.4f" + chr(10) +
+        "  coordinate descent on M    %+.3f%%" + chr(10) +
+        "  same search, diag(M) only  %+.3f%%" + chr(10) +
+        "  NET from off-diagonal      %+.3f%%" + chr(10) +
+        "  rows moved a full level    %.1f%%" + chr(10) +
+        "  gain if <=2%% may move      %+.3f%%" + chr(10) +
+        "  gain if <=5%% may move      %+.3f%%",
+        layer_idx, R, n_cols, sweeps,
+        float(offdiag_share.item()), gain(L_cd), gain(L_dg),
+        gain(L_cd) - gain(L_dg), 100.0 * flips_cd,
+        gain(L_b02), gain(L_b05),
+    )
+
+
+_FISHER_DRIFT = {"hist": [], "at": []}
+
+
+@torch.no_grad()
+def _fisher_drift_report(stage, fisher_now):
+    """How much of the cached output Fisher survives as quantisation proceeds?
+
+    The pipeline measures F once, on the full-precision model, and uses it for
+    every layer thereafter. The paper builds its case on that gap -- it names
+    ``Delta H = H_ideal - H``, proves a Theta(n) compounding penalty from it,
+    and gives the cost of recomputing as the reason for living with it -- but
+    never reports how big Delta H actually is.
+
+    This is the measurement, not a method: recomputing F on the fly costs about
+    22 s locally and, extrapolated to the paper's calibration set, more than a
+    whole quantisation run, so periodic refresh is not on the table. What IS on
+    the table is knowing whether the historical F still describes the current
+    one, because that decides whether reusing or averaging past observations can
+    help at all.
+
+    Three quantities per layer:
+      cos(F_0, F_now)     does the original observation still point the same way
+      ||F_now||/||F_0||   is only the scale drifting, or the structure
+      cos(mean, F_now)    does AVERAGING the history beat the single earliest
+                          observation. If it does not, accumulating observations
+                          buys nothing and "deeper layers have seen more" is a
+                          count, not an advantage.
+    """
+    cur = [f.detach().float().cpu() if torch.is_tensor(f) else None
+           for f in fisher_now]
+    _FISHER_DRIFT["hist"].append(cur)
+    _FISHER_DRIFT["at"].append(stage)
+    hist = _FISHER_DRIFT["hist"]
+    if len(hist) < 2:
+        logging.info("fisher_drift stage=%s baseline stored (%d layers)",
+                     stage, sum(1 for f in cur if f is not None))
+        return
+
+    base = hist[0]
+    lines = ["fisher_drift stage=%s vs baseline stage=%s" % (stage, _FISHER_DRIFT["at"][0]),
+             "  layer  cos(F0,Fnow)  |Fnow|/|F0|  cos(mean,Fnow)  mean_better"]
+    for j, fn in enumerate(cur):
+        f0 = base[j]
+        if fn is None or f0 is None:
+            continue
+        a, b = f0.flatten(), fn.flatten()
+        na, nb = a.norm(), b.norm()
+        if na <= 0 or nb <= 0:
+            continue
+        c0 = float((a @ b / (na * nb)).item())
+        prev = [h[j] for h in hist[:-1] if h[j] is not None]
+        m = torch.stack([p.flatten() for p in prev]).mean(0)
+        nm = m.norm()
+        cm = float((m @ b / (nm * nb)).item()) if nm > 0 else float("nan")
+        lines.append("  %-6d %-13.4f %-12.4f %-15.4f %s"
+                     % (j, c0, float((nb / na).item()), cm,
+                        "yes" if cm > c0 + 1e-6 else "no"))
+    logging.info(chr(10).join(lines))
+
+
+_GXFER = {"layers": {t.strip() for t in
+                     (os.environ.get("GXFER_LAYERS") or "").split(",")
+                     if t.strip()}}
+
+
+@torch.no_grad()
+def _gxfer_report(layer_idx, name, obs, noise):
+    """Does a module's gradient, observed early, predict the one it gets later?
+
+    The modules of a layer are quantised one after another, and each starts its
+    Adam state from zero with only 7-23 steps to fill it. One shared backward
+    already produces every module's OWN gradient, so a module could collect
+    observations of its own gradient while earlier modules are being quantised,
+    and arrive with a warm first and second moment. Note what this is not: no
+    weight is moved early, and nothing belonging to one module is handed to
+    another. Each module accumulates only its own gradient -- which is why it is
+    well typed, unlike transferring m and v.
+
+    Whether it is worth anything is a different question, because the model
+    changes underneath: the gradient seen while q_proj was being quantised is
+    taken at a different state than the one k_proj will see at its own turn.
+    So:
+
+      cos(earliest, current)   does the oldest observation still point the way
+      cos(latest, current)     does the most recent one do better, i.e. is the
+                               drift monotone in time
+      cos(mean, current)       does AVERAGING the history beat the single best
+                               single observation -- if not, accumulating is a
+                               count and not an advantage, and Adam's moments
+                               would be warmed with stale directions
+
+    `obs` is the list of this module's gradients seen so far, oldest first, the
+    last entry being the current one.
+    """
+    if len(obs) < 2:
+        return
+    cur = obs[-1].flatten()
+    nc = cur.norm()
+    if nc <= 0:
+        return
+
+    def cos(v):
+        n = v.norm()
+        return float((v @ cur / (n * nc)).item()) if n > 0 else float("nan")
+
+    first = obs[0].flatten()
+    last = obs[-2].flatten()
+    mean = torch.stack([o.flatten() for o in obs[:-1]]).mean(0)
+    c_first, c_last, c_mean = cos(first), cos(last), cos(mean)
+    logging.info(
+        "gxfer layer=%s module=%s n_obs=%d | cos: first=%+.4f latest=%+.4f "
+        "mean=%+.4f | batch-only floor=%+.4f | mean_beats_latest=%s "
+        "| |cur|/|first|=%.3f",
+        layer_idx, name, len(obs) - 1, c_first, c_last, c_mean,
+        (sum(noise) / len(noise)) if noise else float("nan"),
+        "yes" if c_mean > c_last + 1e-6 else "no",
+        float((nc / first.norm()).item()) if first.norm() > 0 else float("nan"),
+    )
+
+
+def _ts_fisher_for(layer_idx, module_name, static_fisher_by_layer, args):
+    """The output metric for two-sided rounding, or None to keep the old path.
+
+    Only modules named by --two_sided_modules get one, so every other module is
+    untouched and a run stays a controlled comparison. The Fisher this pipeline
+    stores is taken at the TRANSFORMER BLOCK output; a module's own output
+    metric is J^T F J with J the Jacobian from there to the block output. For
+    the block's last module that Jacobian is the identity and F can be used
+    as-is, which is why the default names only mlp.down_proj. Any other module
+    would need its own J, so the shape check in the quantiser will refuse it
+    rather than quietly use a metric for the wrong tensor.
+    """
+    if not int(getattr(args, "two_sided_rounding", 0) or 0):
+        return None
+    want = [t.strip() for t in str(getattr(args, "two_sided_modules", "") or "").split(",")]
+    if not any(t and t in module_name for t in want):
+        return None
+    try:
+        f = static_fisher_by_layer[layer_idx]
+    except (TypeError, IndexError, KeyError):
+        f = None
+    if not torch.is_tensor(f) or f.dim() != 2:
+        raise RuntimeError(
+            "--two_sided_rounding needs the layer-output Fisher, which is only "
+            "collected under --global_loss; layer %s has %s."
+            % (layer_idx, type(f).__name__)
+        )
+    return f
+
+
+@torch.no_grad()
+def _two_sided_block_push(W1, U, A, scale, q_lo, maxq):
+    """Row feedback added to one column block, leaving everything else in place.
+
+    The whole-matrix sweep replaces the column-block loop outright and takes the
+    gradient refresh with it, so it cannot say whether the two help together.
+    This keeps the loop: the block is rounded with feedback on BOTH axes, the
+    block's error still propagates to later columns the old way, and the refresh
+    still runs at the boundary. It is also closer to the reference
+    implementation, which works on 16x16 tiles rather than whole matrices.
+
+    Conventions are chosen so that M = I reduces this to the existing loop
+    exactly, which is the property the self-check verifies:
+
+        U = chol(H^-1, upper)  -- already what the pipeline calls Hinv1
+        A = chol(M^-1, upper)  -- the same construction on the row axis
+
+    An entry's error is pushed to later rows AND later columns as one outer
+    product of the two normalised factor rows. Both factors are upper
+    triangular, so the restriction to "later" needs no masking, and at M = I the
+    factor A is the identity: its row is one-hot, the row push vanishes, and
+    what remains is the column push GPTQ already does. The (r, i) entry itself
+    receives its own residual, which turns it into q and is never read again --
+    the same thing the existing loop does by slicing from i rather than i+1.
+
+    Entries sharing an anti-diagonal r + i lie outside each other's push region
+    (one has the larger row, the other the larger column), so a whole
+    anti-diagonal goes at once and the depth is R + count instead of R * count.
+
+    Returns Q, q_int and Err, where Err[:, i] = (propagated w - q) / U[i, i] --
+    the same quantity the existing loop hands to the cross-block propagation,
+    which is correct for any positive-definite M because the compensation of
+    the remaining columns does not depend on the metric.
+    """
+    R, count = W1.shape
+    Wc = W1.clone()
+    Q = torch.zeros_like(Wc)
+    Qi = torch.zeros_like(Wc)
+    Err = torch.zeros_like(Wc)
+    ud = torch.diagonal(U)
+    ad = torch.diagonal(A)
+    Un = U / ud[:, None]          # row i normalised by U[i, i]
+    An = A / ad[:, None]          # row r normalised by A[r, r]
+    for d in range(R + count - 1):
+        r0, r1 = max(0, d - count + 1), min(R - 1, d)
+        rs = torch.arange(r0, r1 + 1, device=Wc.device)
+        cs = d - rs
+        w = Wc[rs, cs]
+        sc = scale[rs, cs]
+        qi = torch.clamp(torch.round(w / sc), q_lo, maxq)
+        q = qi * sc
+        Q[rs, cs] = q
+        Qi[rs, cs] = qi
+        e = w - q
+        Err[rs, cs] = e / ud[cs]
+        Wc -= An.index_select(0, rs).t() @ (e[:, None] * Un.index_select(0, cs))
+    return Q, Qi, Err
+
+
+@torch.no_grad()
+def _ts_blockcheck(W, M, H, scale, q_lo, maxq, percdamp, blocksize=128):
+    """Is there anything left for two-sided rounding to win inside ONE block?
+
+    The whole-matrix sweep replaces the column-block loop outright, which also
+    removes the gradient refresh that lives in it -- so it cannot answer whether
+    the two mechanisms help together. Keeping the loop means running the sweep
+    inside each block of `blocksize` columns instead, which is also closer to
+    the reference implementation (YAQA works on 16x16 tiles, not whole
+    matrices).
+
+    But the headroom measured on the whole matrix need not survive the
+    restriction: the row coupling is untouched, while the column axis is cut
+    from thousands of columns to `blocksize`. If almost all of the gain came
+    from long-range column feedback interacting with the row metric, a
+    block-local sweep has little left to win and is not worth building.
+
+    Reports, per block, the objective reached by the ordinary column sweep and
+    by the two-sided sweep, both restricted to that block's columns.
+    """
+    n = W.shape[1]
+    Wd, Hd, Md, sd = W.double(), H.double(), M.double(), scale.double()
+    rows, tot_g, tot_t = [], 0.0, 0.0
+    for i1 in range(0, n, blocksize):
+        i2 = min(i1 + blocksize, n)
+        Wb, Hb, sb = Wd[:, i1:i2], Hd[i1:i2, i1:i2], sd[:, i1:i2]
+        m = i2 - i1
+        Hh = Hb + torch.eye(m, device=Wb.device, dtype=Wb.dtype) * (
+            percdamp * torch.diagonal(Hb).mean())
+        U = torch.linalg.cholesky(
+            torch.cholesky_inverse(torch.linalg.cholesky(Hh)), upper=True)
+        Wc, Qg = Wb.clone(), torch.zeros_like(Wb)
+        for j in range(m):
+            q = torch.clamp(torch.round(Wc[:, j] / sb[:, j]), q_lo, maxq) * sb[:, j]
+            Qg[:, j] = q
+            Wc[:, j:] -= ((Wc[:, j] - q) / U[j, j])[:, None] * U[j, j:][None, :]
+        rev = torch.arange(m - 1, -1, -1, device=Wb.device)
+        Qt, _ = _two_sided_round(Wb[:, rev], Md, Hb[rev][:, rev], sb[:, rev],
+                                 q_lo, maxq, percdamp=percdamp)
+        Qt = Qt[:, rev]
+
+        def obj(Q):
+            E = Wb - Q
+            return float(torch.einsum("ij,ik,kl,jl->", E, Md, E, Hb).item())
+
+        g, t = obj(Qg), obj(Qt)
+        tot_g += g
+        tot_t += t
+        rows.append((i1, g, t))
+    return tot_g, tot_t, rows
+
+
+@torch.no_grad()
+def _ts_objcheck(W, M, H, scale, q_lo, maxq, percdamp, Q_ts):
+    """Did the two-sided sweep actually lower the objective it optimises?
+
+    Everything the method claims rests on reducing tr[(W-Q)^T M (W-Q) H]. With
+    a full M that is served by letting two rows' errors cancel rather than
+    making each row's error small -- rounding a weight away from its nearest
+    grid point when a large off-diagonal M_rr' makes the cross term negative.
+
+    This answers one question only: does the two-sided sweep beat the column
+    sweep ON THIS SAME SURROGATE? It does not rank the two methods, and the
+    value returned is NOT a stand-in for KL -- a rounding can lower tr(E'MEH)
+    and raise the real divergence, which is precisely the case worth telling
+    apart from the others.
+
+      two-sided does NOT beat the column sweep here -> the question is about
+          this implementation or about solve quality: the sweep is greedy, so
+          the anti-diagonal ordering, the damping and the conditioning of M all
+          affect how close it gets, and any of them can leave it short without
+          anything being outright wrong
+      two-sided DOES beat the column sweep here     -> the surrogate did gain,
+          and the open question moves downstream: why the gain fails to reach
+          KL. Metric fidelity is then a candidate, not a conclusion
+
+    Also reports the median |W-Q| in grid steps. A metric that is badly scaled
+    or near-singular gives huge triangular factors and drags weights far from
+    their own values, which shows here long before it shows in KL.
+    """
+    n = W.shape[1]
+    Wd, Hd, Md, sd = W.double(), H.double(), M.double(), scale.double()
+    Hh = Hd + torch.eye(n, device=Wd.device, dtype=Wd.dtype) * (
+        percdamp * torch.diagonal(Hd).mean())
+    U = torch.linalg.cholesky(
+        torch.cholesky_inverse(torch.linalg.cholesky(Hh)), upper=True)
+    Wc, Qg = Wd.clone(), torch.zeros_like(Wd)
+    for j in range(n):
+        q = torch.clamp(torch.round(Wc[:, j] / sd[:, j]), q_lo, maxq) * sd[:, j]
+        Qg[:, j] = q
+        Wc[:, j:] -= ((Wc[:, j] - q) / U[j, j])[:, None] * U[j, j:][None, :]
+
+    def obj(Q):
+        E = Wd - Q
+        return float(torch.einsum("ij,ik,kl,jl->", E, Md, E, Hd).item())
+
+    def disp(Q):
+        return float(((Wd - Q).abs() / sd).median().item())
+
+    return obj(Qg), obj(Q_ts.double()), disp(Qg), disp(Q_ts.double())
+
+
+@torch.no_grad()
+def _ts_selfcheck(W, H, scale, q_lo, maxq, percdamp, Q_ts):
+    """Does the integrated two-sided path at M = I reproduce a plain GPTQ sweep?
+
+    The standalone test showed the solver reduces to GPTQ on synthetic inputs,
+    but that says nothing about the integration: act_order's permutation, the
+    column reversal LDLQ needs, how the per-row scale is sliced, and the
+    write-back through invperm are all outside it. Any of those can be wrong in
+    a way that still yields plausible KL.
+
+    So this runs the ordinary column sweep on the SAME W and H snapshot, with
+    no gradient refresh, and compares the quantised weights element by element.
+    A KL comparison cannot do this: a wrong permutation moves thousands of
+    weights by a grid step and still lands within a percent or two of the right
+    answer, which reads as "the method does not help much" rather than "the
+    code is wrong".
+    """
+    n = W.shape[1]
+    Hd = H.float()
+    Hd = Hd + torch.eye(n, device=Hd.device, dtype=Hd.dtype) * (
+        percdamp * torch.diagonal(Hd).mean())
+    U = torch.linalg.cholesky(
+        torch.cholesky_inverse(torch.linalg.cholesky(Hd)), upper=True)
+    Wc = W.float().clone()
+    Q = torch.zeros_like(Wc)
+    sc = scale.float()
+    for j in range(n):
+        qi = torch.clamp(torch.round(Wc[:, j] / sc[:, j]), q_lo, maxq)
+        q = qi * sc[:, j]
+        Q[:, j] = q
+        Wc[:, j:] -= ((Wc[:, j] - q) / U[j, j])[:, None] * U[j, j:][None, :]
+    d = (Q - Q_ts.float()).abs()
+
+    # Rounding is discontinuous, so a last-bit difference becomes a whole grid
+    # step and the feedback carries it forward. Comparing only fp32 cannot say
+    # whether the two sweeps differ algebraically or merely drifted, and
+    # comparing only fp64 cannot say either, because GPTQ's own output is
+    # precision-sensitive. Both pairs are needed:
+    #   fp64 gptq vs fp64 two-sided  -> the algebra, which must agree exactly
+    #   fp64 gptq vs fp32 gptq       -> how precision-sensitive GPTQ already is,
+    #                                   the scale against which the fp32 gap is
+    #                                   read
+    def _gptq(Wx, Hx, sx):
+        nx = Wx.shape[1]
+        Hh = Hx + torch.eye(nx, device=Wx.device, dtype=Wx.dtype) * (
+            percdamp * torch.diagonal(Hx).mean())
+        Ux = torch.linalg.cholesky(
+            torch.cholesky_inverse(torch.linalg.cholesky(Hh)), upper=True)
+        Wc2, Qx = Wx.clone(), torch.zeros_like(Wx)
+        for j in range(nx):
+            q = torch.clamp(torch.round(Wc2[:, j] / sx[:, j]), q_lo, maxq) * sx[:, j]
+            Qx[:, j] = q
+            Wc2[:, j:] -= ((Wc2[:, j] - q) / Ux[j, j])[:, None] * Ux[j, j:][None, :]
+        return Qx
+
+    Wd, Hd64, sd = W.double(), H.double(), scale.double()
+    nd = Wd.shape[1]
+    rev = torch.arange(nd - 1, -1, -1, device=Wd.device)
+    Q64 = _gptq(Wd, Hd64, sd)
+    Qt64, _ = _two_sided_round(
+        Wd[:, rev], torch.eye(Wd.shape[0], device=Wd.device, dtype=Wd.dtype),
+        Hd64[rev][:, rev], sd[:, rev], q_lo, maxq, percdamp=percdamp)
+    d_alg = (Q64 - Qt64[:, rev]).abs()
+    d_prec = (Q64 - Q.double()).abs()
+    return (float(d.max().item()), float((d > 0).float().mean().item()),
+            float(d_alg.max().item()), float((d_alg > 0).float().mean().item()),
+            float(d_prec.max().item()), float((d_prec > 0).float().mean().item()))
+
+
+
+
+def _ldl_unit(X, percdamp=0.01):
+    """X = (L + I) D (L + I)^T, returning L with a unit diagonal.
+
+    LDL of X itself, not the Cholesky of X^-1 that GPTQ factors. The two are
+    equivalent (QuIP proves OPTQ and LDLQ equivalent) but the formulas differ,
+    and mixing them gives a wrong feedback coefficient that still looks
+    plausible. The unit diagonal is why no division by a diagonal element
+    appears below -- the name LDLQ is literal.
+    """
+    n = X.shape[0]
+    # Keep float64 when the caller supplies it: the self-check needs a
+    # high-precision run to tell an algebra difference from float32 divergence,
+    # and rounding is discontinuous enough that the two look alike otherwise.
+    Xd = X if X.dtype == torch.float64 else X.float()
+    Xd = Xd + torch.eye(n, device=Xd.device, dtype=Xd.dtype) * (
+        percdamp * torch.diagonal(Xd).mean())
+    C = torch.linalg.cholesky(Xd)
+    return C / torch.diagonal(C)[None, :]
+
+
+@torch.no_grad()
+def _two_sided_round(W, M, H, scale, q_lo, maxq, percdamp=0.01):
+    """Adaptive rounding with feedback along rows as well as columns.
+
+    Minimises tr[(W-Q)^T M (W-Q) H] over per-row grids. GPTQ solves the M = I
+    case, where the rows separate; a full M couples them. Feedback runs
+    backward from the last index, gathering from entries already decided.
+
+    Lo and Li are unit lower triangular, so with a_i = Lo[:, i], b_j = Li[:, j],
+
+        a_i^T E b_j = E[i,j] + sum_{i'>i} Lo[i',i] E[i',j]
+                             + sum_{j'>j} E[i,j'] Li[j',j]
+                             + sum_{i'>i, j'>j} Lo[i',i] E[i',j'] Li[j',j]
+
+    and E[i,j] is still zero when (i,j) is being decided, so the target for an
+    entry is simply W[i,j] + (Lo^T E Li)[i,j] -- all three feedback terms in one
+    bilinear form. Entries on an anti-diagonal i+j = const lie outside each
+    other's gather region (one has the larger row, the other the larger column),
+    so a whole anti-diagonal is decided at once and the sequential depth is
+    m + n rather than m * n. Measured at production size: 4.3 s for
+    1024 x 3072, 4.6 s for 3072 x 1024.
+
+    Returns (Q, q_int). `scale` is (rows, 1) or (rows, cols); only the symmetric
+    grid is handled, which is what W4A16 per-row uses here.
+    """
+    m, n = W.shape
+    dt = W.dtype if W.dtype == torch.float64 else torch.float32
+    Wf = W.to(dt)
+    sc = scale.to(dt)
+    if sc.dim() == 1:
+        sc = sc[:, None]
+    sc = sc.expand(m, n) if sc.shape[1] == 1 else sc
+    Lo = _ldl_unit(M, percdamp)
+    Li = _ldl_unit(H, percdamp)
+    Q = torch.zeros_like(Wf)
+    Qi = torch.zeros_like(Wf)
+    E = torch.zeros_like(Wf)
+    for d in range(m + n - 2, -1, -1):
+        i0, i1 = max(0, d - n + 1), min(m - 1, d)
+        idx = torch.arange(i0, i1 + 1, device=Wf.device)
+        js = d - idx
+        A = Lo.index_select(1, idx)
+        B = Li.index_select(1, js)
+        tgt = Wf[idx, js] + (A * (E @ B)).sum(0)
+        s_ = sc[idx, js]
+        qi = torch.clamp(torch.round(tgt / s_), q_lo, maxq)
+        q = qi * s_
+        Qi[idx, js] = qi
+        Q[idx, js] = q
+        # The residual is measured against the ORIGINAL weight, not the
+        # feedback-adjusted target: the target is where this entry would have
+        # liked to land given what is already decided, while the error that
+        # propagates is how far the stored value sits from the weight itself.
+        E[idx, js] = Wf[idx, js] - q
+    return Q.to(W.dtype), Qi.to(W.dtype)
 
 
 def _reach_probe_block_row(blk, w0, q, disp, path, scale):
@@ -1400,6 +2286,8 @@ class GPTQPlus:
         reference_loss: float,
         hessian_saliency_scale: float = 1.0,
         hessian_group_shard: bool = False,
+        memory_profiler=None,
+        memory_profile_label=None,
     ):
         self.layer = layer
         self.dev = self.layer.weight.device
@@ -1414,6 +2302,8 @@ class GPTQPlus:
         self.alpha = alpha
         self.reference_loss = max(reference_loss, 0)
         self.hessian_saliency_scale = float(hessian_saliency_scale)
+        self.memory_profiler = memory_profiler
+        self.memory_profile_label = str(memory_profile_label or "gptq")
 
         self.saliencies = saliency.float()
         self.gradients = gradient.float()
@@ -1488,6 +2378,13 @@ class GPTQPlus:
         # axis first makes per-subgroup slices contiguous. In rank-parallel
         # mode this can be a strict subset of output groups, matching the rows
         # this rank owns; non-rank paths keep the legacy full group set.
+        if self.memory_profiler is not None:
+            self.memory_profiler.mark(
+                f"{self.memory_profile_label}_before_hessian_allocate",
+                hessian_shape=(int(self.hessian_group_ids.numel()), self.columns, self.columns),
+                hessian_dtype="float32",
+                hessian_bytes=(int(self.hessian_group_ids.numel()) * self.columns * self.columns * 4),
+            )
         self.H = torch.zeros(
             (int(self.hessian_group_ids.numel()), self.columns, self.columns),
             device=self.dev
@@ -1508,6 +2405,14 @@ class GPTQPlus:
         self.token_count = 0
         self._finalized = False
         self.profile_recorder = None
+        if self.memory_profiler is not None:
+            self.memory_profiler.mark(
+                f"{self.memory_profile_label}_hessian_allocated",
+                hessian_shape=tuple(int(dim) for dim in self.H.shape),
+                hessian_dtype=str(self.H.dtype),
+                hessian_bytes=int(self.H.numel() * self.H.element_size()),
+                activation_square_bytes=int(self.act_square.numel() * self.act_square.element_size()),
+            )
 
     def _selected_column_count(self, blocksize, max_blocks):
         if max_blocks is None:
@@ -1522,6 +2427,8 @@ class GPTQPlus:
         profile_recorder=None,
         profile_section=None,
         log_context="",
+        need_hinv_init=True,
+        inplace_damping=False,
     ):
         """Return H^{-1} and its upper Cholesky factor for GPTQ updates.
 
@@ -1538,6 +2445,7 @@ class GPTQPlus:
 
         diag_idx = torch.arange(H_sub.shape[0], device=H_sub.device)
         diag_mean = torch.mean(torch.diag(H_sub))
+        diag_original = torch.diagonal(H_sub).clone() if inplace_damping else None
         last_error = None
         while 1 > damp_percent > 0:
             try:
@@ -1547,12 +2455,19 @@ class GPTQPlus:
                     else _NULL_CONTEXT
                 )
                 with section:
-                    # Every retry must start from the original Hessian.  Reusing
-                    # the prior H_work cumulatively added both old and new
-                    # damping and even changed the mean used to compute it.
-                    H_work = H_sub.clone()
                     damp = damp_percent * diag_mean
-                    H_work[diag_idx, diag_idx] += damp
+                    # Every retry starts from the pristine diagonal.  The
+                    # optional path avoids a full H_sub clone by damping the
+                    # active subgroup in place; H_sub is a private working
+                    # copy in fasterquant and is not consumed after inversion.
+                    if inplace_damping:
+                        H_work = H_sub
+                        diagonal = torch.diagonal(H_work)
+                        diagonal.copy_(diag_original)
+                        diagonal.add_(damp)
+                    else:
+                        H_work = H_sub.clone()
+                        H_work[diag_idx, diag_idx] += damp
                     chol = torch.linalg.cholesky(H_work)
                     Hinv_init = torch.cholesky_inverse(chol)
                     Hinv = torch.linalg.cholesky(Hinv_init, upper=True)
@@ -1560,7 +2475,7 @@ class GPTQPlus:
                     raise torch._C._LinAlgError(
                         "Hinv contains non-finite values despite successful Cholesky"
                     )
-                return Hinv_init, Hinv, damp_percent, False
+                return Hinv_init if need_hinv_init else None, Hinv, damp_percent, False
             except torch._C._LinAlgError as e:
                 last_error = e
                 logging.warning(
@@ -1581,7 +2496,7 @@ class GPTQPlus:
                 damp_percent,
                 last_error,
             )
-            return eye, eye, damp_percent, True
+            return (eye if need_hinv_init else None), eye, damp_percent, True
 
         raise ValueError(
             f"Quantization{log_context}: `damp_percent` must between 0 and 1. current is {damp_percent}"
@@ -1634,7 +2549,11 @@ class GPTQPlus:
         device = H_subs.device
         dtype = H_subs.dtype
         diag_idx = torch.arange(columns, device=device)
-        eye = torch.eye(columns, device=device, dtype=dtype)
+        # The identity inverse is only needed if damping retries give up.
+        # Avoid allocating a CxC GPU tensor for every healthy Hessian group;
+        # for a 6144-wide FP32 subgroup this otherwise reserves 144 MiB on
+        # the normal Cholesky-success path.
+        eye = None
         Hinv_init = torch.empty_like(H_subs) if need_hinv_init else None
         Hinv = torch.empty_like(H_subs)
         damp_percent = torch.full((num_groups,), damp_percent_value, device=device, dtype=torch.float32)
@@ -1705,6 +2624,8 @@ class GPTQPlus:
                             damp_auto_increment,
                         )
                 if giveup_idx.numel() > 0:
+                    if eye is None:
+                        eye = torch.eye(columns, device=device, dtype=dtype)
                     if need_hinv_init:
                         Hinv_init.index_copy_(0, giveup_idx, eye.expand(giveup_idx.numel(), -1, -1))
                     Hinv.index_copy_(0, giveup_idx, eye.expand(giveup_idx.numel(), -1, -1))
@@ -2011,6 +2932,23 @@ class GPTQPlus:
         return step_size * (exp_avg / denom)
 
     @staticmethod
+    def _shadow_audit_adam_update(
+        grad_slice, exp_avg, exp_avg_sq, step, lr, grad_clip=1.0,
+        adam_beta1=0.9, adam_beta2=0.999, adam_eps=1e-8, v_offset=0,
+    ):
+        """Counterfactual Adam update for an audit; does not mutate live state."""
+        grad = grad_slice.float()
+        if grad_clip is not None and grad_clip > 0:
+            grad = grad.clamp(min=-grad_clip, max=grad_clip)
+        next_step = int(step) + 1
+        m = exp_avg.float() * adam_beta1 + grad * (1.0 - adam_beta1)
+        v = exp_avg_sq.float() * adam_beta2 + grad.square() * (1.0 - adam_beta2)
+        correction1 = 1.0 - adam_beta1 ** next_step
+        correction2 = 1.0 - adam_beta2 ** (next_step + int(v_offset))
+        denom = v.sqrt() / math.sqrt(correction2) + adam_eps
+        return (lr / correction1) * (m / denom)
+
+    @staticmethod
     def _validate_grad_regularizer(
         grad_reg_strategy,
         grad_reg_lambda=0.0,
@@ -2272,6 +3210,9 @@ class GPTQPlus:
         adam_beta1=0.9,
         column_budget_q=1.0,
         horizon_exact=False,
+        grad_steps_per_refresh=1,
+        grad_steps_modules=(),
+        two_sided_metric=None,
         slide_refresh_start=0,
         slide_refresh_block_total=None,
         refresh_full_metrics=False,
@@ -2542,7 +3483,173 @@ class GPTQPlus:
                 _rp_rows = []
                 _fp_rows = []
 
-            for i1 in range(0, C, blocksize):
+            # Two-sided rounding replaces the whole column sweep for this
+            # module: it is a different rounder, not an addition to the
+            # existing one, so the block loop below is skipped entirely and
+            # with it the per-boundary gradient refresh. That is the point --
+            # the question is whether closed-form output-side feedback can
+            # stand in for the Adam step, and leaving both on would answer a
+            # different question.
+            # Two modes. Whole-matrix replaces the column-block loop outright
+            # and so removes the gradient refresh living inside it; block-wise
+            # keeps the loop and only changes how each block is rounded, which
+            # is the configuration that can be compared against the baseline
+            # with the refresh still running.
+            _ts_blockwise = (
+                two_sided_metric is not None
+                and os.environ.get("TS_BLOCKWISE") == "1"
+            )
+            _ts_A = None
+            _ts_active = two_sided_metric is not None and not _ts_blockwise
+            if _ts_blockwise:
+                if G != 1 or groupsize != -1 or not self.quantizer.sym:
+                    raise RuntimeError(
+                        "block-wise two-sided needs --num_groups 1, "
+                        "--w_groupsize -1 and symmetric quantisation; got "
+                        "G=%d groupsize=%d sym=%s"
+                        % (G, groupsize, self.quantizer.sym)
+                    )
+                _M = two_sided_metric.to(dev).float()
+                if _M.shape[0] != R:
+                    raise RuntimeError(
+                        "output metric is %d wide but the module has %d rows"
+                        % (_M.shape[0], R)
+                    )
+                _lam = os.environ.get("TS_LAMBDA")
+                if _lam is not None:
+                    _l = float(_lam)
+                    _M = ((1.0 - _l) * torch.eye(R, device=dev) *
+                          torch.diagonal(_M).mean() + _l * _M)
+                if os.environ.get("TS_FORCE_IDENTITY") == "1":
+                    _M = torch.eye(R, device=dev, dtype=torch.float32)
+                # Same construction the pipeline uses for H: the upper
+                # Cholesky factor of the inverse. At M = I this is the
+                # identity, the row push vanishes, and the block reduces to
+                # the existing loop -- which the self-check verifies rather
+                # than assumes.
+                _Md = _M + torch.eye(R, device=dev) * (
+                    percdamp * torch.diagonal(_M).mean())
+                _ts_A = torch.linalg.cholesky(
+                    torch.cholesky_inverse(torch.linalg.cholesky(_Md)), upper=True
+                )
+                logging.info(
+                    "two_sided_blockwise layer=%s module=%s rows=%d cols=%d",
+                    getattr(self, "layer_idx", "?"),
+                    getattr(self, "layer_name", "?"), R, C,
+                )
+            _ts_active_whole = _ts_active
+            if _ts_active:
+                if G != 1:
+                    raise RuntimeError(
+                        "two-sided rounding needs --num_groups 1: the output metric "
+                        "couples every row, while row groups give each group its own "
+                        "H and split the rows across ranks. Measured over 28 layers, "
+                        "searching under a block-diagonal metric reaches only 50%% of "
+                        "the gain the full metric reaches at G=4 (74%% at G=2), so the "
+                        "grouping is not a cheap approximation here. Got G=%d." % G
+                    )
+                if groupsize != -1:
+                    raise RuntimeError(
+                        "two-sided rounding is only instrumented for per-row scales "
+                        "(--w_groupsize -1); got groupsize=%d." % groupsize
+                    )
+                if not self.quantizer.sym:
+                    raise RuntimeError("two-sided rounding assumes symmetric quant.")
+                _ts_M = two_sided_metric.to(dev).float()
+                # Dial the metric between the identity and the real Fisher:
+                #   M(lam) = (1-lam) * I * mean(diag F)  +  lam * F
+                # The identity is rescaled to F's mean diagonal so lam changes only
+                # the SHAPE of the metric, not its size; a sweep that also changed
+                # the size would confound "more off-diagonal structure" with "a
+                # differently scaled quadratic", and the overall scale of M does not
+                # affect the argmin anyway.
+                # lam = 0 must reproduce arm B exactly -- the path already verified
+                # to match the GPTQ column sweep element for element in fp64 -- so
+                # the sweep carries its own control at one end.
+                _ts_lam = os.environ.get("TS_LAMBDA")
+                if _ts_lam is not None:
+                    _lam = float(_ts_lam)
+                    _eye = torch.eye(R, device=dev, dtype=torch.float32)
+                    _ts_M = (
+                        (1.0 - _lam) * _eye * torch.diagonal(_ts_M).mean()
+                        + _lam * _ts_M
+                    )
+                if os.environ.get("TS_FORCE_IDENTITY") == "1":
+                    # Arm B: keep the new code path but remove the only thing
+                    # it adds, so the run isolates the cost of skipping this
+                    # module's gradient refresh from the effect of the metric.
+                    _ts_M = torch.eye(R, device=dev, dtype=torch.float32)
+                if _ts_M.shape[0] != R:
+                    raise RuntimeError(
+                        "output metric is %dx%d but the module has %d rows; the "
+                        "Fisher is taken at the transformer block output, so it "
+                        "matches only a module whose output IS that block output."
+                        % (_ts_M.shape[0], _ts_M.shape[-1], R)
+                    )
+                # LDLQ sweeps from the last index backward while the loop below
+                # sweeps forward. Reversing the columns of W and H together
+                # turns one into the other; act_order already permutes columns,
+                # so this is just one more permutation, undone on the way out.
+                _rev = torch.arange(C - 1, -1, -1, device=dev)
+                _ts_scale = scale_for_block(0, C)[0]
+                _ts_maxq = int(self.quantizer.maxq.item())
+                _ts_q, _ts_qi = _two_sided_round(
+                    W_sub[0][:, _rev], _ts_M, H_sub[0][_rev][:, _rev],
+                    _ts_scale[:, _rev], -(_ts_maxq + 1), _ts_maxq,
+                    percdamp=percdamp,
+                )
+                state["Q"][0] = _ts_q[:, _rev]
+                state["W_int_sub"][0] = _ts_qi[:, _rev]
+                state["Scale_sub"][0] = _ts_scale
+                if os.environ.get("TS_BLOCKCHECK") == "1":
+                    _bg, _bt, _brows = _ts_blockcheck(
+                        W_sub[0], _ts_M, H_sub[0], _ts_scale,
+                        -(_ts_maxq + 1), _ts_maxq, percdamp, blocksize,
+                    )
+                    logging.info(
+                        "ts_blockcheck layer=%s module=%s blocksize=%d nblk=%d"
+                        " | block-local objective: gptq=%.6e two_sided=%.6e"
+                        " ratio=%.4f | whole-matrix ratio was ~0.65",
+                        getattr(self, "layer_idx", "?"),
+                        getattr(self, "layer_name", "?"), blocksize,
+                        len(_brows), _bg, _bt,
+                        (_bt / _bg if _bg else float("nan")),
+                    )
+                if os.environ.get("TS_OBJCHECK") == "1":
+                    _Lg, _Lt, _dg, _dt = _ts_objcheck(
+                        W_sub[0], _ts_M, H_sub[0], _ts_scale,
+                        -(_ts_maxq + 1), _ts_maxq, percdamp, state["Q"][0],
+                    )
+                    logging.info(
+                        "ts_objcheck layer=%s module=%s | objective tr(EMEH): "
+                        "gptq=%.6e two_sided=%.6e ratio=%.4f | median |W-Q|/grid:"
+                        " gptq=%.4f two_sided=%.4f",
+                        getattr(self, "layer_idx", "?"),
+                        getattr(self, "layer_name", "?"),
+                        _Lg, _Lt, (_Lt / _Lg if _Lg else float("nan")), _dg, _dt,
+                    )
+                if os.environ.get("TS_SELFCHECK") == "1":
+                    (_mx, _fr, _ma, _fa, _mp, _fp) = _ts_selfcheck(
+                        W_sub[0], H_sub[0], _ts_scale, -(_ts_maxq + 1),
+                        _ts_maxq, percdamp, state["Q"][0],
+                    )
+                    logging.info(
+                        "ts_selfcheck layer=%s module=%s grid=%.3e"
+                        " | fp32 pair: max=%.3e frac=%.4f"
+                        " | ALGEBRA (both fp64): max=%.3e frac=%.4f"
+                        " | gptq fp32-vs-fp64: max=%.3e frac=%.4f",
+                        getattr(self, "layer_idx", "?"),
+                        getattr(self, "layer_name", "?"),
+                        float(_ts_scale.abs().median().item()),
+                        _mx, _fr, _ma, _fa, _mp, _fp,
+                    )
+                logging.info(
+                    "two_sided layer=%s module=%s rows=%d cols=%d maxq=%d",
+                    getattr(self, "layer_idx", "?"), getattr(self, "layer_name", "?"),
+                    R, C, _ts_maxq,
+                )
+
+            for i1 in (() if _ts_active else range(0, C, blocksize)):
                 with profile_recorder.section("fasterquant_group_parallel.block.total") if profile_recorder else _NULL_CONTEXT:
                     i2 = min(i1 + blocksize, C)
                     count = i2 - i1
@@ -2628,7 +3735,17 @@ class GPTQPlus:
                                 W_int1_l = torch.zeros_like(W1_l)
                                 Err1_l = torch.zeros_like(W1_l)
                                 Wq_l = torch.zeros_like(W1_l) if _rp_on else None
-                                for i in range(count):
+                                if _ts_blockwise:
+                                    # Row feedback inside the block; the
+                                    # cross-block propagation, the refresh
+                                    # and everything else stay as they are.
+                                    if Wq_l is not None:
+                                        Wq_l.copy_(W1_l)
+                                    Q1_l, W_int1_l, Err1_l = _two_sided_block_push(
+                                        W1_l, Hinv1_l[0], _ts_A,
+                                        scale_l, q_lo, maxq,
+                                    )
+                                for i in (() if _ts_blockwise else range(count)):
                                     w = W1_l[:, i]
                                     if Wq_l is not None:
                                         # the value actually rounded, after
@@ -2680,6 +3797,7 @@ class GPTQPlus:
                                         _rp_disp[local_group_idx, local_row_idx, i1:i2],
                                         scale_l.detach().float(),
                                         q_lo, maxq,
+                                        _rp_w0[local_group_idx, local_row_idx, i1:i2],
                                     ))
 
                     Q1, W_int1, Scale1, Err1 = sync_block_tensors(Q1, W_int1, Scale1, Err1)
@@ -2834,6 +3952,23 @@ class GPTQPlus:
                                 1.0 - effective_idx / max(effective_total - 1, 1)
                                 if effective_total > 1 else 1.0
                             )
+                            # Before the real refresh, so batch_offset=0 is
+                            # literally the batch this step is about to take.
+                            if _multistep_enabled(
+                                getattr(self, "layer_idx", "?"), refresh_idx,
+                                n_refresh_total,
+                            ):
+                                _multistep_probe(
+                                    getattr(self, "layer_idx", "?"),
+                                    getattr(self, "layer_name", "?"),
+                                    refresh_idx, gradient_refresh_fn, natural_order,
+                                    current_sub_weight,
+                                    state["grad_optimizer_state"],
+                                    i2, perm, actorder, G, R, C, dev,
+                                    grad_lr, grad_clip, adam_beta1,
+                                    self._compute_grad_optimizer_update_batched,
+                                    horizon_p, column_budget_q, horizon_exact,
+                                )
                             refreshed_grad, refresh_meta = gradient_refresh_fn(
                                 natural_order(current_sub_weight),
                                 slide_alpha=slide_alpha,
@@ -2968,6 +4103,63 @@ class GPTQPlus:
                                         _rp_disp[:, :, i2:] -= _u
                                         _rp_path[:, :, i2:] += _u.abs()
 
+                            # Keep stepping this SAME boundary. One step is
+                            # what the paper takes and what every run here has
+                            # taken; the multistep probe put that at ~2% of the
+                            # reduction a 56-step walk reaches on the held-out
+                            # refresh loss, with 11 of 14 modules still
+                            # descending at 56. Each extra step draws a fresh
+                            # gradient rather than reusing this one, so the knob
+                            # buys optimisation and not step size -- the two were
+                            # conflated earlier in this investigation and they
+                            # behave differently (raising lr measured worse).
+                            # A filter rather than a separate code path: the
+                            # modules left out take exactly one step, so a
+                            # filtered run differs from the baseline only in the
+                            # named modules and the comparison stays controlled.
+                            _k_eff = int(grad_steps_per_refresh)
+                            if grad_steps_modules:
+                                _nm = str(getattr(self, "layer_name", ""))
+                                if not any(t in _nm for t in grad_steps_modules):
+                                    _k_eff = 1
+                            for _ in range(max(_k_eff - 1, 0)):
+                                _w = state["W_sub"].clone()
+                                _w[:, :, :i2] = state["Q"][:, :, :i2]
+                                if use_hessian_group_shard:
+                                    sync_weight_rows_from_col_(_w, i2)
+                                _g, _ = gradient_refresh_fn(
+                                    natural_order(_w), slide_alpha=slide_alpha,
+                                )
+                                _g = _g.to(dev).float().reshape(G, R, C)
+                                if actorder:
+                                    _g = _g[:, :, perm]
+                                _u2 = self._compute_grad_optimizer_update_batched(
+                                    state["grad_optimizer_state"],
+                                    (
+                                        _g.index_select(0, hessian_group_ids).contiguous()
+                                        if use_hessian_group_shard else _g
+                                    ),
+                                    i2,
+                                    grad_lr,
+                                    grad_clip=grad_clip,
+                                    adam_beta1=adam_beta1,
+                                    step_scale=_hstep,
+                                )
+                                if _u2.numel() == 0:
+                                    break
+                                if use_hessian_group_shard:
+                                    state["W_sub"][hessian_group_ids, :, i2:] -= _u2
+                                else:
+                                    state["W_sub"][:, :, i2:] -= _u2
+                                if _rp_on:
+                                    _u2d = _u2.detach().float()
+                                    if use_hessian_group_shard:
+                                        _rp_disp[hessian_group_ids, :, i2:] -= _u2d
+                                        _rp_path[hessian_group_ids, :, i2:] += _u2d.abs()
+                                    else:
+                                        _rp_disp[:, :, i2:] -= _u2d
+                                        _rp_path[:, :, i2:] += _u2d.abs()
+
                             if refresh_full_metrics:
                                 if optimizer_update_raw.numel() > 0:
                                     raw_2d = optimizer_update_raw.reshape(-1, optimizer_update_raw.shape[-1]).float()
@@ -3069,6 +4261,14 @@ class GPTQPlus:
         """
         if self._finalized:
             raise RuntimeError("add_batch called after finalize_hessian. Re-init GPTQPlus to reuse.")
+        if self.memory_profiler is not None:
+            self.memory_profiler.mark(
+                f"{self.memory_profile_label}_hessian_batch_workspace",
+                batch_size=int(inp.shape[0]) if inp.dim() == 3 else 1,
+                sequence_length=int(inp.shape[-2]) if inp.dim() >= 2 else 0,
+                input_width=self.columns,
+                hessian_bytes=int(self.H.numel() * self.H.element_size()),
+            )
         profile_recorder = self.profile_recorder
         with profile_recorder.section("add_batch.total") if profile_recorder else _NULL_CONTEXT:
             if inp.dim() == 2:
@@ -3122,6 +4322,12 @@ class GPTQPlus:
                     # Pure sum; normalisation deferred to `finalize_hessian`. Tracking
                     # `token_count` lets finalize recover seq_len = token_count / index.
                     self.H.add_(block)
+            if self.memory_profiler is not None:
+                self.memory_profiler.mark(
+                    f"{self.memory_profile_label}_hessian_batch_accumulated",
+                    batch_index=int(self.index),
+                    hessian_bytes=int(self.H.numel() * self.H.element_size()),
+                )
             with profile_recorder.section("add_batch.accumulate_act_square") if profile_recorder else _NULL_CONTEXT:
                 self.act_square.add_((inp ** 2).sum(0))
                 self.token_count += n_tokens
@@ -3165,7 +4371,37 @@ class GPTQPlus:
         # on deep / ill-conditioned layers (e.g. Qwen3-4B layer 24 attention)
         # and `damp_percent` has to auto-increment. Mathematically a no-op on
         # an exactly-symmetric H.
-        self.H = 0.5 * (self.H + self.H.transpose(-1, -2))
+        if self.memory_profiler is not None:
+            self.memory_profiler.mark(
+                f"{self.memory_profile_label}_before_hessian_symmetrize",
+                hessian_bytes=int(self.H.numel() * self.H.element_size()),
+            )
+        # Keep only one full-size temporary during symmetrization. The former
+        # expression `0.5 * (H + H.T)` materialized both the sum and its scaled
+        # result while the original H was still live, which can transiently
+        # require roughly 3 * sizeof(H) for a wide projection such as MLP
+        # down_proj. The opt-in legacy branch exists only to make exact paired
+        # memory comparisons on the same software/runtime stack.
+        symmetrize_impl = os.environ.get(
+            "REALQ_HESSIAN_SYMMETRIZE_IMPL", "single_buffer"
+        ).strip().lower()
+        if symmetrize_impl == "legacy":
+            self.H = 0.5 * (self.H + self.H.transpose(-1, -2))
+        elif symmetrize_impl == "single_buffer":
+            H_symmetric = torch.empty_like(self.H)
+            torch.add(self.H, self.H.transpose(-1, -2), out=H_symmetric)
+            H_symmetric.mul_(0.5)
+            self.H = H_symmetric
+        else:
+            raise ValueError(
+                "REALQ_HESSIAN_SYMMETRIZE_IMPL must be 'legacy' or 'single_buffer', "
+                f"got {symmetrize_impl!r}"
+            )
+        if self.memory_profiler is not None:
+            self.memory_profiler.mark(
+                f"{self.memory_profile_label}_after_hessian_symmetrize",
+                hessian_bytes=int(self.H.numel() * self.H.element_size()),
+            )
         # NaN/Inf sanitisation. Once NaN leaks into H it's terminal — no damp
         # can recover Cholesky and the retry loop runs until damp exceeds 1
         # and crashes. Replace with zeros so the `dead channel` check in
@@ -3182,6 +4418,91 @@ class GPTQPlus:
             )
             self.H = torch.nan_to_num(self.H, nan=0.0, posinf=0.0, neginf=0.0)
         self._finalized = True
+
+    @torch.no_grad()
+    def _preview_next_quantized_block(
+        self,
+        state,
+        current_block_end,
+        blocksize,
+        second_order_scale,
+    ):
+        """Return a copy of the current GPTQ state after previewing one block.
+
+        The current quantized prefix is copied from Q. The next block is run
+        through the same per-column symmetric quantizer, within-block GPTQ
+        compensation, and trailing-column compensation used by fasterquant.
+        No live quantizer, weight, or optimizer state is mutated.
+        """
+        block_start = int(current_block_end)
+        block_end = min(block_start + int(blocksize), self.columns)
+        if block_start <= 0 or block_start >= block_end:
+            raise ValueError(
+                "Next-block preview requires a non-empty unquantized block; "
+                f"got start={block_start}, end={block_end}."
+            )
+
+        shadow_weight = state["W_sub"].clone()
+        shadow_weight[:, :block_start] = state["Q"][:, :block_start]
+
+        count = block_end - block_start
+        Hinv = state["Hinv"]
+        Hinv_block = Hinv[block_start:block_end, block_start:block_end]
+        GHinv_block = state["GHinv"][:, block_start:block_end].clone()
+        Z_block = state["Z"][:, block_start:block_end]
+        W_block = shadow_weight[:, block_start:block_end].clone()
+        Q_block = torch.empty_like(W_block)
+        Err_block = torch.empty_like(W_block)
+        fast_quant_scale = state["fast_quant_scale"]
+        if fast_quant_scale is not None:
+            fast_quant_maxq = int(self.quantizer.maxq.item())
+            fast_quant_lo = -(fast_quant_maxq + 1)
+
+        for local_col in range(count):
+            w = W_block[:, local_col]
+            if fast_quant_scale is not None:
+                int_weight = torch.clamp(
+                    torch.round(w.unsqueeze(1) / fast_quant_scale),
+                    fast_quant_lo,
+                    fast_quant_maxq,
+                )
+                q = (fast_quant_scale * int_weight).to(w.dtype).flatten()
+            else:
+                q, _, _ = self.quantizer.fake_quantize(
+                    w.unsqueeze(1),
+                    st_idx=state["row_start"],
+                    end_idx=state["row_end"],
+                )
+                q = q.flatten()
+            d = Hinv_block[local_col, local_col]
+            gh_col = GHinv_block[:, local_col]
+            err = (w - q - gh_col) / d
+            Err_block[:, local_col] = err
+            Q_block[:, local_col] = q
+
+            W_block[:, local_col:] -= float(second_order_scale) * (
+                err.unsqueeze(1) * Hinv_block[local_col, local_col:].unsqueeze(0)
+                + GHinv_block[:, local_col:]
+            )
+            GHinv_block[:, local_col:].sub_(
+                Z_block[:, local_col].unsqueeze(1)
+                * Hinv_block[local_col, local_col:].unsqueeze(0)
+            )
+
+        shadow_weight[:, block_start:block_end] = Q_block
+        if block_end < self.columns:
+            Hinv_cross = Hinv[block_start:block_end, block_end:]
+            D = torch.arange(count - 1, -1, -1, device=Hinv.device).to(shadow_weight)
+            GHinv_rest = state["GHinv"][:, block_end:]
+            G_update = count * GHinv_rest - torch.einsum(
+                "ij,j,jk->ik", Z_block, D, Hinv_cross
+            )
+            second_order_update = Err_block.matmul(Hinv_cross)
+            shadow_weight[:, block_end:] -= float(second_order_scale) * (
+                second_order_update + G_update
+            )
+
+        return shadow_weight
 
     def fasterquant(
         self,
@@ -3210,6 +4531,9 @@ class GPTQPlus:
         adam_beta1=0.9,
         column_budget_q=1.0,
         horizon_exact=False,
+        grad_steps_per_refresh=1,
+        grad_steps_modules=(),
+        two_sided_metric=None,
         diagnostic_recorder=None,
         slide_refresh_start=0,
         slide_refresh_block_total=None,
@@ -3217,10 +4541,52 @@ class GPTQPlus:
         group_parallel_mode="none",
         grad_sq_full=None,
         warm_start_steps=0,
+        joint_update_fn=None,
+        joint_target_modules=None,
+        preview_next_quant_block=False,
+        preview_next_quant_block_adam_aware=False,
+        inner_kernel_impl="torch",
+        hinv_cpu_offload=False,
+        hessian_cpu_offload=False,
+        hessian_damping_inplace=False,
+        hinv_cpu_reuse_buffer=False,
     ):
         profile_recorder = profile_recorder or self.profile_recorder
         # Alias the recorder so call sites can do `rec and rec.save_block(...)`.
         rec = diagnostic_recorder
+        # Optional mechanism audit for the next-column-block preview. This is
+        # deliberately opt-in and records only explicitly selected refreshes.
+        shadow_audit_dir = os.environ.get("REALQ_SHADOW_AUDIT_DIR")
+        shadow_audit_spec = os.environ.get("REALQ_SHADOW_AUDIT_TARGET", "")
+        shadow_audit_pending = None
+        shadow_audit_event = 0
+        shadow_audit_selected_blocks = set()
+        hinv_cpu_host_bytes = 0
+        hinv_cpu_h2d_bytes = 0
+        hinv_cpu_h2d_seconds = 0.0
+        hessian_cpu_host_bytes = 0
+        hessian_cpu_h2d_bytes = 0
+        hessian_cpu_d2h_seconds = 0.0
+        hessian_cpu_h2d_seconds = 0.0
+        if shadow_audit_dir and preview_next_quant_block:
+            try:
+                audit_layer_text, audit_module_name, audit_blocks_text = shadow_audit_spec.split(":", 2)
+                shadow_audit_selected_blocks = {
+                    int(value) for value in audit_blocks_text.split(",") if value.strip()
+                }
+                shadow_audit_enabled = (
+                    int(getattr(self, "layer_idx", -1)) == int(audit_layer_text)
+                    and getattr(self, "layer_name", "") == audit_module_name
+                    and bool(shadow_audit_selected_blocks)
+                )
+            except (ValueError, TypeError):
+                raise ValueError(
+                    "REALQ_SHADOW_AUDIT_TARGET must be layer:module:block,block"
+                )
+            if shadow_audit_enabled:
+                os.makedirs(shadow_audit_dir, exist_ok=True)
+        else:
+            shadow_audit_enabled = False
         self._validate_grad_regularizer(
             grad_reg_strategy,
             grad_reg_lambda=grad_reg_lambda,
@@ -3229,6 +4595,72 @@ class GPTQPlus:
             grad_gate_sine_amp=grad_gate_sine_amp,
         )
         group_parallel_mode = (group_parallel_mode or "none").lower()
+        inner_kernel_impl = (inner_kernel_impl or "torch").lower()
+        if hinv_cpu_offload:
+            if self.alpha != 0:
+                raise ValueError("hinv_cpu_offload requires alpha=0.")
+            if g_update_mode != "block_gd" or group_parallel_mode != "none":
+                raise ValueError("hinv_cpu_offload requires block_gd and group_parallel_mode='none'.")
+            if inner_kernel_impl != "torch" or preview_next_quant_block:
+                raise ValueError("hinv_cpu_offload requires the torch inner kernel and no next-block preview.")
+        if hessian_cpu_offload:
+            if self.alpha != 0:
+                raise ValueError("hessian_cpu_offload requires alpha=0 in the validated path.")
+            if g_update_mode != "block_gd" or group_parallel_mode != "none":
+                raise ValueError("hessian_cpu_offload requires block_gd and group_parallel_mode='none'.")
+            if inner_kernel_impl != "torch" or preview_next_quant_block:
+                raise ValueError("hessian_cpu_offload requires the torch inner kernel and no next-block preview.")
+        if inner_kernel_impl not in {"torch", "triton_fused"}:
+            raise ValueError(
+                f"Unsupported inner_kernel_impl={inner_kernel_impl!r}; "
+                "expected 'torch' or 'triton_fused'."
+            )
+        fused_gptq_column = None
+        if inner_kernel_impl == "triton_fused":
+            if group_parallel_mode != "none":
+                raise ValueError("triton_fused inner kernel currently requires group_parallel_mode='none'.")
+            if g_update_mode != "block_gd":
+                raise ValueError("triton_fused inner kernel currently requires g_update_mode='block_gd'.")
+            if block_atomic_quant:
+                raise ValueError("triton_fused inner kernel is incompatible with block_atomic_quant.")
+            if two_sided_metric is not None:
+                raise ValueError("triton_fused inner kernel does not support two-sided rounding.")
+            try:
+                from gptq_utils.triton_gptq_kernels import fused_gptq_column_
+            except ImportError as exc:
+                raise RuntimeError(
+                    "triton_fused inner kernel requested, but Triton could not be imported."
+                ) from exc
+            fused_gptq_column = fused_gptq_column_
+        if preview_next_quant_block:
+            if g_update_mode != "block_gd":
+                raise ValueError("--preview_next_quant_block requires --g_update_mode=block_gd.")
+            if group_parallel_mode != "none":
+                raise ValueError(
+                    "--preview_next_quant_block currently supports only "
+                    "--group_parallel_quant=none."
+                )
+            if groupsize != -1:
+                raise ValueError(
+                    "--preview_next_quant_block currently supports only "
+                    "per-row weight quantization (--w_groupsize=-1)."
+                )
+            if block_atomic_quant:
+                raise ValueError(
+                    "--preview_next_quant_block is incompatible with "
+                    "--block_atomic_quant; the preview needs sequential GPTQ "
+                    "within-block compensation."
+                )
+            if two_sided_metric is not None:
+                raise ValueError(
+                    "--preview_next_quant_block cannot be combined with "
+                    "two-sided rounding in this implementation."
+                )
+        if preview_next_quant_block_adam_aware and not preview_next_quant_block:
+            raise ValueError(
+                "--preview_next_quant_block_adam_aware requires "
+                "--preview_next_quant_block."
+            )
         # The probe lives in _fasterquant_group_parallel only. Running it under
         # group_parallel_mode=none would produce a clean log with no reach_probe
         # lines in it, which reads exactly like "the reach is zero" -- refuse
@@ -3241,6 +4673,26 @@ class GPTQPlus:
                 "--horizon_trace / --horizon_alpha are only instrumented in "
                 "the group-parallel path. Set GROUP_PARALLEL_QUANT=rank."
             )
+        if grad_steps_per_refresh != 1:
+            if group_parallel_mode == "none":
+                raise RuntimeError(
+                    "--grad_steps_per_refresh is only instrumented in the "
+                    "group-parallel path; this run would silently take one step."
+                )
+            if grad_steps_per_refresh < 1:
+                raise RuntimeError(
+                    "--grad_steps_per_refresh must be >= 1, got %r."
+                    % (grad_steps_per_refresh,)
+                )
+            if grad_reg_strategy not in (None, "none"):
+                # The extra steps apply the raw optimiser update; the
+                # first-order regulariser is only wired into step 1, so a
+                # k>1 run would regularise 1/k of its own updates.
+                raise RuntimeError(
+                    "--grad_steps_per_refresh > 1 is not instrumented for "
+                    "grad_reg_strategy=%r (only the first step would be "
+                    "regularised)." % (grad_reg_strategy,)
+                )
         if column_budget_q != 1.0 and group_parallel_mode == "none":
             raise ValueError(
                 "--column_budget_q is only instrumented in the group-parallel "
@@ -3321,6 +4773,9 @@ class GPTQPlus:
                     horizon_p=horizon_p,
                     adam_beta1=adam_beta1,
                     column_budget_q=column_budget_q,
+                    grad_steps_per_refresh=grad_steps_per_refresh,
+                    grad_steps_modules=grad_steps_modules,
+                    two_sided_metric=two_sided_metric,
                     horizon_exact=horizon_exact,
                     slide_refresh_start=slide_refresh_start,
                     slide_refresh_block_total=slide_refresh_block_total,
@@ -3371,6 +4826,18 @@ class GPTQPlus:
                 rec.save_module_level("reference_loss", torch.tensor(self.reference_loss))
                 rec.save_module_level("saliencies", self.saliencies)
                 rec.save_module_level("alpha", torch.tensor(self.alpha))
+            H_cpu_storage = None
+            if hessian_cpu_offload:
+                # The accumulated Hessian is immutable from this point on. Keep
+                # its groups in host RAM and stage one exact FP32 group at a time.
+                # The copy completes before dropping the CUDA source tensor.
+                torch.cuda.synchronize(self.dev)
+                _copy_started = time.perf_counter()
+                H_cpu_storage = self.H.to("cpu")
+                torch.cuda.synchronize(self.dev)
+                hessian_cpu_d2h_seconds += time.perf_counter() - _copy_started
+                hessian_cpu_host_bytes += int(H_cpu_storage.numel() * H_cpu_storage.element_size())
+                self.H = None
             with profile_recorder.section("fasterquant.allocate_outputs") if profile_recorder else _NULL_CONTEXT:
                 Q_final = torch.zeros_like(W)
                 W_int_final = torch.zeros_like(W)
@@ -3419,6 +4886,16 @@ class GPTQPlus:
                 fast_quant_scale_full = None
                 fast_quant_maxq = None
                 fast_quant_lo = None
+            if inner_kernel_impl == "triton_fused":
+                if not fast_quant_enabled or not getattr(self.quantizer, "sym", True):
+                    raise ValueError(
+                        "triton_fused inner kernel currently requires ready per-row symmetric quantization "
+                        "(--w_groupsize=-1, weight bits < 16)."
+                    )
+                if blocksize > 128:
+                    raise ValueError(
+                        f"triton_fused inner kernel supports blocksize <= 128; got {blocksize}."
+                    )
 
             rows_per_sub = self.rows // self.num_groups
             subgroup_states = []
@@ -3432,7 +4909,13 @@ class GPTQPlus:
 
                     with profile_recorder.section("fasterquant.subgroup.slice_inputs") if profile_recorder else _NULL_CONTEXT:
                         W_sub = W[row_start:row_end, :].clone()
-                        H_sub = self.H[sub_idx].clone()
+                        if hessian_cpu_offload:
+                            _copy_started = time.perf_counter()
+                            H_sub = H_cpu_storage[sub_idx].to(self.dev)
+                            hessian_cpu_h2d_seconds += time.perf_counter() - _copy_started
+                            hessian_cpu_h2d_bytes += int(H_sub.numel() * H_sub.element_size())
+                        else:
+                            H_sub = self.H[sub_idx].clone()
                         gradients_sub = self.gradients[row_start: row_end, :].to(self.dev).float().clone()
                         dead = torch.diag(H_sub) == 0
                         H_sub[dead, dead] = 1
@@ -3475,6 +4958,13 @@ class GPTQPlus:
                         W_int_sub = torch.zeros_like(W_sub)
                         Scale_sub = torch.zeros_like(W_sub)
 
+                    if self.memory_profiler is not None:
+                        self.memory_profiler.mark(
+                            f"{self.memory_profile_label}_before_hessian_inverse",
+                            subgroup=sub_idx,
+                            subgroup_hessian_shape=tuple(int(dim) for dim in H_sub.shape),
+                            subgroup_hessian_bytes=int(H_sub.numel() * H_sub.element_size()),
+                        )
                     Hinv_init, Hinv, damp_percent, hessian_identity_fallback = (
                         self._compute_hessian_inverse_with_fallback(
                             H_sub,
@@ -3482,8 +4972,20 @@ class GPTQPlus:
                             profile_recorder=profile_recorder,
                             profile_section="fasterquant.subgroup.compute_hinv",
                             log_context=f" subgroup={sub_idx}",
+                            need_hinv_init=bool(enable_gradient_update and self.alpha > 0),
+                            inplace_damping=hessian_damping_inplace,
                         )
                     )
+                    if self.memory_profiler is not None:
+                        self.memory_profiler.mark(
+                            f"{self.memory_profile_label}_after_hessian_inverse",
+                            subgroup=sub_idx,
+                            inverse_bytes=int(Hinv.numel() * Hinv.element_size()),
+                            initial_inverse_bytes=(
+                                int(Hinv_init.numel() * Hinv_init.element_size())
+                                if Hinv_init is not None else 0
+                            ),
+                        )
 
                     with profile_recorder.section("fasterquant.subgroup.init_ghinv") if profile_recorder else _NULL_CONTEXT:
                         beta, beta_view, Z, GHinv = self._compute_gradient_terms(
@@ -3492,6 +4994,10 @@ class GPTQPlus:
                             Hinv,
                             enable_gradient_update,
                         )
+                    if hessian_cpu_offload:
+                        # H_sub is not used after inverse/gradient initialization;
+                        # release the CUDA group before starting the next one.
+                        del H_sub
 
                     # Diagnostic: per-subgroup snapshot of the Hessian inverse,
                     # the permuted weight and gradient (post-actorder), and the
@@ -3512,6 +5018,15 @@ class GPTQPlus:
                             rec.save_subgroup(sub_idx, "perm", perm)
                             rec.save_subgroup(sub_idx, "invperm", invperm)
 
+                    # Hinv is immutable for the subgroup. Under the guarded
+                    # alpha=0 block-GD path, stage only each active block's row
+                    # slice to CUDA and retain the rest in host memory.
+                    if hinv_cpu_offload:
+                        hinv_cpu_host_bytes += int(Hinv.numel() * Hinv.element_size())
+                        Hinv_state = Hinv.to("cpu")
+                    else:
+                        Hinv_state = Hinv
+
                     subgroup_states.append(
                         {
                             "sub_idx": sub_idx,
@@ -3520,7 +5035,8 @@ class GPTQPlus:
                             "W_sub": W_sub,
                             "gradients_sub": gradients_sub,
                             "Hinv_init": Hinv_init,
-                            "Hinv": Hinv,
+                            "Hinv": None if hinv_cpu_offload else Hinv_state,
+                            "Hinv_cpu": Hinv_state if hinv_cpu_offload else None,
                             "Q": Q,
                             "W_int_sub": W_int_sub,
                             "Scale_sub": Scale_sub,
@@ -3552,6 +5068,8 @@ class GPTQPlus:
                             ),
                         }
                     )
+                    if hinv_cpu_offload:
+                        del Hinv, Hinv_state
 
             # Number of blocks + refreshes, for the loss-slide-window schedule.
             # Refresh fires after every block except the last, so n_refresh = n_blocks - 1.
@@ -3576,7 +5094,38 @@ class GPTQPlus:
                             W_int1 = torch.zeros_like(W1)
                             Scale1 = torch.zeros_like(W1).to(state["Scale_sub"].dtype)
                             Err1 = torch.zeros_like(W1)
-                            Hinv1 = state["Hinv"][i1:i2, i1:i2]
+                            if hinv_cpu_offload:
+                                _copy_started = time.perf_counter()
+                                if hinv_cpu_reuse_buffer:
+                                    # All consumers finish before the next block.
+                                    # Preserve the layout of .to(): upper
+                                    # Cholesky factors are column-major. A
+                                    # contiguous workspace changes GEMM layouts
+                                    # and can perturb the quantization trajectory.
+                                    cpu_rows = state["Hinv_cpu"][i1:i2, :]
+                                    workspace = state.get("Hinv_row_workspace")
+                                    if workspace is None:
+                                        workspace = torch.empty_like(cpu_rows, device=self.dev)
+                                        state["Hinv_row_workspace"] = workspace
+                                    if tuple(workspace.shape) == tuple(cpu_rows.shape):
+                                        Hinv_row = workspace
+                                    else:
+                                        # A short final block is compact in its
+                                        # own stride order, just like .to(). Meta
+                                        # inference allocates no GPU storage.
+                                        stride = torch.empty_like(cpu_rows, device="meta").stride()
+                                        Hinv_row = workspace.as_strided(cpu_rows.shape, stride)
+                                    Hinv_row.copy_(cpu_rows)
+                                else:
+                                    Hinv_row = state["Hinv_cpu"][i1:i2, :].to(self.dev)
+                                hinv_cpu_h2d_seconds += time.perf_counter() - _copy_started
+                                hinv_cpu_h2d_bytes += int(Hinv_row.numel() * Hinv_row.element_size())
+                            else:
+                                Hinv_row = None
+                            Hinv1 = (
+                                Hinv_row[:, i1:i2]
+                                if hinv_cpu_offload else state["Hinv"][i1:i2, i1:i2]
+                            )
                             GHinv1 = state["GHinv"][:, i1:i2].clone()
                             Z1 = state["Z"][:, i1:i2]
                             inner_update_mode = "surrogate_online" if g_update_mode == "block_backward" else "frozen" if block_gd_mode else g_update_mode
@@ -3685,7 +5234,47 @@ class GPTQPlus:
                             # per block at zero benefit when profiling is disabled (the
                             # block-level `fasterquant.block.total` range already bounds
                             # the inner loop for Nsight).
+                            # Keep one opt-in-to-profiling NVTX range around the whole
+                            # sequential column loop. This excludes the per-block true
+                            # gradient refresh that also sits inside `block.total`, while
+                            # avoiding a range push/pop for every column.
+                            profile_inner_column_loop = (
+                                profile_recorder is not None and profile_recorder.enabled
+                            )
+                            inner_loop_wall_start = None
+                            if profile_inner_column_loop:
+                                inner_loop_range = (
+                                    f"{profile_recorder.prefix}.fasterquant.block.inner_column_loop"
+                                    if profile_recorder.prefix
+                                    else "fasterquant.block.inner_column_loop"
+                                )
+                                torch.cuda.nvtx.range_push(inner_loop_range)
+                                if QuantProfileRecorder._WALL_ENABLED:
+                                    inner_loop_wall_start = torch.cuda.Event(
+                                        enable_timing=True
+                                    )
+                                    inner_loop_wall_start.record()
                             for i in range(count):
+                                if inner_kernel_impl == "triton_fused":
+                                    if not is_frozen_inner:
+                                        raise RuntimeError(
+                                            "triton_fused inner kernel requires the frozen block_gd inner GHinv path."
+                                        )
+                                    fused_gptq_column(
+                                        W1,
+                                        GHinv1_eff,
+                                        Z1,
+                                        Hinv1,
+                                        fast_quant_scale,
+                                        Q1,
+                                        W_int1,
+                                        Err1,
+                                        i,
+                                        maxq=fast_quant_maxq,
+                                        qlo=fast_quant_lo,
+                                        second_order_scale=second_order_scale,
+                                    )
+                                    continue
                                 w = W1[:, i]
                                 d = Hinv1[i, i]
 
@@ -3757,6 +5346,16 @@ class GPTQPlus:
                                         state["beta_view"],
                                         inner_update_mode,
                                     )
+                            if profile_inner_column_loop:
+                                if inner_loop_wall_start is not None:
+                                    inner_loop_wall_end = torch.cuda.Event(
+                                        enable_timing=True
+                                    )
+                                    inner_loop_wall_end.record()
+                                    QuantProfileRecorder._WALL_STATS.setdefault(
+                                        inner_loop_range, []
+                                    ).append((inner_loop_wall_start, inner_loop_wall_end))
+                                torch.cuda.nvtx.range_pop()
 
                         with profile_recorder.section("fasterquant.block.writeback_inner") if profile_recorder else _NULL_CONTEXT:
                             state["Q"][:, i1:i2] = Q1
@@ -3794,6 +5393,7 @@ class GPTQPlus:
                                 "current_sub_weight": current_sub_weight,
                                 "Err1": Err1,
                                 "Z1": Z1,
+                                "Hinv_row": Hinv_row,
                             }
                         )
 
@@ -3901,13 +5501,17 @@ class GPTQPlus:
                                 state["beta_view"],
                                 outer_mode,
                             )
+                            Hinv_cross = (
+                                block_state["Hinv_row"][:, i2:]
+                                if hinv_cpu_offload else state["Hinv"][i1:i2, i2:]
+                            )
                             G_Update = count * GHinv_rest - torch.einsum(
                                 "ij,j,jk->ik",
                                 block_state["Z1"],
                                 D,
-                                state["Hinv"][i1:i2, i2:],
+                                Hinv_cross,
                             )
-                            second_order_update = block_state["Err1"].matmul(state["Hinv"][i1:i2, i2:])
+                            second_order_update = block_state["Err1"].matmul(Hinv_cross)
                             total_outer_update = second_order_update + G_Update
 
                             # Diagnostic: outer update components BEFORE they are
@@ -3922,7 +5526,7 @@ class GPTQPlus:
                                     "ij,j,jk->ik",
                                     block_state["Z1"],
                                     D,
-                                    state["Hinv"][i1:i2, i2:],
+                                    Hinv_cross,
                                 )
                                 rec.save_block(sub_idx, block_idx, "GHinv_rest_at_outer", GHinv_rest)
                                 rec.save_block(sub_idx, block_idx, "count_times_GHinv_rest", count * GHinv_rest)
@@ -3957,7 +5561,7 @@ class GPTQPlus:
                                 )
 
                         with profile_recorder.section("fasterquant.block.outer_update_ghinv") if profile_recorder else _NULL_CONTEXT:
-                            state["GHinv"][:, i2:] -= state["Z"][:, i1:i2].matmul(state["Hinv"][i1:i2, i2:])
+                            state["GHinv"][:, i2:] -= state["Z"][:, i1:i2].matmul(Hinv_cross)
                             if block_gd_mode:
                                 self._clear_grad_optimizer_state(state["grad_optimizer_state"], i1, i2)
 
@@ -3967,14 +5571,149 @@ class GPTQPlus:
 
                         with profile_recorder.section("fasterquant.block.true_gradient_refresh") if profile_recorder else _NULL_CONTEXT:
                             weight_snapshot = self.layer.weight.data.clone().float()
+                            actual_weight_snapshot = (
+                                weight_snapshot.clone() if shadow_audit_enabled else None
+                            )
                             for state in subgroup_states:
                                 current_sub_weight = state["W_sub"].clone()
                                 current_sub_weight[:, :i2] = state["Q"][:, :i2]
+                                if actual_weight_snapshot is not None:
+                                    current_sub_weight_orig = (
+                                        current_sub_weight[:, state["invperm"]]
+                                        if actorder else current_sub_weight
+                                    )
+                                    actual_weight_snapshot[
+                                        state["row_start"]:state["row_end"], :
+                                    ] = current_sub_weight_orig
+                                if preview_next_quant_block:
+                                    preview_sub_weight = self._preview_next_quantized_block(
+                                        state=state,
+                                        current_block_end=i2,
+                                        blocksize=blocksize,
+                                        second_order_scale=second_order_scale,
+                                    )
+                                    preview_orig_order = (
+                                        preview_sub_weight[:, state["invperm"]]
+                                        if actorder else preview_sub_weight
+                                    )
+                                    weight_snapshot[
+                                        state["row_start"]:state["row_end"], :
+                                    ] = preview_orig_order
+                                    del preview_sub_weight, preview_orig_order
+                                    continue
                                 current_sub_weight_orig = (
                                     current_sub_weight[:, state["invperm"]]
                                     if actorder else current_sub_weight
                                 )
                                 weight_snapshot[state["row_start"]:state["row_end"], :] = current_sub_weight_orig
+                            if preview_next_quant_block:
+                                logging.info(
+                                    "QUANT_PREVIEW_NEXT_BLOCK layer=%s current=[%d,%d) preview=[%d,%d)",
+                                    getattr(self, "layer_idx", "?"),
+                                    max(i2 - blocksize, 0),
+                                    i2,
+                                    i2,
+                                    min(i2 + blocksize, self.columns),
+                                )
+
+                            # At this boundary the unshadowed snapshot is the
+                            # actual GPTQ state: already-quantized prefix plus
+                            # the current compensated floating tail. If a
+                            # previous preview is pending, this is the state
+                            # after that previewed block was actually quantized
+                            # and after the preceding Adam update.
+                            if shadow_audit_enabled and shadow_audit_pending is not None:
+                                actual_block_idx = i1 // blocksize
+                                if actual_block_idx != shadow_audit_pending["block_idx"] + 1:
+                                    raise RuntimeError(
+                                        "Shadow audit lost sequential block alignment: "
+                                        f"expected {shadow_audit_pending['block_idx'] + 1}, "
+                                        f"got {actual_block_idx}."
+                                    )
+                                actual_capture = {}
+                                actual_grad, actual_meta = gradient_refresh_fn(
+                                    actual_weight_snapshot,
+                                    audit_sample_indices=shadow_audit_pending["sample_indices"],
+                                    audit_capture=actual_capture,
+                                )
+                                _c0, _c1 = shadow_audit_pending["predicted_cols"]
+                                _adam_states = [
+                                    _saved for _saved in shadow_audit_pending["adam_state"]
+                                    if _saved["type"] in {"adam", "warm_adam"}
+                                ]
+                                _pred_adam = (
+                                    torch.zeros((actual_grad.shape[0], _c1 - _c0), dtype=torch.float32)
+                                    if _adam_states else None
+                                )
+                                _actual_adam = torch.zeros_like(_pred_adam) if _pred_adam is not None else None
+                                _adam_type = None
+                                for _saved in _adam_states:
+                                    _rs, _re = _saved["row_range"]
+                                    _perm = _saved["perm"]
+                                    _pg = shadow_audit_pending["gradient"][_rs:_re]
+                                    _ag = actual_grad[_rs:_re].detach().float().cpu()
+                                    if _perm is not None:
+                                        _pg = _pg[:, _perm]
+                                        _ag = _ag[:, _perm]
+                                    _opt_type = _saved["type"]
+                                    _adam_type = _opt_type
+                                    if _opt_type in {"adam", "warm_adam"}:
+                                        _u_pred = self._shadow_audit_adam_update(
+                                            _pg[:, _c0:_c1], _saved["exp_avg"],
+                                            _saved["exp_avg_sq"], _saved["step"],
+                                            shadow_audit_pending["grad_lr"],
+                                            grad_clip=shadow_audit_pending["grad_clip"],
+                                            v_offset=_saved.get("v_offset", 0),
+                                        )
+                                        _u_actual = self._shadow_audit_adam_update(
+                                            _ag[:, _c0:_c1], _saved["exp_avg"],
+                                            _saved["exp_avg_sq"], _saved["step"],
+                                            shadow_audit_pending["grad_lr"],
+                                            grad_clip=shadow_audit_pending["grad_clip"],
+                                            v_offset=_saved.get("v_offset", 0),
+                                        )
+                                        _pred_adam[_rs:_re] = _u_pred.cpu()
+                                        _actual_adam[_rs:_re] = _u_actual.cpu()
+                                audit_path = os.path.join(
+                                    shadow_audit_dir,
+                                    f"event_{shadow_audit_event:03d}_layer{self.layer_idx}_"
+                                    f"{self.layer_name.replace('.', '_')}_block"
+                                    f"{shadow_audit_pending['block_idx']}.pt",
+                                )
+                                torch.save({
+                                    "metadata": {
+                                        "layer": int(self.layer_idx),
+                                        "module": str(self.layer_name),
+                                        "predicted_block": int(shadow_audit_pending["block_idx"]),
+                                        "predicted_cols": shadow_audit_pending["predicted_cols"],
+                                        "actual_quantized_block": int(actual_block_idx),
+                                        "actual_cols": [int(i1), int(i2)],
+                                        "sample_indices": shadow_audit_pending["sample_indices"],
+                                        "actual_sample_indices": actual_meta.get("sample_indices", []),
+                                        "adam_optimizer": _adam_type,
+                                    },
+                                    "predicted_weight": shadow_audit_pending["weight"],
+                                    "adam_aware_next_block_weight": shadow_audit_pending["adam_aware_next_block_weight"],
+                                    "actual_weight": actual_weight_snapshot.detach().float().cpu(),
+                                    "predicted_gradient": shadow_audit_pending["gradient"],
+                                    "actual_gradient": actual_grad.detach().float().cpu(),
+                                    "predicted_adam_update_same_state": _pred_adam,
+                                    "actual_gradient_adam_update_same_state": _actual_adam,
+                                    "predicted_module_output": shadow_audit_pending["module_output"],
+                                    "actual_module_output": actual_capture.get("module_output"),
+                                }, audit_path)
+                                logging.info("SHADOW_AUDIT_SAVED path=%s", audit_path)
+                                shadow_audit_event += 1
+                                shadow_audit_pending = None
+
+                            audit_block_idx = i1 // blocksize
+                            audit_capture = (
+                                {}
+                                if shadow_audit_enabled
+                                and audit_block_idx in shadow_audit_selected_blocks
+                                and i2 < self.columns
+                                else None
+                            )
 
                             # Loss-slide-window schedule. The schedule spans
                             # the whole transformer block when the caller
@@ -4000,11 +5739,153 @@ class GPTQPlus:
                                 1.0 - effective_idx / max(effective_total - 1, 1)
                                 if effective_total > 1 else 1.0
                             )
-                            refreshed_grad, refresh_meta = gradient_refresh_fn(
-                                weight_snapshot,
-                                slide_alpha=slide_alpha,
-                            )
+                            _joint_targets = None
+                            if joint_target_modules:
+                                _joint_targets = [
+                                    (_mname, _mmod.weight.data.clone())
+                                    for _mname, _mmod in joint_target_modules
+                                ]
+                            if preview_next_quant_block_adam_aware:
+                                # First obtain a provisional gradient on the
+                                # pre-update preview. Use it only to estimate
+                                # the optimizer step that the live trajectory
+                                # will apply; then quantize that updated clone
+                                # and compute the gradient actually used by the
+                                # optimizer on the predicted post-update state.
+                                _grad0, _meta0 = gradient_refresh_fn(
+                                    weight_snapshot,
+                                    slide_alpha=slide_alpha,
+                                    joint_targets=_joint_targets,
+                                )
+                                if not _meta0.get("sample_indices"):
+                                    raise RuntimeError(
+                                        "Adam-aware shadow refresh requires the "
+                                        "provisional refresh to expose sample_indices."
+                                    )
+                                _predicted_updated_snapshot = torch.empty_like(weight_snapshot)
+                                _grad0 = _grad0.to(self.dev).float()
+                                for _state in subgroup_states:
+                                    _grad0_sub = _grad0[
+                                        _state["row_start"]:_state["row_end"], :
+                                    ]
+                                    if actorder:
+                                        _grad0_sub = _grad0_sub[:, _state["perm"]]
+                                    _opt0 = _state["grad_optimizer_state"]
+                                    if _opt0["type"] in {"adam", "warm_adam"}:
+                                        _update0_raw = self._shadow_audit_adam_update(
+                                            _grad0_sub[:, i2:],
+                                            _opt0["exp_avg"][:, i2:],
+                                            _opt0["exp_avg_sq"][:, i2:],
+                                            _opt0["step"],
+                                            grad_lr,
+                                            grad_clip=grad_clip,
+                                            v_offset=_opt0.get("v_offset", 0),
+                                        )
+                                    else:
+                                        _grad0_tail = _grad0_sub[:, i2:]
+                                        if grad_clip is not None and grad_clip > 0:
+                                            _grad0_tail = _grad0_tail.clamp(
+                                                min=-grad_clip, max=grad_clip
+                                            )
+                                        _update0_raw = grad_lr * _grad0_tail
+                                    _current_weight0 = _state["W_sub"].clone()
+                                    _current_weight0[:, :i2] = _state["Q"][:, :i2]
+                                    _update0, _, _ = self._apply_first_order_regularizer(
+                                        _state,
+                                        _current_weight0,
+                                        _update0_raw,
+                                        i2,
+                                        grad_lr,
+                                        grad_reg_strategy,
+                                        grad_reg_lambda,
+                                        grad_gate_floor,
+                                        grad_gate_sharpness,
+                                        grad_gate_sine_amp,
+                                    )
+                                    _shadow_weight0 = _state["W_sub"].clone()
+                                    _shadow_weight0[:, :i2] = _state["Q"][:, :i2]
+                                    _shadow_weight0[:, i2:] -= _update0
+                                    _shadow_state0 = dict(_state)
+                                    _shadow_state0["W_sub"] = _shadow_weight0
+                                    _preview0 = self._preview_next_quantized_block(
+                                        state=_shadow_state0,
+                                        current_block_end=i2,
+                                        blocksize=blocksize,
+                                        second_order_scale=second_order_scale,
+                                    )
+                                    _preview0_orig = (
+                                        _preview0[:, _state["invperm"]]
+                                        if actorder else _preview0
+                                    )
+                                    _predicted_updated_snapshot[
+                                        _state["row_start"]:_state["row_end"], :
+                                    ] = _preview0_orig
+                                    del _grad0_sub, _update0_raw, _current_weight0
+                                    del _update0, _shadow_weight0, _shadow_state0, _preview0, _preview0_orig
+                                refreshed_grad, refresh_meta = gradient_refresh_fn(
+                                    _predicted_updated_snapshot,
+                                    slide_alpha=slide_alpha,
+                                    joint_targets=_joint_targets,
+                                    audit_sample_indices=_meta0.get("sample_indices"),
+                                    audit_capture=audit_capture,
+                                )
+                                weight_snapshot = _predicted_updated_snapshot
+                                logging.info(
+                                    "SHADOW_ADAM_AWARE_REFRESH layer=%s module=%s block=%d "
+                                    "sample_indices_reused=%d",
+                                    getattr(self, "layer_idx", "?"),
+                                    getattr(self, "layer_name", "?"),
+                                    int(audit_block_idx),
+                                    len(_meta0.get("sample_indices", [])),
+                                )
+                                del _grad0, _predicted_updated_snapshot, _meta0
+                            else:
+                                refreshed_grad, refresh_meta = gradient_refresh_fn(
+                                    weight_snapshot,
+                                    slide_alpha=slide_alpha,
+                                    joint_targets=_joint_targets,
+                                    audit_capture=audit_capture,
+                                )
+                            if audit_capture is not None:
+                                if shadow_audit_pending is not None:
+                                    raise RuntimeError("Shadow audit pending event was not consumed")
+                                shadow_audit_pending = {
+                                    "block_idx": int(audit_block_idx),
+                                    "predicted_cols": [int(i2), int(min(i2 + blocksize, self.columns))],
+                                    "sample_indices": list(refresh_meta.get("sample_indices", [])),
+                                    "weight": weight_snapshot.detach().float().cpu(),
+                                    "gradient": refreshed_grad.detach().float().cpu(),
+                                    "module_output": audit_capture.get("module_output"),
+                                    "adam_aware_next_block_weight": None,
+                                    "grad_lr": float(grad_lr),
+                                    "grad_clip": grad_clip,
+                                    "adam_state": [
+                                        {
+                                            "row_range": [int(state["row_start"]), int(state["row_end"])],
+                                            "perm": state["perm"].detach().cpu() if actorder else None,
+                                            "type": state["grad_optimizer_state"]["type"],
+                                            "step": int(state["grad_optimizer_state"]["step"]),
+                                            "v_offset": int(state["grad_optimizer_state"].get("v_offset", 0)),
+                                            "exp_avg": (
+                                                state["grad_optimizer_state"]["exp_avg"][:, i2:min(i2 + blocksize, self.columns)].detach().float().cpu()
+                                                if state["grad_optimizer_state"]["type"] in {"adam", "warm_adam"}
+                                                else None
+                                            ),
+                                            "exp_avg_sq": (
+                                                state["grad_optimizer_state"]["exp_avg_sq"][:, i2:min(i2 + blocksize, self.columns)].detach().float().cpu()
+                                                if state["grad_optimizer_state"]["type"] in {"adam", "warm_adam"}
+                                                else None
+                                            ),
+                                        }
+                                        for state in subgroup_states
+                                    ],
+                                }
                             refreshed_grad = refreshed_grad.to(self.dev).float()
+                            if joint_update_fn is not None:
+                                joint_update_fn(
+                                    refresh_meta.get("joint_grads", [])
+                                    if refresh_meta else []
+                                )
                             # Diagnostic stats: disabled by default because each
                             # metric costs a torch op + .item() (cudaStreamSync)
                             # and the trailing tensors shrink only linearly across
@@ -4102,6 +5983,38 @@ class GPTQPlus:
                                     grad_gate_sharpness,
                                     grad_gate_sine_amp,
                                 )
+                                if audit_capture is not None:
+                                    # Faithful one-step preview: the live
+                                    # trajectory applies this Adam/regularized
+                                    # update to the floating tail before GPTQ
+                                    # quantizes the next block. Preview that
+                                    # same ordering on a disposable state copy.
+                                    _shadow_updated = state["W_sub"].clone()
+                                    _shadow_updated[:, :i2] = state["Q"][:, :i2]
+                                    _shadow_updated[:, i2:] -= optimizer_update
+                                    _shadow_state = dict(state)
+                                    _shadow_state["W_sub"] = _shadow_updated
+                                    _shadow_preview = self._preview_next_quantized_block(
+                                        state=_shadow_state,
+                                        current_block_end=i2,
+                                        blocksize=blocksize,
+                                        second_order_scale=second_order_scale,
+                                    )
+                                    _shadow_preview_orig = (
+                                        _shadow_preview[:, state["invperm"]]
+                                        if actorder else _shadow_preview
+                                    )
+                                    _preview_start = i2
+                                    _preview_end = min(i2 + blocksize, self.columns)
+                                    if shadow_audit_pending["adam_aware_next_block_weight"] is None:
+                                        shadow_audit_pending["adam_aware_next_block_weight"] = torch.empty(
+                                            (weight_snapshot.shape[0], _preview_end - _preview_start),
+                                            dtype=torch.float32,
+                                        )
+                                    shadow_audit_pending["adam_aware_next_block_weight"][
+                                        state["row_start"]:state["row_end"], :
+                                    ] = _shadow_preview_orig[:, _preview_start:_preview_end].detach().float().cpu()
+                                    del _shadow_updated, _shadow_state, _shadow_preview, _shadow_preview_orig
                                 # Diagnostic: block_gd refresh results PER SUBGROUP.
                                 # refreshed_grad_sub is the per-row gradient of the
                                 # refresh loss wrt this subgroup's weight; optimizer_update
@@ -4287,6 +6200,27 @@ class GPTQPlus:
                     torch.isnan(self.quantizer.zero).any().item() if self.quantizer.zero is not None else None,
                 )
                 raise ValueError("NaN in weights")
+            if hinv_cpu_offload:
+                logging.info(
+                    "stage2_hinv_cpu_offload layer=%s module=%s host_factor_bytes=%d "
+                    "h2d_slice_bytes_total=%d h2d_wall_seconds=%.4f",
+                    getattr(self, "layer_idx", "?"),
+                    getattr(self, "layer_name", "?"),
+                    hinv_cpu_host_bytes,
+                    hinv_cpu_h2d_bytes,
+                    hinv_cpu_h2d_seconds,
+                )
+            if hessian_cpu_offload:
+                logging.info(
+                    "stage2_hessian_cpu_offload layer=%s module=%s host_hessian_bytes=%d "
+                    "h2d_group_bytes=%d d2h_copy_seconds=%.6f h2d_copy_seconds=%.6f",
+                    getattr(self, "layer_idx", -1),
+                    getattr(self, "layer_name", "unknown"),
+                    hessian_cpu_host_bytes,
+                    hessian_cpu_h2d_bytes,
+                    hessian_cpu_d2h_seconds,
+                    hessian_cpu_h2d_seconds,
+                )
 
     def analyze_ghinv_dynamics(
         self,
@@ -4927,7 +6861,8 @@ def hidden2logits(hidden_states, analyzer: model_utils.ModelAnalyzer):
 
 
 def _deterministic_categorical_labels(logits: torch.Tensor, global_sample_indices,
-                                      base_seed: int) -> torch.Tensor:
+                                      base_seed: int,
+                                      chunk_tokens: int = 0) -> torch.Tensor:
     """Per-sample deterministic `Categorical(logits).sample()`.
 
     Each row's labels depend ONLY on that row's global sample index, not on
@@ -4940,6 +6875,9 @@ def _deterministic_categorical_labels(logits: torch.Tensor, global_sample_indice
     logits: (bsz, ..., V)
     global_sample_indices: sequence of length bsz, each an int global sample id
     base_seed: tag that namespaces this call site (e.g. hash of layer_idx)
+    chunk_tokens: optional token-row chunk size. This keeps the same categorical
+        distribution and deterministic seed per sample, but changes the exact
+        multinomial draw sequence relative to the unchunked implementation.
     """
     bsz = logits.shape[0]
     assert len(global_sample_indices) == bsz, (
@@ -4947,6 +6885,9 @@ def _deterministic_categorical_labels(logits: torch.Tensor, global_sample_indice
     )
     trailing_shape = logits.shape[1:-1]
     vocab = logits.shape[-1]
+    chunk_tokens = int(chunk_tokens)
+    if chunk_tokens < 0:
+        raise ValueError(f"chunk_tokens must be non-negative, got {chunk_tokens}.")
     out = torch.empty(logits.shape[:-1], dtype=torch.long, device=logits.device)
     for i in range(bsz):
         # torch.Generator accepts any device torch supports; we match logits.device.
@@ -4955,8 +6896,22 @@ def _deterministic_categorical_labels(logits: torch.Tensor, global_sample_indice
         )
         # multinomial takes (num_rows, vocab) and a `generator` kwarg, which
         # `Categorical.sample` does not expose portably across torch versions.
-        probs = torch.softmax(logits[i].reshape(-1, vocab).float(), dim=-1)
-        sample = torch.multinomial(probs, 1, generator=gen).reshape(trailing_shape)
+        rows = logits[i].reshape(-1, vocab)
+        if chunk_tokens == 0 or rows.shape[0] <= chunk_tokens:
+            probs = torch.softmax(rows.float(), dim=-1)
+            sample = torch.multinomial(probs, 1, generator=gen)
+        else:
+            sample_parts = []
+            for start in range(0, rows.shape[0], chunk_tokens):
+                probs = torch.softmax(
+                    rows[start:start + chunk_tokens].float(), dim=-1
+                )
+                sample_parts.append(
+                    torch.multinomial(probs, 1, generator=gen)
+                )
+                del probs
+            sample = torch.cat(sample_parts, dim=0)
+        sample = sample.reshape(trailing_shape)
         out[i] = sample
     return out
 
@@ -5006,6 +6961,8 @@ def collect_static_end_to_end_saliency_and_fisher(
     grad_hessian_topk,
     batch_size,
     collect_fisher=True,
+    collect_fisher_shrinkage=False,
+    fisher_shrinkage_target="isotropic",
     collect_legacy_fisher_diag=False,
     collect_refined_rkl=False,
     refined_rkl_damp=0.01,
@@ -5015,8 +6972,10 @@ def collect_static_end_to_end_saliency_and_fisher(
     refined_diag_rkl_store_dtype=torch.bfloat16,
     use_fsdp=False,
     fsdp_cpu_offload=False,
+    saved_tensor_offload_threshold_mb=0,
     saliency_clip_percentile=0.99,
     profile_recorder=None,
+    memory_profiler=None,
     capture_fp_final=False,
     fp_final_store_dtype=torch.bfloat16,
     fisher_layer_ids=None,
@@ -5029,12 +6988,23 @@ def collect_static_end_to_end_saliency_and_fisher(
     fisher_rademacher_k=0,
     rademacher_seed=0,
     num_samples_for_grad=0,
+    categorical_label_chunk_tokens=0,
+    sequence_fisher_cache=None,
+    fisher_accum_packed=False,
+    saved_tensor_offload_deduplicate=False,
 ):
     fisher_rademacher_k = int(fisher_rademacher_k)
     num_samples_for_grad = int(num_samples_for_grad)
+    collect_fisher_shrinkage = bool(collect_fisher_shrinkage)
     if fisher_rademacher_k < 0:
         raise ValueError(
             f"fisher_rademacher_k must be non-negative, got {fisher_rademacher_k}."
+        )
+    if collect_fisher_shrinkage and not collect_fisher:
+        raise ValueError("collect_fisher_shrinkage requires collect_fisher=True.")
+    if collect_fisher_shrinkage and fisher_rademacher_k > 0:
+        raise ValueError(
+            "Sequence-level Fisher shrinkage currently requires fisher_rademacher_k=0."
         )
     if num_samples_for_grad < 0:
         raise ValueError(
@@ -5054,6 +7024,15 @@ def collect_static_end_to_end_saliency_and_fisher(
         num_samples_for_grad > 0
         and (collect_fisher or collect_saliency or collect_dynsal)
     )
+    fisher_accum_packed = bool(fisher_accum_packed and collect_fisher)
+    fisher_tri_rows = fisher_tri_cols = None
+    if fisher_accum_packed:
+        hidden_size = int(getattr(getattr(model, "config", None), "hidden_size", 0))
+        if hidden_size <= 0:
+            raise ValueError(
+                "packed Fisher accumulation needs model.config.hidden_size"
+            )
+        fisher_tri_rows, fisher_tri_cols = lower_triangle_indices(hidden_size)
     if collect_legacy_fisher_diag and fisher_rademacher_k > 0:
         raise ValueError(
             "legacy_fisher_diag_mse stores per-sample/per-token g^2 from the "
@@ -5099,7 +7078,77 @@ def collect_static_end_to_end_saliency_and_fisher(
             refined_rkl_num_A, str(refined_diag_rkl_store_dtype).replace("torch.", ""),
         )
     collect_saliency = bool(collect_saliency or collect_dynsal)
+    saved_tensor_offload_threshold_mb = max(
+        0, int(saved_tensor_offload_threshold_mb)
+    )
+    saved_tensor_offload_stats = {"count": 0, "bytes": 0}
+    saved_tensor_cpu_cache = (
+        SavedTensorCpuCache(saved_tensor_offload_threshold_mb * (1 << 20), deduplicate=True)
+        if saved_tensor_offload_deduplicate and saved_tensor_offload_threshold_mb > 0 else None
+    )
+
+    def _pack_saved_tensor(tensor):
+        nbytes = tensor.numel() * tensor.element_size()
+        if (
+            tensor.device.type == "cuda"
+            and not tensor.is_leaf
+            and nbytes >= saved_tensor_offload_threshold_mb * (1 << 20)
+        ):
+            # Copy to pageable CPU memory. This is intentionally synchronous:
+            # the saved value must be complete before the forward activation
+            # can be released. The unpack hook returns the original value and
+            # device; the autograd graph and REAL-Q hooks remain unchanged.
+            saved_tensor_offload_stats["count"] += 1
+            saved_tensor_offload_stats["bytes"] += nbytes
+            return (
+                "gptqplus_saved_tensor_cpu",
+                tensor.detach().to(device="cpu", copy=True),
+                tensor.device,
+            )
+        return tensor
+
+    def _unpack_saved_tensor(packed):
+        if (
+            isinstance(packed, tuple)
+            and len(packed) == 3
+            and packed[0] == "gptqplus_saved_tensor_cpu"
+        ):
+            return packed[1].to(device=packed[2])
+        return packed
+
+    def _model_forward_for_static_stats(input_ids):
+        if saved_tensor_offload_threshold_mb <= 0:
+            return model(input_ids=input_ids)
+        if saved_tensor_cpu_cache is not None:
+            with saved_tensor_cpu_cache.context():
+                return model(input_ids=input_ids)
+        with torch.autograd.graph.saved_tensors_hooks(
+            _pack_saved_tensor, _unpack_saved_tensor
+        ):
+            return model(input_ids=input_ids)
+
     layers = analyzer.get_layers()
+    if fisher_accum_packed:
+        fisher_layers = sum(
+            fisher_layer_ids is None or layer_idx in fisher_layer_ids
+            for layer_idx in range(len(layers))
+        )
+        fisher_dim = int(model.config.hidden_size)
+        full_accum_bytes = fisher_layers * fisher_dim * fisher_dim * 4
+        packed_accum_bytes = (
+            fisher_layers * fisher_dim * (fisher_dim + 1) // 2 * 4
+        )
+        logging.info(
+            "FISHER_ACCUM_STORAGE mode=packed_symmetric layers=%d dim=%d "
+            "estimated_full_fp32_mib=%.3f estimated_packed_fp32_mib=%.3f "
+            "component_reduction_percent=%.2f; Fisher remains full-matrix "
+            "BF16 when returned to the unchanged REAL-Q loss/cache interface",
+            fisher_layers,
+            fisher_dim,
+            full_accum_bytes / (1 << 20),
+            packed_accum_bytes / (1 << 20),
+            100.0 * (1.0 - packed_accum_bytes / max(full_accum_bytes, 1)),
+        )
     # Wrap model with FSDP2 so the full-model backward fits on many small GPUs.
     # Params + grads are sharded across the current default process group; each
     # layer all-gathers on forward and reshards afterwards. Since all params
@@ -5166,6 +7215,19 @@ def collect_static_end_to_end_saliency_and_fisher(
         if collect_saliency else None
     )
     fisher_data = [None for _ in layers]
+    fisher_sample_frob_sq_data = (
+        [torch.zeros((), dtype=torch.float32, device=dev) for _ in layers]
+        if collect_fisher_shrinkage else None
+    )
+    fisher_sample_diag_frob_sq_data = (
+        [torch.zeros((), dtype=torch.float32, device=dev) for _ in layers]
+        if collect_fisher_shrinkage and fisher_shrinkage_target == "diagonal"
+        else None
+    )
+    if collect_fisher_shrinkage and fisher_shrinkage_target not in ("isotropic", "diagonal"):
+        raise ValueError(
+            f"Unknown Fisher shrinkage target: {fisher_shrinkage_target!r}."
+        )
     legacy_fisher_diag_data = (
         [[] for _ in layers] if collect_legacy_fisher_diag else None
     )
@@ -5403,6 +7465,8 @@ def collect_static_end_to_end_saliency_and_fisher(
             out_tensor = out[0] if isinstance(out, (tuple, list)) else out
 
             def grad_hook(grad):
+                if sequence_fisher_cache is not None:
+                    sequence_fisher_cache.capture(layer_idx, grad, _E2E_PRECOMPUTE_LOSS_GRAD_SCALE)
                 if not current_backward_role["saliency_fisher"]:
                     return
                 if sink_size > 0 and grad.dim() >= 2 and grad.shape[1] > sink_size:
@@ -5417,12 +7481,47 @@ def collect_static_end_to_end_saliency_and_fisher(
                     )
                 if collect_fisher:
                     grad_flat = grad_fp32.reshape(-1, grad_fp32.shape[-1])
+                    if collect_fisher_shrinkage:
+                        # Estimate the dispersion of per-sequence Fisher blocks
+                        # without storing N copies of an H×H matrix. For a
+                        # sequence gradient matrix G (T×H),
+                        # ||GᵀG||_F² = ||GGᵀ||_F²; the latter uses a T×T
+                        # temporary and is much smaller when T << H.
+                        seq_len_eff = max(1, int(grad_fp32.shape[1]))
+                        token_gram = torch.bmm(
+                            grad_fp32, grad_fp32.transpose(1, 2)
+                        )
+                        fisher_sample_frob_sq_data[layer_idx].add_(
+                            token_gram.square().sum()
+                            / (
+                                _E2E_PRECOMPUTE_QUADRATIC_SCALE ** 2
+                                * float(seq_len_eff ** 2)
+                            )
+                        )
+                        if fisher_shrinkage_target == "diagonal":
+                            # ||diag(GᵀG)||²_F = Σ_j (Σ_t G[t,j]²)².
+                            # Keeping this separately lets the estimator measure
+                            # only sampling noise in cross-channel correlations.
+                            sequence_diag = grad_fp32.square().sum(dim=1)
+                            fisher_sample_diag_frob_sq_data[layer_idx].add_(
+                                sequence_diag.square().sum()
+                                / (
+                                    _E2E_PRECOMPUTE_QUADRATIC_SCALE ** 2
+                                    * float(seq_len_eff ** 2)
+                                )
+                            )
+                            del sequence_diag
+                        del token_gram
                     # `grad` comes from an output-token SUM loss. Accumulate the
                     # unnormalised sum over middle-layer tokens here; aggregation
                     # below divides once by the global middle-token count to store
                     # the shared E_middle[g g^T] Fisher coefficient.
-                    fisher_block = grad_flat.t() @ grad_flat  # stays on GPU fp32
+                    fisher_block = grad_flat.t() @ grad_flat  # GPU fp32 temporary
                     fisher_block.div_(_E2E_PRECOMPUTE_QUADRATIC_SCALE * float(stat_repeats))
+                    if fisher_accum_packed:
+                        fisher_block = pack_symmetric_lower(
+                            fisher_block, fisher_tri_rows, fisher_tri_cols
+                        )
                     if fisher_data[layer_idx] is None:
                         fisher_data[layer_idx] = fisher_block
                     else:
@@ -5653,7 +7752,11 @@ def collect_static_end_to_end_saliency_and_fisher(
         if not use_fsdp:
             # FSDP2 already placed the shards on each rank's GPU; don't try to
             # move the whole model to one device.
+            if memory_profiler is not None:
+                memory_profiler.mark("static_fisher_before_model_to_device")
             model = model.to(dev)
+            if memory_profiler is not None:
+                memory_profiler.mark("static_fisher_model_on_device")
         model.eval()
         # The precompute only reads **activation gradients** via hooks (saliency /
         # fisher = mean of grad².pow). Weight gradients are never consumed here, so
@@ -5792,6 +7895,10 @@ def collect_static_end_to_end_saliency_and_fisher(
             ):
                 with profile_recorder.section("pipeline.static_fisher.batch.total") if profile_recorder else _NULL_CONTEXT:
                     global_start = shard.start + local_start
+                    if sequence_fisher_cache is not None:
+                        sequence_fisher_cache.batch_start = local_start
+                        sequence_fisher_cache.probe = 0
+                        sequence_fisher_cache.active = True
                     if _collect_any_refined and refined_rkl_samples_per_A > 0:
                         # Route this batch's contributions to the correct sub-A
                         # bucket. We required `samples_per_A % batch_size == 0` so
@@ -5806,11 +7913,23 @@ def collect_static_end_to_end_saliency_and_fisher(
                         refined_prev_a = cur_a
                     with profile_recorder.section("pipeline.static_fisher.batch.prepare_inputs") if profile_recorder else _NULL_CONTEXT:
                         input_ids = torch.cat(loop_local_batches[local_start:local_start + local_batch_size], dim=0).to(dev)
+                    if memory_profiler is not None:
+                        memory_profiler.mark(
+                            "static_fisher_batch_forward",
+                            batch=local_start // local_batch_size,
+                            local_start=local_start,
+                        )
                     with profile_recorder.section("pipeline.static_fisher.batch.forward") if profile_recorder else _NULL_CONTEXT:
-                        outputs = model(input_ids=input_ids)
+                        outputs = _model_forward_for_static_stats(input_ids)
                         logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
                         teacher_logits = logits.detach()
                         student_logits = logits
+                    if memory_profiler is not None:
+                        memory_profiler.mark(
+                            "static_fisher_batch_label_sampling",
+                            batch=local_start // local_batch_size,
+                            local_start=local_start,
+                        )
                     if grad_hessian_topk > 0:
                         with profile_recorder.section("pipeline.static_fisher.batch.topk_slice") if profile_recorder else _NULL_CONTEXT:
                             teacher_logits, indices = teacher_logits.topk(
@@ -5842,6 +7961,13 @@ def collect_static_end_to_end_saliency_and_fisher(
                             teacher_logits,
                             _global_indices,
                             base_seed=0,  # global static saliency uses its own namespace
+                            chunk_tokens=categorical_label_chunk_tokens,
+                        )
+                    if memory_profiler is not None:
+                        memory_profiler.mark(
+                            "static_fisher_batch_nll_build",
+                            batch=local_start // local_batch_size,
+                            local_start=local_start,
                         )
                     with profile_recorder.section("pipeline.static_fisher.batch.nll_build") if profile_recorder else _NULL_CONTEXT:
                         sl_for_nll = student_logits
@@ -5865,6 +7991,12 @@ def collect_static_end_to_end_saliency_and_fisher(
                                 reduction="sum",
                             )
                             loss_for_backward = loss * _E2E_PRECOMPUTE_LOSS_GRAD_SCALE
+                    if memory_profiler is not None:
+                        memory_profiler.mark(
+                            "static_fisher_batch_backward",
+                            batch=local_start // local_batch_size,
+                            local_start=local_start,
+                        )
                     with profile_recorder.section("pipeline.static_fisher.batch.backward") if profile_recorder else _NULL_CONTEXT:
                         if not collect_grad_stats_this_batch:
                             try:
@@ -5936,10 +8068,54 @@ def collect_static_end_to_end_saliency_and_fisher(
                             current_backward_role["saliency_fisher"] = True
                             current_backward_role["refined"] = True
                             model.zero_grad()
-                            loss_for_backward.backward()
+                            loss_for_backward.backward(retain_graph=(
+                                sequence_fisher_cache is not None and sequence_fisher_cache.probes > 1
+                            ))
+                            if sequence_fisher_cache is not None:
+                                current_backward_role["saliency_fisher"] = False
+                                current_backward_role["refined"] = False
+                                try:
+                                    for probe in range(1, sequence_fisher_cache.probes):
+                                        sequence_fisher_cache.probe = probe
+                                        probe_labels = _deterministic_categorical_labels(
+                                            teacher_logits, _global_indices, base_seed=8100 + probe,
+                                        )
+                                        probe_loss = F.cross_entropy(
+                                            student_logits.reshape(-1, student_logits.shape[-1]),
+                                            probe_labels.reshape(-1), reduction="sum",
+                                        )
+                                        model.zero_grad()
+                                        (probe_loss * _E2E_PRECOMPUTE_LOSS_GRAD_SCALE).backward(
+                                            retain_graph=probe + 1 < sequence_fisher_cache.probes,
+                                        )
+                                        del probe_labels, probe_loss
+                                finally:
+                                    sequence_fisher_cache.active = False
+                                    current_backward_role["saliency_fisher"] = True
+                                    current_backward_role["refined"] = True
+                    if memory_profiler is not None:
+                        fisher_gpu_bytes = sum(
+                            int(t.numel() * t.element_size())
+                            for t in fisher_data
+                            if torch.is_tensor(t) and t.device.type == "cuda"
+                        )
+                        memory_profiler.mark(
+                            "static_fisher_after_backward_accumulators",
+                            batch=local_start // local_batch_size,
+                            fisher_gpu_accumulator_bytes=fisher_gpu_bytes,
+                            fisher_accum_packed=bool(fisher_accum_packed),
+                        )
                     del outputs, logits, teacher_logits, student_logits, labels, loss, loss_for_backward, input_ids
                     if per_token_nll is not None:
                         del per_token_nll
+                    if memory_profiler is not None:
+                        memory_profiler.mark(
+                            "static_fisher_batch_cleanup",
+                            batch=local_start // local_batch_size,
+                            local_start=local_start,
+                        )
+            if sequence_fisher_cache is not None:
+                sequence_fisher_cache.validate()
             # Flush the last sub-A's accumulators. The streaming flush inside
             # the loop only fires on transitions, so the final one needs to be
             # drained explicitly.
@@ -6106,7 +8282,7 @@ def collect_static_end_to_end_saliency_and_fisher(
                             with profile_recorder.section("pipeline.static_fisher.dynsal_batch") if profile_recorder else _NULL_CONTEXT:
                                 global_start = shard.start + local_start
                                 input_ids = torch.cat(local_batches[local_start:local_start + local_batch_size], dim=0).to(dev)
-                                outputs = model(input_ids=input_ids)
+                                outputs = _model_forward_for_static_stats(input_ids)
                                 logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
                                 teacher_logits = logits.detach()
                                 student_logits = logits
@@ -6256,6 +8432,7 @@ def collect_static_end_to_end_saliency_and_fisher(
     with profile_recorder.section("pipeline.static_fisher.aggregate") if profile_recorder else _NULL_CONTEXT:
         static_saliency = []
         static_fisher = []
+        static_fisher_shrinkage = [] if collect_fisher_shrinkage else None
         static_legacy_fisher_diag = []
         for layer_idx, module_dict in enumerate(module_dicts):
             layer_saliency = {}
@@ -6286,15 +8463,25 @@ def collect_static_end_to_end_saliency_and_fisher(
                 if want_fisher_this_layer:
                     if fisher_data[layer_idx] is None:
                         raise ValueError(f"Failed to collect static end-to-end Fisher for layer={layer_idx}.")
-                    # fisher_data[layer_idx] is now accumulated in GPU fp32 (see
-                    # make_layer_hook). In-place all-reduce then ship to CPU bf16
-                    # exactly once per layer.
+                    # fisher_data[layer_idx] is accumulated in GPU fp32. The
+                    # opt-in packed path stores only its lower triangle during
+                    # Stage-0 accumulation and all-reduces that compact vector;
+                    # one full matrix is reconstructed here for the unchanged
+                    # REAL-Q loss/cache interface.
                     fisher_sum = fisher_data[layer_idx]
                     if fisher_sum.device.type != "cuda":
                         # Fall back to the old CPU→GPU path if it ever holds CPU
                         # (e.g. legacy caller or serialized dict).
                         fisher_sum = fisher_sum.to(dev)
                     dist_utils.allreduce_sum_(fisher_sum)
+                    if fisher_accum_packed:
+                        fisher_sum = unpack_symmetric_lower(
+                            fisher_sum,
+                            int(model.config.hidden_size),
+                            fisher_tri_rows,
+                            fisher_tri_cols,
+                        )
+                        fisher_data[layer_idx] = None
                     # Token count: derive from the already-catted saliency tensor
                     # rather than from the per-batch chunks (which we freed above
                     # to cut a 14 GB transient CPU peak). Same value either way.
@@ -6306,7 +8493,75 @@ def collect_static_end_to_end_saliency_and_fisher(
                         eff_seq_len = max(1, token_batches[0].shape[1] - max(0, sink_size))
                         local_tokens = int(grad_stat_local_limit * eff_seq_len)
                     total_tokens = dist_utils.allreduce_sum_scalar(local_tokens)
-                    static_fisher.append((fisher_sum / float(total_tokens)).to(torch.bfloat16).cpu())
+                    fisher_mean = fisher_sum / float(total_tokens)
+                    if collect_fisher_shrinkage:
+                        sample_frob_sq_sum = dist_utils.allreduce_sum_scalar(
+                            float(fisher_sample_frob_sq_data[layer_idx].item())
+                        )
+                        local_samples = min(
+                            len(local_batches), grad_stat_local_limit
+                        )
+                        total_samples = dist_utils.allreduce_sum_scalar(local_samples)
+                        if total_samples < 2:
+                            raise ValueError(
+                                "Adaptive Fisher shrinkage requires at least two "
+                                f"global calibration sequences; got {total_samples}."
+                            )
+                        fisher_frob_sq = float(fisher_mean.square().sum().item())
+                        trace_fisher = float(torch.diagonal(fisher_mean).sum().item())
+                        hidden_size = int(fisher_mean.shape[0])
+                        if fisher_shrinkage_target == "diagonal":
+                            diag_sample_frob_sq_sum = dist_utils.allreduce_sum_scalar(
+                                float(fisher_sample_diag_frob_sq_data[layer_idx].item())
+                            )
+                            fisher_diag_frob_sq = float(
+                                torch.diagonal(fisher_mean).square().sum().item()
+                            )
+                            sample_target_frob_sq_sum = max(
+                                0.0, sample_frob_sq_sum - diag_sample_frob_sq_sum
+                            )
+                            target_distance_sq = max(
+                                0.0, fisher_frob_sq - fisher_diag_frob_sq
+                            )
+                            centered_frob_sq_sum = max(
+                                0.0,
+                                sample_target_frob_sq_sum
+                                - float(total_samples) * target_distance_sq,
+                            )
+                            target_name = "diagonal(F)"
+                        else:
+                            centered_frob_sq_sum = max(
+                                0.0,
+                                sample_frob_sq_sum
+                                - float(total_samples) * fisher_frob_sq,
+                            )
+                            target_distance_sq = max(
+                                0.0,
+                                fisher_frob_sq - (trace_fisher ** 2) / float(hidden_size),
+                            )
+                            target_name = "trace(F)/H*I"
+                        # Data-estimated linear shrinkage of the mean Fisher.
+                        # Independent units are calibration sequences, not
+                        # correlated token positions within each sequence.
+                        beta = centered_frob_sq_sum / float(total_samples ** 2)
+                        shrinkage = (
+                            min(1.0, max(0.0, beta / target_distance_sq))
+                            if target_distance_sq > 1e-20 else 0.0
+                        )
+                        if not math.isfinite(shrinkage):
+                            raise FloatingPointError(
+                                f"Non-finite Fisher shrinkage at layer={layer_idx}: "
+                                f"beta={beta}, distance={target_distance_sq}."
+                            )
+                        static_fisher_shrinkage.append(float(shrinkage))
+                        logging.info(
+                            "FFN_FISHER_SHRINKAGE_STATS layer=%d lambda=%.6g "
+                            "samples=%d beta=%.6g target_distance=%.6g target=%s",
+                            layer_idx, shrinkage, total_samples, beta,
+                            target_distance_sq, target_name,
+                        )
+                        fisher_sample_frob_sq_data[layer_idx] = None
+                    static_fisher.append(fisher_mean.to(torch.bfloat16).cpu())
                     # Release the per-layer GPU fp32 Fisher immediately. For
                     # Llama-7B: 32 × 64 MB = 2 GB ~ freed as we go.
                     fisher_data[layer_idx] = None
@@ -6315,8 +8570,12 @@ def collect_static_end_to_end_saliency_and_fisher(
                     # Caller opted out of fisher for this layer (e.g. refined_mix
                     # back half uses refined_residual_kl, which doesn't need fisher).
                     static_fisher.append(None)
+                    if collect_fisher_shrinkage:
+                        static_fisher_shrinkage.append(None)
             else:
                 static_fisher.append(None)
+                if collect_fisher_shrinkage:
+                    static_fisher_shrinkage.append(None)
             if collect_legacy_fisher_diag:
                 want_legacy_this_layer = (
                     fisher_layer_ids is None or layer_idx in fisher_layer_ids
@@ -6380,9 +8639,23 @@ def collect_static_end_to_end_saliency_and_fisher(
         fp_inps_final = torch.cat(fp_final_cache, dim=0)
         fp_final_cache.clear()
 
+    if saved_tensor_offload_threshold_mb > 0:
+        if saved_tensor_cpu_cache is not None:
+            saved_tensor_offload_stats["count"] = saved_tensor_cpu_cache.stats["copies"]
+            saved_tensor_offload_stats["bytes"] = saved_tensor_cpu_cache.stats["copied_bytes"]
+            logging.info("STAGE0_OFFLOAD_METRICS %s", json.dumps({"rank": dist_utils.get_rank(), "threshold_mib": saved_tensor_offload_threshold_mb, "deduplicate": True, **saved_tensor_cpu_cache.stats}))
+        logging.info(
+            "Stage-0 saved-tensor CPU offload: threshold=%d MiB, tensors=%d, "
+            "cumulative_payload=%.2f GiB.",
+            saved_tensor_offload_threshold_mb,
+            saved_tensor_offload_stats["count"],
+            saved_tensor_offload_stats["bytes"] / (1 << 30),
+        )
+
     return (
         static_saliency,
         static_fisher,
+        static_fisher_shrinkage,
         static_legacy_fisher_diag,
         static_refined_A,
         static_refined_diag_A,
@@ -6659,6 +8932,8 @@ def compute_refresh_loss(
     sink_size=0,
     a_loss_ratio=1.0,
     a_loss_threshold=None,
+    kl_logit_chunk_tokens=0,
+    kl_recompute_head=False,
 ):
     refresh_loss_type = canonical_refresh_loss_type(refresh_loss_type)
     # `sink_size > 0` (driven by --ignore_attention_sink) drops the first
@@ -6673,24 +8948,63 @@ def compute_refresh_loss(
             return x
         return x[:, sink_size:]
 
+    def _mean_tokenwise_kl(student_logits, teacher_logits):
+        if kl_logit_chunk_tokens > 0:
+            return chunked_tokenwise_kl_from_logits(
+                student_logits,
+                teacher_logits,
+                chunk_tokens=kl_logit_chunk_tokens,
+            )
+        return tokenwise_kl_from_logits(student_logits, teacher_logits).mean()
+
     if refresh_loss_type == "kl":
         with profile_recorder.section("compute_refresh_loss.kl.total") if profile_recorder else _NULL_CONTEXT:
+            if kl_recompute_head:
+                if kl_logit_chunk_tokens <= 0:
+                    raise ValueError(
+                        "kl_recompute_head requires kl_logit_chunk_tokens > 0"
+                    )
+                head = analyzer.get_lm_head()
+                if not isinstance(head, nn.Linear):
+                    raise TypeError(
+                        "recomputed-head KL currently requires an nn.Linear lm_head; "
+                        f"got {type(head).__name__}"
+                    )
+                with profile_recorder.section("compute_refresh_loss.kl.recomputed_head") if profile_recorder else _NULL_CONTEXT:
+                    student_hidden = analyzer.get_layernorm_before_head()(
+                        _drop_sink(out_hidden)
+                    )
+                    with torch.no_grad():
+                        teacher_hidden = analyzer.get_layernorm_before_head()(
+                            _drop_sink(fp_hidden)
+                        )
+                    return recomputed_linear_head_tokenwise_kl(
+                        student_hidden,
+                        teacher_hidden,
+                        head.weight,
+                        head.bias,
+                        chunk_tokens=kl_logit_chunk_tokens,
+                        topk=kl_topk,
+                    )
             with profile_recorder.section("compute_refresh_loss.kl.logits_quant") if profile_recorder else _NULL_CONTEXT:
-                logits = hidden2logits(
-                    _drop_sink(out_hidden), analyzer
-                ).float()
+                logits = hidden2logits(_drop_sink(out_hidden), analyzer)
             with profile_recorder.section("compute_refresh_loss.kl.logits_fp") if profile_recorder else _NULL_CONTEXT:
-                logits_fp = hidden2logits(
-                    _drop_sink(fp_hidden), analyzer
-                ).float()
+                logits_fp = hidden2logits(_drop_sink(fp_hidden), analyzer)
+            if kl_logit_chunk_tokens > 0:
+                return chunked_tokenwise_kl_from_logits(
+                    logits,
+                    logits_fp,
+                    chunk_tokens=kl_logit_chunk_tokens,
+                    topk=kl_topk,
+                )
+            logits = logits.float()
+            logits_fp = logits_fp.float()
             if kl_topk > 0:
                 with profile_recorder.section("compute_refresh_loss.kl.topk_slice") if profile_recorder else _NULL_CONTEXT:
                     logits_fp, indices = logits_fp.topk(kl_topk, dim=-1, sorted=False)
                     logits = logits.gather(-1, indices)
             with profile_recorder.section("compute_refresh_loss.kl.kl_div") if profile_recorder else _NULL_CONTEXT:
-                return tokenwise_kl_from_logits(
-                    logits, logits_fp
-                ).mean()
+                return _mean_tokenwise_kl(logits, logits_fp)
 
     delta = _drop_sink(out_hidden - fp_hidden)
     if (
@@ -6706,6 +9020,34 @@ def compute_refresh_loss(
     if is_hidden_mse_loss(refresh_loss_type):
         with profile_recorder.section("compute_refresh_loss.hidden_mse") if profile_recorder else _NULL_CONTEXT:
             return 0.5 * delta.square().sum(dim=-1).mean()
+
+    nonlinear_mse_component = None
+    if refresh_loss_type in ("ffn_nonlinear_mse", "ffn_nonlinear_hybrid"):
+        # The caller selects this objective only for the three SwiGLU FFN
+        # projections. `out_hidden` is produced by the actual transformer
+        # layer forward, so this residual includes the nonlinear gate/up
+        # interaction rather than a Fisher Taylor proxy. Match its units to the
+        # layer Fisher objective with the mean local curvature (trace(F)/H); no
+        # loss-scale sweep is needed.
+        if layer_output_fisher is None:
+            raise ValueError(
+                f"{refresh_loss_type} requires the layer-output Fisher matrix for scale matching."
+            )
+        if layer_output_fisher.dim() != 2 or layer_output_fisher.shape[0] != layer_output_fisher.shape[1]:
+            raise ValueError(
+                f"{refresh_loss_type} expects a shared layer Fisher matrix (H, H), "
+                f"got {tuple(layer_output_fisher.shape)}."
+            )
+        fisher = layer_output_fisher.to(device=delta.device, dtype=torch.float32)
+        if fisher.shape[0] != delta.shape[-1]:
+            raise ValueError(
+                f"Fisher hidden dim {fisher.shape[0]} does not match residual dim {delta.shape[-1]}."
+            )
+        curvature = torch.diagonal(fisher).mean().clamp_min(1e-12)
+        with profile_recorder.section("compute_refresh_loss.ffn_nonlinear") if profile_recorder else _NULL_CONTEXT:
+            nonlinear_mse_component = 0.5 * curvature * delta.float().square().sum(dim=-1).mean()
+        if refresh_loss_type == "ffn_nonlinear_mse":
+            return nonlinear_mse_component
 
     if refresh_loss_type == "residual_kl":
         # Residual-stream shortcut: assume (layers i+1 .. N-1) act as identity on
@@ -6735,9 +9077,7 @@ def compute_refresh_loss(
                     logits_fp, indices = logits_fp.topk(kl_topk, dim=-1, sorted=False)
                     logits_perturbed = logits_perturbed.gather(-1, indices)
             with profile_recorder.section("compute_refresh_loss.residual_kl.kl_div") if profile_recorder else _NULL_CONTEXT:
-                return tokenwise_kl_from_logits(
-                    logits_perturbed, logits_fp
-                ).mean()
+                return _mean_tokenwise_kl(logits_perturbed, logits_fp)
 
     if refresh_loss_type == "refined_residual_kl":
         # One-step Jacobi refinement of residual_kl. Instead of assuming
@@ -6779,9 +9119,7 @@ def compute_refresh_loss(
                     logits_fp, indices = logits_fp.topk(kl_topk, dim=-1, sorted=False)
                     logits_perturbed = logits_perturbed.gather(-1, indices)
             with profile_recorder.section("compute_refresh_loss.refined_residual_kl.kl_div") if profile_recorder else _NULL_CONTEXT:
-                return tokenwise_kl_from_logits(
-                    logits_perturbed, logits_fp
-                ).mean()
+                return _mean_tokenwise_kl(logits_perturbed, logits_fp)
 
     if refresh_loss_type == "refined_diag_residual_kl":
         # Diagonal variant of refined_residual_kl: treat J as diagonal per
@@ -6818,9 +9156,7 @@ def compute_refresh_loss(
                     logits_fp, indices = logits_fp.topk(kl_topk, dim=-1, sorted=False)
                     logits_perturbed = logits_perturbed.gather(-1, indices)
             with profile_recorder.section("compute_refresh_loss.refined_diag_residual_kl.kl_div") if profile_recorder else _NULL_CONTEXT:
-                return tokenwise_kl_from_logits(
-                    logits_perturbed, logits_fp
-                ).mean()
+                return _mean_tokenwise_kl(logits_perturbed, logits_fp)
 
     if layer_output_fisher is None:
         raise ValueError(
@@ -6863,6 +9199,10 @@ def compute_refresh_loss(
                 ).sum(dim=-1)
                 fisher_loss = fisher_loss_per_token.mean()
 
+        if refresh_loss_type == "ffn_nonlinear_hybrid":
+            if nonlinear_mse_component is None:
+                raise RuntimeError("Missing exact nonlinear MSE component for FFN hybrid loss.")
+            return 0.5 * (fisher_loss + nonlinear_mse_component)
         if refresh_loss_type != "refined_mse":
             return fisher_loss
 
@@ -7501,6 +9841,341 @@ class ModuleGradSecondMoment:
         return gbar_sq + var_s / max(float(batch_size), 1.0)
 
 
+def compute_cross_module_compensation(
+    layer,
+    full,
+    inps,
+    attention_mask,
+    position_ids,
+    position_embeddings,
+    dev,
+    feeder_name,
+    target_name,
+    feeder_fp,
+    feeder_cur,
+    damping=0.01,
+    sample_indices=None,
+    layer_output_fisher=None,
+    diagnostic_layer_output_fisher=None,
+    diagnose_fisher_split=False,
+):
+    """Closed-form cross-module compensation: cancel the feeder module's NET
+    quantization error by adjusting the (downstream) target module's weight.
+
+        delta_W_target = -(delta_out . F)^T . h_target . (h_target^T h_target + lambda I)^{-1}
+
+    delta_out = out(feeder quantised) - out(feeder FP) is the NET error the
+    feeder injects into the layer output (after its own within-module
+    compensation); h_target is the target's fresh input. Incremental: each
+    compensation is for ONE feeder's net error, not the accumulated layer output
+    error, so the magnitude stays bounded (mirroring GPTQ's within-module
+    behaviour).
+    """
+    feeder_resolved, feeder_module = resolve_quant_module(full, feeder_name)
+    target_resolved, target_module = resolve_quant_module(full, target_name)
+    feeder_fn = functional_weight_name_for_quant_module(
+        layer, feeder_name, feeder_resolved, feeder_module
+    )
+
+    feeder_fp_t = feeder_fp.detach().to(
+        device=feeder_module.weight.device, dtype=feeder_module.weight.data.dtype
+    )
+    feeder_cur_t = feeder_cur.detach().to(
+        device=feeder_module.weight.device, dtype=feeder_module.weight.data.dtype
+    )
+
+    captured = {}
+
+    def _hook(m, inp, out):
+        captured["h"] = inp[0].detach()
+
+    handle = target_module.register_forward_hook(_hook)
+
+    if sample_indices is None:
+        sample_indices = list(range(inps.shape[0]))
+    batch_indices = list(sample_indices)
+    batch_size = len(batch_indices)
+    batch_attention_mask = (
+        attention_mask.expand(batch_size, -1, -1, -1)
+        if attention_mask is not None else None
+    )
+    batch_position_ids = (
+        position_ids.expand(batch_size, -1) if position_ids is not None else None
+    )
+    batch_position_embeddings = (
+        (position_embeddings[0].expand(batch_size, -1, -1),
+         position_embeddings[1].expand(batch_size, -1, -1))
+        if position_embeddings is not None else None
+    )
+    kwargs = {
+        "attention_mask": batch_attention_mask,
+        "position_ids": batch_position_ids,
+        "position_embeddings": batch_position_embeddings,
+    }
+
+    try:
+        with torch.no_grad():
+            out_before = functional_call(
+                layer, {feeder_fn: feeder_fp_t},
+                (inps[batch_indices].to(dev),), kwargs, strict=False,
+            )
+            out_before = out_before[0] if isinstance(out_before, (tuple, list)) else out_before
+            captured.pop("h", None)
+            out_after = functional_call(
+                layer, {feeder_fn: feeder_cur_t},
+                (inps[batch_indices].to(dev),), kwargs, strict=False,
+            )
+            out_after = out_after[0] if isinstance(out_after, (tuple, list)) else out_after
+            h_target = captured["h"]
+    finally:
+        handle.remove()
+
+    delta_out = (out_after - out_before).to(dtype=torch.float32)
+    h = h_target.to(dtype=torch.float32)
+
+    n_tokens = delta_out.numel() // delta_out.shape[-1]
+    delta_out_flat = delta_out.reshape(n_tokens, delta_out.shape[-1])
+    h_flat = h.reshape(n_tokens, h.shape[-1])
+    H = h_flat.t() @ h_flat
+    lam = float(damping) * float(H.diagonal().mean().item())
+    H_reg = H + lam * torch.eye(H.shape[0], device=H.device, dtype=H.dtype)
+    if layer_output_fisher is not None:
+        _F = layer_output_fisher.to(dtype=torch.float32, device=delta_out_flat.device)
+        _weighted = delta_out_flat @ _F
+    else:
+        _weighted = delta_out_flat
+    delta_W = -(_weighted.t() @ h_flat) @ torch.linalg.inv(H_reg)
+
+    # Diagnostic of the exact residual this correction is meant to cancel.
+    # This is distinct from the full layer residual used by block-GD, which also
+    # contains unrelated errors from earlier quantized modules.
+    _probe_F = diagnostic_layer_output_fisher
+    if _probe_F is None:
+        _probe_F = layer_output_fisher
+    if diagnose_fisher_split and _probe_F is not None and target_name == "mlp.down_proj":
+        _probe_F = _probe_F.to(dtype=torch.float32, device=delta_out_flat.device)
+        _probe_D = torch.diag(torch.diagonal(_probe_F))
+        _probe_O = _probe_F - _probe_D
+        residuals = {
+            "before": delta_out_flat,
+            "after": delta_out_flat + h_flat.matmul(delta_W.t()),
+        }
+        for _tag, _residual in residuals.items():
+            _parts = {}
+            for _part_name, _metric in (
+                ("full", _probe_F),
+                ("diag", _probe_D),
+                ("offdiag", _probe_O),
+            ):
+                _loss = 0.5 * (_residual.matmul(_metric) * _residual).sum(dim=-1).mean()
+                _grad = _metric.matmul(_residual.t().matmul(h_flat)) / max(n_tokens, 1)
+                _parts[_part_name] = (float(_loss.item()), float(_grad.norm().item()))
+            logging.info(
+                "CROSS_RESIDUAL_PROBE tag=%s target=%s tokens=%d "
+                "loss_full=%.7g loss_diag=%.7g loss_offdiag=%.7g "
+                "grad_norm_full=%.7g grad_norm_diag=%.7g grad_norm_offdiag=%.7g",
+                _tag, target_name, n_tokens,
+                _parts["full"][0], _parts["diag"][0], _parts["offdiag"][0],
+                _parts["full"][1], _parts["diag"][1], _parts["offdiag"][1],
+            )
+
+    return delta_W
+
+
+@torch.no_grad()
+def compute_cross_module_compensation_all(
+    layer,
+    full,
+    inps,
+    attention_mask,
+    position_ids,
+    position_embeddings,
+    dev,
+    feeder_name,
+    target_names,
+    feeder_fp,
+    feeder_cur,
+    damping=0.01,
+    sample_indices=None,
+    layer_output_fisher=None,
+):
+    """Closed-form compensation of ONE feeder's net error onto EVERY not-yet-
+    quantised module in the same layer, evenly split.
+
+    ``delta_out = out(feeder cur) - out(feeder fp)`` is the feeder's net
+    perturbation of the layer output, measured by functional_call replacing only
+    the feeder (so it carries the whole downstream path, non-linearities
+    included).
+
+    Two target classes need two different closed forms:
+
+    * residual-stream modules (``o_proj`` / ``down_proj``, out == hidden): their
+      output lands directly on the residual stream, so
+          delta_W = -(delta_out^T h)(h^T h + lambda I)^-1     (delta_out / m)
+      exactly ``compute_cross_module_compensation``, only split by ``m``.
+    * SwiGLU modules (``mlp.up_proj`` / ``mlp.gate_proj``): their output reaches
+      the residual stream only through ``SiLU(gate) * up`` then ``down_proj``.
+      Linearising that chain at the token-mean activation gives
+          A_up   = W_down diag(mean_t SiLU(gate_out_t))
+          A_gate = W_down diag(mean_t [SiLU'(gate_out_t) * up_out_t])
+      and the least-squares solution of ``A delta_W x = -delta_out^T`` is
+          delta_W = -(A^T A + l I)^-1 A^T delta_out^T x (x^T x + l I)^-1
+      where ``x`` is the MLP input (shared by up and gate).
+
+    Splitting: every target receives ``delta_out / m`` (``m`` = number of
+    targets), so the targets jointly cancel exactly one delta_out. Without the
+    split the sum is ``-m * delta_out`` -- the over-compensation that made
+    ``eager_cross_compensate`` diverge.
+
+    Returns ``{target_name: delta_W}``; only successfully computed entries are
+    kept.
+    """
+    feeder_resolved, feeder_module = resolve_quant_module(full, feeder_name)
+    feeder_fn = functional_weight_name_for_quant_module(
+        layer, feeder_name, feeder_resolved, feeder_module
+    )
+    feeder_fp_t = feeder_fp.detach().to(
+        device=feeder_module.weight.device, dtype=feeder_module.weight.data.dtype
+    )
+    feeder_cur_t = feeder_cur.detach().to(
+        device=feeder_module.weight.device, dtype=feeder_module.weight.data.dtype
+    )
+
+    # Classify targets: residual-stream vs SwiGLU (everything else is skipped --
+    # q/k/v need the attention softmax linearised, out of scope for this pass).
+    residual_names, swiglu_names = [], []
+    target_mod = {}
+    for tn in target_names:
+        tr, tm = resolve_quant_module(full, tn)
+        if tm is None:
+            continue
+        target_mod[tn] = tm
+        if tn.endswith(("o_proj", "down_proj")):
+            residual_names.append(tn)
+        elif tn.endswith(("up_proj", "gate_proj")):
+            swiglu_names.append(tn)
+    m = len(residual_names) + len(swiglu_names)
+    if m == 0:
+        return {}
+
+    captured = {}
+
+    def _input_hook(key):
+        def _hook(_m, _inp, _out):
+            captured[key] = _inp[0].detach()
+        return _hook
+
+    def _output_hook(key):
+        def _hook(_m, _inp, out):
+            captured[key] = out.detach()
+        return _hook
+
+    handles = []
+    for tn in residual_names + swiglu_names:
+        handles.append(target_mod[tn].register_forward_hook(_input_hook("h:" + tn)))
+    for key, mod_name in (("g", "mlp.gate_proj"), ("u", "mlp.up_proj")):
+        _m = full.get(mod_name) or full.get(mod_name + ".module")
+        if _m is not None:
+            handles.append(_m.register_forward_hook(_output_hook(key)))
+
+    if sample_indices is None:
+        sample_indices = list(range(inps.shape[0]))
+    batch_indices = list(sample_indices)
+    batch_size = len(batch_indices)
+    batch_attention_mask = (
+        attention_mask.expand(batch_size, -1, -1, -1)
+        if attention_mask is not None else None
+    )
+    batch_position_ids = (
+        position_ids.expand(batch_size, -1) if position_ids is not None else None
+    )
+    batch_position_embeddings = (
+        (position_embeddings[0].expand(batch_size, -1, -1),
+         position_embeddings[1].expand(batch_size, -1, -1))
+        if position_embeddings is not None else None
+    )
+    kwargs = {
+        "attention_mask": batch_attention_mask,
+        "position_ids": batch_position_ids,
+        "position_embeddings": batch_position_embeddings,
+    }
+
+    try:
+        with torch.no_grad():
+            out_before = functional_call(
+                layer, {feeder_fn: feeder_fp_t},
+                (inps[batch_indices].to(dev),), kwargs, strict=False,
+            )
+            out_before = out_before[0] if isinstance(out_before, (tuple, list)) else out_before
+            out_after = functional_call(
+                layer, {feeder_fn: feeder_cur_t},
+                (inps[batch_indices].to(dev),), kwargs, strict=False,
+            )
+            out_after = out_after[0] if isinstance(out_after, (tuple, list)) else out_after
+    finally:
+        for h_ in handles:
+            h_.remove()
+
+    delta_out = (out_after - out_before).to(dtype=torch.float32)  # (T, H)
+    n_tokens = delta_out.numel() // delta_out.shape[-1]
+    delta_out_flat = delta_out.reshape(n_tokens, delta_out.shape[-1])
+    if layer_output_fisher is not None:
+        _F = layer_output_fisher.to(dtype=torch.float32, device=delta_out_flat.device)
+        delta_out_flat = delta_out_flat @ _F
+    delta_out_split = delta_out_flat / float(m)  # 分摊
+
+    results = {}
+
+    # Residual-stream targets: closed form identical to the single-target version.
+    for tn in residual_names:
+        h = captured.get("h:" + tn)
+        if h is None:
+            continue
+        h_flat = h.to(dtype=torch.float32).reshape(n_tokens, h.shape[-1])
+        H = h_flat.t() @ h_flat
+        lam = float(damping) * float(H.diagonal().mean().item())
+        H_reg = H + lam * torch.eye(H.shape[0], device=H.device, dtype=H.dtype)
+        delta_W = -(delta_out_split.t() @ h_flat) @ torch.linalg.inv(H_reg)
+        results[tn] = delta_W
+
+    # SwiGLU targets: linearise SiLU(gate) * up through down_proj.
+    if swiglu_names:
+        down_mod = full.get("mlp.down_proj") or full.get("mlp.down_proj.module")
+        W_down = None if down_mod is None else down_mod.weight.data.to(
+            dtype=torch.float32, device=delta_out_flat.device
+        )
+        g = captured.get("g")  # (T, 3072)
+        u = captured.get("u")  # (T, 3072)
+        if W_down is not None and g is not None:
+            g = g.to(dtype=torch.float32).reshape(n_tokens, g.shape[-1])
+            sigmoid_g = torch.sigmoid(g)
+            silu = g * sigmoid_g  # SiLU(g)
+            silu_grad = sigmoid_g * (1.0 + g * (1.0 - sigmoid_g))  # SiLU'(g)
+            for tn in swiglu_names:
+                h = captured.get("h:" + tn)
+                if h is None:
+                    continue
+                x_flat = h.to(dtype=torch.float32).reshape(n_tokens, h.shape[-1])
+                if tn.endswith("up_proj"):
+                    a_bar = silu.mean(dim=0)  # mean_t SiLU(gate)
+                else:
+                    u_t = u.to(dtype=torch.float32).reshape(n_tokens, u.shape[-1])
+                    a_bar = (silu_grad * u_t).mean(dim=0)  # mean_t SiLU'(g)*u
+                A = W_down * a_bar[None, :]  # W_down diag(a_bar): (H, 3072)
+                AtA = A.t() @ A
+                lam = float(damping) * float(AtA.diagonal().mean().item())
+                AtA_reg = AtA + lam * torch.eye(AtA.shape[0], device=AtA.device, dtype=AtA.dtype)
+                Hx = x_flat.t() @ x_flat
+                lamx = float(damping) * float(Hx.diagonal().mean().item())
+                Hx_reg = Hx + lamx * torch.eye(Hx.shape[0], device=Hx.device, dtype=Hx.dtype)
+                Z = torch.linalg.solve(AtA_reg, A.t() @ delta_out_split.t())
+                Y = torch.linalg.solve(Hx_reg, x_flat.t())
+                delta_W = -(Z @ Y.t())
+                results[tn] = delta_W
+
+    return results
+
+
 def collect_true_weight_gradient(
     layer,
     analyzer,
@@ -7530,6 +10205,7 @@ def collect_true_weight_gradient(
     dp_rank=0,
     shard_size=None,
     refresh_mb=None,
+    kl_logit_chunk_tokens=0,
     refined_mse_pool_ids=None,
     refined_mse_grad_pool=None,
     refined_mse_mean_grad=None,
@@ -7540,6 +10216,15 @@ def collect_true_weight_gradient(
     a_loss_ratio=1.0,
     a_loss_clip_scope="local_backward_chunk",
     grad_sq_accum=None,
+    extra_weight_overrides=None,
+    joint_targets=None,
+    sequence_fisher_cache=None,
+    sequence_fisher_layer_idx=None,
+    audit_capture=None,
+    third_order_suffix_layers=None,
+    third_order_layer_idx=None,
+    third_order_refresh_estimator="central_cubic",
+    kl_recompute_head=False,
 ):
     """Compute the refresh gradient as a per-rank partial sum + count.
 
@@ -7567,10 +10252,61 @@ def collect_true_weight_gradient(
     caller's allreduce does the right thing.
     """
     refresh_loss_type = canonical_refresh_loss_type(refresh_loss_type)
+    use_third_order_refresh = third_order_suffix_layers is not None
+    if use_third_order_refresh:
+        if refresh_loss_type != "fisher_diag_mse":
+            raise ValueError(
+                "Matrix-free third-order refresh currently requires fisher_diag_mse."
+            )
+        if third_order_layer_idx is None or fp_inps_final is None:
+            raise ValueError(
+                "Matrix-free third-order refresh requires a layer index and FP final hidden."
+            )
     resolved_module_name, module = resolve_quant_module(full, module_name)
     functional_weight_name = functional_weight_name_for_quant_module(
         layer, module_name, resolved_module_name, module
     )
+    extra_overrides = {}
+    if extra_weight_overrides:
+        for _extra_name, _extra_w in extra_weight_overrides.items():
+            _extra_resolved, _extra_module = resolve_quant_module(full, _extra_name)
+            _extra_fn = functional_weight_name_for_quant_module(
+                layer, _extra_name, _extra_resolved, _extra_module
+            )
+            _extra_src = _extra_w.detach()
+            _extra_dev = _extra_module.weight.device
+            _extra_dtype = _extra_module.weight.data.dtype
+            if _extra_src.device == _extra_dev and _extra_src.dtype == _extra_dtype:
+                _extra_override = _extra_src.clone()
+            else:
+                _extra_override = _extra_src.to(_extra_dev, dtype=_extra_dtype)
+            extra_overrides[_extra_fn] = _extra_override
+    # Joint targets: additional modules whose gradient is computed in the SAME
+    # backward as the primary module. Each is overridden to its own weight,
+    # made differentiable, and its per-rank partial grad sum is returned via
+    # `extras["joint_partial_grad_sums"]` so the caller can aggregate and apply
+    # them without re-running the forward/backward.
+    joint_target_tensors = []
+    joint_partial_grad_sums = []
+    if joint_targets:
+        for _jname, _jw in joint_targets:
+            _jresolved, _jmodule = resolve_quant_module(full, _jname)
+            _jfname = functional_weight_name_for_quant_module(
+                layer, _jname, _jresolved, _jmodule
+            )
+            _jsrc = _jw.detach()
+            _jdev = _jmodule.weight.device
+            _jdtype = _jmodule.weight.data.dtype
+            if _jsrc.device == _jdev and _jsrc.dtype == _jdtype:
+                _jcast = _jsrc.clone()
+            else:
+                _jcast = _jsrc.to(_jdev, dtype=_jdtype)
+            _jcast.requires_grad_(True)
+            extra_overrides[_jfname] = _jcast
+            joint_target_tensors.append(_jcast)
+            joint_partial_grad_sums.append(
+                torch.zeros_like(_jcast, dtype=torch.float32)
+            )
     if sample_indices is None:
         raw_indices = list(range(inps.shape[0]))
     else:
@@ -7639,6 +10375,14 @@ def collect_true_weight_gradient(
             override_weight = src.to(target_dev, dtype=target_dtype)
     override_weight.requires_grad_(True)
     partial_grad_sum = torch.zeros_like(override_weight, dtype=torch.float32)
+    audit_hook = None
+    audit_outputs = []
+    if audit_capture is not None:
+        def _shadow_audit_forward_hook(_module, _inputs, output):
+            value = output[0] if isinstance(output, (tuple, list)) else output
+            if torch.is_tensor(value):
+                audit_outputs.append(value.detach().float().cpu())
+        audit_hook = module.register_forward_hook(_shadow_audit_forward_hook)
     # Measured second moment of this module's refresh gradient. Hooks stay
     # attached only for the batch loop below; `functional_call` swaps the weight
     # but still runs the module's own forward, so they fire normally.
@@ -7804,7 +10548,7 @@ def collect_true_weight_gradient(
 
     if len(selected_indices) > 0:
         grad_modules = [layer]
-        if refresh_loss_type in ("kl", "residual_kl", "refined_residual_kl"):
+        if refresh_loss_type in ("kl", "residual_kl", "refined_residual_kl") or use_third_order_refresh:
             # These losses also send grad through the final norm + lm_head,
             # so we must include them in `temporary_requires_grad` so their
             # param.requires_grad is forced to False for the duration of the
@@ -7812,6 +10556,8 @@ def collect_true_weight_gradient(
             grad_modules.extend(
                 [analyzer.get_layernorm_before_head(), analyzer.get_lm_head()]
             )
+        if use_third_order_refresh:
+            grad_modules.extend(third_order_suffix_layers)
         if slide_active:
             grad_modules.append(next_layer)
         with temporary_requires_grad(grad_modules, []):
@@ -7838,9 +10584,12 @@ def collect_true_weight_gradient(
                             )
 
                         with layer_recorder.section("layer.true_weight_grad.batch.forward") if layer_recorder else _NULL_CONTEXT:
+                            _call_overrides = {functional_weight_name: override_weight}
+                            if extra_overrides:
+                                _call_overrides.update(extra_overrides)
                             out = functional_call(
                                 layer,
-                                {functional_weight_name: override_weight},
+                                _call_overrides,
                                 (inps[batch_indices].to(dev),),
                                 {
                                     "attention_mask": batch_attention_mask,
@@ -7975,7 +10724,182 @@ def collect_true_weight_gradient(
                                 sink_size=sink_size,
                                 a_loss_ratio=a_loss_ratio,
                                 a_loss_threshold=a_loss_threshold,
+                                kl_logit_chunk_tokens=kl_logit_chunk_tokens,
+                                kl_recompute_head=kl_recompute_head,
                             )
+                            if use_third_order_refresh:
+                                # Keep REAL-Q's Fisher scalar for the refresh
+                                # trace, but replace its activation gradient by
+                                # g0 + F*delta + 1/2*T[delta,delta]. The cubic
+                                # contraction is estimated matrix-free from the
+                                # symmetric second difference of exact
+                                # downstream-KL gradients at y0 +/- delta.
+                                # Suffix weights are frozen; autograd still
+                                # differentiates through them to the layer output.
+                                y0_fp32 = fp_hidden.detach().float()
+                                y_plus_fp32 = out_hidden.detach().float()
+                                delta_third = y_plus_fp32 - y0_fp32
+                                g_fisher = torch.autograd.grad(
+                                    refresh_loss_current,
+                                    out_hidden,
+                                    retain_graph=False,
+                                )[0].detach().float()
+
+                                fp_final_batch = fp_inps_final[batch_indices].to(dev)
+                                with torch.no_grad():
+                                    teacher_logits = hidden2logits(
+                                        fp_final_batch, analyzer
+                                    ).detach().float()
+
+                                def _third_order_downstream_kl(hidden):
+                                    tail_hidden = hidden
+                                    for _suffix in third_order_suffix_layers:
+                                        _suffix_out = _suffix(
+                                            tail_hidden,
+                                            attention_mask=batch_attention_mask,
+                                            position_ids=batch_position_ids,
+                                            position_embeddings=batch_position_embeddings,
+                                        )
+                                        tail_hidden = (
+                                            _suffix_out[0]
+                                            if isinstance(_suffix_out, (tuple, list))
+                                            else _suffix_out
+                                        )
+                                    student_logits = hidden2logits(
+                                        tail_hidden, analyzer
+                                    ).float()
+                                    ref_logits = teacher_logits
+                                    if sink_size > 0 and student_logits.shape[1] > sink_size:
+                                        student_logits = student_logits[:, sink_size:]
+                                        ref_logits = ref_logits[:, sink_size:]
+                                    if kl_logit_chunk_tokens > 0:
+                                        return chunked_tokenwise_kl_from_logits(
+                                            student_logits,
+                                            ref_logits,
+                                            chunk_tokens=kl_logit_chunk_tokens,
+                                        )
+                                    return tokenwise_kl_from_logits(
+                                        student_logits, ref_logits
+                                    ).mean()
+
+                                loss_plus = _third_order_downstream_kl(out_hidden)
+                                g_plus = torch.autograd.grad(
+                                    loss_plus, out_hidden, retain_graph=False
+                                )[0].detach().float()
+                                del loss_plus
+
+                                _plus_displacement = y_plus_fp32 - y0_fp32
+                                _bf16_symmetry_error = float("nan")
+                                _bf16_minus_scale = float("nan")
+                                if third_order_refresh_estimator == "central_cubic":
+                                    y0 = fp_hidden.detach().to(dtype=out_hidden.dtype)
+                                    y0_leaf = y0.requires_grad_(True)
+                                    loss_zero = _third_order_downstream_kl(y0_leaf)
+                                    g_zero = torch.autograd.grad(
+                                        loss_zero, y0_leaf
+                                    )[0].detach().float()
+                                    del y0_leaf, loss_zero
+
+                                    y_minus = (
+                                        y0_fp32 - delta_third
+                                    ).to(dtype=out_hidden.dtype).requires_grad_(True)
+                                    # The suffix runs in the model activation
+                                    # dtype. Rounding y0-d can break the +/-
+                                    # symmetry, so audit the actual displacements.
+                                    _minus_displacement = y_minus.detach().float() - y0_fp32
+                                    _delta_norm = delta_third.norm().clamp_min(
+                                        torch.finfo(torch.float32).tiny
+                                    )
+                                    _bf16_symmetry_error = (
+                                        (_plus_displacement + _minus_displacement).norm()
+                                        / (2.0 * _delta_norm)
+                                    ).item()
+                                    _bf16_minus_scale = (
+                                        _minus_displacement.norm() / _delta_norm
+                                    ).item()
+                                    loss_minus = _third_order_downstream_kl(y_minus)
+                                    g_minus = torch.autograd.grad(
+                                        loss_minus, y_minus
+                                    )[0].detach().float()
+                                    del y_minus, loss_minus
+                                    g_candidate = (
+                                        g_zero + g_fisher
+                                        + 0.5 * (g_plus + g_minus - 2.0 * g_zero)
+                                    )
+                                    _finite_grads = (g_fisher, g_plus, g_zero, g_minus)
+                                    _correction_norm = (
+                                        g_candidate - g_zero - g_fisher
+                                    ).norm().item()
+                                elif third_order_refresh_estimator == "exact_downstream":
+                                    # Diagnostic/upper-bound path: g(y_q) has
+                                    # already been computed exactly through the
+                                    # frozen FP suffix. Use it directly and skip
+                                    # the extra reference/minus KL backwards.
+                                    g_zero = None
+                                    g_minus = None
+                                    g_candidate = g_plus
+                                    _finite_grads = (g_fisher, g_plus)
+                                    _correction_norm = 0.0
+                                else:
+                                    raise ValueError(
+                                        "Unknown third-order refresh estimator: "
+                                        f"{third_order_refresh_estimator!r}"
+                                    )
+
+                                if not all(torch.isfinite(_g).all().item() for _g in _finite_grads):
+                                    raise FloatingPointError(
+                                        "Non-finite output gradient in REAL-Q "
+                                        "downstream refresh "
+                                        f"(layer={third_order_layer_idx}, module={module_name})."
+                                    )
+                                audit_key = (int(third_order_layer_idx), str(module_name))
+                                audit_logged = getattr(
+                                    collect_true_weight_gradient,
+                                    "_third_order_audit_logged", set(),
+                                )
+                                if audit_key not in audit_logged:
+                                    audit_logged.add(audit_key)
+                                    collect_true_weight_gradient._third_order_audit_logged = audit_logged
+                                    _eps = torch.finfo(torch.float32).eps
+                                    _cos_fisher_true = torch.nn.functional.cosine_similarity(
+                                        g_fisher.reshape(1, -1), g_plus.reshape(1, -1), dim=1
+                                    ).item()
+                                    _cos_candidate_true = torch.nn.functional.cosine_similarity(
+                                        g_candidate.reshape(1, -1), g_plus.reshape(1, -1), dim=1
+                                    ).item()
+                                    _norm_delta = delta_third.norm().item()
+                                    _norm_fp = fp_hidden.detach().float().norm().item()
+                                    logging.info(
+                                        "THIRD_ORDER_GRAD_AUDIT layer=%d module=%s estimator=%s "
+                                        "batch=%d delta_over_fp=%.6g fisher_norm=%.6g "
+                                        "exact_kl_norm=%.6g candidate_norm=%.6g "
+                                        "cos_fisher_exact=%.6g cos_candidate_exact=%.6g "
+                                        "higher_order_correction_norm=%.6g "
+                                        "bf16_symmetry_error=%.6g bf16_minus_scale=%.6g",
+                                        third_order_layer_idx, module_name,
+                                        third_order_refresh_estimator, batch_size,
+                                        _norm_delta / max(_norm_fp, _eps),
+                                        g_fisher.norm().item(), g_plus.norm().item(),
+                                        g_candidate.norm().item(), _cos_fisher_true,
+                                        _cos_candidate_true,
+                                        _correction_norm,
+                                        _bf16_symmetry_error, _bf16_minus_scale,
+                                    )
+                                # Forward value stays equal to Fisher MSE for
+                                # comparable loss logging; derivative is exactly
+                                # the candidate output gradient above.
+                                linearized_value = (
+                                    out_hidden.float() * g_candidate.to(out_hidden.device)
+                                ).sum()
+                                refresh_loss_current = (
+                                    refresh_loss_current.detach()
+                                    + linearized_value - linearized_value.detach()
+                                )
+                            if sequence_fisher_cache is not None:
+                                refresh_loss_current = sequence_fisher_cache.blend(
+                                    refresh_loss_current, out_hidden - fp_hidden,
+                                    sequence_fisher_layer_idx, batch_indices, dev, module_name,
+                                )
                         if slide_active:
                             with layer_recorder.section("layer.true_weight_grad.batch.slide_next_forward") if layer_recorder else _NULL_CONTEXT:
                                 next_out = next_layer(
@@ -8021,6 +10945,8 @@ def collect_true_weight_gradient(
                                     sink_size=sink_size,
                                     a_loss_ratio=a_loss_ratio,
                                     a_loss_threshold=next_a_loss_threshold,
+                                    kl_logit_chunk_tokens=kl_logit_chunk_tokens,
+                                    kl_recompute_head=kl_recompute_head,
                                 )
                             with layer_recorder.section("layer.true_weight_grad.batch.blend") if layer_recorder else _NULL_CONTEXT:
                                 refresh_loss = (
@@ -8037,16 +10963,23 @@ def collect_true_weight_gradient(
                             refresh_loss = refresh_loss_current
 
                         with layer_recorder.section("layer.true_weight_grad.batch.backward") if layer_recorder else _NULL_CONTEXT:
-                            batch_grad = torch.autograd.grad(
-                                refresh_loss, override_weight, retain_graph=False
-                            )[0].float()
+                            batch_grads = torch.autograd.grad(
+                                refresh_loss,
+                                [override_weight] + joint_target_tensors,
+                                retain_graph=False,
+                            )
+                            batch_grads = [g.float() for g in batch_grads]
                         with layer_recorder.section("layer.true_weight_grad.batch.accumulate") if layer_recorder else _NULL_CONTEXT:
                             # `autograd.grad` returns ∂(mean_loss)/∂W. Multiply by batch
                             # size to recover a sum-over-samples gradient so per-rank
                             # partials aggregate with a plain allreduce_sum. All refresh
                             # losses, including legacy_fisher_diag_mse, use batch/token
                             # mean convention here.
-                            partial_grad_sum.add_(batch_grad, alpha=float(batch_size))
+                            partial_grad_sum.add_(batch_grads[0], alpha=float(batch_size))
+                            for _ji, _jg in enumerate(batch_grads[1:]):
+                                joint_partial_grad_sums[_ji].add_(
+                                    _jg, alpha=float(batch_size)
+                                )
                             loss_sum += _reduce_refresh_loss_for_aggregation(
                                 refresh_loss_type, refresh_loss, batch_size
                             )
@@ -8060,8 +10993,16 @@ def collect_true_weight_gradient(
 
     if grad_sq_accum is not None:
         grad_sq_accum.detach()
+    if audit_hook is not None:
+        audit_hook.remove()
 
     extras = {"loss_sum": loss_sum}
+    if audit_capture is not None:
+        audit_capture["module_output"] = (
+            torch.cat(audit_outputs, dim=0) if audit_outputs else None
+        )
+    if joint_partial_grad_sums:
+        extras["joint_partial_grad_sums"] = joint_partial_grad_sums
     if slide_active:
         extras["loss_sum_current"] = loss_sum_current
         extras["loss_sum_next"] = loss_sum_next
@@ -8100,6 +11041,8 @@ def collect_layer_grad_hessian_stats(
     skip_gradient_backward=False,
     sink_size=0,
     a_loss_ratio=1.0,
+    kl_logit_chunk_tokens=0,
+    kl_recompute_head=False,
 ):
     layer_refresh_loss_type = canonical_refresh_loss_type(layer_refresh_loss_type)
     gptq_reference_loss_type = canonical_refresh_loss_type(gptq_reference_loss_type)
@@ -8286,9 +11229,16 @@ def collect_layer_grad_hessian_stats(
                             if sink_size > 0 and kl_logits.shape[1] > sink_size:
                                 kl_logits = kl_logits[:, sink_size:]
                                 kl_logits_fp = kl_logits_fp[:, sink_size:]
-                            gradient_loss = tokenwise_kl_from_logits(
-                                kl_logits, kl_logits_fp
-                            ).mean()
+                            if kl_logit_chunk_tokens > 0:
+                                gradient_loss = chunked_tokenwise_kl_from_logits(
+                                    kl_logits,
+                                    kl_logits_fp,
+                                    chunk_tokens=kl_logit_chunk_tokens,
+                                )
+                            else:
+                                gradient_loss = tokenwise_kl_from_logits(
+                                    kl_logits, kl_logits_fp
+                                ).mean()
                         else:
                             fp_final_batch = (
                                 None if fp_inps_final is None
@@ -8319,6 +11269,8 @@ def collect_layer_grad_hessian_stats(
                                 profile_recorder=layer_recorder,
                                 sink_size=sink_size,
                                 a_loss_ratio=a_loss_ratio,
+                                kl_logit_chunk_tokens=kl_logit_chunk_tokens,
+                                kl_recompute_head=kl_recompute_head,
                             )
 
                     with layer_recorder.section("layer.grad_hessian.gradient_backward.total") if layer_recorder else _NULL_CONTEXT:
@@ -8404,6 +11356,7 @@ def run_pre_quant_gd(
     dp_rank=0,
     shard_size=None,
     refresh_mb=None,
+    kl_logit_chunk_tokens=0,
     refined_mse_pool_ids=None,
     refined_mse_grad_pool=None,
     refined_mse_mean_grad=None,
@@ -8411,6 +11364,7 @@ def run_pre_quant_gd(
     sink_size=0,
     a_loss_ratio=1.0,
     a_loss_clip_scope="local_backward_chunk",
+    kl_recompute_head=False,
 ):
     if num_steps <= 0 or not module_names:
         return
@@ -8466,6 +11420,8 @@ def run_pre_quant_gd(
                                 dp_rank=dp_rank,
                                 shard_size=shard_size if shard_size is not None else inps.shape[0],
                                 refresh_mb=refresh_mb,
+                                kl_logit_chunk_tokens=kl_logit_chunk_tokens,
+                                kl_recompute_head=kl_recompute_head,
                                 refined_mse_pool_ids=refined_mse_pool_ids,
                                 refined_mse_grad_pool=refined_mse_grad_pool,
                                 refined_mse_mean_grad=refined_mse_mean_grad,
@@ -8563,7 +11519,33 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
     else:
         orig_device = next(model.parameters()).device
     stage2_cpu_master = bool(getattr(model, "_gptqplus_stage2_cpu_master", False))
+    third_order_refresh_layer = int(getattr(args, "third_order_refresh_layer", -1))
+    if third_order_refresh_layer >= 0:
+        if third_order_refresh_layer >= len(layers) - 1:
+            raise ValueError(
+                "--third_order_refresh_layer must select a non-final transformer layer; "
+                f"got {third_order_refresh_layer} for {len(layers)} layers."
+            )
+        if stage2_cpu_master:
+            raise ValueError(
+                "--third_order_refresh_layer is not supported with stage2_cpu_master."
+            )
+        if getattr(args, "quant_stop_layer", None) is not None:
+            stop_layer = parse_quant_stop_layer(args.quant_stop_layer, len(layers))
+            if stop_layer < third_order_refresh_layer:
+                raise ValueError(
+                    "--quant_stop_layer must reach --third_order_refresh_layer."
+                )
     global_loss_enabled = bool(getattr(args, "global_loss", False))
+    ffn_shrink_target = (
+        "diagonal"
+        if bool(getattr(args, "ffn_adaptive_fisher_offdiag_shrinkage", False))
+        else "isotropic"
+    )
+    ffn_shrink_enabled = bool(
+        getattr(args, "ffn_adaptive_fisher_shrinkage", False)
+        or getattr(args, "ffn_adaptive_fisher_offdiag_shrinkage", False)
+    )
     if stage2_cpu_master:
         if args.grad_refresh_loss == "refined_mse":
             raise RuntimeError(
@@ -8601,6 +11583,12 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
     quant_profile_enabled = getattr(args, "enable_quant_profile", False)
     run_recorder = QuantProfileRecorder(dev) if quant_profile_enabled else None
     pipeline_recorder = QuantProfileRecorder(dev) if quant_profile_enabled else None
+    memory_profiler = (
+        memory_utils.CudaPhaseMemoryProfiler(
+            os.path.join(args.output_dir, "memory_profile"), dev
+        )
+        if bool(getattr(args, "enable_memory_profile", False)) else None
+    )
     target_layers = (
         set(parse_quant_profile_target_layers(getattr(args, "quant_profile_target_layers", "all"), len(layers)))
         if quant_profile_enabled else set()
@@ -8611,6 +11599,15 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
     )
     target_modules = set(parsed_target_modules)
     quant_stop_layer = parse_quant_stop_layer(getattr(args, "quant_stop_layer", None), len(layers))
+    sequence_fisher_cache = None
+    if getattr(args, "sequence_fisher_mode", "off") != "off":
+        if dist_utils.get_world_size() != 1:
+            raise ValueError("Sequence Fisher pilot currently supports one rank only.")
+        sequence_fisher_cache = SequenceFisherCache(
+            args.nsamples, args.sequence_fisher_probes,
+            range(min(len(layers) - 1, len(layers) if quant_stop_layer is None else quant_stop_layer + 1)),
+            args.sequence_fisher_mode, args.sequence_fisher_mix,
+        )
     if quant_stop_layer is not None:
         logging.info("Quantization will stop after transformer layer %d.", quant_stop_layer)
     preclip_enabled = bool(args.w_clip and getattr(args, "pre_clip", True))
@@ -8825,7 +11822,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
         # a by-product of the static saliency/fisher forward pass to avoid a
         # separate bs=1 Stage 2 precompute later. Populated on CPU in bf16;
         # moved to match fp_inps's device/dtype once `inps` is captured below.
-        need_fp_inps_final = analysis_need_fp_inps_final or args.grad_refresh_loss in (
+        need_fp_inps_final = analysis_need_fp_inps_final or third_order_refresh_layer >= 0 or args.grad_refresh_loss in (
             "residual_kl", "refined_residual_kl", "refined_mse", "refined_mix",
         )
         fp_inps_final_cpu = None
@@ -8903,6 +11900,26 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     analysis_tag += "_mainFisher"
                 if args.grad_refresh_loss == "legacy_fisher_diag_mse":
                     analysis_tag += "_mainLegacyFisherDiag"
+                ffn_shrink_target = (
+                    "diagonal"
+                    if bool(getattr(args, "ffn_adaptive_fisher_offdiag_shrinkage", False))
+                    else "isotropic"
+                )
+                ffn_shrink_enabled = bool(
+                    getattr(args, "ffn_adaptive_fisher_shrinkage", False)
+                    or getattr(args, "ffn_adaptive_fisher_offdiag_shrinkage", False)
+                )
+                ffn_shrink_tag = (
+                    f"_ffn_seq_shrink_{ffn_shrink_target}"
+                    if ffn_shrink_enabled else ""
+                )
+                label_chunk_tokens = int(
+                    getattr(args, "static_fisher_label_chunk_tokens", 0)
+                )
+                label_chunk_tag = (
+                    f"_labelchunk{label_chunk_tokens}"
+                    if label_chunk_tokens > 0 else ""
+                )
                 static_cache_key = (
                     f"{args.model_name}_mid{model_identity_tag}_{dataset_id}_s{args.nsamples}_"
                     f"blk{args.seq_len}_rot{rotate_flag}_rotid{rotation_identity_tag}_"
@@ -8913,7 +11930,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     f"{_STATIC_SALIENCY_SCHEMA_TAG}_"
                     f"rklNA{rkl_na}_fpfinal{fpfinal_tag}"
                     f"_e2els{int(_E2E_PRECOMPUTE_LOSS_GRAD_SCALE)}"
-                    f"{grad_stat_tag}{mix_tag}{dynsal_tag}{analysis_tag}"
+                    f"{grad_stat_tag}{mix_tag}{dynsal_tag}{analysis_tag}{ffn_shrink_tag}{label_chunk_tag}"
                 )
                 # Bind `_sink{N}` to the cache key only when the option is on,
                 # so legacy caches keep their byte-identical key (no migration).
@@ -8992,6 +12009,20 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     static_fisher_by_layer = _loaded.get("fisher", None)
                     if static_fisher_by_layer is None:
                         static_fisher_by_layer = [None] * len(layers)
+                    static_fisher_shrinkage_by_layer = _loaded.get(
+                        "fisher_shrinkage", None
+                    )
+                    if ffn_shrink_enabled:
+                        if (
+                            static_fisher_shrinkage_by_layer is None
+                            or len(static_fisher_shrinkage_by_layer) != len(layers)
+                        ):
+                            raise RuntimeError(
+                                "Cached static precompute lacks per-layer Fisher "
+                                "shrinkage coefficients required by "
+                                "adaptive FFN Fisher shrinkage. Delete the cache "
+                                "and rerun to regenerate it."
+                            )
                     static_legacy_fisher_diag_by_layer = _loaded.get("legacy_fisher_diag", None)
                     if static_legacy_fisher_diag_by_layer is None:
                         static_legacy_fisher_diag_by_layer = [None] * len(layers)
@@ -9093,6 +12124,8 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     fisher_layer_ids = None
                 if analysis_collect_refined_rkl or analysis_collect_refined_diag_rkl:
                     refined_rkl_layer_ids = None
+                if memory_profiler is not None:
+                    memory_profiler.mark("static_end_to_end_saliency_fisher")
                 with pipeline_recorder.section("pipeline.static_end_to_end_saliency_fisher") if pipeline_recorder else _NULL_CONTEXT:
                     # 4th return (`refined_diag_A`) is only used by
                     # analyze_grad_cosine today; main quant pipeline ignores it.
@@ -9103,7 +12136,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     # wrapper {"by_layer": [...], "N_global": int}, None when
                     # `--enable_dynamic_saliency=0` (default).
                     want_dynsal = bool(int(getattr(args, "enable_dynamic_saliency", 0)))
-                    static_saliency_by_layer, static_fisher_by_layer, static_legacy_fisher_diag_by_layer, static_refined_A_by_layer, static_refined_diag_A_by_layer, fp_inps_final_cpu, static_dynsal = \
+                    static_saliency_by_layer, static_fisher_by_layer, static_fisher_shrinkage_by_layer, static_legacy_fisher_diag_by_layer, static_refined_A_by_layer, static_refined_diag_A_by_layer, fp_inps_final_cpu, static_dynsal = \
                         collect_static_end_to_end_saliency_and_fisher(
                             model=model,
                             analyzer=analyzer,
@@ -9114,14 +12147,26 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             batch_size=args.global_loss_bsz,
                             use_fsdp=bool(getattr(args, "fsdp_precompute", False)),
                             fsdp_cpu_offload=bool(getattr(args, "fsdp_cpu_offload", False)),
+                            saved_tensor_offload_threshold_mb=int(
+                                getattr(args, "static_saved_tensor_offload_mib", 0)
+                            ),
+                            saved_tensor_offload_deduplicate=bool(
+                                getattr(args, "static_saved_tensor_offload_deduplicate", False)
+                            ),
                             saliency_clip_percentile=getattr(args, "saliency_clip_percentile", 0.99),
                             collect_fisher=want_fisher,
+                            collect_fisher_shrinkage=bool(
+                                getattr(args, "ffn_adaptive_fisher_shrinkage", False)
+                                or getattr(args, "ffn_adaptive_fisher_offdiag_shrinkage", False)
+                            ),
+                            fisher_shrinkage_target=ffn_shrink_target,
                             collect_legacy_fisher_diag=want_legacy_fisher_diag,
                             collect_refined_rkl=want_refined,
                             refined_rkl_damp=getattr(args, "refined_rkl_damp", 0.01),
                             refined_rkl_num_A=int(getattr(args, "refined_rkl_num_A", 1)),
                             collect_refined_diag_rkl=analysis_collect_refined_diag_rkl,
                             profile_recorder=pipeline_recorder,
+                            memory_profiler=memory_profiler,
                             capture_fp_final=need_fp_inps_final,
                             fisher_layer_ids=fisher_layer_ids,
                             refined_rkl_layer_ids=refined_rkl_layer_ids,
@@ -9137,6 +12182,13 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                                 int(getattr(args, "refresh_seed", 0)) + 1701
                             ),
                             num_samples_for_grad=int(getattr(args, "num_samples_for_grad", 0)),
+                            sequence_fisher_cache=sequence_fisher_cache,
+                            categorical_label_chunk_tokens=int(
+                                getattr(args, "static_fisher_label_chunk_tokens", 0)
+                            ),
+                            fisher_accum_packed=bool(
+                                getattr(args, "static_fisher_packed_accumulation", False)
+                            ),
                         )
                 if static_cache_file is not None:
                     with pipeline_recorder.section("pipeline.static_cache.save") if pipeline_recorder else _NULL_CONTEXT:
@@ -9144,6 +12196,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         _to_save = {
                             "saliency": static_saliency_by_layer,
                             "fisher": static_fisher_by_layer,
+                            "fisher_shrinkage": static_fisher_shrinkage_by_layer,
                             "legacy_fisher_diag": static_legacy_fisher_diag_by_layer,
                             "refined_A": static_refined_A_by_layer,
                         }
@@ -9173,10 +12226,26 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
             # intended workflow is: (1) torchrun precompute with FSDP, (2)
             # separately run the quant pass without FSDP which reads the cache.
             if bool(getattr(args, "exit_after_precompute", False)):
+                # The precompute cache has been persisted to CPU. Release
+                # allocator-held idle GPU blocks at this process handoff,
+                # rather than retaining backward's old activation cache.
+                # This is outside the per-module/per-refresh hot loop and
+                # shared by both memory-control and candidate paths.
+                torch.cuda.synchronize(dev)
+                _handoff_before = {"allocated_bytes": torch.cuda.memory_allocated(dev),
+                                   "reserved_bytes": torch.cuda.memory_reserved(dev)}
+                torch.cuda.empty_cache()
+                _handoff_after = {"allocated_bytes": torch.cuda.memory_allocated(dev),
+                                  "reserved_bytes": torch.cuda.memory_reserved(dev)}
+                logging.info("STAGE0_GPU_CACHE_HANDOFF %s", json.dumps({"rank": dist_utils.get_rank(), "before": _handoff_before, "after": _handoff_after}))
                 logging.info(
                     "exit_after_precompute=1 → finished static saliency/fisher stage, exiting. "
                     "Rerun without --exit_after_precompute to perform quantization."
                 )
+                if memory_profiler is not None:
+                    memory_profiler.mark("stage0_exit")
+                    memory_profiler.finish(status="stage0_precompute_complete")
+                    logging.info("CUDA phase memory profile written to %s", memory_profiler.path)
                 if dist.is_initialized():
                     dist.barrier()
                     dist.destroy_process_group()
@@ -9184,6 +12253,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
         else:
             static_saliency_by_layer = [None] * len(layers)
             static_fisher_by_layer = [None] * len(layers)
+            static_fisher_shrinkage_by_layer = None
             static_legacy_fisher_diag_by_layer = [None] * len(layers)
             static_refined_A_by_layer = None
             static_refined_diag_A_by_layer = None
@@ -9192,6 +12262,9 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                 "Global loss mode is disabled. Saliency/Fisher caches will be collected layerwise with the output head, "
                 "and GPTQ+ second-order terms will use layerwise KL."
             )
+
+        if memory_profiler is not None:
+            memory_profiler.mark("runtime_module_materialization")
 
         per_layer_runtime_modules = list(analyzer.get_pre_block_modules())
         per_layer_runtime_modules.extend(
@@ -9216,9 +12289,15 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
             )
         n_local = args.nsamples // dp_world
         dp_shard = slice(dp_rank * n_local, (dp_rank + 1) * n_local)
+        # CPU offload must apply before allocation/clone to avoid a transient
+        # pair of full calibration buffers on CUDA. Capture still copies the
+        # original BF16 values; subsequent per-sample forwards are unchanged.
+        input_cache_device = "cpu" if getattr(args, "stage2_input_cache_cpu_init", False) else dev
         inps = torch.zeros(
-            (n_local, model.seqlen, model.config.hidden_size), dtype=dtype, device=dev
+            (n_local, model.seqlen, model.config.hidden_size), dtype=dtype, device=input_cache_device
         )
+        logging.info("Stage-2 captured input cache device=%s local_samples=%d seq_len=%d hidden_size=%d",
+                     inps.device, n_local, model.seqlen, model.config.hidden_size)
         cache = {"global_i": 0, "attention_mask": None}
 
         class Catcher(nn.Module):
@@ -9384,6 +12463,9 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         fp_inps_final = scratch
                     del scratch
 
+        if memory_profiler is not None:
+            memory_profiler.mark("quantization_layer_loop_setup")
+
         if dp_global_shuffle:
             # Every rank sees all global sample ids; `collect_true_weight_gradient`
             # filters to the rank's shard.
@@ -9406,7 +12488,41 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
         refined_mse_d2h_event = None
         pbar = tqdm(layer_indices, ncols=120, desc="Quantizing Layers", position=0)
         for i in pbar:
+            if memory_profiler is not None:
+                memory_profiler.mark(f"layer_{i}_materialization_and_stats_setup", layer=i)
+            # Re-measure the output Fisher on the CURRENT, partly quantised
+            # model and compare it with the cached one. Diagnostic only: at
+            # the paper's calibration size a single re-measurement costs more
+            # than a whole quantisation run, so this is not a refresh
+            # schedule. It answers whether the cached F still describes the
+            # current one, which is what decides if reusing or averaging past
+            # observations can help -- and it is the quantity the paper's own
+            # Theta(n) argument is built on but never reports.
+            _fd_at = os.environ.get("FISHER_DRIFT_AT")
+            if _fd_at and str(i) in {t.strip() for t in _fd_at.split(",")}:
+                _fd_t0 = time.time()
+                _, _fd_f, _, _, _, _, _, _ = collect_static_end_to_end_saliency_and_fisher(
+                    model=model, analyzer=analyzer, dataloader=dataloader, dev=dev,
+                    saliency_num_groups=args.num_groups,
+                    grad_hessian_topk=args.grad_hessian_topk,
+                    batch_size=args.global_loss_bsz,
+                    collect_fisher=True, collect_legacy_fisher_diag=False,
+                    collect_refined_rkl=False, collect_refined_diag_rkl=False,
+                    capture_fp_final=False, collect_dynsal=False,
+                )
+                logging.info("fisher_drift remeasure at layer=%d took %.1fs",
+                             i, time.time() - _fd_t0)
+                _fisher_drift_report("after_%d_layers" % i, _fd_f)
             layer = layer_manager.materialize_layer(i)
+            third_order_refresh_active = (i == third_order_refresh_layer)
+            if third_order_refresh_active:
+                logging.info(
+                    "THIRD_ORDER_REFRESH layer=%d: materializing %d FP suffix blocks "
+                    "for matrix-free cubic correction during FFN block-GD refreshes.",
+                    i, len(layers) - i - 1,
+                )
+                for _suffix_idx in range(i + 1, len(layers)):
+                    layer_manager.materialize_layer(_suffix_idx)
             full = analyzer.get_quantizable_modules(layer)
             layer_recorder = QuantProfileRecorder(dev, prefix=f"layers.{i}") if quant_profile_enabled else None
             analysis_is_target = False
@@ -9709,6 +12825,9 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             position_embeddings=position_embeddings,
                         )[0].to(fp_inps.device)
 
+            if memory_profiler is not None:
+                memory_profiler.mark(f"layer_{i}_stats_and_hessian", layer=i)
+
             # --- Loss-slide-window setup: precompute reference output of the
             # next FP transformer block, so the per-block refresh can blend the
             # current-layer loss with the next-layer loss. Supported under:
@@ -9818,6 +12937,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             bits=args.w_bits,
                             sym=not args.w_asym,
                             mse=args.w_clip,
+                            w_clip_search_impl=args.pre_clip_search_impl,
                         )
 
             if analysis_hook is not None:
@@ -9854,6 +12974,23 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
 
             layer_output_fisher = None
             subset = build_quant_subset(full, names)
+            if os.environ.get("CVP_PROBE") == "1":
+                _dn = full.get("mlp.down_proj") or full.get("mlp.down_proj.module")
+                # static_fisher_by_layer is a LIST indexed by layer, and it is
+                # only populated under --global_loss; without that flag it is
+                # all-None and this probe has nothing to measure.
+                _fl = None
+                try:
+                    _fl = static_fisher_by_layer[i]
+                except (TypeError, IndexError, KeyError):
+                    _fl = None
+                if _dn is not None and torch.is_tensor(_fl) and _fl.dim() == 2:
+                    if os.environ.get("CVP_HEADROOM") == "1":
+                        _cvp_headroom_probe(i, _fl, _dn.weight.data)
+                    _group_energy_probe(i, _fl, _dn.weight.data)
+                else:
+                    logging.info("cvp_probe layer=%s SKIPPED: dn=%s fisher=%s",
+                                 i, _dn is not None, type(_fl).__name__)
             layer_output_fisher_by_module = {}
             pre_gd_refresh_loss_type = layer_refresh_loss_type
             if effective_pre_gd_steps > 0 and is_fisher_backed_loss(pre_gd_refresh_loss_type):
@@ -9963,6 +13100,10 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             dp_rank=dp_rank,
                             shard_size=n_local,
                             refresh_mb=getattr(args, "refresh_mb", None),
+                            kl_logit_chunk_tokens=getattr(
+                                args, "kl_logit_chunk_tokens", 0
+                            ),
+                            kl_recompute_head=getattr(args, "kl_recompute_head", False),
                             refined_mse_pool_ids=layer_refined_mse_pool_ids,
                             refined_mse_grad_pool=layer_refined_mse_grad_pool,
                             refined_mse_mean_grad=layer_refined_mse_mean_grad,
@@ -10136,6 +13277,8 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                                 getattr(args, "group_parallel_quant", "none") == "rank"
                                 and dist_utils.get_world_size() > 1
                             ),
+                            memory_profiler=memory_profiler,
+                            memory_profile_label=f"layer_{i}_{normalize_quant_module_name(module_name).replace('.', '_')}",
                         )
                         gptq_local[module_name].quantizer = quant_utils.WeightQuantizer()
                         gptq_local[module_name].quantizer.configure(
@@ -10143,6 +13286,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             perchannel=True,
                             sym=layer_weight_sym,
                             mse=args.w_clip,
+                            w_clip_search_impl=args.quantizer_search_impl,
                         )
                 return gptq_local
 
@@ -10262,6 +13406,10 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         skip_gradient_backward=skip_ref_backward,
                         sink_size=sink_size,
                         a_loss_ratio=args.a_loss_ratio,
+                        kl_logit_chunk_tokens=getattr(
+                            args, "kl_logit_chunk_tokens", 0
+                        ),
+                        kl_recompute_head=getattr(args, "kl_recompute_head", False),
                     )
                     gptq = build_gptq_for_subset(
                         layerwide_subset,
@@ -10270,6 +13418,92 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         mean_reference_loss,
                     )
                     accumulate_hessian_for_gptq(gptq, layerwide_subset)
+
+            _cross_feeder = {}
+            _fisher_split_probe_seen_refresh = set()
+
+            def _probe_fisher_split(tag, module_name, weight_snapshot, sample_indices):
+                """Measure full/diagonal/off-diagonal Fisher gradients without updates."""
+                if not getattr(args, "diagnose_fisher_split", False):
+                    return
+                if i != 0 or module_name != "mlp.down_proj":
+                    return
+                if dp_world != 1:
+                    raise RuntimeError("--diagnose_fisher_split currently requires one process.")
+                if layer_output_fisher is None or layer_output_fisher.dim() != 2:
+                    logging.warning(
+                        "FISHER_SPLIT_PROBE skipped: layer=%d module=%s has no shared 2D Fisher",
+                        i, module_name,
+                    )
+                    return
+                indices = [int(x) for x in sample_indices]
+                if not indices:
+                    return
+                fisher = layer_output_fisher.to(device=dev, dtype=torch.float32)
+                fisher_diag = torch.diag(torch.diagonal(fisher))
+                fisher_offdiag = fisher - fisher_diag
+                parts = {}
+                for part_name, part_fisher in (
+                    ("full", fisher),
+                    ("diag", fisher_diag),
+                    ("offdiag", fisher_offdiag),
+                ):
+                    grad_sum, count, loss_sum_part, _ = collect_true_weight_gradient(
+                        layer=layer,
+                        analyzer=analyzer,
+                        module_name=module_name,
+                        full=full,
+                        inps=inps,
+                        fp_inps=fp_inps,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        position_embeddings=position_embeddings,
+                        bsz=min(max(1, int(args.backward_bsz)), len(indices)),
+                        kl_topk=args.kl_topk,
+                        dev=dev,
+                        weight_override=weight_snapshot,
+                        sample_indices=indices,
+                        refresh_loss_type="fisher_diag_mse",
+                        layer_output_fisher=part_fisher,
+                        global_shuffle=False,
+                        dp_rank=dp_rank,
+                        shard_size=n_local,
+                        sink_size=sink_size,
+                        a_loss_ratio=1.0,
+                    )
+                    if count <= 0:
+                        raise RuntimeError("FISHER_SPLIT_PROBE received no samples.")
+                    parts[part_name] = (
+                        grad_sum / float(count),
+                        float(loss_sum_part) / float(count),
+                    )
+
+                g_full, loss_full = parts["full"]
+                g_diag, loss_diag = parts["diag"]
+                g_off, loss_off = parts["offdiag"]
+                eps = 1e-30
+
+                def _cos(a, b):
+                    return float(torch.sum(a * b).item()) / max(
+                        float(a.norm().item() * b.norm().item()), eps
+                    )
+
+                additive_error = (g_full - g_diag - g_off).norm() / g_full.norm().clamp_min(eps)
+                logging.info(
+                    "FISHER_SPLIT_PROBE tag=%s layer=%d module=%s samples=%d "
+                    "loss_full=%.7g loss_diag=%.7g loss_offdiag=%.7g "
+                    "grad_norm_full=%.7g grad_norm_diag=%.7g grad_norm_offdiag=%.7g "
+                    "diag_over_full=%.7g offdiag_over_full=%.7g "
+                    "cos_diag_full=%.7g cos_offdiag_full=%.7g cos_diag_offdiag=%.7g "
+                    "gradient_additivity_error=%.7g",
+                    tag, i, module_name, len(indices), loss_full, loss_diag, loss_off,
+                    float(g_full.norm().item()), float(g_diag.norm().item()),
+                    float(g_off.norm().item()),
+                    float((g_diag.norm() / g_full.norm().clamp_min(eps)).item()),
+                    float((g_off.norm() / g_full.norm().clamp_min(eps)).item()),
+                    _cos(g_diag, g_full), _cos(g_off, g_full), _cos(g_diag, g_off),
+                    float(additive_error.item()),
+                )
 
             for group_names in sequential:
                 subset = build_quant_subset(full, group_names)
@@ -10397,6 +13631,10 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         skip_gradient_backward=skip_ref_backward,
                         sink_size=sink_size,
                         a_loss_ratio=args.a_loss_ratio,
+                        kl_logit_chunk_tokens=getattr(
+                            args, "kl_logit_chunk_tokens", 0
+                        ),
+                        kl_recompute_head=getattr(args, "kl_recompute_head", False),
                     )
                     gptq = build_gptq_for_subset(
                         subset,
@@ -10410,6 +13648,9 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                 # every refresh of that module so the pre-pass sees the whole
                 # calibration pass before `build_prior` reads it.
                 grad_sq_accums = {}
+                ffn_nonlinear_logged_modules = set()
+                ffn_shrink_logged_modules = set()
+                ffn_adaptive_shrunk_fisher = None
                 collect_grad_sq = "warm_adam" in {
                     getattr(args, "grad_optimizer", None),
                     getattr(args, "final_layer_grad_optimizer", None),
@@ -10424,7 +13665,96 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     slide_next_refined_mse_grad_pool=None,
                     slide_next_refined_mse_mean_grad=None,
                 ):
-                    def refresh_fn(weight_snapshot, slide_alpha=1.0):
+                    def refresh_fn(
+                        weight_snapshot, slide_alpha=1.0, frozen=False,
+                        batch_offset=0, extra_weight_overrides=None,
+                        joint_targets=None, audit_sample_indices=None,
+                        audit_capture=None,
+                    ):
+                        module_refresh_loss_type = layer_refresh_loss_type
+                        if (
+                            (
+                                getattr(args, "ffn_nonlinear_refresh", False)
+                                or getattr(args, "ffn_nonlinear_hybrid_refresh", False)
+                            )
+                            and i != final_layer_idx
+                            and module_name in {
+                                "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"
+                            }
+                        ):
+                            is_hybrid = bool(getattr(args, "ffn_nonlinear_hybrid_refresh", False))
+                            module_refresh_loss_type = (
+                                "ffn_nonlinear_hybrid" if is_hybrid else "ffn_nonlinear_mse"
+                            )
+                            if module_name not in ffn_nonlinear_logged_modules:
+                                logging.info(
+                                    "FFN_NONLINEAR_REFRESH layer=%d module=%s "
+                                    "loss=%s fisher_trace_scale=mean_diag",
+                                    i, module_name, module_refresh_loss_type,
+                                )
+                                ffn_nonlinear_logged_modules.add(module_name)
+                        module_output_fisher = layer_output_fisher
+                        if (
+                            ffn_shrink_enabled
+                            and i != final_layer_idx
+                            and module_name in {
+                                "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"
+                            }
+                        ):
+                            nonlocal ffn_adaptive_shrunk_fisher, ffn_shrink_logged_modules
+                            if layer_output_fisher is None:
+                                raise RuntimeError(
+                                    "Adaptive FFN Fisher shrinkage requires the "
+                                    "precomputed layer-output Fisher."
+                                )
+                            _lambda = float(static_fisher_shrinkage_by_layer[i])
+                            if ffn_adaptive_shrunk_fisher is None:
+                                _F = layer_output_fisher.to(
+                                    device=dev, dtype=torch.float32
+                                )
+                                ffn_adaptive_shrunk_fisher = _F.mul(1.0 - _lambda)
+                                if bool(getattr(args, "ffn_adaptive_fisher_offdiag_shrinkage", False)):
+                                    ffn_adaptive_shrunk_fisher.diagonal().add_(
+                                        torch.diagonal(_F) * _lambda
+                                    )
+                                else:
+                                    _mu = torch.diagonal(_F).mean()
+                                    ffn_adaptive_shrunk_fisher.diagonal().add_(
+                                        _mu * _lambda
+                                    )
+                            if module_name not in ffn_shrink_logged_modules:
+                                logging.info(
+                                    "FFN_FISHER_SHRINKAGE_APPLY layer=%d module=%s "
+                                    "lambda=%.6g target=%s modules="
+                                    "gate_proj,up_proj,down_proj",
+                                    i, module_name, _lambda,
+                                    "diagonal(F)"
+                                    if bool(getattr(args, "ffn_adaptive_fisher_offdiag_shrinkage", False))
+                                    else "trace(F)/H*I",
+                                )
+                                ffn_shrink_logged_modules.add(module_name)
+                            module_output_fisher = ffn_adaptive_shrunk_fisher
+                        if (
+                            getattr(args, "refresh_fisher_offdiag_only", False)
+                            and i != final_layer_idx
+                            and module_name == "mlp.down_proj"
+                        ):
+                            if not getattr(args, "cross_module_compensate", False):
+                                raise ValueError(
+                                    "--refresh_fisher_offdiag_only requires --cross_module_compensate."
+                                )
+                            if layer_output_fisher is None or layer_output_fisher.dim() != 2:
+                                raise ValueError(
+                                    "--refresh_fisher_offdiag_only requires a shared 2D layer-output Fisher."
+                                )
+                            module_output_fisher = layer_output_fisher - torch.diag(
+                                torch.diagonal(layer_output_fisher)
+                            )
+                            logging.info(
+                                "FISHER_OFFDIAG_ONLY layer=%d module=%s slide_alpha=%.6g; "
+                                "diagonal removed from current-layer refresh Fisher",
+                                i, module_name, slide_alpha,
+                            )
                         grad_sq_accum = None
                         if collect_grad_sq:
                             grad_sq_accum = grad_sq_accums.get(module_name)
@@ -10437,8 +13767,23 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                                         _mod, sink_size=sink_size
                                     )
                                     grad_sq_accums[module_name] = grad_sq_accum
-                        if args.final_layer_full_backward and i == final_layer_idx:
+                        if audit_sample_indices is not None:
+                            sample_indices = list(audit_sample_indices)
+                        elif args.final_layer_full_backward and i == final_layer_idx:
                             sample_indices = full_refresh_sample_indices
+                        elif frozen:
+                            # Measurement, not a training step. next_indices()
+                            # moves the cursor, the permutation AND the rng, so
+                            # consuming one here re-composes the batch of every
+                            # later refresh in the run -- invisible in the logs,
+                            # and worth 5% of final KL once (see
+                            # BackwardSampleScheduler.frozen). batch_offset picks
+                            # which upcoming batch to look at while taking none:
+                            # 0 is the one the real step is about to use, 1 the
+                            # one after it, drawn identically and never stepped on.
+                            with gradient_refresh_scheduler.frozen():
+                                for _ in range(batch_offset + 1):
+                                    sample_indices = gradient_refresh_scheduler.next_indices()
                         else:
                             sample_indices = gradient_refresh_scheduler.next_indices()
                         partial_grad_sum, partial_count, loss_sum, grad_extras = (
@@ -10457,8 +13802,8 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                                 dev=dev,
                                 weight_override=weight_snapshot,
                                 sample_indices=sample_indices,
-                                refresh_loss_type=layer_refresh_loss_type,
-                                layer_output_fisher=layer_output_fisher,
+                                refresh_loss_type=module_refresh_loss_type,
+                                layer_output_fisher=module_output_fisher,
                                 slide_alpha=slide_alpha,
                                 next_layer=slide_next_layer,
                                 fp_inps_next=slide_fp_inps_next,
@@ -10471,6 +13816,10 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                                 dp_rank=dp_rank,
                                 shard_size=n_local,
                                 refresh_mb=getattr(args, "refresh_mb", None),
+                                kl_logit_chunk_tokens=getattr(
+                                    args, "kl_logit_chunk_tokens", 0
+                                ),
+                                kl_recompute_head=getattr(args, "kl_recompute_head", False),
                                 refined_mse_pool_ids=layer_refined_mse_pool_ids,
                                 refined_mse_grad_pool=layer_refined_mse_grad_pool,
                                 refined_mse_mean_grad=layer_refined_mse_mean_grad,
@@ -10481,6 +13830,31 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                                 a_loss_ratio=args.a_loss_ratio,
                                 a_loss_clip_scope=args.a_loss_clip_scope,
                                 grad_sq_accum=grad_sq_accum,
+                                extra_weight_overrides=extra_weight_overrides,
+                                joint_targets=joint_targets,
+                                sequence_fisher_cache=(sequence_fisher_cache
+                                    if i != final_layer_idx and module_name in
+                                    ("mlp.gate_proj", "mlp.up_proj", "mlp.down_proj") else None),
+                                sequence_fisher_layer_idx=i,
+                                audit_capture=audit_capture,
+                                third_order_suffix_layers=(
+                                    layers[i + 1:]
+                                    if third_order_refresh_active
+                                    and module_name in {
+                                        "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"
+                                    }
+                                    else None
+                                ),
+                                third_order_layer_idx=(
+                                    i if third_order_refresh_active
+                                    and module_name in {
+                                        "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"
+                                    }
+                                    else None
+                                ),
+                                third_order_refresh_estimator=getattr(
+                                    args, "third_order_refresh_estimator", "central_cubic"
+                                ),
                             )
                         )
                         # DP aggregation. When world_size > 1 we pack the grad sum
@@ -10489,25 +13863,28 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         # collectives. Each collective costs one cudaStreamSynchronize
                         # on every rank; packing cuts 20-40% off true_gradient_refresh
                         # wall time in multi-rank runs.
+                        joint_partial_grad_sums = grad_extras.get("joint_partial_grad_sums", [])
                         if dp_world > 1:
                             extra_scalar_keys = [
                                 k for k in ("loss_sum_current", "loss_sum_next")
                                 if k in grad_extras
                             ]
-                            # Layout: [grad_flat | count | loss_sum | extra_scalar_keys...]
-                            # fp32 is enough: partial_count fits exactly (< 2^24), and
-                            # a single-collective sum matches the precision of the
-                            # original per-tensor allreduces (NCCL uses fp32 paths too).
-                            grad_flat = partial_grad_sum.reshape(-1)
+                            # Layout: [grad_flats... | count | loss_sum | extra_scalar_keys...]
+                            _all_psums = [partial_grad_sum] + joint_partial_grad_sums
+                            _grad_flats = [ps.reshape(-1) for ps in _all_psums]
+                            _grad_nums = [gf.numel() for gf in _grad_flats]
                             scalar_vec = torch.tensor(
                                 [float(partial_count), float(loss_sum)]
                                 + [float(grad_extras[k]) for k in extra_scalar_keys],
-                                dtype=grad_flat.dtype, device=grad_flat.device,
+                                dtype=_grad_flats[0].dtype, device=_grad_flats[0].device,
                             )
-                            packed = torch.cat([grad_flat, scalar_vec])
+                            packed = torch.cat(_grad_flats + [scalar_vec])
                             dist_utils.allreduce_sum_(packed)
-                            partial_grad_sum.copy_(packed[:grad_flat.numel()].view_as(partial_grad_sum))
-                            scalar_out = packed[grad_flat.numel():]
+                            _offset = 0
+                            for _ps, _n in zip(_all_psums, _grad_nums):
+                                _ps.copy_(packed[_offset:_offset + _n].view_as(_ps))
+                                _offset += _n
+                            scalar_out = packed[_offset:]
                             global_count = int(scalar_out[0].item())
                             global_loss_sum = scalar_out[1].item()
                             for idx, k in enumerate(extra_scalar_keys, start=2):
@@ -10521,6 +13898,21 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                                 f"sample_indices={sample_indices[:8]}..."
                             )
                         grad = partial_grad_sum / float(global_count)
+                        if (
+                            getattr(args, "diagnose_fisher_split", False)
+                            and i == 0
+                            and module_name == "mlp.down_proj"
+                            and not frozen
+                            and module_name not in _fisher_split_probe_seen_refresh
+                        ):
+                            _probe_fisher_split(
+                                "first_real_block_refresh",
+                                module_name,
+                                weight_snapshot,
+                                sample_indices,
+                            )
+                            _fisher_split_probe_seen_refresh.add(module_name)
+                        joint_grads = [jps / float(global_count) for jps in joint_partial_grad_sums]
                         mean_refresh_loss = global_loss_sum / float(global_count)
                         trace_sample_indices = sample_indices
                         if (
@@ -10554,6 +13946,8 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             "mean_refresh_loss": mean_refresh_loss,
                             "sample_indices": trace_sample_indices,
                         }
+                        if joint_grads:
+                            meta["joint_grads"] = joint_grads
                         if slide_next_layer is not None:
                             # Record α=1 explicitly at the first slide step.
                             # collect_true_weight_gradient deliberately skips
@@ -10617,10 +14011,59 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
 
                     return observer
 
+                if memory_profiler is not None:
+                    memory_profiler.mark(f"layer_{i}_quantization_and_refresh", layer=i)
                 with layer_recorder.section("layer.module_quantization") if layer_recorder else _NULL_CONTEXT:
+                    _joint_adam_states = {}
                     for name in subset:
                         if name not in gptq:
                             continue
+                        # Before this module is touched, take every module's
+                        # own gradient at the CURRENT state. A module thus
+                        # arrives at its own turn holding observations of its
+                        # own gradient from while earlier modules were being
+                        # quantised -- no weight moved early, nothing borrowed
+                        # from another module. Diagnostic: one backward per
+                        # module per probe point, where a real implementation
+                        # would get all of them from the single backward the
+                        # refresh already does.
+                        if str(i) in _GXFER.get("layers", set()):
+                            # Iterate the whole layer, not `subset`: modules are
+                            # quantised in sub-groups -- [q,k,v], [o], [up,gate],
+                            # [down] -- and `subset` holds only the group in
+                            # hand, so using it would confine a module's history
+                            # to its own group. The question is whether a module
+                            # can collect its own gradient while ANY earlier
+                            # module is being quantised, which spans the groups.
+                            for _gn in [_n for _ns in sequential for _n in _ns]:
+                                _gm = full.get(_gn) or full.get(_gn + ".module")
+                                if _gm is None:
+                                    continue
+                                _gfn = make_gradient_refresh_fn(_gn)
+                                # frozen=True: this is a measurement, and
+                                # next_indices() moves the cursor, the
+                                # permutation and the rng, so consuming here
+                                # re-composes the batch of every later refresh.
+                                # batch_offset 0 and 1 are two different
+                                # batches at the SAME model state: the cosine
+                                # between them is how much of any later
+                                # disagreement is just which samples were drawn,
+                                # which a drift number is meaningless without.
+                                _w0 = _gm.weight.data.clone()
+                                _gg, _ = _gfn(_w0, frozen=True, batch_offset=0)
+                                _gb, _ = _gfn(_w0, frozen=True, batch_offset=1)
+                                _ga, _gbf = _gg.detach().float().cpu().flatten(), \
+                                    _gb.detach().float().cpu().flatten()
+                                _nb = float((_ga @ _gbf / (_ga.norm() * _gbf.norm())
+                                             ).item()) if _ga.norm() > 0 and _gbf.norm() > 0 else float("nan")
+                                _key = (i, _gn)
+                                _GXFER.setdefault(_key, []).append(
+                                    _gg.detach().float().cpu()
+                                )
+                                _GXFER.setdefault(("nb",) + _key, []).append(_nb)
+                                if _gn == name:
+                                    _gxfer_report(i, _gn, _GXFER[_key],
+                                                  _GXFER[("nb",) + _key])
                         pbar.set_postfix(module=f"layers.{i}." + name, loss=f"{mean_reference_loss:.2e}")
                         layer_w_groupsize = args.w_groupsize
                         effective_grad_optimizer = (
@@ -10883,9 +14326,167 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         gptq[name].layer_idx = i
                         gptq[name].layer_name = name
                         _horizon_boot(args)
+                        # Joint block-GD: at each block boundary of THIS module's
+                        # quantization, also take one Adam step on every
+                        # not-yet-quantised module in the block, using a
+                        # persistent per-module Adam state so they warm up across
+                        # the whole layer instead of cold-starting at their own
+                        # turn. This turns the per-module sequential block-GD
+                        # into a partially-joint optimiser.
+                        _joint_update_fn_for_name = None
+                        _joint_target_modules = None
+                        if (
+                            getattr(args, "joint_block_gd", False)
+                            and args.g_update_mode == "block_gd"
+                            and i != final_layer_idx
+                        ):
+                            _seq = [_n for _ns in sequential for _n in _ns]
+                            _later_names = (
+                                _seq[_seq.index(name) + 1:] if name in _seq else []
+                            )
+                            _later_mods = []
+                            for _gn in _later_names:
+                                _gm = full.get(_gn) or full.get(_gn + ".module")
+                                if _gm is None:
+                                    continue
+                                _later_mods.append((_gn, _gm))
+                            if _later_mods:
+                                _joint_lr = args.grad_lr
+                                _joint_b1 = float(getattr(args, "adam_beta1", 0.9))
+                                _joint_b2 = 0.999
+                                logging.info(
+                                    "joint_block_gd: layer=%d after=%s will jointly "
+                                    "update %d later modules at each block boundary",
+                                    i, name, len(_later_mods),
+                                )
+
+                                _joint_target_modules = _later_mods
+
+                                def _joint_update_fn(joint_grads):
+                                    for (_gn, _gm), _g in zip(_later_mods, joint_grads):
+                                        _st = _joint_adam_states.get(_gn)
+                                        if _st is None:
+                                            _st = {
+                                                "m": torch.zeros_like(_g),
+                                                "v": torch.zeros_like(_g),
+                                                "step": 0,
+                                            }
+                                            _joint_adam_states[_gn] = _st
+                                        _st["step"] += 1
+                                        _st["m"].mul_(_joint_b1).add_(
+                                            _g, alpha=1.0 - _joint_b1
+                                        )
+                                        _st["v"].mul_(_joint_b2).addcmul_(
+                                            _g, _g, value=1.0 - _joint_b2
+                                        )
+                                        _m_hat = _st["m"] / (
+                                            1.0 - _joint_b1 ** _st["step"]
+                                        )
+                                        _v_hat = _st["v"] / (
+                                            1.0 - _joint_b2 ** _st["step"]
+                                        )
+                                        _update = _m_hat / (_v_hat.sqrt() + 1e-8)
+                                        _gm.weight.data.sub_(
+                                            _update.to(
+                                                device=_gm.weight.device,
+                                                dtype=_gm.weight.dtype,
+                                            )
+                                            * float(_joint_lr)
+                                        )
+
+                                _joint_update_fn_for_name = _joint_update_fn
+                        # Cross-module closed-form compensation, incremental and
+                        # just-in-time: right before quantising a residual-stream
+                        # module, cancel its feeder's NET error (not the accumulated
+                        # error) with a closed-form correction on this module, using
+                        # its FRESH input. Mirrors GPTQ's within-module behaviour.
+                        _probe_closed_target = (
+                            getattr(args, "diagnose_fisher_split", False)
+                            and i == 0
+                            and name == "mlp.down_proj"
+                        )
+                        _probe_closed_applied = False
+                        _probe_closed_indices = list(range(min(inps.shape[0], 8)))
+                        if _probe_closed_target:
+                            _probe_target = full.get(name) or full.get(name + ".module")
+                            _probe_fisher_split(
+                                "before_closed_form",
+                                name,
+                                _probe_target.weight.data.detach().clone(),
+                                _probe_closed_indices,
+                            )
+                        if (
+                            getattr(args, "cross_module_compensate", False)
+                            and args.g_update_mode == "block_gd"
+                            and name in {"self_attn.o_proj", "mlp.down_proj"}
+                        ):
+                            _feeder = (
+                                "self_attn.v_proj" if name == "self_attn.o_proj"
+                                else "mlp.up_proj"
+                            )
+                            _st = _cross_feeder.get(_feeder)
+                            if _st is not None:
+                                _tgt = full.get(name) or full.get(name + ".module")
+                                if _tgt is not None:
+                                    _delta_W = compute_cross_module_compensation(
+                                        layer=layer,
+                                        full=full,
+                                        inps=inps,
+                                        attention_mask=attention_mask,
+                                        position_ids=position_ids,
+                                        position_embeddings=position_embeddings,
+                                        dev=dev,
+                                        feeder_name=_feeder,
+                                        target_name=name,
+                                        feeder_fp=_st["fp"],
+                                        feeder_cur=_st["cur"],
+                                damping=float(getattr(args, "cross_module_damping", 0.01)),
+                                sample_indices=list(range(min(inps.shape[0], 8))),
+                                layer_output_fisher=(
+                                    None
+                                    if getattr(args, "diagnose_unweighted_closed_form", False)
+                                    else layer_output_fisher
+                                ),
+                                diagnostic_layer_output_fisher=layer_output_fisher,
+                                diagnose_fisher_split=_probe_closed_target,
+                            )
+                                    _tgt.weight.data.add_(
+                                        _delta_W.to(
+                                            device=_tgt.weight.device,
+                                            dtype=_tgt.weight.data.dtype,
+                                        )
+                                    )
+                                    _probe_closed_applied = True
+                                    logging.info(
+                                        "cross_module_compensate: layer=%d %s->%s norm=%.4e",
+                                        i, _feeder, name,
+                                        float(_delta_W.float().norm().item()),
+                                    )
+                        if _probe_closed_target:
+                            _probe_target = full.get(name) or full.get(name + ".module")
+                            _probe_fisher_split(
+                                "after_closed_form" if _probe_closed_applied else "no_closed_form_control",
+                                name,
+                                _probe_target.weight.data.detach().clone(),
+                                _probe_closed_indices,
+                            )
+                        # Capture feeder FP weight before its quantisation.
+                        if name in {"self_attn.v_proj", "mlp.up_proj"}:
+                            _fmod = full.get(name) or full.get(name + ".module")
+                            if _fmod is not None:
+                                _cross_feeder.setdefault(name, {})["fp"] = _fmod.weight.data.clone()
+                        # cross_all: every module can be a feeder, so keep its FP
+                        # weight too (used after fasterquant to spread its net error).
+                        _cross_all_fp = None
+                        if getattr(args, "cross_module_compensate_all", False):
+                            _fmod = full.get(name) or full.get(name + ".module")
+                            if _fmod is not None:
+                                _cross_all_fp = _fmod.weight.data.clone()
                         gptq[name].fasterquant(
                             grad_sq_full=grad_sq_full,
                             warm_start_steps=warm_start_steps,
+                            joint_update_fn=_joint_update_fn_for_name,
+                            joint_target_modules=_joint_target_modules,
                             blocksize=args.blocksize,
                             percdamp=args.percdamp,
                             groupsize=layer_w_groupsize,
@@ -10904,19 +14505,147 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             grad_gate_sharpness=args.grad_gate_sharpness,
                             grad_gate_sine_amp=args.grad_gate_sine_amp,
                             second_order_scale=args.second_order_scale,
+                            inner_kernel_impl=getattr(args, "gptq_inner_kernel", "torch"),
                             block_atomic_quant=args.block_atomic_quant,
                             block_observer=make_block_observer(name, _module_grad_optimizer) if args.g_update_mode in {"block_backward", "block_gd"} else None,
                             grad_clip=effective_main_grad_clip,
                             horizon_p=float(getattr(args, "horizon_p", 0.0) or 0.0),
                             adam_beta1=float(getattr(args, "adam_beta1", 0.9)),
                             column_budget_q=float(getattr(args, "column_budget_q", 1.0)),
+                            grad_steps_per_refresh=int(getattr(args, "grad_steps_per_refresh", 1)),
+                            two_sided_metric=(
+                                _ts_fisher_for(i, name, static_fisher_by_layer, args)
+                            ),
+                            grad_steps_modules=tuple(
+                                t.strip()
+                                for t in str(getattr(args, "grad_steps_modules", "") or "").split(",")
+                                if t.strip()
+                            ),
                             horizon_exact=bool(getattr(args, "horizon_exact", False)),
                             diagnostic_recorder=diagnostic_registry.get_or_create(i, name),
                             slide_refresh_start=slide_refresh_cursor,
                             slide_refresh_block_total=slide_refresh_block_total,
                             refresh_full_metrics=bool(getattr(args, "refresh_full_metrics", False)),
                             group_parallel_mode=getattr(args, "group_parallel_quant", "none"),
+                            preview_next_quant_block=bool(
+                                getattr(args, "preview_next_quant_block", False)
+                                and i != final_layer_idx
+                            ),
+                            preview_next_quant_block_adam_aware=bool(
+                                getattr(args, "preview_next_quant_block_adam_aware", False)
+                                and i != final_layer_idx
+                            ),
+                            hinv_cpu_offload=bool(
+                                getattr(args, "stage2_hinv_cpu_offload", False)
+                            ) or f"{i}.{name}" in {
+                                selector.strip()
+                                for selector in str(
+                                    getattr(args, "stage2_hinv_cpu_offload_modules", "") or ""
+                                ).split(",")
+                                if selector.strip()
+                            },
+                            hessian_cpu_offload=bool(
+                                getattr(args, "stage2_hessian_cpu_offload", False)
+                            ),
+                            hinv_cpu_reuse_buffer=bool(
+                                getattr(args, "stage2_hinv_cpu_reuse_buffer", False)
+                            ),
+                            hessian_damping_inplace=bool(
+                                getattr(args, "stage2_hessian_damping_inplace", False)
+                            ),
                         )
+                        # Store feeder quantised weight after its quantisation.
+                        if name in {"self_attn.v_proj", "mlp.up_proj"}:
+                            _fmod = full.get(name) or full.get(name + ".module")
+                            if _fmod is not None:
+                                _cross_feeder.setdefault(name, {})["cur"] = _fmod.weight.data.clone()
+                        # cross_all: spread THIS module's net error over every
+                        # not-yet-quantised module, closed-form, evenly split.
+                        if (
+                            getattr(args, "cross_module_compensate_all", False)
+                            and args.g_update_mode == "block_gd"
+                            and i != final_layer_idx
+                            and _cross_all_fp is not None
+                        ):
+                            _all_seq = [_n for _ns in sequential for _n in _ns]
+                            _later = _all_seq[_all_seq.index(name) + 1:] if name in _all_seq else []
+                            # Residual-stream targets only: q/k/v/o/gate's error all
+                            # lands on the still-unquantised o_proj/down_proj. The
+                            # SwiGLU targets (up/gate) are OFF here -- their
+                            # linearisation (esp. gate's SiLU'(g)*u) is numerically
+                            # ill-conditioned and over-compensates (norm up to 2.74
+                            # vs 0.13 for residual). Re-add "up_proj","gate_proj"
+                            # to re-enable the SwiGLU branch.
+                            _targets = [tn for tn in _later if tn.endswith(("o_proj", "down_proj"))]
+                            if _targets:
+                                _fmod = full.get(name) or full.get(name + ".module")
+                                _comp = compute_cross_module_compensation_all(
+                                    layer=layer, full=full, inps=inps,
+                                    attention_mask=attention_mask,
+                                    position_ids=position_ids,
+                                    position_embeddings=position_embeddings,
+                                    dev=dev,
+                                    feeder_name=name,
+                                    target_names=_targets,
+                                    feeder_fp=_cross_all_fp,
+                                    feeder_cur=_fmod.weight.data.clone(),
+                                    damping=float(getattr(args, "cross_module_damping", 0.01)),
+                                    sample_indices=list(range(min(inps.shape[0], 8))),
+                                    layer_output_fisher=layer_output_fisher,
+                                )
+                                for _tn, _dW in _comp.items():
+                                    _tm = full.get(_tn) or full.get(_tn + ".module")
+                                    if _tm is None:
+                                        continue
+                                    _tm.weight.data.add_(_dW.to(
+                                        device=_tm.weight.device, dtype=_tm.weight.data.dtype
+                                    ))
+                                    logging.info(
+                                        "cross_module_compensate_all: layer=%d %s->%s norm=%.4e",
+                                        i, name, _tn, float(_dW.float().norm().item()),
+                                    )
+                        # Situation B: eager cross-module compensation. After
+                        # `name` is quantised its residual has just entered the
+                        # layer output; take one SGD step on every module that
+                        # comes LATER in the block so they start cancelling it
+                        # now instead of waiting for their own turn. This turns
+                        # the sequential optimisation into partially-joint
+                        # optimisation. The gradient is computed at the CURRENT
+                        # state (so it is fresh, unlike the cross-module
+                        # gradient ACCUMULATION probe), and frozen=True peeks
+                        # one batch without consuming it, so the same batch
+                        # serves every later module -- mirroring a single shared
+                        # backward. The final layer is skipped (its gradient
+                        # path through lm_head is a special case).
+                        if (
+                            getattr(args, "eager_cross_compensate", False)
+                            and args.g_update_mode == "block_gd"
+                            and i != final_layer_idx
+                        ):
+                            _eager_seq = [_n for _ns in sequential for _n in _ns]
+                            _later_modules = (
+                                _eager_seq[_eager_seq.index(name) + 1:]
+                                if name in _eager_seq else []
+                            )
+                            for _gn in _later_modules:
+                                _gm = full.get(_gn) or full.get(_gn + ".module")
+                                if _gm is None:
+                                    continue
+                                _gfn = make_gradient_refresh_fn(_gn)
+                                _g, _ = _gfn(_gm.weight.data.clone(), frozen=True)
+                                if _g is None:
+                                    continue
+                                logging.info(
+                                    "eager_cross_compensate: layer=%d after=%s -> %s grad_norm=%.4e",
+                                    i, name, _gn, float(_g.float().norm().item()),
+                                )
+                                _gm.weight.data.sub_(
+                                    _g.to(
+                                        device=_gm.weight.device,
+                                        dtype=_gm.weight.dtype,
+                                    )
+                                    * float(getattr(args, "eager_cross_lr", 2e-5))
+                                )
                         slide_refresh_cursor += slide_refreshes_per_module[name]
                         # DP correctness check (debug only): fasterquant is meant
                         # to be deterministic given identical inputs, and since H /
@@ -10957,6 +14686,8 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     "is_target": analysis_is_target,
                 })
 
+            if memory_profiler is not None:
+                memory_profiler.mark(f"layer_{i}_activation_replay_and_cleanup", layer=i)
             with layer_recorder.section("layer.quantized_replay_forward") if layer_recorder else _NULL_CONTEXT:
                 for j in range(inps.shape[0]):
                     inps[j] = layer(
@@ -10967,6 +14698,8 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     )[0].squeeze(0).to(inps.device)
 
             with layer_recorder.section("layer.cleanup") if layer_recorder else _NULL_CONTEXT:
+                if sequence_fisher_cache is not None:
+                    sequence_fisher_cache.release(i)
                 if slide_active_layer and slide_next_layer is not None:
                     del slide_fp_inps_next
                     layer_manager.release_layer(i + 1, slide_next_layer, update_master=False, orig_device=orig_device)
@@ -10974,6 +14707,14 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     slide_fp_inps_next = None
                     slide_next_layer_output_fisher = None
                     slide_next_refined_A_list = None
+                if third_order_refresh_active:
+                    for _suffix_idx in range(i + 1, len(layers)):
+                        layer_manager.release_layer(
+                            _suffix_idx,
+                            layers[_suffix_idx],
+                            update_master=False,
+                            orig_device=orig_device,
+                        )
                 layer_manager.release_layer(i, layer, update_master=True, orig_device=orig_device)
                 del layer
                 del gptq
@@ -11040,6 +14781,8 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
             refined_mse_d2h_event.synchronize()
             refined_mse_d2h_event = None
 
+        if memory_profiler is not None:
+            memory_profiler.mark("runtime_restore_and_finalize")
         with pipeline_recorder.section("pipeline.restore_modules") if pipeline_recorder else _NULL_CONTEXT:
             layer_manager.release_runtime_modules(per_layer_runtime_modules, orig_device)
             model.config.use_cache = use_cache
@@ -11051,5 +14794,8 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
     if quant_profile_enabled:
         logging.info("Quant profile NVTX ranges emitted. Inspect them with Nsight Systems/Compute.")
         QuantProfileRecorder.dump_wall_summary()
+    if memory_profiler is not None:
+        memory_profiler.finish(status="quantization_complete")
+        logging.info("CUDA phase memory profile written to %s", memory_profiler.path)
     logging.info("-----GPTQPlus Quantization Done-----\n")
     return quantizers

@@ -16,7 +16,9 @@ handed to :meth:`realq.quant.RealQLayer.quantize`.
 from __future__ import annotations
 
 import logging
+import hashlib
 import math
+import os
 import random as _random
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -202,6 +204,10 @@ class RefreshContext:
                 "trace_module, and blocksize"
             )
         self.adam_step = 0
+        # The experimental cross-module prior may initialize only v from a
+        # donor. Keep its bias-correction age separate from m's true local age.
+        self.adam_v_step = 0
+        self._adam_v_transfer_applied = False
         # Per-current-linear column-boundary ordinal. REALQ-Plus Adam steps
         # can be larger because the weight may already have been updated while
         # it was a future/sliding weight; trace column ranges must not use that
@@ -431,6 +437,9 @@ class _WeightRefreshState:
     exp_avg: torch.Tensor | None
     exp_avg_sq: torch.Tensor | None
     step: int = 0
+    # Normally tracks ``step`` exactly; separate age permits a mathematically
+    # coherent v-only restart without changing m's bias correction.
+    v_step: int = 0
     quantizing: bool = False
     quantized: bool = False
 
@@ -742,6 +751,212 @@ def _aggregate_block_refresh_sums(
     return global_count, global_used, global_loss_sums
 
 
+_ADAM_HISTORY_POLICIES = {
+    "keep",
+    "reset_each_refresh",
+    "reset_m_each_refresh",
+    "reset_m_and_m_age_each_refresh",
+    "reset_v_each_refresh",
+    "reset_v_and_v_age_each_refresh",
+    "reset_bias_age_each_refresh",
+    "radam",
+    "adabelief",
+    "adopt",
+}
+
+
+def _adam_history_policy() -> str:
+    policy = os.environ.get("REALQ_ADAM_HISTORY_POLICY", "keep")
+    if policy not in _ADAM_HISTORY_POLICIES:
+        raise ValueError(
+            "REALQ_ADAM_HISTORY_POLICY must be one of "
+            f"{sorted(_ADAM_HISTORY_POLICIES)}, got {policy!r}"
+        )
+    return policy
+
+
+def _adam_history_policy_for_layer(layer_idx: int | None) -> str:
+    """Apply the selected research policy only to an optional layer set.
+
+    ``REALQ_ADAM_HISTORY_LAYERS`` accepts ``all`` (the default), comma-
+    separated layer indices, and inclusive ranges such as ``0-26``. The
+    explicit range makes early/final-layer scope experiments reproducible and
+    avoids baking a particular model depth into the optimizer.
+    """
+    policy = _adam_history_policy()
+    scope = os.environ.get("REALQ_ADAM_HISTORY_LAYERS", "all").strip()
+    if not scope or scope.lower() == "all":
+        return policy
+    if layer_idx is None:
+        raise ValueError(
+            "REALQ_ADAM_HISTORY_LAYERS requires a known layer index; "
+            f"got scope={scope!r}"
+        )
+    selected = False
+    for part in scope.split(","):
+        item = part.strip()
+        if not item:
+            raise ValueError(
+                "REALQ_ADAM_HISTORY_LAYERS contains an empty item: "
+                f"{scope!r}"
+            )
+        if "-" in item:
+            bounds = item.split("-")
+            if len(bounds) != 2 or not all(x.strip().isdigit() for x in bounds):
+                raise ValueError(
+                    "REALQ_ADAM_HISTORY_LAYERS ranges must be inclusive "
+                    f"nonnegative integers, got {item!r}"
+                )
+            low, high = (int(x.strip()) for x in bounds)
+            if high < low:
+                raise ValueError(
+                    "REALQ_ADAM_HISTORY_LAYERS range end precedes start: "
+                    f"{item!r}"
+                )
+        else:
+            if not item.isdigit():
+                raise ValueError(
+                    "REALQ_ADAM_HISTORY_LAYERS entries must be layer indices "
+                    f"or inclusive ranges, got {item!r}"
+                )
+            low = high = int(item)
+        selected = selected or low <= int(layer_idx) <= high
+    return policy if selected else "keep"
+
+
+def _zero_adam_buffer_selected(
+    buffer: torch.Tensor, columns: slice | torch.Tensor | None
+) -> None:
+    if columns is None:
+        buffer.zero_()
+    elif isinstance(columns, slice):
+        buffer[:, columns].zero_()
+    else:
+        reset_index = columns.to(device=buffer.device, dtype=torch.long)
+        buffer.index_fill_(1, reset_index, 0.0)
+
+
+def _adam_probe_target_rule(ctx: "RefreshContext") -> str:
+    """Return the one-step diagnostic rule at a selected REAL-Q refresh."""
+
+    rule = os.environ.get("REALQ_ADAM_PROBE_RULE", "adam")
+    if rule not in (
+        "adam",
+        "reset_m",
+        "reset_m_direction_norm_matched_adam",
+        "adam_direction_norm_matched_reset_m",
+        "grams_direction",
+        "norm_matched_gradient",
+        "cautious",
+        "cautious_mask",
+        "cautious_scale",
+        "no_parameter_update",
+    ):
+        raise ValueError(
+            "REALQ_ADAM_PROBE_RULE must be one of 'adam', "
+            "'reset_m', 'reset_m_direction_norm_matched_adam', "
+            "'adam_direction_norm_matched_reset_m', "
+            "'grams_direction', 'norm_matched_gradient', 'cautious', "
+            "'cautious_mask', 'cautious_scale', or 'no_parameter_update', "
+            f"got {rule!r}"
+        )
+    target_vars = (
+        "REALQ_ADAM_PROBE_LAYER",
+        "REALQ_ADAM_PROBE_MODULE",
+        "REALQ_ADAM_PROBE_BLOCK",
+    )
+    target_values = [os.environ.get(name) for name in target_vars]
+    if all(value is None for value in target_values):
+        if rule != "adam":
+            raise ValueError(
+                "non-default REALQ_ADAM_PROBE_RULE requires a target layer, "
+                "module, and block"
+            )
+        return "adam"
+    if any(value is None for value in target_values):
+        raise ValueError(
+            "set all of REALQ_ADAM_PROBE_LAYER, "
+            "REALQ_ADAM_PROBE_MODULE, and REALQ_ADAM_PROBE_BLOCK"
+        )
+    target_layer, target_module, target_block = target_values
+    matches = _is_adam_probe_target(ctx)
+    return rule if matches else "adam"
+
+
+def _is_adam_probe_target(ctx: "RefreshContext") -> bool:
+    target_layer = os.environ.get("REALQ_ADAM_PROBE_LAYER")
+    target_module = os.environ.get("REALQ_ADAM_PROBE_MODULE")
+    target_block = os.environ.get("REALQ_ADAM_PROBE_BLOCK")
+    if target_layer is None or target_module is None or target_block is None:
+        return False
+    return (
+        ctx.trace_layer is not None
+        and int(ctx.trace_layer) == int(target_layer)
+        and ctx.trace_module == target_module
+        and ctx.refresh_step - 1 == int(target_block)
+    )
+
+
+def _probe_tensor_sha256(tensor: torch.Tensor) -> str:
+    raw = tensor.detach().contiguous().cpu().numpy().tobytes()
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _norm_matched_gradient_update(
+    adam_update: torch.Tensor, gradient: torch.Tensor
+) -> torch.Tensor:
+    """Use the clipped gradient direction at Adam's active-slice L2 norm."""
+
+    update_norm = torch.linalg.vector_norm(adam_update)
+    gradient_norm = torch.linalg.vector_norm(gradient)
+    if gradient_norm.item() == 0.0:
+        return torch.zeros_like(gradient)
+    return gradient * (update_norm / gradient_norm)
+
+
+def _match_update_l2_norm(
+    update_to_scale: torch.Tensor, reference_update: torch.Tensor
+) -> torch.Tensor:
+    """Scale one update to another update's global L2 norm."""
+
+    update_norm = torch.linalg.vector_norm(update_to_scale)
+    reference_norm = torch.linalg.vector_norm(reference_update)
+    if update_norm.item() == 0.0:
+        return torch.zeros_like(update_to_scale)
+    return update_to_scale * (reference_norm / update_norm)
+
+
+def _log_adam_probe_snapshot(
+    *,
+    ctx: "RefreshContext",
+    rule: str,
+    weight: torch.Tensor,
+    grad: torch.Tensor,
+    exp_avg_before: torch.Tensor,
+    exp_avg_sq_before: torch.Tensor,
+) -> None:
+    if not _is_adam_probe_target(ctx):
+        return
+    logging.info(
+        "[adam_probe_snapshot] layer=%s module=%s block=%d rule=%s "
+        "adam_step=%d w_sha256=%s g_sha256=%s m_sha256=%s v_sha256=%s "
+        "w_norm=%.9g g_norm=%.9g m_norm=%.9g v_norm=%.9g",
+        ctx.trace_layer,
+        ctx.trace_module,
+        ctx.refresh_step - 1,
+        rule,
+        ctx.adam_step,
+        _probe_tensor_sha256(weight),
+        _probe_tensor_sha256(grad),
+        _probe_tensor_sha256(exp_avg_before),
+        _probe_tensor_sha256(exp_avg_sq_before),
+        float(torch.linalg.vector_norm(weight.detach().float()).item()),
+        float(torch.linalg.vector_norm(grad.detach().float()).item()),
+        float(torch.linalg.vector_norm(exp_avg_before.detach().float()).item()),
+        float(torch.linalg.vector_norm(exp_avg_sq_before.detach().float()).item()),
+    )
+
+
 def _adam_update_selected(
     state: _WeightRefreshState,
     grad: torch.Tensor,
@@ -750,12 +965,55 @@ def _adam_update_selected(
     lr: float,
     grad_clip: float,
     compact_update: bool = False,
+    layer_idx: int | None = None,
 ) -> torch.Tensor:
     """Advance one Adam state and return a full or active-only update."""
 
     if state.exp_avg is None or state.exp_avg_sq is None:
         raise RuntimeError(f"optimizer state for {state.name!r} was released")
+    # Research-only ablations for Adam state across REAL-Q's discrete
+    # quantize/compensate refresh boundaries. The default `keep` path leaves
+    # the original optimizer transition untouched.
+    history_policy = _adam_history_policy_for_layer(layer_idx)
+    reset_m = history_policy in (
+        "reset_each_refresh",
+        "reset_m_each_refresh",
+        "reset_m_and_m_age_each_refresh",
+    )
+    reset_v = history_policy in (
+        "reset_each_refresh",
+        "reset_v_each_refresh",
+        "reset_v_and_v_age_each_refresh",
+    )
+    reset_v_age = history_policy == "reset_v_and_v_age_each_refresh"
+    reset_m_age = history_policy == "reset_m_and_m_age_each_refresh"
+    reset_age = history_policy in (
+        "reset_each_refresh", "reset_bias_age_each_refresh"
+    )
+    if history_policy != "keep":
+        if not getattr(state, "_history_ablation_logged", False):
+            logging.info(
+                "[adam_history_ablation] policy=%s layer=%s module=%s",
+                history_policy,
+                layer_idx,
+                state.name,
+            )
+            state._history_ablation_logged = True
+        if reset_m:
+            _zero_adam_buffer_selected(state.exp_avg, columns)
+        if reset_v:
+            _zero_adam_buffer_selected(state.exp_avg_sq, columns)
+        if reset_v_age:
+            state.v_step = 0
+        if reset_m_age:
+            # Restart only first-moment history and its bias-correction age;
+            # preserve the second-moment trajectory and its independent age.
+            state.step = 0
+        if reset_age:
+            state.step = 0
+            state.v_step = 0
     state.step += 1
+    state.v_step += 1
     if columns is None:
         grad_sel = grad
         ea = state.exp_avg
@@ -774,16 +1032,58 @@ def _adam_update_selected(
     if grad_clip > 0:
         grad_sel = grad_sel.clamp(min=-grad_clip, max=grad_clip)
     beta1, beta2, eps = 0.9, 0.999, 1e-8
-    ea.mul_(beta1).add_(grad_sel, alpha=1.0 - beta1)
-    ev.mul_(beta2).addcmul_(grad_sel, grad_sel, value=1.0 - beta2)
+    adopt_first_step = history_policy == "adopt" and state.step == 1
+    if history_policy == "adopt":
+        if adopt_first_step:
+            # ADOPT initializes v_0 from a gradient, then starts its first
+            # normalized-momentum update. Reuse this refresh's already
+            # available gradient for that initialization, preserving REAL-Q's
+            # no-extra-backward constraint and Adam's sign-like first step.
+            normalized_grad = grad_sel / grad_sel.abs().clamp_min(eps)
+            ea.copy_(normalized_grad)
+            ev.copy_(grad_sel.square())
+        else:
+            normalized_grad = grad_sel / ev.sqrt().clamp_min(eps)
+            ea.mul_(beta1).add_(normalized_grad, alpha=1.0 - beta1)
+            ev.mul_(beta2).addcmul_(
+                grad_sel, grad_sel, value=1.0 - beta2
+            )
+    else:
+        ea.mul_(beta1).add_(grad_sel, alpha=1.0 - beta1)
+        second_moment_input = (
+            grad_sel - ea if history_policy == "adabelief" else grad_sel
+        )
+        ev.mul_(beta2).addcmul_(
+            second_moment_input,
+            second_moment_input,
+            value=1.0 - beta2,
+        )
     if index is not None:
         state.exp_avg.index_copy_(1, index, ea)
         state.exp_avg_sq.index_copy_(1, index, ev)
     bc1 = 1.0 - beta1 ** state.step
-    bc2 = 1.0 - beta2 ** state.step
+    bc2 = 1.0 - beta2 ** state.v_step
     denom = ev.sqrt() / math.sqrt(bc2)
     denom.add_(eps)
-    selected_update = (lr / bc1) * (ea / denom)
+    if history_policy == "adopt":
+        selected_update = lr * ea
+    elif history_policy == "radam":
+        rho_inf = 2.0 / (1.0 - beta2) - 1.0
+        beta2_t = beta2 ** state.v_step
+        rho_t = rho_inf - 2.0 * state.v_step * beta2_t / (1.0 - beta2_t)
+        m_hat = ea / bc1
+        if rho_t > 5.0:
+            rect = math.sqrt(
+                (rho_t - 4.0)
+                * (rho_t - 2.0)
+                * rho_inf
+                / ((rho_inf - 4.0) * (rho_inf - 2.0) * rho_t)
+            )
+            selected_update = lr * rect * (m_hat / denom)
+        else:
+            selected_update = lr * m_hat
+    else:
+        selected_update = (lr / bc1) * (ea / denom)
     if compact_update:
         return selected_update
     update = torch.zeros_like(grad)
@@ -807,6 +1107,7 @@ def _apply_block_adam(
     compact_update: bool = False,
     collect_audits: bool = True,
     gradients_are_means: bool = False,
+    layer_idx: int | None = None,
 ) -> tuple[torch.Tensor, tuple[ActiveWeightAudit, ...]]:
     """Update every active FP32 master and return auditable runtime evidence."""
 
@@ -887,6 +1188,7 @@ def _apply_block_adam(
             if (
                 compact_update
                 and not collect_audits
+                and _adam_history_policy_for_layer(layer_idx) == "keep"
                 and not isinstance(entry.active_columns, slice)
                 and entry.state.exp_avg is not None
                 and entry.state.exp_avg_sq is not None
@@ -899,6 +1201,7 @@ def _apply_block_adam(
                 )
             ):
                 entry.state.step += 1
+                entry.state.v_step += 1
                 update = triton_block_adam.fused_adam_step(
                     grad_sum,
                     entry.state.exp_avg,
@@ -927,6 +1230,7 @@ def _apply_block_adam(
                     lr=lr,
                     grad_clip=grad_clip,
                     compact_update=compact_update,
+                    layer_idx=layer_idx,
                 )
             if entry.is_current:
                 if update is None:
@@ -1112,6 +1416,32 @@ def _make_single_linear_grad_refresh_fn_legacy(
         trailing_col_start: int,
         perm: torch.Tensor | None = None,
     ) -> torch.Tensor | None:
+        transfer_target_layer = os.environ.get(
+            "REALQ_ADAM_V_TRANSFER_TARGET_LAYER"
+        )
+        transfer_target_module = os.environ.get(
+            "REALQ_ADAM_V_TRANSFER_TARGET_MODULE"
+        )
+        if (
+            os.environ.get("REALQ_ADAM_V_TRANSFER_MODE")
+            and transfer_target_layer is not None
+            and transfer_target_module == str(ctx.trace_module)
+            and transfer_target_layer == str(ctx.trace_layer)
+            and ctx.refresh_step == 0
+        ):
+            logging.info(
+                "[adam_v_transfer_entry] layer=%s module=%s "
+                "refresh=0 mode=%s env_dir=%s m_step=%d v_step=%d "
+                "active_suffix_start=%d active_suffix_width=%d",
+                ctx.trace_layer,
+                ctx.trace_module,
+                os.environ.get("REALQ_ADAM_V_TRANSFER_MODE"),
+                os.environ.get("REALQ_ADAM_TRANSFER_DIAG_DIR"),
+                ctx.adam_step,
+                ctx.adam_v_step,
+                trailing_col_start,
+                stitched_weight_fp32.shape[1] - trailing_col_start,
+            )
         # Match old GPTQ+ ``collect_true_weight_gradient`` (lines 6500-6726)
         # under ``--dp_global_shuffle=True``:
         #   selected_global = scheduler.next_indices()  # backward_samples global ids
@@ -1135,7 +1465,25 @@ def _make_single_linear_grad_refresh_fn_legacy(
         # be identical too.
         with nvtx.nvtx_range("refresh.setup"):
             ctx.adam_step += 1
+            ctx.adam_v_step += 1
             ctx.refresh_step += 1
+            if (
+                ctx.refresh_step == 2
+                and ctx._adam_v_transfer_applied
+                and os.environ.get("REALQ_ADAM_V_TRANSFER_MODE")
+                and os.environ.get("REALQ_ADAM_V_TRANSFER_TARGET_LAYER")
+                == str(ctx.trace_layer)
+                and os.environ.get("REALQ_ADAM_V_TRANSFER_TARGET_MODULE")
+                == str(ctx.trace_module)
+            ):
+                logging.info(
+                    "[adam_v_transfer_age] layer=%s module=%s refresh=1 "
+                    "m_step=%d v_step=%d",
+                    ctx.trace_layer,
+                    ctx.trace_module,
+                    ctx.adam_step,
+                    ctx.adam_v_step,
+                )
             selected_global = ctx.next_indices()
             # GLOBAL → LOCAL filter. ``inps`` is this rank's contiguous shard
             # of size ``n_local`` starting at ``rank * n_local`` in the global
@@ -1434,6 +1782,49 @@ def _make_single_linear_grad_refresh_fn_legacy(
             # AFTER ``W_sub = W_sub[:, perm]``.
             if perm is not None:
                 accum_grad = accum_grad[:, perm]
+            history_policy = _adam_history_policy_for_layer(ctx.trace_layer)
+            reset_m = history_policy in (
+                "reset_each_refresh",
+                "reset_m_each_refresh",
+                "reset_m_and_m_age_each_refresh",
+            )
+            reset_v = history_policy in (
+                "reset_each_refresh",
+                "reset_v_each_refresh",
+                "reset_v_and_v_age_each_refresh",
+            )
+            reset_v_age = history_policy == "reset_v_and_v_age_each_refresh"
+            reset_m_age = history_policy == "reset_m_and_m_age_each_refresh"
+            reset_age = history_policy in (
+                "reset_each_refresh", "reset_bias_age_each_refresh"
+            )
+            if history_policy != "keep":
+                if reset_m:
+                    ctx.exp_avg[:, trailing_col_start:].zero_()
+                if reset_v:
+                    ctx.exp_avg_sq[:, trailing_col_start:].zero_()
+                if reset_v_age:
+                    # m keeps its real module age; only v is freshly
+                    # bias-corrected for this refresh (v_hat = clipped g^2).
+                    ctx.adam_v_step = 1
+                if reset_m_age:
+                    # m is zeroed only on the active floating suffix. The
+                    # current gradient is its fresh first observation; retain
+                    # the historical v estimate and its independent age.
+                    ctx.adam_step = 1
+                if reset_age:
+                    # refresh() increments the counter at entry, so initialize
+                    # its diagnostic/bias-correction age to zero here.
+                    ctx.adam_step = 1
+                    ctx.adam_v_step = 1
+                if not getattr(ctx, "_history_ablation_logged", False):
+                    logging.info(
+                        "[adam_history_ablation] policy=%s layer=%s module=%s",
+                        history_policy,
+                        ctx.trace_layer,
+                        ctx.trace_module,
+                    )
+                    ctx._history_ablation_logged = True
             # Slice trailing columns and grad-clip (per-element clamp; matches
             # old ``_compute_grad_optimizer_update_batched`` line 1105-1106).
             grad_slice = accum_grad[:, trailing_col_start:]
@@ -1443,14 +1834,289 @@ def _make_single_linear_grad_refresh_fn_legacy(
             #   denom = sqrt(ev) / sqrt(bc2) + eps  (NOT sqrt(ev / bc2))
             ea = ctx.exp_avg[:, trailing_col_start:]
             ev = ctx.exp_avg_sq[:, trailing_col_start:]
-            ea.mul_(ctx.beta1).add_(grad_slice, alpha=1.0 - ctx.beta1)
-            ev.mul_(ctx.beta2).addcmul_(grad_slice, grad_slice, value=1.0 - ctx.beta2)
+            transfer_info = None
+            if os.environ.get("REALQ_ADAM_V_TRANSFER_MODE"):
+                from realq.refresh.adam_transfer_diagnostic import (
+                    initialize_v_from_previous_row_profile,
+                )
+
+                transfer_info = initialize_v_from_previous_row_profile(
+                    layer=int(ctx.trace_layer),
+                    module=str(ctx.trace_module),
+                    refresh_index=ctx.refresh_step - 1,
+                    grad=grad_slice,
+                    exp_avg_sq=ev,
+                    beta2=ctx.beta2,
+                )
+                if transfer_info is not None:
+                    if ctx.adam_step != 1:
+                        raise RuntimeError(
+                            "normalized row-prior transfer is only valid at "
+                            "the target module's first local Adam step; got "
+                            f"{ctx.adam_step} for layer={ctx.trace_layer} "
+                            f"module={ctx.trace_module}"
+                        )
+                    logging.info(
+                        "[adam_v_transfer] layer=%s module=%s "
+                        "donor_layer=%d refresh=%d corr=%.5f "
+                        "donor_to_target_scale=%.6g shrinkage=%.4f "
+                        "m_step=%d virtual_v_step=%d",
+                        ctx.trace_layer,
+                        ctx.trace_module,
+                        int(ctx.trace_layer) - 1,
+                        ctx.refresh_step - 1,
+                        float(transfer_info["correlation"]),
+                        float(transfer_info["donor_to_target_scale"]),
+                        float(transfer_info["shrinkage"]),
+                        ctx.adam_step,
+                        int(transfer_info["target_v_step"]),
+                    )
+                    ctx.adam_v_step = int(transfer_info["target_v_step"])
+                    ctx._adam_v_transfer_applied = True
+            probe_rule = _adam_probe_target_rule(ctx)
+            _log_adam_probe_snapshot(
+                ctx=ctx,
+                rule=probe_rule,
+                weight=stitched_weight_fp32[:, trailing_col_start:],
+                grad=grad_slice,
+                exp_avg_before=ea,
+                exp_avg_sq_before=ev,
+            )
+            adopt_first_step = history_policy == "adopt" and ctx.adam_step == 1
+            if history_policy == "adopt":
+                if adopt_first_step:
+                    normalized_grad = grad_slice / grad_slice.abs().clamp_min(
+                        ctx.eps
+                    )
+                    ea.copy_(normalized_grad)
+                    ev.copy_(grad_slice.square())
+                else:
+                    normalized_grad = grad_slice / ev.sqrt().clamp_min(ctx.eps)
+                    ea.mul_(ctx.beta1).add_(
+                        normalized_grad, alpha=1.0 - ctx.beta1
+                    )
+                    ev.mul_(ctx.beta2).addcmul_(
+                        grad_slice, grad_slice, value=1.0 - ctx.beta2
+                    )
+            else:
+                ea.mul_(ctx.beta1).add_(grad_slice, alpha=1.0 - ctx.beta1)
+                second_moment_input = (
+                    grad_slice - ea
+                    if history_policy == "adabelief"
+                    else grad_slice
+                )
+                ev.mul_(ctx.beta2).addcmul_(
+                    second_moment_input,
+                    second_moment_input,
+                    value=1.0 - ctx.beta2,
+                )
             bc1 = 1.0 - ctx.beta1 ** ctx.adam_step
-            bc2 = 1.0 - ctx.beta2 ** ctx.adam_step
+            v_step = (
+                int(transfer_info["target_v_step"])
+                if transfer_info is not None
+                else ctx.adam_v_step
+            )
+            bc2 = 1.0 - ctx.beta2 ** v_step
             denom = ev.sqrt() / math.sqrt(bc2)
             denom.add_(ctx.eps)
             step_size = ctx.layer_lr / bc1
-            update = step_size * (ea / denom)
+            if history_policy == "adopt":
+                update = ctx.layer_lr * ea
+            elif history_policy == "radam":
+                rho_inf = 2.0 / (1.0 - ctx.beta2) - 1.0
+                beta2_t = ctx.beta2 ** v_step
+                rho_t = (
+                    rho_inf
+                    - 2.0 * v_step * beta2_t / (1.0 - beta2_t)
+                )
+                if rho_t > 5.0:
+                    rect = math.sqrt(
+                        (rho_t - 4.0)
+                        * (rho_t - 2.0)
+                        * rho_inf
+                        / (
+                            (rho_inf - 4.0)
+                            * (rho_inf - 2.0)
+                            * rho_t
+                        )
+                    )
+                    update = step_size * rect * (ea / denom)
+                else:
+                    update = step_size * ea
+            else:
+                update = step_size * (ea / denom)
+            if transfer_info is not None:
+                # Compare the candidate preconditioner with the exact base
+                # Adam first-step estimator vhat=g^2. This is diagnostic-only
+                # and runs only at the explicitly selected transfer target.
+                with torch.no_grad():
+                    grad32 = grad_slice.detach().float()
+                    base_vhat = grad32.square()
+                    candidate_vhat = ev.detach().float() / max(bc2, 1e-30)
+                    base_update = ctx.layer_lr * grad32 / (
+                        grad32.abs() + ctx.eps
+                    )
+                    candidate_update = update.detach().float()
+                    base_norm = torch.linalg.vector_norm(base_update).clamp_min(1e-30)
+                    candidate_norm = torch.linalg.vector_norm(candidate_update).clamp_min(1e-30)
+                    update_cosine = torch.sum(base_update * candidate_update) / (
+                        base_norm * candidate_norm
+                    )
+                    relative_update_change = torch.linalg.vector_norm(
+                        candidate_update - base_update
+                    ) / base_norm
+                    vhat_ratio = candidate_vhat / base_vhat.clamp_min(1e-30)
+                    within_row = base_vhat - base_vhat.mean(dim=1, keepdim=True)
+                    within_row_cv = torch.sqrt(
+                        within_row.square().mean()
+                        / base_vhat.mean().square().clamp_min(1e-30)
+                    )
+                    logging.info(
+                        "[adam_v_transfer_effect] layer=%s module=%s "
+                        "refresh=%d update_cosine=%.8g "
+                        "relative_update_l2_change=%.8g "
+                        "coordinate_vhat_ratio_p05=%.8g "
+                        "coordinate_vhat_ratio_median=%.8g "
+                        "coordinate_vhat_ratio_p95=%.8g "
+                        "target_within_row_g2_cv=%.8g",
+                        ctx.trace_layer,
+                        ctx.trace_module,
+                        ctx.refresh_step - 1,
+                        float(update_cosine.item()),
+                        float(relative_update_change.item()),
+                        float(torch.quantile(vhat_ratio, 0.05).item()),
+                        float(torch.quantile(vhat_ratio, 0.50).item()),
+                        float(torch.quantile(vhat_ratio, 0.95).item()),
+                        float(within_row_cv.item()),
+                    )
+            if os.environ.get("REALQ_ADAM_TRANSFER_DIAG_DIR"):
+                from realq.refresh.adam_transfer_diagnostic import record_refresh
+
+                record_refresh(
+                    layer=int(ctx.trace_layer),
+                    module=str(ctx.trace_module),
+                    refresh_index=ctx.refresh_step - 1,
+                    adam_step=ctx.adam_v_step,
+                    grad=grad_slice,
+                    exp_avg_sq=ev,
+                    beta2=ctx.beta2,
+                )
+            if os.environ.get("REALQ_ADAM_MOMENT_DRIFT_DIAG_DIR"):
+                from realq.refresh.adam_transfer_diagnostic import record_moment_drift
+
+                record_moment_drift(
+                    layer=int(ctx.trace_layer),
+                    module=str(ctx.trace_module),
+                    refresh_index=ctx.refresh_step - 1,
+                    adam_step=ctx.adam_v_step,
+                    grad=grad_slice,
+                    exp_avg_sq=ev,
+                    beta2=ctx.beta2,
+                )
+            if _is_adam_probe_target(ctx):
+                probe_reference_update = update.detach().float().clone()
+                product = update.detach().float() * grad_slice.detach().float()
+                product_abs = product.abs()
+                weight_sum = product_abs.sum().clamp_min(1e-30)
+                cautious_mask = product > 0
+                cautious_scale = cautious_mask.numel() / (cautious_mask.sum().item() + 1.0)
+                cos_d_g = torch.sum(
+                    update.detach().float() * grad_slice.detach().float()
+                ) / (
+                    torch.linalg.vector_norm(update.detach().float())
+                    * torch.linalg.vector_norm(grad_slice.detach().float())
+                ).clamp_min(1e-30)
+                logging.info(
+                    "[adam_probe_direction] layer=%s module=%s block=%d "
+                    "cos_descent_update_grad=%.9g conflict_fraction=%.9g "
+                    "conflict_update_mass_fraction=%.9g adam_update_l2=%.9g "
+                    "grams_update_l2=%.9g zero_gradient_fraction=%.9g "
+                    "cautious_retained_fraction=%.9g cautious_scale=%.9g",
+                    ctx.trace_layer,
+                    ctx.trace_module,
+                    ctx.refresh_step - 1,
+                    float(cos_d_g.item()),
+                    float((product < 0).float().mean().item()),
+                    float(product_abs[product < 0].sum().div(weight_sum).item()),
+                    float(torch.linalg.vector_norm(update.detach().float()).item()),
+                    float(
+                        torch.linalg.vector_norm(
+                            torch.sign(grad_slice.detach().float())
+                            * update.detach().float().abs()
+                        ).item()
+                    ),
+                    float((grad_slice == 0).float().mean().item()),
+                    float(cautious_mask.float().mean().item()),
+                    float(cautious_scale),
+                )
+            transition_observer = getattr(refresh, "_adam_transition_observer", None)
+            if transition_observer is not None and _is_adam_probe_target(ctx):
+                transition_observer.capture_refresh(
+                    inps=inps, fp_target=fp_out_for_this_layer,
+                    fisher=fisher, next_fp_target=next_fp_out,
+                    next_fisher=next_fisher, selected=selected,
+                    kw=kw, weight_name=weight_name, slide_alpha=slide_alpha,
+                    a_loss_ratio=a_loss_ratio, a_loss_threshold=a_loss_threshold,
+                    next_a_loss_threshold=next_a_loss_threshold,
+                    raw_gradient=accum_grad[:, trailing_col_start:],
+                    clipped_gradient=grad_slice, adam_update=update,
+                    adam_step=ctx.adam_step, grad_clip=ctx.grad_clip,
+                    actual_loss=float(global_loss_sums[0].item() / global_count),
+                    module_dtype=str(module.weight.dtype),
+                    layer_reference_state=layer.state_dict(),
+                )
+            if probe_rule == "grams_direction":
+                update = torch.sign(grad_slice) * update.abs()
+            elif probe_rule == "norm_matched_gradient":
+                update = _norm_matched_gradient_update(update, grad_slice)
+            elif probe_rule in (
+                "reset_m",
+                "reset_m_direction_norm_matched_adam",
+                "adam_direction_norm_matched_reset_m",
+            ):
+                # At this refresh, a correctly reset m and m-age produce
+                # m_hat=g while retaining the same post-EMA v and v-age.
+                reset_m_update = ctx.layer_lr * grad_slice / denom
+                if probe_rule == "reset_m":
+                    update = reset_m_update
+                elif probe_rule == "reset_m_direction_norm_matched_adam":
+                    update = _match_update_l2_norm(reset_m_update, update)
+                else:
+                    update = _match_update_l2_norm(update, reset_m_update)
+            elif probe_rule in ("cautious", "cautious_mask", "cautious_scale"):
+                mask = (update * grad_slice) > 0
+                if probe_rule != "cautious_scale":
+                    update = update * mask.to(dtype=update.dtype)
+                if probe_rule != "cautious_mask":
+                    update.mul_(mask.numel() / (mask.sum().item() + 1.0))
+            elif probe_rule == "no_parameter_update":
+                update.zero_()
+            if _is_adam_probe_target(ctx):
+                applied = update.detach().float()
+                reference = probe_reference_update
+                applied_norm = torch.linalg.vector_norm(applied)
+                reference_norm = torch.linalg.vector_norm(reference)
+                cosine = torch.sum(applied * reference) / (
+                    applied_norm * reference_norm
+                ).clamp_min(1e-30)
+                logging.info(
+                    "[adam_probe_applied] layer=%s module=%s block=%d rule=%s "
+                    "update_l2=%.9g adam_update_l2=%.9g "
+                    "norm_ratio_to_adam=%.9g cosine_to_adam=%.9g "
+                    "relative_delta_l2=%.9g",
+                    ctx.trace_layer,
+                    ctx.trace_module,
+                    ctx.refresh_step - 1,
+                    probe_rule,
+                    float(applied_norm.item()),
+                    float(reference_norm.item()),
+                    float((applied_norm / reference_norm.clamp_min(1e-30)).item()),
+                    float(cosine.item()),
+                    float(
+                        torch.linalg.vector_norm(applied - reference)
+                        / reference_norm.clamp_min(1e-30)
+                    ),
+                )
             # Return fp32 update — caller subtracts from its fp32 working W
             # master so the precision of the per-step delta survives even when
             # lr is below module-dtype ULP.
@@ -1657,6 +2323,17 @@ def make_grad_refresh_fn(
             # Adam step rather than restarting at one per linear.
             ctx.refresh_step += 1
             ctx.adam_step = block_state.expected_next_step(module_name)
+            if (
+                _adam_history_policy_for_layer(ctx.trace_layer)
+                in (
+                    "reset_each_refresh",
+                    "reset_m_and_m_age_each_refresh",
+                )
+            ):
+                # The experimental policy resets the state inside
+                # _adam_update_selected. Keep loss/step diagnostics aligned
+                # with the actual bias-correction age used by that update.
+                ctx.adam_step = 1
 
         a_loss_threshold = None
         next_a_loss_threshold = None
@@ -1907,6 +2584,7 @@ def make_grad_refresh_fn(
                 compact_update=ctx.fused_block_adam,
                 collect_audits=ctx.trace_enabled,
                 gradients_are_means=direct_single_chunk,
+                layer_idx=ctx.trace_layer,
             )
         if global_loss_sums is not None:
             ctx.record_loss_observation(

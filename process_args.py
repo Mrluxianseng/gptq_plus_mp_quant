@@ -65,6 +65,34 @@ def parse_gen():
     parser.add_argument("--nsamples", type=int, default=1024, help="The number of examples to use")
     parser.add_argument("--seq_len", type=int, default=2048, help="The sequence length to use in calibration")
     parser.add_argument("--eval_seq_len", type=int, default=2048, help="The sequence length to use in PPL&KL evaluation")
+    parser.add_argument(
+        "--eval_samples", type=int, default=0,
+        help="Number of fixed-length test windows for screening KL/PPL; 0 uses the full test split.",
+    )
+    parser.add_argument(
+        "--eval_start_sample", type=int, default=0,
+        help="Index of the first fixed-length test window used for KL/PPL evaluation.",
+    )
+    parser.add_argument(
+        "--eval_logit_chunk_tokens",
+        type=int,
+        default=0,
+        help=(
+            "Optional exact full-vocabulary KL/PPL evaluation memory cap: apply "
+            "the LM head and distribution math to this many token rows at a time. "
+            "0 keeps the original full-sequence evaluation path."
+        ),
+    )
+    parser.add_argument(
+        "--eval_ce_chunk_tokens",
+        type=int,
+        default=0,
+        help=(
+            "Optional token-row chunk size for exact causal CE/PPL evaluation. "
+            "This avoids materializing full-sequence FP32 logits; 0 preserves "
+            "the original full-sequence cross-entropy operation."
+        ),
+    )
     # Gradient profiling
     parser.add_argument("--mode", type=str, default="gradients", choices=["tokens", "gradients"],
                         help="The mode to run in")
@@ -82,6 +110,18 @@ def parse_gen():
     parser.add_argument("--k_asym", action="store_true", help="K cache asymmetric quantization")
     parser.add_argument("--v_asym", action="store_true", help="V cache asymmetric quantization")
     parser.add_argument("--w_clip", action="store_true", help="Enable weight clipping")
+    parser.add_argument(
+        "--pre_clip_search_impl",
+        choices=("cartesian_legacy", "symmetric_union_exact"),
+        default="cartesian_legacy",
+        help="MSE candidate search used only by the pre-clip stage; symmetric_union_exact is bit-exact on its supported finite symmetric FP32 domain.",
+    )
+    parser.add_argument(
+        "--quantizer_search_impl",
+        choices=("cartesian_legacy", "symmetric_union_exact"),
+        default="cartesian_legacy",
+        help="MSE candidate search used by GPTQ's initial weight-quantizer calibration; symmetric_union_exact is bit-exact on its supported finite symmetric FP32 domain.",
+    )
     parser.add_argument(
         "--pre_clip",
         dest="pre_clip",
@@ -232,6 +272,172 @@ def parse_gen():
         ),
     )
     parser.add_argument(
+        "--two_sided_rounding",
+        type=int,
+        default=0,
+        choices=[0, 1],
+        help=(
+            "Round with feedback on BOTH axes of the weight matrix instead of "
+            "columns only. GPTQ implicitly treats the metric on output channels "
+            "as the identity, which makes every row an independent problem; with "
+            "the real output-side metric M the rows couple, and the coupling can "
+            "only enter through the choice of grid point (the column compensation "
+            "is the same formula for any positive-definite M). This is the "
+            "algorithm of YAQA / BoA / GPTQ-2D / BaKron, reimplemented rather "
+            "than copied. 0 is byte-identical to the current pipeline."
+        ),
+    )
+    parser.add_argument(
+        "--two_sided_modules",
+        type=str,
+        default="mlp.down_proj",
+        help=(
+            "Comma-separated substrings naming which modules use two-sided "
+            "rounding; every other module keeps the existing path, so a run is a "
+            "controlled comparison. Default is mlp.down_proj alone: it is last in "
+            "the block, so its output IS the block output up to the residual, the "
+            "Jacobian to the block output is the identity, and the output metric "
+            "is exactly the layer-output Fisher the pipeline already computes. "
+            "Every other module needs that Fisher transported through a Jacobian."
+        ),
+    )
+    parser.add_argument(
+        "--grad_steps_modules",
+        type=str,
+        default="",
+        help=(
+            "Restrict --grad_steps_per_refresh to modules whose name contains "
+            "one of these comma-separated substrings; empty (default) applies it "
+            "everywhere. Every other module keeps exactly one step, so the run is "
+            "a controlled comparison against the baseline rather than a different "
+            "algorithm. mlp.down_proj is the one module whose contribution to the "
+            "layer output is exactly linear in its own weight (it is last in the "
+            "block, so nothing in-layer follows it), which makes its surrogate "
+            "exactly quadratic and its extra steps interpretable without any "
+            "non-linearity confound. self_attn.o_proj is NOT such a module -- its "
+            "output enters the residual and then passes through the whole MLP."
+        ),
+    )
+    parser.add_argument(
+        "--eager_cross_compensate",
+        action="store_true",
+        default=False,
+        help=(
+            "Situation B: after each linear module is quantised, immediately "
+            "take one plain-SGD gradient step on every NOT-yet-quantised module "
+            "in the same transformer block, so they start compensating the "
+            "just-introduced residual right away instead of waiting for their "
+            "own turn. Turns the sequential per-module optimisation into "
+            "partially-joint optimisation. Uses the same refresh loss as "
+            "block_gd; the step size is --eager_cross_lr. Requires "
+            "--g_update_mode block_gd. Off (default) leaves the pipeline "
+            "byte-identical to before."
+        ),
+    )
+    parser.add_argument(
+        "--eager_cross_lr",
+        type=float,
+        default=2e-5,
+        help=(
+            "Learning rate for the --eager_cross_compensate SGD step applied to "
+            "not-yet-quantised modules after each module boundary. Positive: "
+            "weights move to reduce the refresh loss."
+        ),
+    )
+    parser.add_argument(
+        "--joint_block_gd",
+        action="store_true",
+        default=False,
+        help=(
+            "Transform block-GD into a partially-joint optimiser: at each block "
+            "boundary of the module being quantised, in addition to the current "
+            "module's trailing columns, take one Adam step on every "
+            "not-yet-quantised module in the same transformer block (its full "
+            "weight). Each module carries a persistent Adam state that "
+            "accumulates across the whole layer, so it is no longer cold-started "
+            "at its own turn. Uses the same refresh loss as block_gd; step size "
+            "is the layer's scheduled --grad_lr. Requires --g_update_mode "
+            "block_gd. Off (default) leaves the pipeline unchanged."
+        ),
+    )
+    parser.add_argument(
+        "--cross_module_compensate",
+        action="store_true",
+        default=False,
+        help=(
+            "After mlp.up_proj is quantised, compute a closed-form correction "
+            "for mlp.down_proj that cancels up_proj's layer-output perturbation. "
+            "Pure closed-form (no gradient): delta_W_down = -delta_out · "
+            "h_down^T · (H_down + lambda I)^{-1}, the cross-module analogue of "
+            "GPTQ's within-module compensation. Requires --g_update_mode "
+            "block_gd. Off (default) leaves the pipeline unchanged."
+        ),
+    )
+    parser.add_argument(
+        "--diagnose_fisher_split",
+        action="store_true",
+        default=False,
+        help=(
+            "Diagnostic only: for layer 0 mlp.down_proj, log gradients from "
+            "the full layer-output Fisher, its diagonal, and its off-diagonal "
+            "part before/after cross-module compensation and at the first block "
+            "refresh. Adds a few backward passes; does not change updates."
+        ),
+    )
+    parser.add_argument(
+        "--diagnose_unweighted_closed_form",
+        action="store_true",
+        default=False,
+        help=(
+            "Diagnostic ablation for --cross_module_compensate: compute the "
+            "closed-form target correction from the unweighted residual (omit "
+            "the layer Fisher multiplier). Intended for comparison only."
+        ),
+    )
+    parser.add_argument(
+        "--refresh_fisher_offdiag_only",
+        action="store_true",
+        default=False,
+        help=(
+            "Experiment: zero the layer-output Fisher diagonal only for the "
+            "mlp.down_proj block-GD refresh after cross-module compensation. "
+            "Requires --cross_module_compensate and block_gd. The resulting "
+            "off-diagonal quadratic can be indefinite."
+        ),
+    )
+    parser.add_argument(
+        "--cross_module_compensate_all",
+        action="store_true",
+        default=False,
+        help=(
+            "Closed-form cross-module compensation, but spread over EVERY "
+            "not-yet-quantised module in the same layer instead of just the next "
+            "residual-stream one. After each module is quantised its net error is "
+            "computed once and split evenly across all later o_proj/down_proj "
+            "(exact closed form) and up/gate (SwiGLU-linearised closed form) "
+            "modules, so the targets jointly cancel exactly one feeder error "
+            "instead of over-compensating. Requires --g_update_mode block_gd. "
+            "Mutually independent of --cross_module_compensate (the sequential "
+            "single-target variant)."
+        ),
+    )
+    parser.add_argument(
+        "--grad_steps_per_refresh",
+        type=int,
+        default=1,
+        help=(
+            "block_gd only: how many Adam steps to take at each column-block "
+            "boundary. The paper takes exactly 1, which leaves a column 7-23 "
+            "updates over its whole life. The multistep probe measured that the "
+            "single step reaches only ~2%% of what a 56-step walk reaches on the "
+            "held-out refresh loss, so 1 is a budget rather than a converged "
+            "optimum; this turns it into a knob. Each extra step draws a FRESH "
+            "gradient (a real backward, consuming the sample stream), so k>1 is "
+            "more optimisation and not an lr rescale -- and it costs k times the "
+            "refresh, which dominates run time. 1 is byte-identical to before."
+        ),
+    )
+    parser.add_argument(
         "--column_budget_q",
         type=float,
         default=1.0,
@@ -378,6 +584,65 @@ def parse_gen():
         ),
     )
     parser.add_argument(
+        "--sequence_fisher_mode", choices=("off", "token", "sequence", "cross"), default="off",
+        help="Opt-in FFN Adam loss: aggregate Fisher mixed with sample-aligned score projections.",
+    )
+    parser.add_argument("--sequence_fisher_probes", type=int, default=4)
+    parser.add_argument("--sequence_fisher_mix", type=float, default=0.5)
+    parser.add_argument(
+        "--ffn_nonlinear_refresh",
+        action="store_true",
+        default=False,
+        help=(
+            "Engineering hybrid for the SwiGLU FFN: keep fisher_diag_mse on "
+            "attention projections, but use the exact transformer-layer output "
+            "reconstruction residual for mlp.gate_proj/up_proj/down_proj. The "
+            "residual is evaluated after the real SwiGLU forward, and is scaled "
+            "by mean layer-Fisher curvature to keep gradient units comparable. "
+            "Requires --global_loss, --grad_refresh_loss=fisher_diag_mse, and "
+            "--g_update_mode=block_gd."
+        ),
+    )
+    parser.add_argument(
+        "--ffn_nonlinear_hybrid_refresh",
+        action="store_true",
+        default=False,
+        help=(
+            "For SwiGLU FFN projections, average the layer-Fisher quadratic loss "
+            "with an exact transformer-layer output MSE scaled by mean Fisher "
+            "curvature. This preserves Fisher directions while adding nonlinear "
+            "residual sensitivity. Requires --global_loss, "
+            "--grad_refresh_loss=fisher_diag_mse, and --g_update_mode=block_gd."
+        ),
+    )
+    parser.add_argument(
+        "--ffn_adaptive_fisher_shrinkage",
+        action="store_true",
+        default=False,
+        help=(
+            "For non-final SwiGLU FFN projections, shrink the shared empirical "
+            "layer Fisher toward trace(F)/H * I using a sequence-level estimate "
+            "of Fisher-matrix sampling variance. This replaces the fixed 50/50 "
+            "Fisher/MSE blend with a per-layer data-estimated curvature metric. "
+            "Requires --global_loss, --grad_refresh_loss=fisher_diag_mse, "
+            "--g_update_mode=block_gd, fisher_rademacher_k=0, and at least two "
+            "calibration sequences."
+        ),
+    )
+    parser.add_argument(
+        "--ffn_adaptive_fisher_offdiag_shrinkage",
+        action="store_true",
+        default=False,
+        help=(
+            "For non-final SwiGLU FFN projections, preserve the empirical Fisher "
+            "diagonal and shrink only its off-diagonal correlations toward zero, "
+            "with sequence-level data-estimated intensity. This tests whether "
+            "finite-calibration noise in cross-channel correlations is the source "
+            "of the isotropic-shrinkage KL regression. Requires the same setup as "
+            "--ffn_adaptive_fisher_shrinkage."
+        ),
+    )
+    parser.add_argument(
         "--global_loss",
         dest="global_loss",
         action="store_true",
@@ -454,6 +719,44 @@ def parse_gen():
         ),
     )
     parser.add_argument(
+        "--static_saved_tensor_offload_mib",
+        type=int,
+        default=0,
+        help=(
+            "Stage-0 static Fisher/saliency backward memory tradeoff: copy saved, "
+            "non-leaf CUDA tensors of at least this many MiB to CPU during the "
+            "full-model forward, then restore them for backward. 0 disables it. "
+            "This trades host-device traffic for lower activation peak memory."
+        ),
+    )
+    parser.add_argument(
+        "--static_saved_tensor_offload_deduplicate",
+        action="store_true",
+        help="Opt-in version/view-aware sharing of Stage-0 CPU saved-tensor copies; requires positive static_saved_tensor_offload_mib.",
+    )
+    parser.add_argument(
+        "--static_fisher_label_chunk_tokens",
+        type=int,
+        default=0,
+        help=(
+            "Opt-in memory tradeoff for static end-to-end Fisher label sampling: "
+            "softmax and multinomial-sample this many token rows at a time. "
+            "Preserves the categorical distribution and per-sample determinism, "
+            "but changes the exact sampled labels versus the unchunked path. 0 disables it."
+        ),
+    )
+    parser.add_argument(
+        "--static_fisher_packed_accumulation",
+        action="store_true",
+        help=(
+            "Store only the lower triangle of each symmetric full empirical Fisher "
+            "accumulator during Stage-0, then reconstruct one full matrix at a time "
+            "before returning the unchanged BF16 REAL-Q cache. This reduces the "
+            "GPU-resident Fisher accumulation component by about 50%% without "
+            "dropping cross-channel terms; default off."
+        ),
+    )
+    parser.add_argument(
         "--fisher_rademacher_k",
         type=int,
         default=0,
@@ -509,6 +812,51 @@ def parse_gen():
             "model; other ranks build a meta skeleton and receive the current layer "
             "on GPU by broadcast. Intended for two-stage runs that read a static "
             "precompute cache."
+        ),
+    )
+    parser.add_argument(
+        "--stage2_hinv_cpu_offload",
+        action="store_true",
+        help=(
+            "Experimental Stage-2 memory mode: keep per-output-group GPTQ "
+            "inverse-Cholesky factors in CPU RAM and copy only the active "
+            "column-block row slice to CUDA. Requires alpha=0, block_gd, "
+            "group_parallel_quant=none, and the PyTorch inner kernel."
+        ),
+    )
+    parser.add_argument(
+        "--stage2_hinv_cpu_offload_modules",
+        default="",
+        help=(
+            "Comma-separated Stage-2 module selectors for selective Hinv CPU offload, "
+            "formatted as LAYER.MODULE (for example, 27.mlp.down_proj). Uses the "
+            "same exact-staging path and compatibility constraints as "
+            "--stage2_hinv_cpu_offload, but leaves all unselected modules on GPU."
+        ),
+    )
+    parser.add_argument(
+        "--stage2_hinv_cpu_reuse_buffer",
+        action="store_true",
+        help="Experimental: reuse one CUDA Hinv row staging buffer per offloaded subgroup instead of allocating each block. Requires Hinv CPU offload.",
+    )
+    parser.add_argument(
+        "--stage2_hessian_cpu_offload",
+        action="store_true",
+        help=(
+            "Experimental Stage-2 memory mode: move the accumulated per-group "
+            "GPTQ Hessian to CPU RAM, then copy one output-group Hessian to "
+            "CUDA at a time. Exact data staging; requires alpha=0, block_gd, "
+            "group_parallel_quant=none, and the PyTorch inner kernel."
+        ),
+    )
+    parser.add_argument(
+        "--stage2_hessian_damping_inplace",
+        action="store_true",
+        help=(
+            "Experimental Stage-2 memory mode: add Hessian damping in-place on the "
+            "active subgroup to avoid a full H_work clone during inverse construction. "
+            "Currently intended for alpha=0, block_gd, group_parallel_quant=none, "
+            "and the PyTorch inner kernel."
         ),
     )
     parser.add_argument(
@@ -651,6 +999,16 @@ def parse_gen():
         help="Scale applied to the pure GPTQ second-order update in block_gd mode.",
     )
     parser.add_argument(
+        "--gptq_inner_kernel",
+        choices=("torch", "triton_fused"),
+        default="torch",
+        help=(
+            "Implementation for the sequential GPTQ inner-column update. "
+            "triton_fused is experimental and currently supports block_gd, "
+            "per-row symmetric quantization, and blocksize <= 128."
+        ),
+    )
+    parser.add_argument(
         "--blocksize",
         type=int,
         default=128,
@@ -660,6 +1018,26 @@ def parse_gen():
         "--block_atomic_quant",
         action="store_true",
         help="Quantize each block atomically without any block-internal GPTQ/GPTQ+ updates; only apply cross-block updates after the block is quantized.",
+    )
+    parser.add_argument(
+        "--preview_next_quant_block",
+        action="store_true",
+        help=(
+            "Before each block_gd refresh, evaluate the existing loss on a "
+            "shadow state that simulates GPTQ quantization of the next column "
+            "block. Initial implementation supports symmetric per-row weights "
+            "with group_parallel_quant=none."
+        ),
+    )
+    parser.add_argument(
+        "--preview_next_quant_block_adam_aware",
+        action="store_true",
+        help=(
+            "Refine the next-block shadow state with a preliminary refresh: "
+            "estimate the Adam update, apply it to a disposable weight copy, "
+            "GPTQ-quantize the next block, then recompute the refresh gradient "
+            "on that predicted post-update state. Adds one backward per refresh."
+        ),
     )
     parser.add_argument(
         "--group_parallel_quant",
@@ -685,6 +1063,25 @@ def parse_gen():
         type=int,
         default=-1,
         help="Top-k KL support; <=0 uses the full vocabulary (paper default).",
+    )
+    parser.add_argument(
+        "--kl_logit_chunk_tokens",
+        type=int,
+        default=0,
+        help=(
+            "Optional exact-KL refresh memory cap: process logits in chunks of "
+            "this many flattened token rows, avoiding full-size FP32 softmax "
+            "temporaries. 0 keeps the original full-tensor KL path."
+        ),
+    )
+    parser.add_argument(
+        "--kl_recompute_head",
+        action="store_true",
+        help=(
+            "For exact full-vocabulary KL refresh, recompute linear lm_head "
+            "logits per token chunk in backward instead of retaining full "
+            "student/teacher logits. Requires --kl_logit_chunk_tokens > 0."
+        ),
     )
     parser.add_argument(
         "--grad_hessian_topk",
@@ -778,7 +1175,20 @@ def parse_gen():
     )
     parser.add_argument("--save_qmodel_path", type=str, default=None, help="The path to save quantized model ckpt")
     parser.add_argument("--offload_inps", action="store_true", help="Offload inputs to CPU")
+    parser.add_argument(
+        "--stage2_input_cache_cpu_init", action="store_true",
+        help="Create captured Stage-2 input/reference caches directly on CPU; requires --offload_inps.",
+    )
     parser.add_argument("--enable_quant_profile", action="store_true", help="Emit NVTX ranges for Nsight profiling during GPTQ+ quantization.")
+    parser.add_argument(
+        "--enable_memory_profile",
+        action="store_true",
+        help=(
+            "Record opt-in CUDA allocated/reserved high-water marks between "
+            "coarse GPTQ+ pipeline stages under <output_dir>/memory_profile/. "
+            "Stage markers synchronize CUDA and add profiling overhead."
+        ),
+    )
     parser.add_argument("--quant_profile_target_layers", type=str, default="all", help="Layer ids to profile in detail when quant profiling is enabled.")
     parser.add_argument("--quant_profile_target_modules", type=str, default="all", help="Comma-separated module names to profile in detail when quant profiling is enabled.")
     parser.add_argument("--quant_stop_layer", type=str, default=None, help="Inclusive transformer layer index to stop after; intended for short profiling/debug runs.")
@@ -943,6 +1353,28 @@ def parse_gen():
         ),
     )
     parser.add_argument(
+        "--third_order_refresh_layer",
+        type=int,
+        default=-1,
+        help=(
+            "Experimental REAL-Q comparison: on this zero-based non-final layer, "
+            "replace the Fisher output gradient with Fisher plus a matrix-free "
+            "third-order downstream-KL correction for gate/up/down FFN refreshes. "
+            "Requires global Fisher + block_gd; -1 disables it."
+        ),
+    )
+    parser.add_argument(
+        "--third_order_refresh_estimator",
+        choices=("central_cubic", "exact_downstream"),
+        default="central_cubic",
+        help=(
+            "Output-gradient estimator used with --third_order_refresh_layer. "
+            "central_cubic applies the matrix-free symmetric correction; "
+            "exact_downstream uses the already-computed full-vocabulary KL "
+            "gradient through the frozen FP suffix as a diagnostic/control."
+        ),
+    )
+    parser.add_argument(
         "--enable_dynamic_saliency",
         type=int,
         default=0,
@@ -1071,6 +1503,31 @@ def parse_gen():
             )
     if args.group_parallel_quant != "none" and args.w_method != "gptq_plus":
         raise ValueError("--group_parallel_quant is currently implemented only for --w_method=gptq_plus.")
+    if getattr(args, "preview_next_quant_block", False):
+        if args.g_update_mode != "block_gd":
+            raise ValueError("--preview_next_quant_block requires --g_update_mode=block_gd.")
+        if args.group_parallel_quant != "none":
+            raise ValueError(
+                "--preview_next_quant_block currently requires "
+                "--group_parallel_quant=none."
+            )
+        if args.w_groupsize != -1:
+            raise ValueError(
+                "--preview_next_quant_block currently requires per-row "
+                "weight quantization (--w_groupsize=-1)."
+            )
+        if args.block_atomic_quant or getattr(args, "two_sided_rounding", 0):
+            raise ValueError(
+                "--preview_next_quant_block requires standard sequential "
+                "GPTQ inner-block quantization and is incompatible with "
+                "--block_atomic_quant / --two_sided_rounding."
+            )
+    if getattr(args, "preview_next_quant_block_adam_aware", False) and not getattr(
+        args, "preview_next_quant_block", False
+    ):
+        raise ValueError(
+            "--preview_next_quant_block_adam_aware requires --preview_next_quant_block."
+        )
 
     if args.backward_samples == -1:
         args.backward_samples = args.nsamples
@@ -1151,6 +1608,39 @@ def parse_gen():
         raise ValueError(
             f"`final_layer_backward_bsz` must be positive when provided. Got {args.final_layer_backward_bsz}."
         )
+    if args.kl_logit_chunk_tokens < 0:
+        raise ValueError(
+            "`kl_logit_chunk_tokens` must be nonnegative; 0 disables logit chunking. "
+            f"Got {args.kl_logit_chunk_tokens}."
+        )
+    if args.eval_logit_chunk_tokens < 0:
+        raise ValueError(
+            "`eval_logit_chunk_tokens` must be nonnegative; 0 disables evaluation "
+            f"logit chunking. Got {args.eval_logit_chunk_tokens}."
+        )
+    if args.eval_ce_chunk_tokens < 0:
+        raise ValueError(
+            "`eval_ce_chunk_tokens` must be nonnegative; 0 disables chunked "
+            f"cross-entropy. Got {args.eval_ce_chunk_tokens}."
+        )
+    if args.eval_ce_chunk_tokens > 0 and args.eval_logit_chunk_tokens <= 0:
+        raise ValueError(
+            "`eval_ce_chunk_tokens` requires `eval_logit_chunk_tokens > 0` "
+            "so evaluation uses the memory-aware full-vocabulary path."
+        )
+    if args.kl_recompute_head and args.kl_logit_chunk_tokens <= 0:
+        raise ValueError(
+            "`kl_recompute_head` requires `kl_logit_chunk_tokens > 0`."
+        )
+    if args.static_fisher_label_chunk_tokens < 0:
+        raise ValueError(
+            "`static_fisher_label_chunk_tokens` must be nonnegative; 0 disables label chunking. "
+            f"Got {args.static_fisher_label_chunk_tokens}."
+        )
+    if args.static_saved_tensor_offload_mib < 0:
+        raise ValueError("static_saved_tensor_offload_mib must be nonnegative")
+    if args.static_saved_tensor_offload_deduplicate and args.static_saved_tensor_offload_mib <= 0:
+        raise ValueError("static_saved_tensor_offload_deduplicate requires positive static_saved_tensor_offload_mib")
     if args.global_loss_bsz is None:
         args.global_loss_bsz = args.bsz
     if args.global_loss_bsz <= 0:
@@ -1257,6 +1747,101 @@ def parse_gen():
             f"refined_rkl_num_A ({args.refined_rkl_num_A}) must divide nsamples "
             f"({args.nsamples}) evenly."
         )
+    _ffn_custom_refresh_flags = (
+        args.ffn_nonlinear_refresh,
+        args.ffn_nonlinear_hybrid_refresh,
+        args.ffn_adaptive_fisher_shrinkage,
+        args.ffn_adaptive_fisher_offdiag_shrinkage,
+    )
+    if args.sequence_fisher_mode != "off":
+        if not (args.global_loss and args.grad_refresh_loss == "fisher_diag_mse"
+                and args.g_update_mode == "block_gd" and args.enable_gptq_plus == 0):
+            raise ValueError("Sequence Fisher requires static global Fisher and block_gd refresh.")
+        if args.sequence_fisher_probes < 1 or not 0 <= args.sequence_fisher_mix <= 1:
+            raise ValueError("Sequence Fisher requires probes >= 1 and mix in [0, 1].")
+        incompatible = ("cross_module_compensate", "cross_module_compensate_all",
+                        "eager_cross_compensate", "two_sided_rounding", "preview_next_quant_block",
+                        "loss_slide_window", "ignore_attention_sink", "static_cache_path",
+                        "fsdp_precompute", "fisher_rademacher_k", "num_samples_for_grad",
+                        "enable_dynamic_saliency")
+        enabled = [name for name in incompatible if getattr(args, name, False)]
+        if enabled or any(_ffn_custom_refresh_flags) or args.a_loss_ratio != 1.0:
+            raise ValueError(f"Unsupported combination for sequence Fisher pilot: {enabled}")
+    if any(_ffn_custom_refresh_flags):
+        if sum(bool(x) for x in _ffn_custom_refresh_flags) > 1:
+            raise ValueError("Choose only one custom FFN refresh mode.")
+        if not args.global_loss:
+            raise ValueError(
+                "--ffn_nonlinear_refresh requires --global_loss for layer-Fisher scale matching."
+            )
+        if args.grad_refresh_loss != "fisher_diag_mse":
+            raise ValueError(
+                "--ffn_nonlinear_refresh currently requires "
+                "--grad_refresh_loss=fisher_diag_mse."
+            )
+        if args.g_update_mode != "block_gd":
+            raise ValueError(
+                "--ffn_nonlinear_refresh currently requires --g_update_mode=block_gd."
+            )
+        if args.ffn_adaptive_fisher_shrinkage or args.ffn_adaptive_fisher_offdiag_shrinkage:
+            adaptive_flag = (
+                "--ffn_adaptive_fisher_offdiag_shrinkage"
+                if args.ffn_adaptive_fisher_offdiag_shrinkage
+                else "--ffn_adaptive_fisher_shrinkage"
+            )
+            if args.nsamples < 2:
+                raise ValueError(
+                    f"{adaptive_flag} requires at least two calibration sequences."
+                )
+            if int(getattr(args, "fisher_rademacher_k", 0)) != 0:
+                raise ValueError(
+                    f"{adaptive_flag} currently estimates sequence-level "
+                    "variance from the summed-token Fisher and cannot be combined with "
+                    "--fisher_rademacher_k."
+                )
+
+    if args.third_order_refresh_layer >= 0:
+        if not args.global_loss or args.grad_refresh_loss != "fisher_diag_mse":
+            raise ValueError(
+                "--third_order_refresh_layer requires --global_loss and "
+                "--grad_refresh_loss=fisher_diag_mse."
+            )
+        if args.g_update_mode != "block_gd":
+            raise ValueError(
+                "--third_order_refresh_layer requires --g_update_mode=block_gd."
+            )
+        incompatible = []
+        if args.loss_slide_window:
+            incompatible.append("loss_slide_window")
+        if args.ignore_attention_sink:
+            incompatible.append("ignore_attention_sink")
+        if args.a_loss_ratio != 1.0:
+            incompatible.append("a_loss_ratio != 1")
+        if args.sequence_fisher_mode != "off":
+            incompatible.append("sequence_fisher_mode")
+        if any(_ffn_custom_refresh_flags):
+            incompatible.append("custom FFN/Fisher refresh flags")
+        if args.cross_module_compensate or args.cross_module_compensate_all:
+            incompatible.append("cross-module compensation")
+        if args.joint_block_gd:
+            incompatible.append("joint_block_gd")
+        if args.eager_cross_compensate:
+            incompatible.append("eager_cross_compensate")
+        if args.preview_next_quant_block:
+            incompatible.append("preview_next_quant_block")
+        if args.two_sided_rounding:
+            incompatible.append("two_sided_rounding")
+        if incompatible:
+            raise ValueError(
+                "--third_order_refresh_layer currently excludes: "
+                + ", ".join(incompatible)
+            )
+    elif args.third_order_refresh_estimator != "central_cubic":
+        raise ValueError(
+            "--third_order_refresh_estimator requires "
+            "--third_order_refresh_layer."
+        )
+
     # refined_mse validation: needs end-to-end forward machinery (→ global_loss
     # enables fp_inps_final precompute), per-rank pool size bounded by local
     # shard + divisible by per-rank backward batch so the collection loop
@@ -1392,6 +1977,43 @@ def parse_gen():
             raise ValueError("--stage2_cpu_master does not support --act_quant_aware_gptq yet.")
         if getattr(args, "k_cache_quant_aware_gptq", False):
             raise ValueError("--stage2_cpu_master does not support --k_cache_quant_aware_gptq yet.")
+    if getattr(args, "stage2_input_cache_cpu_init", False) and not args.offload_inps:
+        raise ValueError("--stage2_input_cache_cpu_init requires --offload_inps.")
+    if getattr(args, "stage2_hinv_cpu_reuse_buffer", False) and not (
+        getattr(args, "stage2_hinv_cpu_offload", False) or getattr(args, "stage2_hinv_cpu_offload_modules", "")
+    ):
+        raise ValueError("--stage2_hinv_cpu_reuse_buffer requires Hinv CPU offload.")
+    if getattr(args, "stage2_hinv_cpu_offload", False) or getattr(args, "stage2_hinv_cpu_offload_modules", ""):
+        if args.alpha != 0:
+            raise ValueError("--stage2_hinv_cpu_offload requires --alpha=0 because GPTQ+ first-order terms use Hinv.")
+        if args.g_update_mode != "block_gd":
+            raise ValueError("--stage2_hinv_cpu_offload currently requires --g_update_mode=block_gd.")
+        if args.group_parallel_quant != "none":
+            raise ValueError("--stage2_hinv_cpu_offload currently requires --group_parallel_quant=none.")
+        if getattr(args, "gptq_inner_kernel", "torch") != "torch":
+            raise ValueError("--stage2_hinv_cpu_offload currently requires --gptq_inner_kernel=torch.")
+        if args.preview_next_quant_block:
+            raise ValueError("--stage2_hinv_cpu_offload is incompatible with --preview_next_quant_block.")
+    if getattr(args, "stage2_hessian_cpu_offload", False):
+        if args.alpha != 0:
+            raise ValueError("--stage2_hessian_cpu_offload requires --alpha=0 for this validated block-GD path.")
+        if args.g_update_mode != "block_gd":
+            raise ValueError("--stage2_hessian_cpu_offload currently requires --g_update_mode=block_gd.")
+        if args.group_parallel_quant != "none":
+            raise ValueError("--stage2_hessian_cpu_offload currently requires --group_parallel_quant=none.")
+        if getattr(args, "gptq_inner_kernel", "torch") != "torch":
+            raise ValueError("--stage2_hessian_cpu_offload currently requires --gptq_inner_kernel=torch.")
+        if args.preview_next_quant_block:
+            raise ValueError("--stage2_hessian_cpu_offload is incompatible with --preview_next_quant_block.")
+    if getattr(args, "stage2_hessian_damping_inplace", False):
+        if args.alpha != 0:
+            raise ValueError("--stage2_hessian_damping_inplace currently requires --alpha=0.")
+        if args.g_update_mode != "block_gd":
+            raise ValueError("--stage2_hessian_damping_inplace currently requires --g_update_mode=block_gd.")
+        if args.group_parallel_quant != "none":
+            raise ValueError("--stage2_hessian_damping_inplace currently requires --group_parallel_quant=none.")
+        if getattr(args, "gptq_inner_kernel", "torch") != "torch":
+            raise ValueError("--stage2_hessian_damping_inplace currently requires --gptq_inner_kernel=torch.")
     if args.fsdp_precompute and args.exit_after_precompute and not args.skip_eval:
         logging.info(
             "--fsdp_precompute --exit_after_precompute is a Stage 1 cache build; "

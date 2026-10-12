@@ -70,6 +70,7 @@ def _setup_eval(cfg: "Config", analyzer: model_utils.ModelAnalyzer):
         loader = data_utils.get_loaders(
             ds, split="test", tokenizer=analyzer.tokenizer,
             seq_len=cfg.eval_seq_len, num_samples=cfg.nsamples,
+            max_samples=(cfg.eval_samples if cfg.eval_samples > 0 else None),
         )
         rl, orig_lm_head = eval_utils.get_ref_logits(cfg, analyzer, ds, loader)
         test_loaders[ds] = loader

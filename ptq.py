@@ -23,7 +23,11 @@ from gptq_utils.quant_aware_utils import (
 )
 from utils import checkpoint_utils, data_utils, dist_utils, eval_utils, model_utils, rotation_utils, \
                   memory_utils, quant_utils
-from utils.reproducibility import configure_reproducibility
+from utils.reproducibility import (
+    configure_default_inference_sdpa,
+    configure_deterministic_sdpa,
+    configure_reproducibility,
+)
 
 torch.backends.cuda.matmul.allow_tf32 = False
 
@@ -100,6 +104,11 @@ def main(args):
         )
         add_activation_quant_wrappers()
 
+    # Teacher logits should use the same available inference kernels as final
+    # evaluation/deployment. Deterministic math SDPA is restored immediately
+    # after this pass for quantization-time gradient calculations.
+    configure_default_inference_sdpa()
+
     # Generate reference logits for KL eval
     test_loader_dict, ref_logits_dict = {}, {}
     orig_lm_head = None
@@ -114,8 +123,11 @@ def main(args):
     rank_runs_eval = not bool(getattr(args, "stage2_cpu_master", False)) or dist_utils.is_main()
     if not args.skip_eval and rank_runs_eval:
         for eval_dataset in args.eval_datasets:
+            eval_samples = int(getattr(args, "eval_samples", 0) or 0)
             test_loader = data_utils.get_loaders(eval_dataset, split="test", tokenizer=tokenizer,
-                                                 seq_len=args.eval_seq_len, num_samples=args.nsamples)
+                                                 seq_len=args.eval_seq_len, num_samples=args.nsamples,
+                                                 max_samples=eval_samples if eval_samples > 0 else None,
+                                                 start_sample=int(getattr(args, "eval_start_sample", 0)))
             ref_logits, orig_lm_head = eval_utils.get_ref_logits(args, analyzer, eval_dataset, test_loader)
             test_loader_dict[eval_dataset] = test_loader
             ref_logits_dict[eval_dataset] = ref_logits
@@ -131,6 +143,8 @@ def main(args):
         and dist.is_initialized()
     ):
         dist.barrier()
+
+    configure_deterministic_sdpa()
 
     # Rotate the weights
     if args.load_qmodel_path:
@@ -200,6 +214,17 @@ def main(args):
         )
 
     # Eval
+    if not args.skip_eval:
+        # Quantization uses deterministic math SDPA for repeatable gradients.
+        # Restore available inference kernels before reporting deployed KL/PPL
+        # against the cached teacher logits.
+        configure_default_inference_sdpa()
+        logging.info(
+            "[eval] SDPA flash=%s mem_efficient=%s math=%s",
+            torch.backends.cuda.flash_sdp_enabled(),
+            torch.backends.cuda.mem_efficient_sdp_enabled(),
+            torch.backends.cuda.math_sdp_enabled(),
+        )
     if not args.skip_eval and rank_runs_eval:
         eval_utils.kl_ppl_eval(args, analyzer, orig_lm_head, test_loader_dict, ref_logits_dict)
         del orig_lm_head, ref_logits_dict

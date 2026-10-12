@@ -372,7 +372,10 @@ def get_tokens(dataset_name, split, tokenizer, seq_len, num_samples, save_path=N
     return tokens
 
 
-def get_loaders(dataset_name, split, tokenizer, seq_len, num_samples, seed=0):
+def get_loaders(
+    dataset_name, split, tokenizer, seq_len, num_samples, seed=0,
+    max_samples=None, start_sample=0,
+):
     logging.info(f"Fetching dataset: {dataset_name}")
     texts = _get_dataset(tokenizer, dataset_name, split)
     logging.info(f"Sampling {num_samples} samples of length {seq_len} from {dataset_name}...")
@@ -391,4 +394,21 @@ def get_loaders(dataset_name, split, tokenizer, seq_len, num_samples, seed=0):
             trainloader.append((inp, tar))
         return trainloader
     elif split == "test":
+        start_sample = int(start_sample)
+        if start_sample < 0:
+            raise ValueError(f"test start_sample must be nonnegative, got {start_sample}")
+        start_token = start_sample * int(seq_len)
+        if max_samples is not None:
+            num_tokens = int(max_samples) * int(seq_len)
+            if num_tokens <= 0:
+                raise ValueError(f"test max_samples must be positive, got {max_samples}")
+            end_token = start_token + num_tokens
+            if end_token > enc.input_ids.shape[1]:
+                raise ValueError(
+                    f"test window range [{start_sample}, {start_sample + int(max_samples)}) "
+                    f"requires {end_token} tokens, but dataset has {enc.input_ids.shape[1]}"
+                )
+            enc["input_ids"] = enc.input_ids[:, start_token:end_token]
+        elif start_token:
+            enc["input_ids"] = enc.input_ids[:, start_token:]
         return enc

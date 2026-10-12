@@ -12,6 +12,8 @@ previously undisclosed paper-table settings into paper disclosures.
 
 ## Settings explicitly specified by the paper
 
+Metric priority (checked against the root-directory PDF on 2026-09-28): KL is the primary fidelity metric; PPL and zero-shot accuracy are secondary. See PDF page 3 section 3.1, page 7 section 6.1, and page 18 appendix D.1. A PPL decrease alone does not establish a quantization improvement, and a PPL increase alone does not invalidate a reproducible KL decrease. This priority also governs the current experimental loss modifications.
+
 | Setting | Paper requirement |
 |---|---|
 | Weight quantization | Symmetric. W4A16 is per-row; group size 128 is used for W3/W2 and W*x*A4KV4 (`main.tex:235`). |

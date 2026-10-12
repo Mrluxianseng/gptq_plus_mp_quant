@@ -2101,6 +2101,7 @@ def _load_or_collect_static_analysis_stats(
         (
             _static_saliency_unused,
             static_fisher_by_layer,
+            _static_fisher_shrinkage_unused,
             static_legacy_fisher_diag_by_layer,
             static_refined_A_by_layer,
             static_refined_diag_A_by_layer,

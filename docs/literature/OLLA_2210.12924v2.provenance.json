@@ -1,0 +1,17 @@
+{
+  "url": "https://arxiv.org/pdf/2210.12924v2",
+  "sha256": "69aebb2c874871e363ccec93e2ea15891e91c793153cde37004d17ea12ddef0b",
+  "bytes": 1053563,
+  "version": "v2, 2022-11-02",
+  "authors": [
+    "Benoit Steiner",
+    "Mostafa Elhoushi",
+    "Jacob Kahn",
+    "James Hegarty"
+  ],
+  "used_sections": [
+    "2.2 tensor lifetimes",
+    "2.3 tensor locations"
+  ],
+  "use": "Engineering lifetime/location rationale; no reproduction of ILP optimizer"
+}

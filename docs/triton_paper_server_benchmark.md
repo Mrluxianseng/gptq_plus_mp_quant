@@ -19,7 +19,9 @@ python tools/run_triton_paper_benchmark.py \
 
 ## 固定实验条件
 
-默认正式配置与已验证的 Qwen3-0.6B/W4 全模型实验一致：28 层、Wikitext-2 校准 32×256 token、W4、4 groups、GPTQ block size 128、act-order、`block_gd`、Adam、REAL-Q `fisher_diag_mse` refresh、seed 44；评估使用 Wikitext-2 的 8 个样本、序列长度 1024。Control 使用 PyTorch 列循环，candidate 使用 `triton_fused`。两者使用相同精确 union 搜索路径。配置故意固定，脚本只暴露模型路径、重复数、唯一标签、解释器和 timeout，避免无意把参数扫点混入正式速度对比。
+**配置身份说明（2026-10-10）。** 当前本地版本的默认命令是下述 32×256 缩减验证配置，文件名中的 paper 不能据此理解为论文 2048×2048 正式规模。正式配置与证据验收见 [全流程验证协议](full_pipeline_memory_validation_20261010.md) 和 [论文配置审计](REALQ_PAPER_PROTOCOL.md)。服务器此前运行的其他源码版本须以其保存的 manifest 为准，不与本地默认命令混用。
+
+默认缩减验证配置与已验证的 Qwen3-0.6B/W4 全模型实验一致：28 层、Wikitext-2 校准 32×256 token、W4、4 groups、GPTQ block size 128、act-order、`block_gd`、Adam、REAL-Q `fisher_diag_mse` refresh、seed 44；评估使用 Wikitext-2 的 8 个样本、序列长度 1024。Control 使用 PyTorch 列循环，candidate 使用 `triton_fused`。两者使用相同精确 union 搜索路径。配置故意固定，脚本只暴露模型路径、重复数、唯一标签、解释器和 timeout，避免无意把参数扫点混入速度对比。
 
 ## 输出与停止条件
 

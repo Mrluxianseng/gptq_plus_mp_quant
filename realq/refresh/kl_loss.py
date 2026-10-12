@@ -23,6 +23,7 @@ from realq.refresh.block_gd import (
     _aggregate_block_refresh_sums,
     _aggregate_loss_sums_for_logging,
     _aggregate_refresh_sums,
+    _adam_history_policy_for_layer,
     _apply_block_adam,
     _functional_weight_name,
     _refresh_batch_kwargs,
@@ -46,6 +47,47 @@ if TYPE_CHECKING:
 FINAL_KL_PROJECTION_TOKEN_CHUNK = 512
 _LOGGER = logging.getLogger(__name__)
 _PROJECTION_CHUNK_ANNOUNCED = False
+
+
+def _legacy_kl_adam_update(
+    ctx: "RefreshContext",
+    grad_slice: torch.Tensor,
+    trailing_col_start: int,
+) -> torch.Tensor:
+    """Adam update for the final-layer single-linear KL compatibility path."""
+    layer_idx = getattr(ctx, "trace_layer", None)
+    history_policy = _adam_history_policy_for_layer(layer_idx)
+    if history_policy == "reset_m_and_m_age_each_refresh":
+        if not getattr(ctx, "_kl_adam_history_logged", False):
+            _LOGGER.info(
+                "[adam_history_ablation] policy=%s path=final_layer_kl layer=%s",
+                history_policy,
+                layer_idx,
+            )
+            ctx._kl_adam_history_logged = True
+        # Match the Fisher/Block-GD candidate: forget direction history for
+        # the active floating suffix while keeping v and its own true age.
+        ctx.exp_avg[:, trailing_col_start:].zero_()
+        ctx.adam_step = 1
+    ea = ctx.exp_avg[:, trailing_col_start:]
+    ev = ctx.exp_avg_sq[:, trailing_col_start:]
+    ea.mul_(ctx.beta1).add_(grad_slice, alpha=1.0 - ctx.beta1)
+    ev.mul_(ctx.beta2).addcmul_(
+        grad_slice, grad_slice, value=1.0 - ctx.beta2
+    )
+    bc1 = 1.0 - ctx.beta1 ** ctx.adam_step
+    # The new policy deliberately separates m's local age from v's persistent
+    # age. For every pre-existing policy, preserve the historical expression.
+    v_age = (
+        ctx.adam_v_step
+        if history_policy == "reset_m_and_m_age_each_refresh"
+        else ctx.adam_step
+    )
+    bc2 = 1.0 - ctx.beta2 ** v_age
+    denom = ev.sqrt() / math.sqrt(bc2)
+    denom.add_(ctx.eps)
+    step_size = ctx.layer_lr / bc1
+    return step_size * (ea / denom)
 
 
 def kl_topk_loss(
@@ -177,6 +219,7 @@ def _make_single_linear_kl_refresh_fn_legacy(
         # counter advances uniformly across ranks).
         with nvtx.nvtx_range("kl_refresh.setup"):
             ctx.adam_step += 1
+            ctx.adam_v_step += 1
             ctx.refresh_step += 1
             selected_global = ctx.next_indices()
             rank = dist_utils.get_rank()
@@ -291,18 +334,9 @@ def _make_single_linear_kl_refresh_fn_legacy(
             grad_slice = accum_grad[:, trailing_col_start:]
             if ctx.grad_clip > 0:
                 grad_slice = grad_slice.clamp(min=-ctx.grad_clip, max=ctx.grad_clip)
-            ea = ctx.exp_avg[:, trailing_col_start:]
-            ev = ctx.exp_avg_sq[:, trailing_col_start:]
-            ea.mul_(ctx.beta1).add_(grad_slice, alpha=1.0 - ctx.beta1)
-            ev.mul_(ctx.beta2).addcmul_(grad_slice, grad_slice, value=1.0 - ctx.beta2)
-            bc1 = 1.0 - ctx.beta1 ** ctx.adam_step
-            bc2 = 1.0 - ctx.beta2 ** ctx.adam_step
-            # Match old order: sqrt(ev) / sqrt(bc2) + eps  (NOT sqrt(ev / bc2)).
-            denom = ev.sqrt() / math.sqrt(bc2)
-            denom.add_(ctx.eps)
-            step_size = ctx.layer_lr / bc1
-            update = step_size * (ea / denom)
-            return update
+            return _legacy_kl_adam_update(
+                ctx, grad_slice, trailing_col_start
+            )
 
     refresh._realq_update_layout = "trailing_quant_order"
     return refresh
@@ -387,6 +421,13 @@ def make_kl_refresh_fn(
             )
             ctx.refresh_step += 1
             ctx.adam_step = block_state.expected_next_step(module_name)
+            if (
+                _adam_history_policy_for_layer(ctx.trace_layer)
+                == "reset_m_and_m_age_each_refresh"
+            ):
+                # _apply_block_adam will reset the selected m buffer and its
+                # age; keep the context's invariant in sync with that update.
+                ctx.adam_step = 1
 
         for iter_idx, start in enumerate(
             range(0, len(selected), ctx.backward_bsz)

@@ -1,4 +1,7 @@
-"""Run the paper-scale, paired REAL-Q PyTorch/Triton benchmark.
+"""Run the validated reduced-calibration REAL-Q PyTorch/Triton benchmark.
+
+This local version defaults to 32x256 calibration, not the paper's 2048x2048
+setting. See docs/full_pipeline_memory_validation_20261010.md for scope.
 
 The validated configuration is intentionally fixed; only the local model path,
 repeat count, run tag, Python executable, and timeout are configurable.
@@ -11,6 +14,7 @@ import csv
 import datetime as dt
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import platform
@@ -241,22 +245,32 @@ class GpuMonitor:
         self.process_path = out_dir / "gpu_processes.log"
 
     def start(self) -> None:
+        # One monitor owns one campaign-specific file. Exclusive creation
+        # prevents a second monitor from silently truncating or interleaving
+        # another writer's samples.
+        with self.telemetry_path.open("x", newline="", encoding="utf-8") as stream:
+            csv.writer(stream).writerow((
+                "timestamp", "gpu_index", "util_gpu_pct", "util_mem_pct",
+                "memory_used_mib", "memory_total_mib", "graphics_clock_mhz",
+                "power_w", "temp_c",
+            ))
+        with self.process_path.open("x", encoding="utf-8") as stream:
+            stream.write("timestamp,pid,process_name,used_gpu_memory_mib\n")
         self.thread.start()
 
     def stop(self) -> None:
         self.stop_event.set()
-        self.thread.join(timeout=self.interval + 5)
+        # Each nvidia-smi call is bounded to 20 seconds. Wait for the active
+        # call to finish before reading/summarizing the file, or fail loudly
+        # rather than racing a still-live telemetry writer.
+        self.thread.join(timeout=45)
+        if self.thread.is_alive():
+            raise RuntimeError("GPU telemetry writer did not stop before summary")
 
     def _run(self) -> None:
         fields = (
-            "utilization.gpu,utilization.memory,memory.used,memory.total,"
+            "index,utilization.gpu,utilization.memory,memory.used,memory.total,"
             "clocks.gr,power.draw,temperature.gpu"
-        )
-        header = "timestamp,util_gpu_pct,util_mem_pct,memory_used_mib,memory_total_mib,"
-        header += "graphics_clock_mhz,power_w,temp_c\n"
-        self.telemetry_path.write_text(header, encoding="utf-8")
-        self.process_path.write_text(
-            "timestamp,pid,process_name,used_gpu_memory_mib\n", encoding="utf-8"
         )
         last_process_sample = 0.0
         while not self.stop_event.is_set():
@@ -266,9 +280,12 @@ class GpuMonitor:
                 f"--query-gpu={fields}", "--format=csv,noheader,nounits",
             ])
             if row:
-                with self.telemetry_path.open("a", encoding="utf-8") as stream:
+                with self.telemetry_path.open("a", newline="", encoding="utf-8") as stream:
+                    writer = csv.writer(stream)
                     for gpu_row in row.splitlines():
-                        stream.write(f"{now},{gpu_row}\n")
+                        values = next(csv.reader([gpu_row]))
+                        if len(values) == 8:
+                            writer.writerow((now, *[value.strip() for value in values]))
             monotonic_now = time.monotonic()
             if monotonic_now - last_process_sample >= 30:
                 apps = command_output([
@@ -293,6 +310,61 @@ def mean_std(values: list[float]) -> dict[str, float | None]:
     }
 
 
+def summarize_gpu_telemetry(path: Path) -> dict[str, Any]:
+    """Read only complete numeric rows from the campaign's owned telemetry CSV."""
+    telemetry: dict[str, Any] = {
+        "samples": 0, "rows_seen": 0, "invalid_rows": 0, "by_gpu": {},
+    }
+    if not path.is_file():
+        return telemetry
+    metric_columns = (
+        "util_gpu_pct", "util_mem_pct", "memory_used_mib", "memory_total_mib",
+        "graphics_clock_mhz", "power_w", "temp_c",
+    )
+    values: dict[str, list[float]] = {key: [] for key in metric_columns}
+    by_gpu_values: dict[str, dict[str, list[float]]] = {}
+    with path.open(newline="", encoding="utf-8") as stream:
+        reader = csv.DictReader(stream)
+        fields = set(reader.fieldnames or ())
+        required = {"timestamp", *metric_columns}
+        if not required.issubset(fields):
+            telemetry["invalid_schema"] = sorted(required - fields)
+            return telemetry
+        for row in reader:
+            telemetry["rows_seen"] += 1
+            try:
+                if not (row.get("timestamp") or "").strip():
+                    raise ValueError("missing timestamp")
+                numeric = {key: float((row.get(key) or "").strip()) for key in metric_columns}
+                if not all(math.isfinite(value) for value in numeric.values()):
+                    raise ValueError("non-finite metric")
+            except (TypeError, ValueError, AttributeError):
+                telemetry["invalid_rows"] += 1
+                continue
+            gpu = (row.get("gpu_index") or "unknown").strip() or "unknown"
+            bucket = by_gpu_values.setdefault(gpu, {key: [] for key in metric_columns})
+            telemetry["samples"] += 1
+            for key, value in numeric.items():
+                values[key].append(value)
+                bucket[key].append(value)
+
+    def summarize(values_by_key: dict[str, list[float]]) -> dict[str, Any]:
+        return {
+            key: {
+                "mean": statistics.mean(items),
+                "median": statistics.median(items),
+                "min": min(items),
+                "max": max(items),
+            }
+            for key, items in values_by_key.items() if items
+        }
+
+    telemetry.update(summarize(values))
+    telemetry["gpu_indices"] = sorted(by_gpu_values)
+    telemetry["by_gpu"] = {gpu: summarize(gpu_values) for gpu, gpu_values in by_gpu_values.items()}
+    return telemetry
+
+
 def summarize(campaign_dir: Path, tag_prefix: str, pairs: list[dict[str, Any]],
               environment: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
     records = json.loads((campaign_dir / "paired_repetitions.json").read_text())
@@ -303,7 +375,13 @@ def summarize(campaign_dir: Path, tag_prefix: str, pairs: list[dict[str, Any]],
         exact = all(control[key] == candidate[key] for key in (
             "state_sha256", "state_tensors", "kl", "ppl"
         ))
-        integrity_ok &= exact and control["state_tensors"] == 507
+        layer_traces = pair.get("layer_output_fingerprints")
+        layer_exact = bool(
+            isinstance(layer_traces, dict)
+            and layer_traces.get(control["tag"]) is not None
+            and layer_traces.get(control["tag"]) == layer_traces.get(candidate["tag"])
+        )
+        integrity_ok &= exact and layer_exact and int(control["state_tensors"]) > 0
         rows.append({
             "pair": index,
             "control_quantization_seconds": control["quantization_seconds"],
@@ -320,35 +398,14 @@ def summarize(campaign_dir: Path, tag_prefix: str, pairs: list[dict[str, Any]],
             "peak_allocated_bytes_candidate": candidate["peak_allocated_bytes"],
             "peak_reserved_bytes_control": control["peak_reserved_bytes"],
             "peak_reserved_bytes_candidate": candidate["peak_reserved_bytes"],
-            "exact_output_match": exact,
+            "exact_output_match": exact and layer_exact,
+            "layer_output_fingerprints_exact": layer_exact,
             "profile_control_ms": control["profile_section_totals_ms"],
             "profile_candidate_ms": candidate["profile_section_totals_ms"],
         })
     quant_speedups = [row["quantization_speedup"] for row in rows]
     wall_speedups = [row["end_to_end_speedup"] for row in rows]
-    telemetry: dict[str, Any] = {"samples": 0}
-    telemetry_path = campaign_dir / "gpu_telemetry.csv"
-    if telemetry_path.is_file():
-        values: dict[str, list[float]] = {
-            "util_gpu_pct": [], "util_mem_pct": [], "memory_used_mib": [],
-            "temp_c": [], "graphics_clock_mhz": [], "power_w": [],
-        }
-        with telemetry_path.open(newline="", encoding="utf-8") as stream:
-            for sample in csv.DictReader(stream):
-                telemetry["samples"] += 1
-                for key, collection in values.items():
-                    try:
-                        collection.append(float(sample[key].strip()))
-                    except (KeyError, ValueError, AttributeError):
-                        pass
-        for key, collection in values.items():
-            if collection:
-                telemetry[key] = {
-                    "mean": statistics.mean(collection),
-                    "median": statistics.median(collection),
-                    "min": min(collection),
-                    "max": max(collection),
-                }
+    telemetry = summarize_gpu_telemetry(campaign_dir / "gpu_telemetry.csv")
     summary = {
         "campaign": tag_prefix,
         "completed_at_local": dt.datetime.now().astimezone().isoformat(),
@@ -390,7 +447,7 @@ def summarize(campaign_dir: Path, tag_prefix: str, pairs: list[dict[str, Any]],
             f"(mean {summary['end_to_end_speedup']['mean']:.3f}×, sample SD "
             f"{wall_sd:.3f}×)." if wall_sd is not None else
             f"(mean {summary['end_to_end_speedup']['mean']:.3f}×; one pair, SD unavailable).",
-            "- Exactness is checked after each pair using all 507 tensor-state hashes, KL, and PPL; the driver stops on the first mismatch.",
+            "- Exactness is checked after each pair using all tensor-state hashes, KL, PPL, and per-layer output fingerprints; the driver stops on the first mismatch.",
             "- Raw paired data: `paired_repetitions.json`; per-run manifests, logs, profile metrics, and source hashes: `outputs/phase_profile_<tag>/`; GPU samples: `gpu_telemetry.csv`.",
         ])
     if telemetry.get("util_gpu_pct"):
@@ -420,8 +477,16 @@ def main() -> None:
                         help="Unique artifact tag; generated from local time by default")
     parser.add_argument("--timeout-seconds", type=int, default=14400,
                         help="Timeout for each arm, default four hours")
-    parser.add_argument("--gpu-index", default=os.environ.get("NVIDIA_SMI_INDEX", "0"),
-                        help="nvidia-smi index used for telemetry")
+    parser.add_argument(
+        "--gpu-index",
+        default=os.environ.get(
+            "NVIDIA_SMI_INDEX", os.environ.get("CUDA_VISIBLE_DEVICES", "0") or "0"
+        ),
+        help=(
+            "nvidia-smi GPU index or comma-separated indices for telemetry; "
+            "defaults to NVIDIA_SMI_INDEX, then CUDA_VISIBLE_DEVICES, then 0"
+        ),
+    )
     parser.add_argument("--monitor-interval", type=float, default=5.0)
     parser.add_argument("--allow-gpu-contention", action="store_true",
                         help="Proceed even when a CUDA compute process is visible at preflight")
@@ -515,6 +580,7 @@ def main() -> None:
         "--pairs", str(args.pairs),
         "--tag-prefix", tag_prefix,
         "--timeout-seconds", str(args.timeout_seconds),
+        "--trace-layer-outputs",
     ]
     returncode = 1
     try:

@@ -1,0 +1,12 @@
+{
+  "kind": "primary_software_source",
+  "project": "PyTorch",
+  "version": "v2.11.0",
+  "url": "https://github.com/pytorch/pytorch/blob/v2.11.0/aten/src/ATen/native/TensorCompare.cpp",
+  "download_url": "https://raw.githubusercontent.com/pytorch/pytorch/v2.11.0/aten/src/ATen/native/TensorCompare.cpp",
+  "retrieved": "2026-10-11T22:36:47.1547137+08:00",
+  "sha256": "a94e8e524374e4afa64489f034847b177dab23d89976bd63de171484295a036d",
+  "bytes": 35221,
+  "verified_symbol": "Tensor isfinite(const Tensor& self)",
+  "note": "Software implementation evidence; not an additional research paper. Initial Invoke-WebRequest TLS download failed; curl retry succeeded."
+}

@@ -33,6 +33,9 @@ class Config:
     nsamples: int = 128
     seq_len: int = 2048
     eval_seq_len: int = 2048
+    # Optional small test-set window count for mechanism screening. Zero keeps
+    # the historical full-test evaluation used by paper-scale runs.
+    eval_samples: int = 0
 
     # ----- weight quantisation --------------------------------------------
     w_bits: int = 4
@@ -697,6 +700,10 @@ class Config:
         if self.backward_samples <= 0:
             raise ValueError(
                 f"`backward_samples` must be positive. Got {self.backward_samples}."
+            )
+        if self.eval_samples < 0:
+            raise ValueError(
+                f"`eval_samples` must be non-negative. Got {self.eval_samples}."
             )
         if self.backward_bsz <= 0:
             raise ValueError(

@@ -1,0 +1,10 @@
+{
+  "title": "GMLake: Efficient and Transparent GPU Memory Defragmentation for Large-scale DNN Training with Virtual Memory Stitching",
+  "source": "https://arxiv.org/pdf/2401.08156v1",
+  "metadata_source": "https://arxiv.org/abs/2401.08156",
+  "venue_note": "arXiv primary page reports Accepted by ASPLOS24",
+  "sha256": "99903eef4b04b25eadd60061e5c724505b803fc16adf7d666e1203e712097eb8",
+  "bytes": 3512095,
+  "downloaded": "2026-10-11 13:41:07",
+  "applied_scope": "fragmentation mechanism/background; no GMLake VMM allocator implemented"
+}

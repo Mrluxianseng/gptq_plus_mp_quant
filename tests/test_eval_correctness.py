@@ -273,3 +273,49 @@ def test_kl_ppl_uses_fp32_distribution_math(monkeypatch):
         )
     assert kl == pytest.approx(float(expected.cpu()), abs=1e-8)
     assert ppl == pytest.approx(float(expected_ppl.cpu()), rel=1e-7)
+
+
+def test_chunked_eval_sample_metrics_match_full_sequence_math():
+    torch.manual_seed(37)
+    hidden_size, vocab_size, token_count = 7, 19, 13
+    student_head = nn.Linear(hidden_size, vocab_size, bias=True, dtype=torch.bfloat16)
+    teacher_head = nn.Linear(hidden_size, vocab_size, bias=True, dtype=torch.bfloat16)
+    teacher_head.load_state_dict(student_head.state_dict())
+    student_hidden = torch.randn(token_count, hidden_size, dtype=torch.bfloat16)
+    teacher_hidden = student_hidden.clone()
+    teacher_hidden[4, 2] += torch.tensor(0.125, dtype=torch.bfloat16)
+    input_ids = torch.randint(0, vocab_size, (token_count,))
+
+    full_student_logits = student_head(student_hidden).float()
+    full_teacher_logits = teacher_head(teacher_hidden).float()
+    expected_nll = F.cross_entropy(
+        full_student_logits[None, :-1, :].permute(0, 2, 1),
+        input_ids[None, 1:],
+        reduction="none",
+    ).float().mean(dim=1)[0]
+    expected_kl = eval_utils.tokenwise_kl_from_logits(
+        full_student_logits, full_teacher_logits
+    ).mean()
+
+    chunk_nll, chunk_kl = eval_utils._chunked_eval_sample_metrics(
+        student_head,
+        teacher_head,
+        student_hidden,
+        teacher_hidden,
+        input_ids,
+        torch.device("cpu"),
+        chunk_tokens=4,
+    )
+
+    assert float(chunk_nll) == pytest.approx(float(expected_nll), abs=2e-6)
+    assert float(chunk_kl) == pytest.approx(float(expected_kl), abs=2e-6)
+
+
+def test_chunked_causal_nll_matches_full_sequence_reduction():
+    torch.manual_seed(109)
+    token_count, vocab_size = 257, 97
+    logits = torch.randn(token_count, vocab_size, dtype=torch.bfloat16)
+    labels = torch.randint(vocab_size, (token_count,))
+    full = eval_utils._causal_nll_from_logits(logits, labels, chunk_tokens=0)
+    chunked = eval_utils._causal_nll_from_logits(logits, labels, chunk_tokens=64)
+    assert float(chunked) == pytest.approx(float(full), abs=2e-6)

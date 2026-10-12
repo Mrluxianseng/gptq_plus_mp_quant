@@ -24,6 +24,16 @@ def configure_deterministic_sdpa() -> None:
         pass
 
 
+def configure_default_inference_sdpa() -> None:
+    """Restore PyTorch's available SDPA kernels for deployment-style eval."""
+    try:
+        torch.backends.cuda.enable_flash_sdp(True)
+        torch.backends.cuda.enable_mem_efficient_sdp(True)
+        torch.backends.cuda.enable_math_sdp(True)
+    except AttributeError:
+        pass
+
+
 def configure_reproducibility(seed: int, *, deterministic: bool = True) -> None:
     """Seed every RNG used by REAL-Q and request deterministic CUDA kernels.
 
@@ -53,6 +63,11 @@ def configure_reproducibility(seed: int, *, deterministic: bool = True) -> None:
         torch.backends.cudnn.deterministic = bool(deterministic)
 
     if deterministic:
+        # ``torch.use_deterministic_algorithms`` only warns for attention
+        # kernels that lack a deterministic backward implementation. Select
+        # the math SDPA backend explicitly so repeated quantization runs do
+        # not silently depend on the memory-efficient kernel's atomic order.
+        configure_deterministic_sdpa()
         try:
             torch.use_deterministic_algorithms(True, warn_only=True)
         except TypeError:
@@ -67,3 +82,10 @@ def configure_reproducibility(seed: int, *, deterministic: bool = True) -> None:
         deterministic,
         os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
     )
+    if hasattr(torch.backends, "cuda"):
+        logging.info(
+            "[reproducibility] SDPA flash=%s mem_efficient=%s math=%s",
+            torch.backends.cuda.flash_sdp_enabled(),
+            torch.backends.cuda.mem_efficient_sdp_enabled(),
+            torch.backends.cuda.math_sdp_enabled(),
+        )
