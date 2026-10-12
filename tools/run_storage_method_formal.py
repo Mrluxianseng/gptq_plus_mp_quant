@@ -23,6 +23,7 @@ from tools.audit_memory_boundary_points import boundaries, compare as compare_po
 from tools.audit_completed_memory_pair_capacity import intervals, cache_inventory
 from tools import compare_full_pipeline_profiles as comparator
 from tools.run_full_pipeline_memory_campaign import stop_process_tree
+from tools.storage_method_distributed_audit import install_entry_audit, audit_directory
 
 METHOD_FLAGS = ('--research_hinv_solver_workspace', '--research_hinv_reuse_consumed_h',
                 '--research_hinv_stable_weight', '--research_replay_early_stats')
@@ -51,6 +52,7 @@ def build_entry():
                       prototype_sha=sha(ROOT/'tools/hessian_dead_subgroup_input_prototype.py'))
     source = add_stats(source, installer_sha=sha(ROOT/'tools/activation_replay_stats_install.py'),
                        prototype_sha=sha(ROOT/'tools/activation_replay_stats_lifetime_prototype.py'))
+    source = install_entry_audit(source)
     anchor = "runpy.run_path('ptq.py', run_name='__main__')"
     assert source.count(anchor) == 1
     guard = "def _forbid_precompute(*args, **kwargs):\n    raise RuntimeError('formal Stage2 must consume its fresh verified cache')\nif '--exit_after_precompute' not in sys.argv:\n    impl.collect_static_end_to_end_saliency_and_fisher=_forbid_precompute\n\n"
@@ -175,10 +177,11 @@ def audit_pair(control, candidate, ranks, bindings):
     config = read(Path(manifest[manifest.index('--model')+1])/'config.json')
     dimension = config['intermediate_size']
     methods = [method_coverage(run, ranks, side == 1, dimension) for side, run in enumerate((control, candidate))]
-    metrics = [s['state_metrics_by_rank'] for s in statuses]
-    rank_states = all(len(m) == ranks and all(r['state_tensors'] == 507 for r in m) for m in metrics)
+    cpu_master = '--stage2_cpu_master' in manifest
+    ownership = [audit_directory(run, ranks=ranks, cpu_master=cpu_master) for run in (control, candidate)]
+    rank_states = all(report['valid'] and owner == status['metrics'] for (report, owner), status in zip(ownership, statuses))
     traces_ok = True
-    for rank in range(ranks):
+    for rank in ([0] if cpu_master else range(ranks)):
         a, b = [read(run/f'layer_output_fingerprints_rank{rank}.json') for run in (control, candidate)]
         traces_ok = traces_ok and a == b and len(a) == 28 and {r['layer'] for r in a} == set(range(28))
         traces_ok = traces_ok and all(r['forward_count'] > 0 and len(r['shapes']) == r['forward_count'] and len(r['sha256']) == 64 for r in a)
@@ -186,7 +189,7 @@ def audit_pair(control, candidate, ranks, bindings):
     gpu_peaks = [nvml_peaks(run) for run in (control, candidate)]
     global_peaks = {k: [s[k] for s in statuses] for k in ('full_process_peak_allocated_bytes', 'full_process_peak_reserved_bytes', 'max_nvml_memory_used_mib')}
     checks = dict(complete_exact_numerics_sources_commands_runtime_gpu=legacy['full_model_quantization_validated'],
-                  all_ranks_507_state=rank_states, all_ranks_all28_nonempty_exact=traces_ok,
+                  complete_507_state_and_all_rank_ownership=rank_states, owner_all28_nonempty_exact=traces_ok,
                   complete_cache_inventory=bool(caches[0]) and caches[0] == caches[1],
                   method_coverage=all(m['valid'] for m in methods),
                   stats_holding_bytes_same=all(a['stats_bytes'] == b['stats_bytes'] for a, b in zip(methods[0]['ranks'], methods[1]['ranks'])),
@@ -199,6 +202,7 @@ def audit_pair(control, candidate, ranks, bindings):
     checks['bound_sources_unchanged'] = True
     return dict(valid=all(checks.values()), capacity_valid=all(checks.values()), checks=checks,
                 full_global_peaks=global_peaks, sampled_nvml_peaks_by_uuid=gpu_peaks,
+                state_ownership=[report for report, _ in ownership],
                 cache_files=caches, method_coverage=methods, interval_count=len(rows[0]),
                 interval_regressions=interval_regressions, missing_intervals=[list(k) for k in sorted(missing)],
                 points=points, strict_interval_point_valid=all(checks.values()) and not interval_regressions and points['valid'],
@@ -268,7 +272,7 @@ def main():
                     cmd = command(args, model, entry, stage, side == 'candidate')
                     save(path, dict(command=cmd, scope='Formal server workload; unvalidated before execution', model=model, pair=pair, side=side))
                     manifests.append(path)
-                launcher = [sys.executable, '-u', str(ROOT/'tools/run_full_pipeline_memory_profile.py'),
+                launcher = [sys.executable, '-u', str(ROOT/'tools/run_storage_method_pipeline.py'),
                             '--stage0-manifest', str(manifests[0]), '--stage2-manifest', str(manifests[1]),
                             '--tag', tag, '--timeout-seconds', str(args.timeout_seconds),
                             '--exact-phase-peaks', '--gpu-indices', args.devices]

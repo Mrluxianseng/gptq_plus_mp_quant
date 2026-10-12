@@ -77,9 +77,27 @@ bash scripts/run_storage_method_formal.sh --run --repeats 3
 - `source_bindings.json`与`entry.py`：本次生成入口和源码绑定，运行中不编辑。
 - `<tag>.log`及每臂`stage0.log/stage2.log`：控制日志和完整worker日志。
 - 每臂`static_cache/`：独立fresh预计算缓存；审查完整目录所有文件的字节SHA，包含Fisher，正式多卡文件数量按实际清单记录，不硬套单卡13文件。
-- `audit_<model>_pN.json`：全rank 507state、28层非空输出、KL/PPL、源/缓存/命令/环境/设备、112inverse/reuse及28write/dead/stats、精确区间峰和独立逐point/global验收。
+- `audit_<model>_pN.json`：CPU master所属rank0的完整507state、28层非空输出及KL/PPL；所有rank的state布局/身份、112inverse/reuse及28write/dead/stats、源/缓存/命令/环境/设备、精确区间峰和独立逐point/global验收。其他rank的meta布局记录不称为权重字节哈希。
 - `status.json`：仅完整执行并通过所有pair后validTrue；GPU异常、数值/来源/覆盖/遥测/全局峰失败均保留证据并停止。
 
 全局capacity主准入要求full-process allocated/reserved和各物理GPU的NVML采样峰不高于同正式control，且完整质量和方法审查通过。allocated/reserved为rank进程峰的最大值，不是多卡显存求和。区间与start/end局部回升保留为诊断，不单独否决用户11:15更新后的全局容量目标；旧strict比较结果同样完整保存。NVML采样不是连续证明，密集插桩时间不能称速度结论。
 
 截至脚本交付，本机只完成CPU/source接入和命令计划验证，没有运行服务器2048×2048或四卡GPU实验。已有双模型各三对pilot收益不是新正式配置的保证；正式结果应以服务器生成的完整审查为准。
+
+## 2026-10-13：双卡CPU master审查修复
+
+用户提供的服务器日志表明，首个0.6B control在量化最后一层后，rank1的post-quant state哈希调用`.cpu()`遇到meta张量而退出；torchrun随后终止rank0。这是正式验收入口错误，不是日志中的OOM，也不能计作完整正式pair。`quant_stop_layer=27`采用0起始编号，包含第28层；进度条27/28不代表缺少最后一层，实际完整覆盖仍须工件审查。
+
+原CPU master路径有意只让rank0保留完整CPU模型并做KL/PPL评估，其他rank按层释放至meta以节省内存。新增`storage_method_distributed_audit.py`只在完整模型所属rank上计算全部state的原格式字节SHA；所有rank记录真实state名称/形状/dtype布局SHA、meta数量、rank/world_size及所有权。非所属rank不复制meta，不广播/伪造rank0的数值哈希或28层输出。若完整模型rank含meta、少于507项、缺少任何rank记录或rank0有层没有真实输出，拒绝验收。普通非CPU master模式仍要求每rank完整state和评估结果一致。
+
+正式控制器改用独立`run_storage_method_pipeline.py`，按上述所有权读实际工件；完整显存峰、所有rank覆盖、fresh缓存和每区间/每point审查继续保留。旧`realq_checkpoint_research_entry.py`、`run_full_pipeline_memory_profile.py`及研究helper均不修改，旧失败目录也不改。此修复不改量化数学、超参数、计时边界、求逆精度或GPU/CPU存储策略。
+
+更新服务器后重新启动新目录：
+
+```bash
+git pull --ff-only https://github.com/Mrluxianseng/gptq_plus_mp_quant.git realq-warmadam
+MODEL_ROOT=/openbayes/home/llmModels DEVICE=0,1 \
+  bash scripts/run_storage_method_formal.sh --run
+```
+
+旧流程未设置`save_qmodel_path`，Stage0准备checkpoint不是已量化模型；进程退出后无法仅补一个哈希就恢复完整量化结果。保留旧outputs，新启动会重新执行两臂fresh完整流程。修复的CPU双进程回归替换CUDA传输为Gloo CPU传输，调用真实层释放函数并执行实际生成的哈希/评估包装；它不等于服务器双卡CUDA正式实验成功。

@@ -367,3 +367,13 @@ NEW outputs/realq-final-complete-acceptance-20261012-v1/fresh_memory_six_pair_su
 效果/评价：WSL CPU5tests通过（正式参数被真实production parser接受、actual源builder、单wrapper、禁用/缺rank/工作区未启用拒绝、算法数据参数变化拒绝），Bash语法及实际shell dry-run四臂通过。NEW outputs/storage-method-formal-cpu-20261012-v3/real_pilot_auditor_cpu_regression.json对既有q06完整pilot读后validTrue，2961interval/11844point及local1interval2point+96完整保留；此为新auditor CPU接入回归，不是新GPU收益。cpu_preparation_status.json绑定新文件SHA，未启动任何formal GPU。较早CPU parser揭示QA应为--lm_eval而非环境变量名--enable_qa_eval，修正后再次真实parser通过，旧CPU计划保留不覆盖。
 
 反思/范围：4卡、旋转、全正式数据和全QA尚需用户在服务器实际验证，脚本准备不作成功或显存比例保证。用户此次明确要求先服务器0.6/1.7正式配置；仅交付方法说明及启动入口，不恢复本机自动实验。正式多卡cache按实际完整文件清单，不硬套单卡13文件。密集profile时间不是低扰动速度，NVML不是连续证明。此前pilot final报告和所有冻结源/负向证据保留。
+
+### 2026-10-13：正式服务器双卡 CPU master post-quant 审查修复
+
+方法/理论：用户提供首个0.6B control日志，Stage2量化至layer27后rank1在完整state哈希`.cpu()`遇到meta张量退出，torchrun终止rank0。原CPU master设计由rank0持有完整CPU模型并做KL/PPL，其他rank释放每层到meta；不应要求meta rank装回全模型来审查。此为正式记录入口接入错误，非该日志中的OOM或方法/数值失败，未完成全评估不能算有效正式pair。quant_stop_layer=27包含第28层，进度27/28不独立证明缺层或完成。
+
+具体方法：新增tools/storage_method_distributed_audit.py与独立tools/run_storage_method_pipeline.py。只改生成entry量化之后的hash块，rank0完整507state原格式字节SHA及28层真实非空输出，所有rank真实布局SHA/name-shape-dtype、meta数量、rank/world_size/所有权；非所属rank明确state_tensors=0/state_sha256=null及layout_only，不广播/复制rank0数值证据。纠正22:15记录“全rank507/all28”不适用于CPU master的要求。普通复制模型模式仍每rank完整数值和评估一致。每rank inverse/write/dead/stats覆盖、fresh缓存、SOURCE/环境/命令、exact区间峰、独立每point及全局显存准入均保留，另核全部rank过程峰身份，owner记录从实际rank0文件读取不取最先打印的rank1日志。旧checkpoint entry、full pipeline runner、量化/helper及旧结果不改。
+
+效果/验证：WSL真实两Gloo CPU进程，用CPU传输替代production CUDA-only广播，调用真实release_layer及实际生成measured_fwrd/held-out hook；原入口在相同meta权重复现NotImplementedError，新入口owner507/all28审查通过且rank1仍meta、无复制模型及虚构trace。完整owner含meta、缺失/重复rank、布局/所有权/world/count/digest错误、缺/空末层输出、伪造非owner字节哈希、非CPU模式缺rank及缺过程峰均拒绝。相关42tests通过（27.20秒），真实pipeline main以CPU worker/telemetry fixture验证owner选择和rank过程峰完整性。双卡四臂正式shell dry-run成功；NEW outputs/storage-method-distributed-audit-cpu-20261013-v1/cpu_preparation_status.json validTrue仅CPU/source。实际entry除了post-quant hash外AST相同；stage launch/profile读取函数、CUDA峰和评估包装相同，11份冻结源与已推送b587245字节相同，真实worker符合Python3.10语法。没有新增CUDA正式实验/显存收益。
+
+评价/反思：此前单进程pilot及compile/parser测试漏掉多卡CPU master权重所有权，应以真实双进程释放和输出包装执行补覆盖。回归初版fixture误用production CUDA-only广播，另一次torch facade漏uint8，修复fixture后全部通过；native Git SHA核对因WSL不能解析Windows worktree gitdir改用Windows原生Python，未修改gitdir/源或伪造结果。CPU修复不能称服务器GPU已通过。旧server未设置save_qmodel_path，Stage0准备checkpoint非已量化模型；进程退出后不能仅补hash恢复，需要新目录fresh重启两臂，原失败目录保留。用户已授权推送，修复交付到mine/realq-warmadam；本机pilot全部正负向及最终报告保持原结论，正式结果仍待服务器完整验收。
