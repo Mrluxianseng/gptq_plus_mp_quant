@@ -281,3 +281,8 @@ NEW outputs/realq-final-complete-acceptance-20261012-v1/fresh_memory_six_pair_su
 效果/验证：新增tests/test_storage_method_log_stream.py验证缺失文件等待、增长UTF8跨块/回车、去重/截断拒绝，真实CPU子进程stage stdout+stderr及成功/失败退出尾部，旧四臂plan动态出现stage日志及最终失败status，新aggregate计划防重复汇总。日志、双进程meta审查和正式参数接入27tests通过（31.08秒）；真实Bash双GPU四臂dry-run生成新计划，只CPU，无新正式GPU结果。NEW outputs/storage-method-log-stream-cpu-20261013-v1保存计划/来源快照，原分阶段日志和此前失败/CPU验收全部保留。
 
 评价/反思/在线用法：此前日志仅说明输出路径，不满足用户一份总日志的使用要求，应核对嵌套subprocess的两层重定向而非仅给nohup。新增单文件tools/stream_storage_method_formal.py可对已运行的旧plan只读汇总各arm pipeline/stage0/stage2，读已有输出后继续跟后续模型/阶段，保留身份，实际controller结束status出现才退出；不启动GPU、不重启实验。在线仅git fetch+git show提取reader至/tmp，不pull/修改任何活动绑定源。新正式程序在本次结束后pull供下次运行。用户原授权交付修复到mine/realq-warmadam；pilot结论不变。
+
+
+### 2026-10-13：缓存接口真实保存格式回归要求
+
+服务器03:14四卡Stage0正常结束，新增缓存检查误将FP32累积dtype要求施加于实际BF16持久化矩阵，误拒layer0；旧测试也用FP32手造缓存。新增contract按生产AST绑定BF16保存表达式，完整检查形状/层/module/rank/有限值/prepared/SHA，错误含实际dtype。回归必须执行生产转换及_to_save映射后真实torch.save，四rank完整文件准入/独立复制字节一致，错误dtype/缺失/损坏等仍拒绝；51项CPU测试通过。保留旧缓存并先CPU完整核验再重启正式任务，不为绕过接口bug重算或改生产精度；CPU通过非正式GPU完整验收。完整记录见主日志同日Fisher缓存准入误拒修复。

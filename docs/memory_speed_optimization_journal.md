@@ -2111,3 +2111,16 @@ NEW outputs/realq-final-complete-acceptance-20261012-v1/fresh_memory_six_pair_su
 效果/验证：新增tests/test_storage_method_log_stream.py验证缺失文件等待、增长UTF8跨块/回车、去重/截断拒绝，真实CPU子进程stage stdout+stderr及成功/失败退出尾部，旧四臂plan动态出现stage日志及最终失败status，新aggregate计划防重复汇总。日志、双进程meta审查和正式参数接入27tests通过（31.08秒）；真实Bash双GPU四臂dry-run生成新计划，只CPU，无新正式GPU结果。NEW outputs/storage-method-log-stream-cpu-20261013-v1保存计划/来源快照，原分阶段日志和此前失败/CPU验收全部保留。
 
 评价/反思/在线用法：此前日志仅说明输出路径，不满足用户一份总日志的使用要求，应核对嵌套subprocess的两层重定向而非仅给nohup。新增单文件tools/stream_storage_method_formal.py可对已运行的旧plan只读汇总各arm pipeline/stage0/stage2，读已有输出后继续跟后续模型/阶段，保留身份，实际controller结束status出现才退出；不启动GPU、不重启实验。在线仅git fetch+git show提取reader至/tmp，不pull/修改任何活动绑定源。新正式程序在本次结束后pull供下次运行。用户原授权交付修复到mine/realq-warmadam；pilot结论不变。
+
+
+### 2026-10-13：服务器四卡Fisher缓存准入误拒修复
+
+瓶颈/失败证据：用户提供03:14:14日志，qwen06b-storage-formal-20261013-030440-bdd78042-precompute四卡Stage0 returncode0、571.657370531秒，随后storage_method_cache.validate_payload误报layer0 Invalid full FP32 Fisher，控制器退出，Stage2未启动。本轮不是Bound source changed，之前源码绑定修复与本问题不同。原服务器缓存、日志、状态保留。
+
+理论/依据：生产gptq_utils/gptq_plus_utils.py中的collect_static_end_to_end_saliency_and_fisher将fisher_mean显式to(torch.bfloat16).cpu后放入static_fisher，由真实_to_save映射持久化。FP32累积精度不等同缓存存储精度。新增校验器错误要求FP32；旧测试手造FP32缓存且错误拒BF16，遗漏真实保存接口。此前旧四卡缓存Invalid full FP32 Fisher不能证明其损坏；正确准入仍须完整形状/数量/有限值/来源/字节检查。
+
+具体方法：contract绑定生产AST保存表达式，记录fisher_dtype=torch.bfloat16；完整矩阵与所有层检查按真实持久化dtype，异常输出实际shape/dtype/type。未改生产源码/数学/量化精度，不转换现有缓存。补正式绑定中实际读取的realq_checkpoint_research_entry及normalized_command所在run_replay_stats_memory_campaign，仍排除无关磁盘工具。
+
+效果/验证：回归直接执行生产collector的BF16转换语句及生产_to_save映射再torch.save，四rank28层fixture重现旧FP32判定错误，修复后候选发现/准入/独立副本字节SHA一致；未来生产存储表达式改变、缺层/模块/Fisher、错形状/dtype、NaN或损坏继续拒绝。WSL相关51CPUtests passed in33.62s，GPU未初始化，没有新本地GPU实验。服务器原样缓存仍待用户侧CPU完整核验，未称正式四臂通过。
+
+评价/反思/后续：此前只按第一条异常修源码绑定，没有验证缓存生产者与消费者契约，造成重复Stage0和额外磁盘占用，必须纠正遗漏。两次四卡已生成缓存保留，先服务器CPU核验新目录后再新正式控制器启动，后续Stage2数值/多rank所有权/覆盖/来源/每区间每point/global验收继续执行。失败附件和CPU验收摘要保存在outputs/storage-method-cache-bf16-repair-20261013-v1；用户授权修复推送至mine/realq-warmadam。此修复非新显存收益或正式配置结论。

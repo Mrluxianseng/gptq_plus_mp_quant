@@ -1,5 +1,7 @@
 """Cache admission, immutable copies, and honest cached comparison scope."""
 from copy import deepcopy
+import ast
+from functools import lru_cache
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -23,10 +25,33 @@ def expected_fixture(root, world=2):
     return cache.contract(cmd), cmd
 
 
+@lru_cache(maxsize=1)
+def production_serialization_code():
+    """Execute the real collector conversion and the real cache payload mapping."""
+    tree = ast.parse((formal.ROOT/'gptq_utils/gptq_plus_utils.py').read_text(encoding='utf-8'))
+    collector = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                     and n.name == 'collect_static_end_to_end_saliency_and_fisher')
+    store = next(n for n in ast.walk(collector) if isinstance(n, ast.Expr)
+                 and ast.unparse(n).startswith('static_fisher.append(fisher_mean.'))
+    mapping = next(n for n in ast.walk(tree) if isinstance(n, ast.Assign)
+                   and any(isinstance(t, ast.Name) and t.id == '_to_save' for t in n.targets)
+                   and isinstance(n.value, ast.Dict)
+                   and 'fisher' in [k.value for k in n.value.keys if isinstance(k, ast.Constant)])
+    return tuple(compile(ast.Module(body=[node], type_ignores=[]), 'production_cache_writer', 'exec')
+                 for node in (store, mapping))
+
+
 def payload(expected):
     shape = (expected['nsamples']//expected['world'], expected['seq_len'], expected['groups'])
-    return dict(saliency=[{name: torch.ones(shape) for name in cache.MODULES} for _ in range(expected['layers'])],
-                fisher=[torch.eye(expected['hidden'], dtype=torch.float32) for _ in range(expected['layers'])])
+    convert, mapping = production_serialization_code()
+    namespace = dict(torch=torch, static_fisher=[], fisher_mean=torch.eye(expected['hidden'], dtype=torch.float32))
+    for _ in range(expected['layers']):
+        exec(convert, namespace)
+    namespace.update(static_saliency_by_layer=[{name: torch.ones(shape) for name in cache.MODULES} for _ in range(expected['layers'])],
+                     static_fisher_by_layer=namespace['static_fisher'], static_fisher_shrinkage_by_layer=None,
+                     static_legacy_fisher_diag_by_layer=[None]*expected['layers'], static_refined_A_by_layer=None)
+    exec(mapping, namespace)
+    return namespace['_to_save']
 
 
 def write_cache(root, expected, prepared=True):
@@ -87,7 +112,8 @@ def test_world_change_and_missing_rank_do_not_hit(tmp_path):
     assert not list(cache.candidates([source], expected))
 
 
-@pytest.mark.parametrize('fault', ['corrupt', 'missing_fisher', 'short_layers', 'missing_module', 'wrong_shape', 'nonfinite', 'fisher_bf16'])
+@pytest.mark.parametrize('fault', ['corrupt', 'missing_fisher', 'short_layers', 'missing_module', 'wrong_shape',
+                                 'nonfinite', 'fisher_fp32', 'fisher_shape', 'fisher_missing_layer'])
 def test_invalid_payload_rejected_and_original_retained(tmp_path, fault):
     expected, _ = expected_fixture(tmp_path)
     source = write_cache(tmp_path/'old', expected)
@@ -99,11 +125,42 @@ def test_invalid_payload_rejected_and_original_retained(tmp_path, fault):
     elif fault == 'missing_module': data['saliency'][0].pop(cache.MODULES[0])
     elif fault == 'wrong_shape': data['saliency'][0][cache.MODULES[0]] = torch.ones(1)
     elif fault == 'nonfinite': data['fisher'][0][0,0] = float('nan')
-    elif fault == 'fisher_bf16': data['fisher'][0] = data['fisher'][0].to(torch.bfloat16)
+    elif fault == 'fisher_fp32': data['fisher'][0] = data['fisher'][0].to(torch.float32)
+    elif fault == 'fisher_shape': data['fisher'][0] = torch.ones(1, dtype=torch.bfloat16)
+    elif fault == 'fisher_missing_layer': data['fisher'][0] = None
     if fault != 'corrupt': torch.save(data, path)
     before = cache.sha(path)
     with pytest.raises(Exception): cache.validate(next(cache.candidates([source], expected)), expected)
     assert cache.sha(path) == before
+
+
+def test_real_production_world4_cache_admitted_and_reused_without_conversion(tmp_path):
+    expected, _ = expected_fixture(tmp_path, world=4)
+    source = write_cache(tmp_path/'outputs/full_pipeline_profile_existing_precompute/static_cache', expected)
+    found = next(cache.candidates([tmp_path/'outputs'], expected))
+    assert found['directory'] == source.resolve()
+    produced = torch.load(found['shards'][0], weights_only=True, mmap=True)
+    assert len(produced['fisher']) == 28
+    assert all(matrix.dtype == torch.bfloat16 for matrix in produced['fisher'])
+    # This is exactly the old validator's erroneous dtype gate: it rejects
+    # output from the actual production conversion/save expressions above.
+    assert produced['fisher'][0].dtype != torch.float32
+    assert expected['fisher_dtype'] == 'torch.bfloat16'
+    admitted = cache.validate(found, expected, require_prepared=True)
+    copied = cache.snapshot(admitted, tmp_path/'new_arm/static_cache')
+    for rank, original in found['shards'].items():
+        target = copied/(expected['model_name']+expected['suffix']+f'_rank{rank}.pt')
+        assert cache.sha(target) == cache.sha(original)
+    cache.validate(next(cache.candidates([copied], expected)), expected, require_prepared=True)
+    assert not torch.cuda.is_initialized()
+
+
+def test_future_production_fisher_dtype_change_requires_schema_review():
+    source = (formal.ROOT/'gptq_utils/gptq_plus_utils.py').read_text(encoding='utf-8')
+    source = source.replace('static_fisher.append(fisher_mean.to(torch.bfloat16).cpu())',
+                            'static_fisher.append(fisher_mean.to(torch.float32).cpu())')
+    with pytest.raises(ValueError, match='storage expression changed'):
+        cache.production_fisher_dtype(ast.parse(source))
 
 
 def test_shards_without_prepared_model_require_preparation(tmp_path):

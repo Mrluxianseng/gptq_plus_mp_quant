@@ -131,3 +131,12 @@ tail -f "$LIVE_LOG"
 ```
 
 reader会先读取当前run已有输出，再自动跟踪后续阶段/模型的日志，保留tag/stage身份；controller最终status出现后输出实际完成/失败状态并退出。它只读旧日志、不修改任何绑定文件。新版本已有完整总日志时reader拒绝重复汇总，直接看nohup总日志即可。新版本源码应在本次实验结束后pull，供下一次启动使用。
+
+
+## 2026-10-13：Fisher缓存dtype校验修复
+
+服务器03:14日志表明，四卡Stage0成功保存缓存并退出，随后独立缓存检查在layer0报Invalid full FP32 Fisher，尚未启动Stage2。生产collector实际执行static_fisher.append(fisher_mean.to(torch.bfloat16).cpu())：累积使用FP32，持久化矩阵使用BF16。新增校验器将累积精度误当存储精度，因此误拒新计算缓存；此前同一错误对旧四卡缓存的拒绝不能证明原文件损坏。生产数学不变，源数据不转换、不重写。
+
+校验contract新增fisher_dtype=torch.bfloat16，通过AST核对生产保存语句；矩阵形状、完整28层/7模块、所有rank、有限值、prepared checkpoint及字节SHA检查保留。异常明确打印实际type/shape/dtype，生产保存语句改变时要求审查schema。回归直接执行真实collector保存转换及真实_to_save映射，创建四rank文件，重现旧FP32检查误拒，验证修复后查找/准入/独立复制及字节一致。相关51项CPU测试通过，没有本地新增GPU实验或服务器正式完整通过结论。
+
+两次20261013四卡precompute目录中的缓存保留，更新后先只用CPU核验现有缓存，再启动新的正式run目录。不要将已生成的缓存删除后重新运行Stage0来绕过校验问题。

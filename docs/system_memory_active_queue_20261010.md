@@ -385,3 +385,8 @@ NEW outputs/realq-final-complete-acceptance-20261012-v1/fresh_memory_six_pair_su
 效果/验证：新增tests/test_storage_method_log_stream.py验证缺失文件等待、增长UTF8跨块/回车、去重/截断拒绝，真实CPU子进程stage stdout+stderr及成功/失败退出尾部，旧四臂plan动态出现stage日志及最终失败status，新aggregate计划防重复汇总。日志、双进程meta审查和正式参数接入27tests通过（31.08秒）；真实Bash双GPU四臂dry-run生成新计划，只CPU，无新正式GPU结果。NEW outputs/storage-method-log-stream-cpu-20261013-v1保存计划/来源快照，原分阶段日志和此前失败/CPU验收全部保留。
 
 评价/反思/在线用法：此前日志仅说明输出路径，不满足用户一份总日志的使用要求，应核对嵌套subprocess的两层重定向而非仅给nohup。新增单文件tools/stream_storage_method_formal.py可对已运行的旧plan只读汇总各arm pipeline/stage0/stage2，读已有输出后继续跟后续模型/阶段，保留身份，实际controller结束status出现才退出；不启动GPU、不重启实验。在线仅git fetch+git show提取reader至/tmp，不pull/修改任何活动绑定源。新正式程序在本次结束后pull供下次运行。用户原授权交付修复到mine/realq-warmadam；pilot结论不变。
+
+
+### 2026-10-13：最新服务器缓存误拒已定位
+
+用户最新03:14日志：qwen06b-storage-formal-20261013-030440-bdd78042-precompute四卡Stage0成功571.657370531秒，之后校验误要求full FP32 Fisher在layer0退出，Stage2未启动。真实生产缓存为BF16；此前新旧缓存同类报错不能证明文件损坏。已CPU修复为生产AST绑定BF16存储schema，执行真实转换/保存映射回归，相关51tests通过，无新本地GPU实验。两次四卡缓存不删除，服务器先CPU核验全部rank/28层/SHA和prepared，再新目录启动正式运行；正式数值/覆盖/显存仍待完整验收。失败附件/CPU摘要在outputs/storage-method-cache-bf16-repair-20261013-v1；不沿用2694/2770作为当前活跃PID，只以服务器实际ps为准。

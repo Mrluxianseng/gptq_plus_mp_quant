@@ -146,6 +146,7 @@ def test_formal_source_binding_excludes_unrelated_tools_and_includes_dependencie
     paths = {path.relative_to(runner.ROOT).as_posix() for path in runner.bound_source_paths()}
     assert 'tools/find_large_files.py' not in paths
     assert 'tools/run_storage_method_pipeline.py' in paths
+    assert 'tools/realq_checkpoint_research_entry.py' in paths
     assert 'tools/hessian_solver_workspace_prototype.py' in paths
     assert 'tools/activation_replay_stats_lifetime_prototype.py' in paths
     assert 'tools/storage_method_cache.py' in paths

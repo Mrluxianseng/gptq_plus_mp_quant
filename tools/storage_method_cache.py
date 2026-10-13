@@ -18,6 +18,24 @@ MODULES = ('self_attn.q_proj', 'self_attn.k_proj', 'self_attn.v_proj', 'self_att
            'mlp.gate_proj', 'mlp.up_proj', 'mlp.down_proj')
 
 
+def production_fisher_dtype(source):
+    """Bind admission to the collector's persisted dtype, not accumulation dtype."""
+    collector = next(node for node in source.body if isinstance(node, ast.FunctionDef)
+                     and node.name == 'collect_static_end_to_end_saliency_and_fisher')
+    stores = [node for node in ast.walk(collector)
+              if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)
+              and isinstance(node.value.func, ast.Attribute)
+              and isinstance(node.value.func.value, ast.Name)
+              and node.value.func.value.id == 'static_fisher'
+              and node.value.func.attr == 'append'
+              and not (len(node.value.args) == 1 and isinstance(node.value.args[0], ast.Constant)
+                       and node.value.args[0].value is None)]
+    expected = ast.parse('static_fisher.append(fisher_mean.to(torch.bfloat16).cpu())').body[0]
+    if len(stores) != 1 or ast.dump(stores[0]) != ast.dump(expected):
+        raise ValueError('Production Fisher storage expression changed; review cache admission schema')
+    return 'torch.bfloat16'
+
+
 def read(path):
     return json.loads(Path(path).read_text(encoding='utf-8-sig'))
 
@@ -78,6 +96,7 @@ def contract(command):
                 constants[node.targets[0].id] = ast.literal_eval(node.value)
     if constants != {'_STATIC_SALIENCY_SCHEMA_TAG': 'salsumv2', '_E2E_PRECOMPUTE_LOSS_GRAD_SCALE': 1000.0}:
         raise ValueError(f'Production static-cache schema changed: {constants!r}')
+    result['fisher_dtype'] = production_fisher_dtype(source)
     rotation = f"generated_hadamard:rotation_seed={result['rotation_seed']}" if result['rotate'] else 'disabled'
     result['rotation_identity'] = rotation
     hidden, intermediate = result['hidden'], int(config.get('intermediate_size', result['hidden']))
@@ -186,8 +205,14 @@ def validate_payload(path, expected):
         shape = (expected['nsamples']//expected['world'], expected['seq_len'], expected['groups'])
         if any(not isinstance(t, torch.Tensor) or t.is_meta or tuple(t.shape) != shape or not t.is_floating_point() for t in sal.values()):
             raise ValueError(f'Invalid saliency shape/dtype at layer{index}')
-        if not isinstance(matrix, torch.Tensor) or matrix.is_meta or tuple(matrix.shape) != (expected['hidden'], expected['hidden']) or matrix.dtype != torch.float32:
-            raise ValueError(f'Invalid full FP32 Fisher at layer{index}')
+        fisher_shape = (expected['hidden'], expected['hidden'])
+        fisher_dtype = expected['fisher_dtype']
+        if (not isinstance(matrix, torch.Tensor) or matrix.is_meta
+                or tuple(matrix.shape) != fisher_shape or str(matrix.dtype) != fisher_dtype):
+            actual = (f'shape={tuple(matrix.shape)}, dtype={matrix.dtype}, meta={matrix.is_meta}'
+                      if isinstance(matrix, torch.Tensor) else f'type={type(matrix).__name__}')
+            raise ValueError(f'Invalid full Fisher at layer{index}: expected shape={fisher_shape}, '
+                             f'dtype={fisher_dtype}; actual {actual}')
         for tensor in [*sal.values(), matrix]:
             flattened = tensor.reshape(-1)
             for start in range(0, flattened.numel(), 1024**2):
