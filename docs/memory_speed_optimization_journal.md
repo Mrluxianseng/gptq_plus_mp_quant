@@ -2103,3 +2103,11 @@ NEW outputs/realq-final-complete-acceptance-20261012-v1/fresh_memory_six_pair_su
 效果/验证：WSL真实两Gloo CPU进程，用CPU传输替代production CUDA-only广播，调用真实release_layer及实际生成measured_fwrd/held-out hook；原入口在相同meta权重复现NotImplementedError，新入口owner507/all28审查通过且rank1仍meta、无复制模型及虚构trace。完整owner含meta、缺失/重复rank、布局/所有权/world/count/digest错误、缺/空末层输出、伪造非owner字节哈希、非CPU模式缺rank及缺过程峰均拒绝。相关42tests通过（27.20秒），真实pipeline main以CPU worker/telemetry fixture验证owner选择和rank过程峰完整性。双卡四臂正式shell dry-run成功；NEW outputs/storage-method-distributed-audit-cpu-20261013-v1/cpu_preparation_status.json validTrue仅CPU/source。实际entry除了post-quant hash外AST相同；stage launch/profile读取函数、CUDA峰和评估包装相同，11份冻结源与已推送b587245字节相同，真实worker符合Python3.10语法。没有新增CUDA正式实验/显存收益。
 
 评价/反思：此前单进程pilot及compile/parser测试漏掉多卡CPU master权重所有权，应以真实双进程释放和输出包装执行补覆盖。回归初版fixture误用production CUDA-only广播，另一次torch facade漏uint8，修复fixture后全部通过；native Git SHA核对因WSL不能解析Windows worktree gitdir改用Windows原生Python，未修改gitdir/源或伪造结果。CPU修复不能称服务器GPU已通过。旧server未设置save_qmodel_path，Stage0准备checkpoint非已量化模型；进程退出后不能仅补hash恢复，需要新目录fresh重启两臂，原失败目录保留。用户已授权推送，修复交付到mine/realq-warmadam；本机pilot全部正负向及最终报告保持原结论，正式结果仍待服务器完整验收。
+
+### 2026-10-13：正式实验四臂实时总日志接入
+
+方法/具体工程：用户要求沿用一个总日志看全部输出，核对eefa863后发现仅控制器stdout进入nohup总日志，worker仍各写stage0/stage2，先前nohup命令未自动汇总。新增storage_method_log_stream.LiveFileRelay，阶段原stdout/stderr保留后每0.25s转发到arm控制stdout，正式控制器再转发全部arm输出到nohup总日志；PYTHONUNBUFFERED=1，plan标记aggregate_worker_stdout。tqdm回车在总日志转为换行，原阶段文件字节不改，最终退出尾部同样排空，rank/tag/stage原输出保留。NVML CSV/区间JSONL仍独立完整原始工件，不向进度日志灌100ms采样。无数学/配置/模型/缓存/峰值门槛变化，无GPU操作；密集profile非低扰动速度结果。
+
+效果/验证：新增tests/test_storage_method_log_stream.py验证缺失文件等待、增长UTF8跨块/回车、去重/截断拒绝，真实CPU子进程stage stdout+stderr及成功/失败退出尾部，旧四臂plan动态出现stage日志及最终失败status，新aggregate计划防重复汇总。日志、双进程meta审查和正式参数接入27tests通过（31.08秒）；真实Bash双GPU四臂dry-run生成新计划，只CPU，无新正式GPU结果。NEW outputs/storage-method-log-stream-cpu-20261013-v1保存计划/来源快照，原分阶段日志和此前失败/CPU验收全部保留。
+
+评价/反思/在线用法：此前日志仅说明输出路径，不满足用户一份总日志的使用要求，应核对嵌套subprocess的两层重定向而非仅给nohup。新增单文件tools/stream_storage_method_formal.py可对已运行的旧plan只读汇总各arm pipeline/stage0/stage2，读已有输出后继续跟后续模型/阶段，保留身份，实际controller结束status出现才退出；不启动GPU、不重启实验。在线仅git fetch+git show提取reader至/tmp，不pull/修改任何活动绑定源。新正式程序在本次结束后pull供下次运行。用户原授权交付修复到mine/realq-warmadam；pilot结论不变。

@@ -12,6 +12,7 @@ from pathlib import Path
 import signal
 import subprocess
 import sys
+import time
 import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -24,6 +25,7 @@ from tools.audit_completed_memory_pair_capacity import intervals, cache_inventor
 from tools import compare_full_pipeline_profiles as comparator
 from tools.run_full_pipeline_memory_campaign import stop_process_tree
 from tools.storage_method_distributed_audit import install_entry_audit, audit_directory
+from tools.storage_method_log_stream import LiveFileRelay
 
 METHOD_FLAGS = ('--research_hinv_solver_workspace', '--research_hinv_reuse_consumed_h',
                 '--research_hinv_stable_weight', '--research_replay_early_stats')
@@ -281,12 +283,12 @@ def main():
     env = dict(os.environ, CUDA_VISIBLE_DEVICES=args.devices,
                PYTORCH_ALLOC_CONF='backend:native', PYTORCH_CUDA_ALLOC_CONF='backend:native',
                OMP_NUM_THREADS=os.environ.get('OMP_NUM_THREADS', '1'),
-               NCCL_SHM_DISABLE=os.environ.get('NCCL_SHM_DISABLE', '1'))
-    save(out/'plan.json', dict(created=datetime.now().isoformat(), gpu_work_started=False,
+               NCCL_SHM_DISABLE=os.environ.get('NCCL_SHM_DISABLE', '1'), PYTHONUNBUFFERED='1')
+    save(out/'plan.json', dict(created=datetime.now().isoformat(), gpu_work_started=False, aggregate_worker_stdout=True,
          formal_workload=args.nsamples == 2048 and args.seq_len == 2048,
          config={k: str(v) if isinstance(v, Path) else v for k,v in vars(args).items() if k != 'models'},
          model_config_sha256={m: sha(args.models[m]/'config.json') for m in selected},
-         entry_sha256=sha(entry), environment={k: env[k] for k in ('CUDA_VISIBLE_DEVICES', 'PYTORCH_ALLOC_CONF', 'NCCL_SHM_DISABLE', 'OMP_NUM_THREADS')},
+         entry_sha256=sha(entry), environment={k: env[k] for k in ('CUDA_VISIBLE_DEVICES', 'PYTORCH_ALLOC_CONF', 'NCCL_SHM_DISABLE', 'OMP_NUM_THREADS', 'PYTHONUNBUFFERED')},
          jobs=jobs, note='Sequential groups, DP/FSDP across selected GPUs; fresh Stage0 per arm. No pilot canonical hashes reused as formal references.'))
     print(f'Plan: {out / "plan.json"}\n2048x2048 defaults; group_parallel_quant=none; GPUs={args.devices}', flush=True)
     if args.dry_run:
@@ -314,7 +316,12 @@ def main():
             print(f"Starting {job['tag']}; log {out/(job['tag']+'.log')}", flush=True)
             with (out/(job['tag']+'.log')).open('x') as log:
                 active = subprocess.Popen(job['launcher'], cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
-                code = active.wait()
+                relay = LiveFileRelay(out/(job['tag']+'.log'))
+                while active.poll() is None:
+                    relay.forward()
+                    time.sleep(0.25)
+                relay.forward()
+                code = active.returncode
             active = None
             if code:
                 raise RuntimeError('Full pipeline failed: ' + job['tag'])

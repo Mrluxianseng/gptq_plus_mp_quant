@@ -22,6 +22,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from tools.storage_method_distributed_audit import audit_directory
+from tools.storage_method_log_stream import LiveFileRelay
 TRACKED = (
     "process_args.py",
     "gptq_utils/gptq_plus_utils.py",
@@ -30,6 +31,7 @@ TRACKED = (
     "utils/eval_utils.py",
     "ptq.py",
     "tools/storage_method_distributed_audit.py",
+    "tools/storage_method_log_stream.py",
     "tools/run_full_pipeline_memory_profile.py",
 )
 
@@ -121,8 +123,10 @@ def run_stage(
             stdout=log,
             stderr=subprocess.STDOUT,
         )
+        relay = LiveFileRelay(log_path)
         next_progress = start + 30
         while proc.poll() is None:
+            relay.forward()
             try:
                 root = psutil.Process(proc.pid)
                 tree = [root, *root.children(recursive=True)]
@@ -145,6 +149,7 @@ def run_stage(
                 print(f"[pipeline] {name} running: {time.monotonic() - start:.1f}s; log={log_path}", flush=True)
                 next_progress = time.monotonic() + 30
             time.sleep(0.25)
+        relay.forward()
         print(f"[pipeline] {name} finished: returncode={proc.returncode}, wall={time.monotonic() - start:.2f}s", flush=True)
         return {"returncode": proc.returncode, "wall_seconds": time.monotonic() - start}
 

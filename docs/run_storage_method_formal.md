@@ -101,3 +101,25 @@ MODEL_ROOT=/openbayes/home/llmModels DEVICE=0,1 \
 ```
 
 旧流程未设置`save_qmodel_path`，Stage0准备checkpoint不是已量化模型；进程退出后无法仅补一个哈希就恢复完整量化结果。保留旧outputs，新启动会重新执行两臂fresh完整流程。修复的CPU双进程回归替换CUDA传输为Gloo CPU传输，调用真实层释放函数并执行实际生成的哈希/评估包装；它不等于服务器双卡CUDA正式实验成功。
+
+## 一个总日志查看所有四臂
+
+新启动计划记录`aggregate_worker_stdout=true`。Stage0/Stage2的完整stdout和stderr先保留原阶段文件，再实时转发至每臂控制日志，最后转发至正式控制器stdout。于是此前nohup命令的`$LOG`就包含四臂自动切换、Fisher进度、量化层/module/loss、cleanup、评估和异常；只需`tail -f "$LOG"`。转发将tqdm的回车转换为换行以便tail阅读，原阶段文件字节保留；NVML采样CSV、区间JSONL等原始数据继续单独保存，不把每100ms原始采样灌入进度总日志。新增转发无GPU操作，设置PYTHONUNBUFFERED=1；密集profile仍不是低扰动速度实验。
+
+如果实验已用旧版本启动，不要中途pull改动绑定源码。只fetch并将独立reader取到/tmp，追加一个CPU日志跟踪进程；不会重启实验或额外启动GPU。以下自动选最新正式run目录，可手动将RUN_DIR改为控制台Plan对应目录：
+
+```bash
+cd /openbayes/home/gptq_plus
+git fetch https://github.com/Mrluxianseng/gptq_plus_mp_quant.git realq-warmadam
+STREAM_SCRIPT="/tmp/stream-storage-formal-$(date +%Y%m%d-%H%M%S).py"
+git show FETCH_HEAD:tools/stream_storage_method_formal.py > "$STREAM_SCRIPT"
+RUN_DIR=$(ls -td outputs/storage-formal-*/ | head -n 1)
+CONTROLLER_LOG=$(ls -t storage-formal-20*.log | head -n 1)
+LIVE_LOG="storage-formal-all-$(date +%Y%m%d-%H%M%S).log"
+nohup /output/env/bin/python -u "$STREAM_SCRIPT" --run-directory "$RUN_DIR" --controller-log "$CONTROLLER_LOG" \
+  > "$LIVE_LOG" 2>&1 < /dev/null &
+echo "总日志=$LIVE_LOG reader_PID=$!"
+tail -f "$LIVE_LOG"
+```
+
+reader会先读取当前run已有输出，再自动跟踪后续阶段/模型的日志，保留tag/stage身份；controller最终status出现后输出实际完成/失败状态并退出。它只读旧日志、不修改任何绑定文件。新版本已有完整总日志时reader拒绝重复汇总，直接看nohup总日志即可。新版本源码应在本次实验结束后pull，供下一次启动使用。
