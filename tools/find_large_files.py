@@ -24,10 +24,12 @@ def human_bytes(value: int) -> str:
     return f"{value} B"
 
 
-def scan(root: Path, errors: list[dict]) -> tuple[list[dict], Counter, int, int]:
+def scan(root: Path, errors: list[dict], seen_inodes: set[tuple[int, int]]) -> tuple[list[dict], Counter, Counter, int, int, int]:
     rows: list[dict] = []
-    extensions: Counter = Counter()
+    logical_extensions: Counter = Counter()
+    allocated_extensions: Counter = Counter()
     total_bytes = 0
+    unique_allocated_bytes = 0
     total_files = 0
 
     def onerror(exc: OSError) -> None:
@@ -47,13 +49,21 @@ def scan(root: Path, errors: list[dict]) -> tuple[list[dict], Counter, int, int]
             if not path.is_file() or path.is_symlink():
                 continue
             size = info.st_size
+            allocated = getattr(info, "st_blocks", 0) * 512 or size
             total_bytes += size
             total_files += 1
             ext = path.suffix.lower() or "[no extension]"
-            extensions[ext] += size
-            rows.append({"path": str(path), "bytes": size, "modified": info.st_mtime})
-    rows.sort(key=lambda row: (-row["bytes"], row["path"]))
-    return rows, extensions, total_bytes, total_files
+            logical_extensions[ext] += size
+            inode = (info.st_dev, info.st_ino)
+            duplicate = inode in seen_inodes
+            seen_inodes.add(inode)
+            if not duplicate:
+                unique_allocated_bytes += allocated
+                allocated_extensions[ext] += allocated
+            rows.append({"path": str(path), "bytes": size, "allocated_bytes": allocated,
+                         "hardlink_duplicate": duplicate, "modified": info.st_mtime})
+    rows.sort(key=lambda row: (-row["allocated_bytes"], -row["bytes"], row["path"]))
+    return rows, logical_extensions, allocated_extensions, total_bytes, unique_allocated_bytes, total_files
 
 
 def main() -> int:
@@ -70,32 +80,37 @@ def main() -> int:
 
     all_rows: list[dict] = []
     all_errors: list[dict] = []
-    by_extension: Counter = Counter()
+    logical_by_extension: Counter = Counter()
+    allocated_by_extension: Counter = Counter()
+    seen_inodes: set[tuple[int, int]] = set()
     scanned_roots = []
-    total_bytes = total_files = 0
+    total_bytes = unique_allocated_bytes = total_files = 0
     for raw in args.root:
         root = Path(raw).expanduser()
         if not root.exists() or not root.is_dir():
             all_errors.append({"path": str(root), "error": "root missing or not a directory"})
             continue
         root = root.resolve()
-        rows, extensions, nbytes, nfiles = scan(root, all_errors)
+        rows, logical_extensions, allocated_extensions, nbytes, allocated, nfiles = scan(root, all_errors, seen_inodes)
         all_rows.extend(rows)
-        by_extension.update(extensions)
+        logical_by_extension.update(logical_extensions)
+        allocated_by_extension.update(allocated_extensions)
         total_bytes += nbytes
+        unique_allocated_bytes += allocated
         total_files += nfiles
         scanned_roots.append(str(root))
 
-    all_rows.sort(key=lambda row: (-row["bytes"], row["path"]))
+    all_rows.sort(key=lambda row: (-row["allocated_bytes"], -row["bytes"], row["path"]))
     print("Read-only large-file inventory")
     print("Roots:", ", ".join(scanned_roots) if scanned_roots else "(none scanned)")
-    print(f"Files: {total_files:,} | apparent size: {human_bytes(total_bytes)}")
+    print(f"File paths: {total_files:,} | apparent size: {human_bytes(total_bytes)} | allocated bytes (hardlinks deduplicated): {human_bytes(unique_allocated_bytes)}")
     print("\nLargest files:")
     for index, row in enumerate(all_rows[:args.top], 1):
-        print(f"{index:4d}. {human_bytes(row['bytes']):>12}  {row['path']}")
+        suffix = " [hardlink duplicate]" if row["hardlink_duplicate"] else ""
+        print(f"{index:4d}. {human_bytes(row['allocated_bytes']):>12} allocated | {human_bytes(row['bytes']):>12} logical  {row['path']}{suffix}")
     print("\nLargest extensions by summed file size:")
-    for ext, size in by_extension.most_common(20):
-        print(f"{human_bytes(size):>12}  {ext}")
+    for ext, size in allocated_by_extension.most_common(20):
+        print(f"{human_bytes(size):>12} allocated | {human_bytes(logical_by_extension[ext]):>12} logical  {ext}")
     if all_errors:
         print(f"\nUnreadable/missing paths: {len(all_errors)} (see JSON if requested)", file=sys.stderr)
 
@@ -105,9 +120,11 @@ def main() -> int:
             "roots": scanned_roots,
             "files_scanned": total_files,
             "apparent_bytes": total_bytes,
+            "unique_allocated_bytes": unique_allocated_bytes,
             "largest_files": all_rows[:args.top],
             "all_files": all_rows,
-            "extension_bytes": dict(by_extension),
+            "extension_allocated_bytes_deduplicated": dict(allocated_by_extension),
+            "extension_apparent_bytes": dict(logical_by_extension),
             "errors": all_errors,
         }
         destination = Path(args.json_path).expanduser()
