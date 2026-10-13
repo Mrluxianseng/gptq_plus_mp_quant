@@ -15,6 +15,7 @@ ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT))
 from tools.audit_qa_score_lifetime_component import memory_mib
 from tools.storage_process_device_peaks import valid_record
+from tools.storage_method_log_stream import LiveFileRelay
 
 
 def sha(path):
@@ -159,6 +160,7 @@ def main():
     args.output.mkdir(parents=True,exist_ok=False)
     paths=[Path(__file__),ROOT/'tools/qa_score_lifetime_prototype.py',ROOT/'tools/qa_score_no_kv_prototype.py',
         ROOT/'tools/storage_process_device_peaks.py',ROOT/'tools/audit_qa_score_lifetime_component.py',
+        ROOT/'tools/storage_method_log_stream.py',
         ROOT/'utils/eval_utils.py',ROOT/'utils/memory_utils.py',Path(args.model)/'config.json']
     bindings={str(path.resolve()):sha(path) for path in paths}
     (args.output/'source_bindings.json').write_text(json.dumps(bindings,indent=2))
@@ -171,8 +173,14 @@ def main():
         with (args.output/(side+'.log')).open('x') as log, (args.output/(side+'_nvml.csv')).open('x') as nvml:
             monitor=subprocess.Popen(['nvidia-smi',f'--id={args.gpu}','--query-gpu=timestamp,memory.used,index,uuid','--format=csv,noheader,nounits','--loop-ms=100'],stdout=nvml,stderr=subprocess.DEVNULL)
             try:
-                subprocess.run([sys.executable,'-u',__file__,'--model',args.model,'--output',str(args.output),
-                    '--mode',args.mode,'--arm',side],env=env,stdout=log,stderr=subprocess.STDOUT,check=True)
+                command=[sys.executable,'-u',__file__,'--model',args.model,'--output',str(args.output),
+                    '--mode',args.mode,'--arm',side]
+                process=subprocess.Popen(command,env=env,stdout=log,stderr=subprocess.STDOUT)
+                relay=LiveFileRelay(args.output/(side+'.log'))
+                while process.poll() is None:
+                    relay.forward();time.sleep(0.5)
+                relay.forward()
+                if process.returncode: raise subprocess.CalledProcessError(process.returncode,command)
             finally:
                 monitor.terminate();monitor.wait(timeout=10)
     result=compare(args.output,bindings)
