@@ -73,7 +73,8 @@ def worker(args):
         return result
     HFLM._loglikelihood_tokens=observed
     hflm=HFLM(pretrained=model,tokenizer=tokenizer,batch_size=16,device='cuda:0')
-    manager=tasks.TaskManager(include_defaults=True)
+    task_dir=ROOT/'datasets/lm_eval_configs/tasks'
+    manager=tasks.TaskManager(include_path=str(task_dir),include_defaults=True) if task_dir.is_dir() else tasks.TaskManager(include_defaults=True)
     torch.cuda.synchronize();torch.cuda.reset_peak_memory_stats()
     start=time.monotonic()
     if args.mode=='short':

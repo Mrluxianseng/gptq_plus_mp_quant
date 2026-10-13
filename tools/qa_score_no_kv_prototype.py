@@ -5,7 +5,10 @@ import textwrap
 
 
 def build_method(original):
-    tree=ast.parse(textwrap.dedent(inspect.getsource(original)))
+    try:
+        tree=ast.parse(textwrap.dedent(inspect.getsource(original)))
+    except (OSError,TypeError,SyntaxError) as exc:
+        raise RuntimeError('Unavailable or invalid HFLM scoring source') from exc
     functions=[n for n in tree.body if isinstance(n,ast.FunctionDef)]
     if len(functions)!=1 or functions[0].name!='_model_call':
         raise RuntimeError('Unexpected HFLM scoring forward')
