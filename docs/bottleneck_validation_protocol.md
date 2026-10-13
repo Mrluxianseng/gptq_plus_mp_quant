@@ -332,3 +332,27 @@ CPU效果/反思：首轮相关34tests通过；真实535状态、两模型meta�
 评价/反思：组件是原模型的局部评分存储验证，不能代替真实量化模型十任务QA、完整535state/28层/KL/PPL或两模型正式全流程容量验收。若工具/数值失败先定位并保留原工件，不改batch/精度或剔慢值掩盖；若成功再做1.7B交叉与正式接入。旧0.6B正式数值有效、NVML19104相等及all-device allocator记录缺口结论仍保留，未将旧失败改为完整容量通过。
 
 2026-10-13服务器GPU续记：代码5fcc371已实际推送mine并服务器fast-forward拉取、Python3.10编译通过；确认四卡空闲后nohup启动qa-score-lifetime-gpu-20261013-v1控制器17277、GPU0，control/candidate各独立进程串行正常完成。原汇总CSV将带MiB单位字符串直接int转换而失败，保留原日志/两臂JSON/NVML/source，不重跑GPU、不改原绑定源。新增只读audit_qa_score_lifetime_component.py，7项CPU单位/缺失拒绝回归通过；13094d9推送拉取后实际独立审查independent_completed_audit.json validTrue，来源/模型完整state SHA/64requests及全部scores逐位相同、真实库源码相同、设备列表完整。C/N allocated13550323200→9756894720B、reserved16842227712→10666115072B、NVML16692→10802MiB（258/192采样）；评分timer0.8395703649→0.8306050133秒，单组件不作稳定加速结论。实际原模型BF16 BoolQ32长文本组件，非量化模型全QA/正式全流程/1.7B验证，不能把此局部峰降幅代替之前正式19104MiB峰或直接推广。原实验源绑定不变，原CSV异常是记录工具错误而非评分/存储方法失败；下一步需要真实量化QA接入及1.7B交叉，尚不启动昂贵PTQ复跑。代码/CPU在本地，真实GPU验证已在服务器完成此短测，无本地GPU实验。
+
+### 2026-10-13：用户授权服务器CPU/GPU继续QA优化
+
+方法/理论：先验证已实现的scored-row log_softmax及logits末消费者释放，再增加独立消融rows_no_kv，仅将真实HFLM._model_call的causal self.model(inps)变为use_cache=False。该函数只读取返回logits且不向下一次forward传past_key_values，生成路径与全局model.config.use_cache不变；是否逐位等价必须实测。官方KV cache用途/存储说明：https://huggingface.co/docs/transformers/v4.57.1/en/kv_cache 。不改batch16/数据/精度/量化数学、不做KV量化或CPU卸载、不追求速度均值。
+
+服务器CPU效果：真实安装lm_eval六组FP32/FP16/BF16×词表fixture所有logprob/cache记录精确，小型真实Qwen3两精度开启/关闭KV的logits精确，全局config仍True，CUDA未初始化；native_cpu.json validTrue。初次错误源拒绝fixture的lambda inspect产生SyntaxError未统一为预期RuntimeError，CPU验证工具退出，旧guard源码及initial_cpu_failure.log保留；只补输入源码异常转换后原数学测试通过，不归为GPU/方法失败。
+
+具体实验：新run_qa_memory_validation_v2.py在服务器GPU0串行control/rows/rows_no_kv三个独立进程，两模型先32长文本BoolQ短测，再完整十任务QA。每组请求token哈希、全部logprob哈希、准确率/原始结果、实际forward use_cache记录、原模型全部state前后SHA、绑定来源及device峰/NVML采样完整验收，任何失败停止后续串行链。无PTQ、无prepared或大模型/数据副本；原completed源绑定不变，新源478f587已实际推送/拉取。总日志logs/qa-memory-validation-server-20261013-v2.log，root outputs/qa-memory-validation-server-20261013-v2，actual控制器20222，当前q06短测；后续actual ps为准。
+
+评价/边界：full在此指原始BF16模型的十任务全量QA，不是REAL-Q量化全流程，更不能替代535state/28层/KL/PPL/完整多卡容量验收。GPU短测尚未全部完成，不冒称KV优化有效或1.7B已验证；无GPU并发、不修改活动冻结工具。评分、CPU/GPU验证都在服务器执行，本地只编辑与版本管理。三方案保留全部结果，若rows_no_kv无额外收益则采用更简方案，若完整分数不一致则拒绝推广，不通过改batch/精度或删慢值掩盖。
+
+### 2026-10-13：QA双模型短测正向、no-KV拒绝、用户停服务器后本地接入准备
+
+实际GPU结果：q06 v2 control/rows逐项分数、64请求/2forward、全部原模型state SHA、来源/参数/缓存flag与GPUidentity精确；C/N allocated13550323200→9756894720B/res16842227712→10666115072B/NVML16692→10802MiB。第三no-KV臂虽然NVML8554MiB，但62/64 logprob不同、1 greedy flag不同、max abs delta0.1875，故明确拒绝；原summary validFalse及independent_no_kv_numerical_rejection.json不改，不重跑该已完成失败方法。CPUtiny-Qwen通过不证明GPU/真实多KV-head路径等价；本地源码DynamicLayer.update有torch.cat，8头CPU布局组件显示值相同而stride从[896,16,128,1]变为[896,112,16,1]，这仅支持缓存开关可能改变布局/内核路径的假设，不确认此次GPU差异唯一根因，不采用关闭KV方案。
+
+后续来源/验证：新增v3只排除已拒绝no-KV调度，冻结v2工作函数/评分数学不改，0262bff已推送并实际服务器拉取。q06已完成rows不重跑，fresh来源/数值准入后只q17短测及两模型完整QA；1.7B短测全部精确且C/N allocated15799897600→12039564800B/res19434307584→13258194944B/NVML19164→13274MiB。两个短测都经新独立只读audit_qa_memory_rows_completed.py实际CPU重审validTrue，旧三臂整体失败仍保留；新auditor6b5dfac部署仅新增未绑定文件，未改GPU活动源。小组件仍为原始BF16模型、非REAL-Q量化全流程，未给出稳定速度/硬件下限结论。
+
+中断/最新范围：SSH59059断开、31586拒绝连接，用户随后明确手动暂时关闭服务器并要求先本地优化；不是自动归为OOM/方法失败，不继续尝试重启。最后实证为控制器21140、q06完整十任务control结束、rows在hellaswag附近；服务器关闭后完整两臂/1.7全QA是否最终结束未知，必须恢复后读actual ps/工件，不沿用PID、不补造status、不声称full QA已通过。总日志logs/qa-memory-rows-validation-server-20261013-v3.log，原模型QA root outputs/qa-memory-rows-validation-server-20261013-v3。保留全部原日志/源/失败/partial控制工件。
+
+本地具体方法/CPU准备：新增qa_scoring_lifetime_install.py仅围绕原qa_eval安装共享CPU整数/摘要观察器，候选按原workspace flag启用scored-row归一化，control保持原逻辑；原函数/异常透传、finally恢复HFLM方法，完整请求token与逐项分数digest及十任务metrics/cache配置精确才过，记录实际选择源代码SHA，不持有GPU tensor。重复安装或已存在QA证据在评分前拒绝，不覆盖老工件。新run_storage_formal_qa_lifetime.py复用原formal/shared cache/数学/全区间point/global审查与全device footer，只添加QA存储方案和严格评分覆盖。真正--run必须fresh独立重审所选模型已完成全十任务原模型QA、当前库源码和模型身份一致，缺失/中断/失败证据或skip QA在GPU启动前拒绝；--only both/06/17原行为保留。未改变旧脚本/60冻结源/原audit结论，未自动跑正式GPU。
+
+效果/边界/反思：本地CUDA隐藏的47相关CPU回归全部通过(13.54秒)，含实际生成入口single wrapper编译、原评分/异常恢复、重复工件保护、实际main --run三个only选项先准入再调度、缺完整QA禁止launch。新保护追加4项局部回归亦通过，CPU工件outputs/qa-formal-install-cpu-20261013-v1。不把fixture QAmetrics或CPU ready当服务器正式成功，raw原模型与正式535包装state仍分开；恢复后先独立检查已有completed arms、仅恢复缺失部分，完整两模型QA及all-device真实CUDA验证之后，才能必要的正式1.7B/新QA方案整体验收。速度次级、未扫描学习率/样本、不创建模型/数据复制，所有计时原值保留。
+
+2026-10-13本地准备最终续记：新增真实词表151936的FP32/FP16/BF16边界、当前库源/model identity的准入拒绝测试后54通过；源码复核进一步发现原prefix已移除--research_hinv_solver_workspace，晚期QA installer若重读sys.argv会误选False。新版仅复用原已保存_hinv_release布尔值，原prefix/数学不改；新增测试实际执行生成入口的原flag capture/removal及QAsetup（C=False/N=True），不再只检查compile或字符串。最终56项CPU回归全部通过(12.90秒)，包括未完成全QA证据/改库/错模型禁止launch、真实main三个only分支及single wrapper/异常恢复/重复证据拒绝；CUDA隐藏未初始化，无本地GPU或正式端到端训练。新CPU快照及完整源/报告outputs/qa-formal-install-cpu-20261013-v2，原47/54结果不覆盖。当前服务器用户已手动关闭，完整QA和真实4device telemetry仍待，不沿用21140等PID，不自动重启、不补造full状态。版本化新入口仅CPU ready，用户恢复服务器后先查真实工件并完成未完成验收，才允正式--run；旧默认正式脚本不改。
