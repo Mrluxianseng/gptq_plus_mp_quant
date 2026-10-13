@@ -421,3 +421,19 @@ state方法/验证：两模型真实Qwen3全28层meta架构加实际rotation wra
 
 CPU效果/反思：首轮相关34tests通过；真实535状态、两模型meta、CPU小Qwen完整bytehash和异常拒绝、十任务/嵌套ceval/空数据/离线错误拒绝及真实--run阻止GPUlaunch回归后81tests通过(48.21秒)。数据路径选择新增测试正在复核，服务器仍须全部十任务真实离线准入。此前只校验Fisher/输入数据和手造507fixture，遗漏正式rotation buffer和运行末尾可选QA数据，造成长量化之后失败；必须纠正先决条件覆盖。control-only部分不是配对显存收益/正式成功，密集profile秒数不是低扰动速度。未删缓存/日志、未并发新GPU。服务器实际无formal/PTQ进程；修复测试/推送/拉取与数据全部准入完成前不重启GPU。
 2026-10-13完整交付/准入续记：缓存路径补充后52项相关CPU回归全部通过(44.48秒)，含显式HF_DATASETS_CACHE优先/无已知路径不伪造默认。代码55701b0已推送并实际服务器fast-forward拉取、Python3.10编译通过；服务器此前无formal/PTQ进程、四卡各2MiB/0%。真实CPU preflight完成，十任务/61叶任务均离线加载成功、errors为空，使用/output/hf_cache/datasets，未下载或复制数据，GPU隐藏。报告outputs/formal-qa-state-repair-20261013-v1/native-offline-qa-preflight.json SHA ee566a27e359a7c3a633925ed1ab7ca2349cb2c6f30e1094ab10f06188858d224，原失败工件不改。不能将这份dataset准入称为QA分数或正式pair成功。依据用户已授权继续正式运行，计划以新root恢复原四臂，仍正式2048×2048/四卡/全部QA/auto shared；没有已保存量化模型可续跑旧control的末尾评估，必须重跑其Stage2，Fisher/prepared仍可复用。只在所有准入完成后启动，后续以实际进程与新status为准。
+### 2026-10-13：欠费关停后的正式实验恢复
+
+用户报告欠费导致容器关停并明确授权重新运行，新SSH端口31586。实际服务器恢复后无formal/PTQ进程，四张RTX5090均2MiB/0%，代码09dfd01未改；上次storage-formal-20261013-091535-qa-repair在0.6B control约第8层中断，root/各arm最终status及量化state均未产生，后面三arm未开始，0完整arms/pairs。不补造status、不将启动/局部层输出称为完成，不重新归因算法失败。
+
+方法/来源：独立检查原60绑定source SHA全部相同，保存旧总日志SHA与中断分类在服务器outputs/formal-billing-interruption-recovery-20261013-v1/independent_interrupted_run_audit.json。无可续读的量化模型权重，使用新root恢复原四臂完整Stage2；同正式配置2048×2048/四卡/全部十项QA，HF_DATASETS_CACHE=/output/hf_cache/datasets，auto/shared复用合格Fisher及prepared，不复制大型输入。不改旧日志/冻结源/失败目录，不并发GPU、不自动重算已完成臂。
+
+实际新控制器881、root outputs/storage-formal-20261013-095943-billing-recovery，总日志同名.log，nohup后台启动。启动状态仍需QA/cache完整预检，尚无新正式pair结果；后续以新status及独立完整数值/方法/来源/区间point/global审查为准，不沿用11599等旧PID。新入口继续启动前QA离线检查及量化前后完整535state布局约束，相关理论/修复/测试见上节，不把中断恢复算新优化收益。
+### 2026-10-13：0.6B正式两臂完成、逐卡附加门槛及QA设备峰记录缺口
+
+完成/证据：billing-recovery的0.6B C/N完整量化+KL/PPL+十任务QA结束，两个worker validTrue；535state/owner28层非空输出/所有rankmeta布局精确、KL0.09737192094326019/PPL21.992847442626953逐位相同，60绑定source未变、全部cache/method/runtime/命令通过。原audit_qwen06b_p1.json validFalse唯一旧主检查失败sampled_each_physical_gpu_peak_nonincreasing：GPU0 NVML7868→9912MiB；旧三全局字段alloc6713250816→6712304640B(-0.90234375MiB)/res9254731776B相同/NVML19104MiB相同。110562exact interval/442248独立point完整无缺失，6873interval及13702point局部回升保留。1.7B未启动，所有GPU已退出，旧报告约108.8MB不覆盖。独立输出outputs/formal-qwen06-completed-capacity-failure-20261013-v1包含来源/数值/峰时刻/每rank峰。
+
+用户截图时间核对：网页北京时间19:58:17对应服务器UTC11:58:17（C），21:56:02对应UTC13:56:02（N）。两处GPU1真实NVML19104MiB，均BoolQ QA：C11:57:57–11:58:27，N13:55:39–13:56:09，两臂acc60.58%。这两个完整运行最大峰来自评估，不能归为纯求逆；GPU0局部增长在N13:43:41末层down_proj后续量化/梯度刷新，rank0reserved6782→8826MiB，唯一分配根因尚未确认。只看四图两段平均/曲线不能证明容量或速度收益。
+
+门槛/测量反思：用户已要求全局容量峰为主，脚本额外逐物理卡非回升比该口径更严，不应自动阻断总体相同硬件容量判断；新独立adapter将逐卡保留诊断，旧validFalse不改。但核对QA再发现get_process_cuda_memory_peaks默认仅当前GPU，而ptq QA调用distribute_model会在rank0中跨其他GPU运行；旧footer未枚举各device，却标complete_process_through_evaluation。因此上述6.4GiB/8.6GiB字段只能说明原采集设备/各rank的已记录峰，不能称全部QA设备的完整allocated/reserved；19104MiB全设备NVML是已记录采样证据，不补造缺失allocator峰。本对数值/QA有效，完整新全局容量验收尚不足，不能为了让队列继续直接放行旧结果。
+
+工程/验证：新增版本化audit_storage_formal_global_capacity.py、run_storage_formal_global_capacity.py、run_storage_formal_multidevice_profile.py、storage_process_device_peaks.py；原60绑定source/worker结果不改。新profile只替换generated footer峰查询，遍历所有visible设备并调用保留exact区间累积的原getter；仅有allocator占用历史的设备同步，不初始化未使用卡来测量，保存rank/device/物理selector/所有device峰及最大值。新准入必须每rank每device列表完整且最大值与status一致；旧单device峰明确拒绝。新wrapper保持原entry/数学/校准/缓存/QA参数，只记录新的容量准入口径并绑定四个新工具。25项CPU通过(2.63秒)：QA峰在另一GPU时必须计入、unused不sync、缺失/重复device/旧scope/错误聚合拒绝，各global真实增长及质量/覆盖/来源/telemetry缺失仍拒绝，原per-GPU报告不改。真实CUDA组件及服务器新记录尚待；不重跑已完整0.6B两臂，不作正式显存收益/稳定速度结论。
