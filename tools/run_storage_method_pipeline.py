@@ -23,7 +23,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from tools.storage_method_distributed_audit import audit_directory
 from tools.storage_method_log_stream import LiveFileRelay
-from tools.storage_method_cache import contract as cache_contract, candidates as cache_candidates, validate as validate_cache, snapshot as snapshot_cache, verify_inventory
+from tools.storage_method_cache import contract as cache_contract, candidates as cache_candidates, validate as validate_cache, prepared_admission, snapshot as snapshot_cache, shared_view as share_cache, verify_inventory
 TRACKED = (
     "process_args.py",
     "gptq_utils/gptq_plus_utils.py",
@@ -221,6 +221,10 @@ def main() -> None:
     parser.add_argument("--gpu-indices", default=None, help="Physical nvidia-smi indices to monitor; comma-separated. Does not set CUDA_VISIBLE_DEVICES.")
     parser.add_argument('--reuse-cache', type=Path, help='Validated cache for Stage2 only; Stage0 is omitted and never claimed measured.')
     parser.add_argument('--initial-cache', type=Path, help='Import matching old shards before Stage0; missing prepared model can be built without repeating Fisher.')
+    parser.add_argument('--cache-storage', choices=('shared', 'copy'), default='shared',
+                        help='shared: reference cache/model bytes without copying; copy: retain legacy independent copies.')
+    parser.add_argument('--reuse-prepared', type=Path,
+                        help='Reuse a matching prepared model from this cache directory even when Fisher must be recomputed.')
     args = parser.parse_args()
     if not args.tag.replace("-", "").isalnum():
         raise ValueError("tag may contain only letters, digits, and hyphens")
@@ -228,6 +232,8 @@ def main() -> None:
         raise ValueError("timeout and telemetry interval must be positive")
     if args.reuse_cache and (args.stage0_only or args.initial_cache):
         raise ValueError('reuse-cache requires Stage2 and cannot combine with initial-cache')
+    if args.reuse_prepared and args.reuse_cache:
+        raise ValueError('reuse-cache already includes its verified prepared model')
 
     stage0_source = Path(args.stage0_manifest).resolve()
     stage2_source = Path(args.stage2_manifest).resolve()
@@ -274,7 +280,17 @@ def main() -> None:
         if found is None:
             raise RuntimeError('Imported cache lacks every exact matching rank shard')
         cache_admission = validate_cache(found, expected, require_prepared=bool(args.reuse_cache))
-        snapshot_cache(cache_admission, cache_path)
+    if args.reuse_prepared:
+        prepared = prepared_admission(args.reuse_prepared, cache_contract(s0))
+        if cache_admission:
+            if cache_admission['prepared']:
+                raise ValueError('initial-cache already contains a prepared model')
+            cache_admission['prepared'] = prepared['prepared']
+            cache_admission['sha256'].update(prepared['sha256'])
+        else:
+            cache_admission = prepared
+    if cache_admission:
+        (share_cache if args.cache_storage == 'shared' else snapshot_cache)(cache_admission, cache_path)
     cache_path_str = str(cache_path)
     set_option(s0, "--static_cache_path", cache_path_str)
     set_option(s2, "--static_cache_path", cache_path_str)
@@ -309,6 +325,7 @@ def main() -> None:
         "stage2_command": s2,
         "fresh_static_cache": cache_path_str,
         "cache_admission": cache_admission,
+        "cache_storage": args.cache_storage if cache_admission else 'fresh_generated',
         "cache_mode": 'stage2_cached' if args.reuse_cache else ('imported_precompute' if args.initial_cache else 'fresh'),
         "hinv_cpu_offload": args.hinv_cpu_offload,
         "hinv_cpu_offload_modules": args.hinv_cpu_offload_modules,
@@ -332,6 +349,8 @@ def main() -> None:
         TRANSFORMERS_OFFLINE="1",
         REALQ_PHASE_PEAK_MODE="exact" if args.exact_phase_peaks else "sampled",
         RESEARCH_IMPORTED_STATIC_CACHE='1' if source_cache else '0',
+        RESEARCH_SHARED_STATIC_CACHE='1' if source_cache and args.cache_storage == 'shared' else '0',
+        RESEARCH_SHARED_PREPARED_CHECKPOINT='1' if cache_admission and cache_admission.get('prepared') and args.cache_storage == 'shared' else '0',
     )
     try:
         import psutil

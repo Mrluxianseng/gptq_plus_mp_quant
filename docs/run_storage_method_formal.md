@@ -10,7 +10,7 @@
 
 默认`--cache-mode auto`：启动时在仓库`cache/`、`outputs/`和额外指定目录中查找旧的静态saliency/Fisher缓存。只有模型文件身份、数据、样本数、序列长度、seed、旋转、分组、loss batch、缓存schema和world size都匹配，且所有rank分片的层数/模块/形状/dtype/有限值与SHA校验通过，才会复用。四卡旧缓存只有rank0–rank2完整、rank3为空时会被拒绝并重算；双卡启动也不会误用四卡分片。
 
-若完整rank缓存存在但没有完整旋转模型checkpoint，控制器会先复制旧分片到本次私有目录，然后只准备模型；缓存命中保护会让该阶段在缓存缺失时直接失败，避免悄悄重算Fisher。若checkpoint和分片均完整，则跳过Stage0。auto模式下每个模型只需一次准备/预计算，control和candidate及重复臂都从各自独立副本读取同一份经过验证的缓存；每个正式比较的测量范围明确标记为`stage2_cached`，Stage0准备单独记入总日志和计划，不计入配对显存峰值。两臂仍各自运行完整28层量化和KL/PPL/QA评估，比较器不会伪造Stage0状态或峰值。
+若完整rank缓存存在但没有完整旋转模型checkpoint，控制器会引用旧分片，并查找其他目录中匹配的prepared模型；没有匹配模型才新建一份。缓存命中保护会让该阶段在缓存缺失时直接失败，避免悄悄重算Fisher。若checkpoint和分片均完整，则跳过Stage0。auto模式默认cache-storage=shared，control和candidate及重复臂通过硬链接读取同一份经过验证的大文件（跨文件系统用文件软链接，不退回复制）；各实验只独立保存少量路径元数据、日志、配置和验收工件。每个正式比较的测量范围明确标记为stage2_cached，Stage0准备单独记入总日志和计划，不计入配对显存峰值。两臂仍各自运行完整28层量化和KL/PPL/QA评估，比较器不会伪造Stage0状态或峰值。
 
 如需评估从空缓存开始的完整流程，可使用`--cache-mode fresh`，此时两臂各自重新运行Stage0，并按`full_pipeline`范围比较。正式参考值由服务器同配置control生成，不能拿cal2×1024的507state hash/KL/PPL当正式结果目标。
 
@@ -84,7 +84,7 @@ bash scripts/run_storage_method_formal.sh --run --repeats 3
 - `plan.json`：四臂/所有重复的命令、实际配置、模型config SHA、entry SHA及环境；dry-run不是GPU成功。
 - `source_bindings.json`与`entry.py`：本次生成入口和源码绑定，运行中不编辑。
 - `<tag>.log`及每臂`stage0.log/stage2.log`：控制日志和完整worker日志。
-- 每臂`static_cache/`：来源缓存的独立副本；不对旧缓存做硬链接或原地改写。审查完整目录所有文件的字节SHA，包含Fisher，正式多卡文件数量按实际清单记录，不硬套单卡13文件。
+- 每臂`static_cache/`：默认只引用共享来源文件，Fisher和prepared权重不增加重复的数据块；路径别名元数据单独保存，不写回共享来源。源文件使用前后及完整目录的字节SHA仍核对，包含Fisher，正式多卡文件数量按实际清单记录，不硬套单卡13文件。`shared_cache_reference.json`保存实际链接类型、源/目标和新增大文件字节数。显式`--cache-storage copy`才采用旧的独立复制策略。
 - `audit_<model>_pN.json`：CPU master所属rank0的完整507state、28层非空输出及KL/PPL；所有rank的state布局/身份、112inverse/reuse及28write/dead/stats、源/缓存/命令/环境/设备、精确区间峰和独立逐point/global验收。其他rank的meta布局记录不称为权重字节哈希。
 - `status.json`：仅完整执行并通过所有pair后validTrue；GPU异常、数值/来源/覆盖/遥测/全局峰失败均保留证据并停止。
 
@@ -140,3 +140,12 @@ reader会先读取当前run已有输出，再自动跟踪后续阶段/模型的�
 校验contract新增fisher_dtype=torch.bfloat16，通过AST核对生产保存语句；矩阵形状、完整28层/7模块、所有rank、有限值、prepared checkpoint及字节SHA检查保留。异常明确打印实际type/shape/dtype，生产保存语句改变时要求审查schema。回归直接执行真实collector保存转换及真实_to_save映射，创建四rank文件，重现旧FP32检查误拒，验证修复后查找/准入/独立复制及字节一致。相关51项CPU测试通过，没有本地新增GPU实验或服务器正式完整通过结论。
 
 两次20261013四卡precompute目录中的缓存保留，更新后先只用CPU核验现有缓存，再启动新的正式run目录。不要将已生成的缓存删除后重新运行Stage0来绕过校验问题。
+
+
+## 2026-10-13：默认共享大文件，取消每臂复制
+
+默认cache-mode=auto、cache-storage=shared。匹配缓存和prepared权重通过硬链接复用同一份磁盘数据，跨文件系统使用文件软链接；两者均不可用时拒绝启动，不默默退回复制。static_cache下仍保留相同文件名，供原加载器和完整SHA审查使用；每臂单独保存source_model路径别名元数据，并在shared_cache_reference.json记录链接源/目标/类型以及additional_bulk_payload_bytes=0。一个目录单独统计的逻辑文件大小可能仍很大，实际新增的大文件数据块为零。
+
+Fisher分片缺失或卡数改变时，控制器会独立查找相同模型身份、旋转配置、序列长度和架构的prepared模型，将它共享给一次性Stage0；该次只新生成所需Fisher，不重复保存已有prepared权重。来源字节使用前后完整核验；共享模型路径禁止prepared checkpoint写入，缓存命中禁止再次收集Fisher。共享只读指实验加载流程：外部程序仍不得写这些引用的源文件，修改会触发SHA拒绝。
+
+日志、显存采样、配置、SHA清单和少量私有元数据仍占空间，首次缺失数据必须保存新缓存；显式cache-mode=fresh为了独立测量预计算仍生成各臂统计，不能称零磁盘增长。显式cache-storage=copy保留旧独立复制策略。默认启动无需新参数，若希望命令明确，可追加--cache-storage shared。57项初版、61项完整CPU回归通过；真实safetensors/torch.load（普通和mmap）加载后内存修改不改来源字节；无新本地GPU实验。原旧副本不自动去重或删除。

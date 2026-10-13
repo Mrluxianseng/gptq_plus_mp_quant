@@ -88,7 +88,7 @@ def build_entry():
     source = install_entry_audit(source)
     anchor = "runpy.run_path('ptq.py', run_name='__main__')"
     assert source.count(anchor) == 1
-    guard = "def _forbid_precompute(*args, **kwargs):\n    raise RuntimeError('cache-only stage must consume its verified cache')\nif '--exit_after_precompute' not in sys.argv or os.environ.get('RESEARCH_IMPORTED_STATIC_CACHE') == '1':\n    impl.collect_static_end_to_end_saliency_and_fisher=_forbid_precompute\n\n"
+    guard = "def _forbid_precompute(*args, **kwargs):\n    raise RuntimeError('cache-only stage must consume its verified cache')\nif '--exit_after_precompute' not in sys.argv or os.environ.get('RESEARCH_IMPORTED_STATIC_CACHE') == '1':\n    impl.collect_static_end_to_end_saliency_and_fisher=_forbid_precompute\nif ('--exit_after_precompute' not in sys.argv and os.environ.get('RESEARCH_SHARED_STATIC_CACHE') == '1') or os.environ.get('RESEARCH_SHARED_PREPARED_CHECKPOINT') == '1':\n    from utils import model_utils as _shared_model_utils\n    _shared_model_utils._save_prepared_checkpoint=_forbid_precompute\n\n"
     source = source.replace(anchor, guard + anchor)
     compile(source, 'formal_storage_entry', 'exec')
     return source
@@ -284,6 +284,8 @@ def parser():
     p.add_argument('--timeout-seconds', type=int, default=86400)
     p.add_argument('--cache-mode', choices=('auto', 'fresh'), default='auto',
                    help='auto: reuse compatible complete cache, otherwise precompute once per model; compare Stage2 only. fresh: precompute separately in every arm and compare the complete workflow.')
+    p.add_argument('--cache-storage', choices=('shared', 'copy'), default='shared',
+                   help='shared: reference large cache/prepared files without copying; copy: legacy independent per-arm copies.')
     p.add_argument('--cache-search-root', action='append', default=[],
                    help='Additional directory containing old per-rank caches; repeat for multiple locations. Defaults also scan repo/cache and repo/outputs.')
     return p
@@ -330,7 +332,8 @@ def main():
                 launcher = [sys.executable, '-u', str(ROOT/'tools/run_storage_method_pipeline.py'),
                             '--stage0-manifest', str(manifests[0]), '--stage2-manifest', str(manifests[1]),
                             '--tag', tag, '--timeout-seconds', str(args.timeout_seconds),
-                            '--exact-phase-peaks', '--gpu-indices', args.devices]
+                            '--exact-phase-peaks', '--gpu-indices', args.devices,
+                            '--cache-storage', args.cache_storage]
                 jobs.append(dict(model=model, pair=pair, side=side, tag=tag, launcher=launcher,
                                  result=str(ROOT/'outputs'/('full_pipeline_profile_'+tag))))
         if args.cache_mode == 'auto':
@@ -357,6 +360,7 @@ def main():
          entry_sha256=sha(entry), environment={k: env[k] for k in ('CUDA_VISIBLE_DEVICES', 'PYTORCH_ALLOC_CONF', 'NCCL_SHM_DISABLE', 'OMP_NUM_THREADS', 'PYTHONUNBUFFERED')},
          jobs=jobs, cache_mode=args.cache_mode, measurement_scope='stage2_cached' if args.cache_mode == 'auto' else 'full_pipeline',
          cache_search_roots=[str(p) for p in search_roots], optional_precompute_jobs=warm_jobs,
+         cache_storage=args.cache_storage,
          note='Auto cache uses one matching complete cache for both arms; precompute is recorded separately. Fresh mode measures Stage0 per arm. No pilot canonical hashes reused as formal references.'))
     print(f'Plan: {out / "plan.json"}\n2048x2048 defaults; group_parallel_quant=none; GPUs={args.devices}; cache={args.cache_mode}', flush=True)
     if args.dry_run:
@@ -420,6 +424,10 @@ def main():
                 else:
                     warm = warm_jobs[job['model']]
                     extra = ['--initial-cache', admitted['directory']] if admitted else []
+                    prepared = cache_manager.find_prepared(search_roots, expected)
+                    if prepared and not (admitted and admitted['prepared']):
+                        extra += ['--reuse-prepared', prepared['directory']]
+                        print('[cache] reusing existing prepared model: '+prepared['prepared'], flush=True)
                     print('[cache] HIT shards; preparing model without recomputing Fisher' if admitted else '[cache] MISS; precomputing once for this model', flush=True)
                     launch(warm, extra)
                     warm_status = read(Path(warm['result'])/'status.json')
@@ -430,9 +438,11 @@ def main():
                     admitted = cache_manager.validate(verified, expected, require_prepared=True)
                     ready_caches[job['model']] = str(directory)
                     status['precomputations'].append(dict(model=job['model'], result=warm['result'], status_sha256=sha(Path(warm['result'])/'status.json'),
-                                                         reused_old_shards=bool(extra), measured_in_pair=False))
+                                                         reused_old_shards='--initial-cache' in extra,
+                                                         reused_prepared='--reuse-prepared' in extra, measured_in_pair=False))
                 remaining_arms = sum(1 for future in jobs[job_index:] if future['model'] == job['model'])
-                disk_preflight = cache_manager.preflight_snapshots(admitted, ROOT/'outputs', remaining_arms)
+                preflight = cache_manager.preflight_shared_views if args.cache_storage == 'shared' else cache_manager.preflight_snapshots
+                disk_preflight = preflight(admitted, ROOT/'outputs', remaining_arms)
                 save(out/f"cache_disk_preflight_{job['model']}.json", disk_preflight)
                 print(f"[cache] disk preflight for {remaining_arms} remaining arms: {disk_preflight}", flush=True)
                 save(out/f"cache_ready_{job['model']}.json", admitted)

@@ -2124,3 +2124,14 @@ NEW outputs/realq-final-complete-acceptance-20261012-v1/fresh_memory_six_pair_su
 效果/验证：回归直接执行生产collector的BF16转换语句及生产_to_save映射再torch.save，四rank28层fixture重现旧FP32判定错误，修复后候选发现/准入/独立副本字节SHA一致；未来生产存储表达式改变、缺层/模块/Fisher、错形状/dtype、NaN或损坏继续拒绝。WSL相关51CPUtests passed in33.62s，GPU未初始化，没有新本地GPU实验。服务器原样缓存仍待用户侧CPU完整核验，未称正式四臂通过。
 
 评价/反思/后续：此前只按第一条异常修源码绑定，没有验证缓存生产者与消费者契约，造成重复Stage0和额外磁盘占用，必须纠正遗漏。两次四卡已生成缓存保留，先服务器CPU核验新目录后再新正式控制器启动，后续Stage2数值/多rank所有权/覆盖/来源/每区间每point/global验收继续执行。失败附件和CPU验收摘要保存在outputs/storage-method-cache-bf16-repair-20261013-v1；用户授权修复推送至mine/realq-warmadam。此修复非新显存收益或正式配置结论。
+
+
+### 2026-10-13：正式实验磁盘缓存/模型共享
+
+瓶颈/依据：用户服务器存储不足，prepared旋转模型及多rank Fisher在每次启动、每个control/candidate实验臂独立复制；0.6B每个臂约14GiB，1.7B更大。prepared是融合LayerNorm/旋转后未量化模型，读取同一来源足够，不必每臂再复制。源模型原件与prepared有区别，不能直接把原件替代旋转权重。存储共享基于同一inode硬链接、跨文件系统文件软链接与加载器内存私有数据，不是新的量化或显存优化算法。
+
+具体方法：默认cache-storage=shared，static_cache仅引用原已验证Fisher和prepared文件；只对source_model别名metadata创建小私有副本。保留文件名、所有rank/层/module/有限值/SHA、method/quality/global验收。每臂shared_cache_reference.json记录源/目标、link类型、新增大型payload字节0；旧独立snapshot仅显式copy模式。shared视图无法建立链接时拒绝，不回退大文件复制。磁盘预检改按小目录/元数据预算+headroom，不再为每臂要求完整14GiB副本。卡数变化或Fisher缺失仍独立查找兼容prepared模型并引用，Stage0只新写Fisher；Fisher完整命中仍省略Stage0。生成入口禁止共享prepared写入，所有来源前后完整SHA不变才通过。
+
+效果/验证：61项WSL CPUtests通过，包括完整四rank28层BF16生产保存表达式、两arm硬链接同inode/私有metadata、跨FS软链接/两种共享都失败时拒绝复制、source变动拒绝、生产保存守卫、同model/rotation prepared跨卡数复用而Fisher不误复用、实际pipeline precompute共享prepared后只生成新Fisher、两CPU进程meta所有权/完整process峰与总日志。实际safetensors.load_file及torch.load普通/mmap加载后修改内存权重/Fisher，来源SHA仍相同。无新本地CUDA实验，无新正式GPU结果或显存收益。CPU证据保存在outputs/storage-method-shared-storage-cpu-20261013-v1；已有失败/缓存/副本不改不删。
+
+评价/反思：此前独立复制便于来源审查，但非必须且忽略用户磁盘限制。现在共享输入与独立验收记录分离；hardlink目录单独du可能仍计完整逻辑大小，不能当新数据块，需按inode去重计真实占用。日志/profile/少量metadata仍增长，首次缺失配置必须保存一份新cache，fresh每臂重算属于明确独立测量而非默认复用，不能承诺所有目录字节零增长。改动下次启动生效，不中途修改服务器活动绑定文件；交付mine/realq-warmadam，用户原授权推送。

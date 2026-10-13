@@ -286,3 +286,8 @@ NEW outputs/realq-final-complete-acceptance-20261012-v1/fresh_memory_six_pair_su
 ### 2026-10-13：缓存接口真实保存格式回归要求
 
 服务器03:14四卡Stage0正常结束，新增缓存检查误将FP32累积dtype要求施加于实际BF16持久化矩阵，误拒layer0；旧测试也用FP32手造缓存。新增contract按生产AST绑定BF16保存表达式，完整检查形状/层/module/rank/有限值/prepared/SHA，错误含实际dtype。回归必须执行生产转换及_to_save映射后真实torch.save，四rank完整文件准入/独立复制字节一致，错误dtype/缺失/损坏等仍拒绝；51项CPU测试通过。保留旧缓存并先CPU完整核验再重启正式任务，不为绕过接口bug重算或改生产精度；CPU通过非正式GPU完整验收。完整记录见主日志同日Fisher缓存准入误拒修复。
+
+
+### 2026-10-13：共享磁盘输入的独立验收
+
+默认正式auto缓存/模型大文件为shared引用，不再每臂复制；单独source_model元数据仍私有，shared_cache_reference.json记录link与additional_bulk_payload_bytes=0。共享source前后SHA、完整每rank/层/module/有限值、prepared身份/旋转/架构、真实数值与显存原验收继续执行，不能因两臂同源免除质量与method检查。生产加载的safetensors和torch.load普通/mmap内存修改不可写回来源；共享prepared写入和命中后再precompute禁止。61项CPU回归通过，无新GPU结果。日志/profile和新配置首次生成数据仍占空间；原副本不自动清理。

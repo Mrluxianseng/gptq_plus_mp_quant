@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Formal W4A16: serial 0.6B C/N then 1.7B C/N, auto-admit a matching cache.
+# Formal W4A16: serial 0.6B C/N then 1.7B C/N; share matching cache/model files.
 set -Eeuo pipefail
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 cd "$ROOT_DIR"

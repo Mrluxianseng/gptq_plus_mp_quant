@@ -223,7 +223,8 @@ def test_actual_pipeline_main_selects_owner_and_requires_all_rank_peaks(tmp_path
     assert len(status['state_metrics_by_rank']) == 2
 
 
-def test_cached_pipeline_skips_stage0_without_fake_peak(tmp_path, monkeypatch):
+@pytest.mark.parametrize('storage', ['shared', 'copy'])
+def test_cached_pipeline_skips_stage0_without_fake_peak(tmp_path, monkeypatch, storage):
     """A cache hit launches only Stage2 and records no invented Stage0 peak."""
     monkeypatch.setattr(pipeline, 'ROOT', tmp_path)
     for name in pipeline.TRACKED:
@@ -244,7 +245,7 @@ def test_cached_pipeline_skips_stage0_without_fake_peak(tmp_path, monkeypatch):
     source_cache = tmp_path/'old-cache'
     source_cache.mkdir()
     monkeypatch.setattr(sys, 'argv', ['profile', '--stage0-manifest', str(stage0), '--stage2-manifest', str(stage2),
-                                     '--tag', 'cached-fixture', '--reuse-cache', str(source_cache)])
+                                     '--tag', 'cached-fixture', '--reuse-cache', str(source_cache), '--cache-storage', storage])
     monkeypatch.setattr(pipeline, 'cache_contract', lambda _: {})
     monkeypatch.setattr(pipeline, 'cache_candidates', lambda *_args, **_kwargs: [
         {'directory': source_cache.resolve(), 'shards': {}, 'prepared': source_cache}])
@@ -252,7 +253,7 @@ def test_cached_pipeline_skips_stage0_without_fake_peak(tmp_path, monkeypatch):
     def snapshot(_admitted, destination):
         destination.mkdir(parents=True)
         (destination/'rank.pt').write_bytes(b'validated fixture')
-    monkeypatch.setattr(pipeline, 'snapshot_cache', snapshot)
+    monkeypatch.setattr(pipeline, 'share_cache' if storage == 'shared' else 'snapshot_cache', snapshot)
     monkeypatch.setattr(pipeline, 'verify_inventory', lambda _: None)
     def monitor(*args, **kwargs):
         kwargs['stdout'].write('2026/10/13 00:00:00.000, 100, 8000, 1, 0, GPU-fixture\n')
@@ -283,3 +284,5 @@ def test_cached_pipeline_skips_stage0_without_fake_peak(tmp_path, monkeypatch):
     assert status['stage0'] == {'returncode': None, 'skipped': 'validated_cache_reuse', 'measured': False}
     assert status['stage0_process_peak_allocated_bytes'] is None
     assert status['full_process_peak_allocated_bytes'] == 100
+    manifest = json.loads((tmp_path/'outputs/full_pipeline_profile_cached-fixture/manifest.json').read_text())
+    assert manifest['cache_storage'] == storage

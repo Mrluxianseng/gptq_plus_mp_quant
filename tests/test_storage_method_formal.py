@@ -127,6 +127,8 @@ def test_dry_run_defaults_to_auto_cache_and_labels_scope(tmp_path, monkeypatch):
     runner.main()
     plan = json.loads((output/'plan.json').read_text())
     assert plan['cache_mode'] == 'auto'
+    assert plan['cache_storage'] == 'shared'
+    assert all(job['launcher'][-2:] == ['--cache-storage', 'shared'] for job in plan['jobs'])
     assert plan['measurement_scope'] == 'stage2_cached'
     assert set(plan['optional_precompute_jobs']) == {'qwen06b', 'qwen17b'}
     assert Path(plan['cache_search_roots'][0]) == runner.ROOT/'cache'
@@ -151,3 +153,28 @@ def test_formal_source_binding_excludes_unrelated_tools_and_includes_dependencie
     assert 'tools/activation_replay_stats_lifetime_prototype.py' in paths
     assert 'tools/storage_method_cache.py' in paths
     assert not any(name.startswith('tools/') and not (runner.ROOT/name).is_file() for name in paths)
+
+
+@pytest.mark.parametrize('stage0', [False, True])
+@pytest.mark.parametrize('prepared_shared', [False, True])
+def test_shared_stage2_forbids_prepared_checkpoint_writer(monkeypatch, stage0, prepared_shared):
+    from utils import model_utils
+    writer = lambda *args, **kwargs: 'prepared-writing-fixture'
+    monkeypatch.setattr(model_utils, '_save_prepared_checkpoint', writer)
+    monkeypatch.setenv('RESEARCH_SHARED_STATIC_CACHE', '1')
+    monkeypatch.setenv('RESEARCH_SHARED_PREPARED_CHECKPOINT', '1' if prepared_shared else '0')
+    monkeypatch.setattr('sys.argv', ['entry.py', *(['--exit_after_precompute'] if stage0 else [])])
+    tree = ast.parse(runner.build_entry())
+    guard = next(node for node in tree.body if isinstance(node, ast.If)
+                 and 'RESEARCH_SHARED_STATIC_CACHE' in ast.unparse(node.test))
+    definition = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                      and node.name == '_forbid_precompute')
+    import os
+    import sys
+    exec(compile(ast.Module(body=[definition, guard], type_ignores=[]), 'shared_checkpoint_guard', 'exec'),
+         dict(os=os, sys=sys))
+    if stage0 and not prepared_shared:
+        assert model_utils._save_prepared_checkpoint() == 'prepared-writing-fixture'
+    else:
+        with pytest.raises(RuntimeError, match='consume its verified cache'):
+            model_utils._save_prepared_checkpoint()

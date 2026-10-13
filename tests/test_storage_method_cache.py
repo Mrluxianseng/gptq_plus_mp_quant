@@ -1,8 +1,10 @@
 """Cache admission, immutable copies, and honest cached comparison scope."""
 from copy import deepcopy
 import ast
+import errno
 from functools import lru_cache
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -161,6 +163,146 @@ def test_future_production_fisher_dtype_change_requires_schema_review():
                             'static_fisher.append(fisher_mean.to(torch.float32).cpu())')
     with pytest.raises(ValueError, match='storage expression changed'):
         cache.production_fisher_dtype(ast.parse(source))
+
+
+def test_shared_views_store_one_payload_and_private_alias_metadata(tmp_path, monkeypatch):
+    expected, _ = expected_fixture(tmp_path, world=4)
+    source = write_cache(tmp_path/'shared-source', expected)
+    admitted = cache.validate(next(cache.candidates([source], expected)), expected, require_prepared=True)
+    before = dict(admitted['sha256'])
+    def forbid_copy(*args, **kwargs):
+        pytest.fail('Shared storage must never copy a large file')
+    monkeypatch.setattr(cache.shutil, 'copy2', forbid_copy)
+    monkeypatch.setattr(cache.shutil, 'copytree', forbid_copy)
+    stored_inodes = {(Path(name).stat().st_dev, Path(name).stat().st_ino) for name in before}
+    view_inodes = set()
+    for side in ('control', 'candidate'):
+        view = cache.shared_view(admitted, tmp_path/side/'static_cache')
+        found = next(cache.candidates([view], expected))
+        cache.validate(found, expected, require_prepared=True)
+        for rank, original in admitted['shards'].items():
+            assert os.path.samefile(found['shards'][int(rank)], original)
+        model = found['prepared']/'model.safetensors'
+        assert os.path.samefile(model, Path(admitted['prepared'])/'model.safetensors')
+        # Actual file-backed tensor readers must keep in-memory quantization
+        # updates from writing through shared filesystem references.
+        from safetensors.torch import load_file
+        tensors = load_file(str(model), device='cpu')
+        next(iter(tensors.values())).add_(1)
+        for mmap in (False, True):
+            loaded = torch.load(found['shards'][0], map_location='cpu', weights_only=True, mmap=mmap)
+            loaded['fisher'][0].add_(1)
+        cache.verify_inventory(before)
+        metadata = found['prepared']/'gptqplus_fsdp_meta_checkpoint.json'
+        assert not os.path.samefile(metadata, Path(admitted['prepared'])/metadata.name)
+        assert cache.read(metadata)['source_model'] == expected['model']
+        view_inodes.update((p.stat().st_dev, p.stat().st_ino) for p in view.rglob('*')
+                           if p.is_file() and p.name != metadata.name)
+        report = cache.read(view.parent/'shared_cache_reference.json')
+        assert report['additional_bulk_payload_bytes'] == 0
+        assert report['private_metadata_bytes'] == metadata.stat().st_size
+        assert all(r['kind'] == 'hardlink' for r in report['references'])
+    # Across two complete four-rank arm views, every large payload is still
+    # one physical inode. Source metadata is untouched, including its alias.
+    assert view_inodes.issubset(stored_inodes)
+    cache.verify_inventory(before)
+    assert cache.read(Path(admitted['prepared'])/'gptqplus_fsdp_meta_checkpoint.json')['source_model'] == '/old/path/alias'
+    budget = cache.preflight_shared_views(admitted, tmp_path, 20)
+    assert budget['additional_bulk_payload_bytes'] == 0 and budget['view_count'] == 20
+
+
+def test_shared_fallback_uses_symlinks_and_never_silently_copies(tmp_path, monkeypatch):
+    expected, _ = expected_fixture(tmp_path)
+    source = write_cache(tmp_path/'shared-source', expected)
+    admitted = cache.validate(next(cache.candidates([source], expected)), expected, require_prepared=True)
+    def no_hardlink(*args, **kwargs):
+        raise OSError(errno.EXDEV, 'cross-device fixture')
+    monkeypatch.setattr(cache.os, 'link', no_hardlink)
+    view = cache.shared_view(admitted, tmp_path/'linked-arm/static_cache')
+    found = next(cache.candidates([view], expected))
+    cache.validate(found, expected, require_prepared=True)
+    assert all(path.is_symlink() for path in found['shards'].values())
+    assert (found['prepared']/'model.safetensors').is_symlink()
+    def no_symlink(*args, **kwargs):
+        raise OSError(errno.EPERM, 'unsupported filesystem fixture')
+    monkeypatch.setattr(Path, 'symlink_to', no_symlink)
+    with pytest.raises(RuntimeError, match='refusing a large copy'):
+        cache.shared_view(admitted, tmp_path/'unsupported-arm/static_cache')
+    cache.verify_inventory(admitted['sha256'])
+
+
+def test_shared_source_mutation_is_rejected(tmp_path):
+    expected, _ = expected_fixture(tmp_path)
+    source = write_cache(tmp_path/'shared-source', expected)
+    admitted = cache.validate(next(cache.candidates([source], expected)), expected, require_prepared=True)
+    cache.shared_view(admitted, tmp_path/'arm/static_cache')
+    path = Path(next(iter(admitted['shards'].values())))
+    path.write_bytes(b'mutated fixture cache')
+    with pytest.raises(RuntimeError, match='Cache source changed'):
+        cache.verify_inventory(admitted['sha256'])
+
+
+def test_prepared_model_reused_across_world_change_without_reusing_fisher(tmp_path):
+    expected, command = expected_fixture(tmp_path, world=2)
+    source = write_cache(tmp_path/'cache/old-world2', expected)
+    world4 = cache.contract([arg.replace('--nproc_per_node=2', '--nproc_per_node=4') for arg in command])
+    assert not list(cache.candidates([tmp_path/'cache'], world4))
+    prepared = cache.find_prepared([tmp_path/'cache'], world4)
+    assert prepared is not None and prepared['shards'] == {}
+    view = cache.shared_view(prepared, tmp_path/'new-world4/static_cache')
+    assert not list(view.glob('*.pt'))
+    model = cache.checkpoint(view, world4)
+    assert model and os.path.samefile(model/'model.safetensors', Path(prepared['prepared'])/'model.safetensors')
+    assert cache.read(model/'gptqplus_fsdp_meta_checkpoint.json')['source_model'] == world4['model']
+    changed = dict(world4, rotation_identity='different rotation')
+    assert cache.find_prepared([tmp_path/'cache'], changed) is None
+
+
+def test_actual_precompute_pipeline_shares_prepared_and_writes_only_new_fisher(tmp_path, monkeypatch):
+    from tools import run_storage_method_pipeline as pipeline
+    import sys
+    expected, stage0_command = expected_fixture(tmp_path)
+    source = write_cache(tmp_path/'old-cache', expected)
+    prepared = cache.prepared_admission(source, expected)
+    monkeypatch.setattr(pipeline, 'ROOT', tmp_path)
+    for name in pipeline.TRACKED:
+        path = tmp_path/name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('CPU fixture source')
+    (tmp_path/'entry.py').write_text(formal.build_entry())
+    s0, s2 = tmp_path/'stage0.json', tmp_path/'stage2.json'
+    s0.write_text(json.dumps(dict(command=stage0_command)))
+    stage2 = [v for v in stage0_command if v not in ('--fsdp_precompute', '--exit_after_precompute')]
+    s2.write_text(json.dumps(dict(command=stage2)))
+    monkeypatch.setattr(sys, 'argv', ['pipeline', '--stage0-manifest', str(s0), '--stage2-manifest', str(s2),
+                                     '--tag', 'reuse-prepared-fixture', '--stage0-only', '--reuse-prepared', str(source)])
+    def monitor(*args, **kwargs):
+        kwargs['stdout'].write('2026/10/13 00:00:00.000, 100, 8000, 1, 0, GPU-fixture\n')
+        kwargs['stdout'].flush()
+        return SimpleNamespace(terminate=lambda: None, wait=lambda **_: 0)
+    monkeypatch.setattr(pipeline.subprocess, 'Popen', monitor)
+    monkeypatch.setattr(pipeline, 'profile_rows', lambda *args, **kwargs: [])
+    def stage(name, command, root, env, log, *args):
+        assert name == 'stage0' and env['RESEARCH_IMPORTED_STATIC_CACHE'] == '0'
+        assert env['RESEARCH_SHARED_PREPARED_CHECKPOINT'] == '1'
+        out = Path(env['RESEARCH_RUN_DIR'])
+        view = Path(command[command.index('--static_cache_path')+1])
+        assert not list(view.glob('*.pt'))
+        model = cache.checkpoint(view, expected)
+        assert model and os.path.samefile(model/'model.safetensors', Path(prepared['prepared'])/'model.safetensors')
+        for rank in range(expected['world']):
+            torch.save(payload(expected), view/(expected['model_name']+expected['suffix']+f'_rank{rank}.pt'))
+            (out/f'process_allocator_peak_stage0_rank{rank}.json').write_text(json.dumps(
+                dict(rank=rank, stage='stage0', peak_allocated_bytes=100, peak_reserved_bytes=200,
+                     scope='complete_process_through_evaluation')))
+        log.write_text('CPU fixture: new Fisher generated from shared prepared model')
+        return dict(returncode=0)
+    monkeypatch.setattr(pipeline, 'run_stage', stage)
+    pipeline.main()
+    out = tmp_path/'outputs/full_pipeline_profile_reuse-prepared-fixture'
+    assert cache.read(out/'status.json')['valid']
+    cache.validate(next(cache.candidates([out/'static_cache'], expected)), expected, require_prepared=True)
+    cache.verify_inventory(prepared['sha256'])
 
 
 def test_shards_without_prepared_model_require_preparation(tmp_path):

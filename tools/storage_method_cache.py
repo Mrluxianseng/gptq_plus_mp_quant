@@ -9,6 +9,7 @@ import hashlib
 import ast
 import json
 import os
+import errno
 from pathlib import Path
 import shutil
 
@@ -168,7 +169,7 @@ def checkpoint(directory, expected):
     return None
 
 
-def candidates(roots, expected):
+def cache_directories(roots):
     seen = set()
     for root in roots:
         root = Path(root).resolve()
@@ -178,16 +179,38 @@ def candidates(roots, expected):
             if directory in seen:
                 continue
             seen.add(directory)
-            files = {}
-            for rank in range(expected['world']):
-                suffix = expected['suffix']+f'_rank{rank}.pt'
-                matches = sorted(p for p in directory.glob('*.pt') if p.name.endswith(suffix))
-                if not matches:
-                    break
-                canonical = directory/(expected['model_name']+suffix)
-                files[rank] = canonical if canonical in matches else matches[0]
-            if len(files) == expected['world']:
-                yield dict(directory=directory, shards=files, prepared=checkpoint(directory, expected))
+            yield directory
+
+
+def prepared_admission(directory, expected):
+    prepared = checkpoint(directory, expected)
+    if prepared is None:
+        raise ValueError('Prepared checkpoint missing/incomplete or incompatible')
+    inventory = {str(path): sha(path) for path in sorted(prepared.rglob('*')) if path.is_file()}
+    return dict(directory=str(Path(directory).resolve()), shards={}, prepared=str(prepared),
+                sha256=inventory, contract=expected)
+
+
+def find_prepared(roots, expected):
+    """Prepared weights depend on model/rotation, not Fisher's rank layout."""
+    for directory in cache_directories(roots):
+        if checkpoint(directory, expected) is not None:
+            return prepared_admission(directory, expected)
+    return None
+
+
+def candidates(roots, expected):
+    for directory in cache_directories(roots):
+        files = {}
+        for rank in range(expected['world']):
+            suffix = expected['suffix']+f'_rank{rank}.pt'
+            matches = sorted(p for p in directory.glob('*.pt') if p.name.endswith(suffix))
+            if not matches:
+                break
+            canonical = directory/(expected['model_name']+suffix)
+            files[rank] = canonical if canonical in matches else matches[0]
+        if len(files) == expected['world']:
+            yield dict(directory=directory, shards=files, prepared=checkpoint(directory, expected))
 
 
 def validate_payload(path, expected):
@@ -257,6 +280,87 @@ def preflight_snapshots(admitted, destination_root, count, reserve_bytes=1024**3
     if not result['sufficient']:
         raise RuntimeError('Insufficient disk for all remaining independent cache copies: '+repr(result))
     return result
+
+
+def preflight_shared_views(admitted, destination_root, count, reserve_bytes=1024**3):
+    """Reserve only small directory/metadata views, never another payload copy."""
+    # File/directory entry overhead varies by filesystem. Budget 8KiB per
+    # referenced file plus one private metadata record per arm, and headroom.
+    per_view = (len(admitted['sha256']) + 4)*8192
+    required = count*per_view + reserve_bytes
+    free = shutil.disk_usage(destination_root).free
+    result = dict(storage='shared', view_count=count,
+                  shared_source_bytes=sum(Path(p).stat().st_size for p in admitted['sha256']),
+                  additional_bulk_payload_bytes=0, estimated_bytes_per_view=per_view,
+                  required_free_bytes=required, free_bytes=free, sufficient=free >= required)
+    if not result['sufficient']:
+        raise RuntimeError('Insufficient disk for small shared cache views: '+repr(result))
+    return result
+
+
+def _reference_file(source, target):
+    """Keep the same stored bytes; unsupported sharing must never become a copy."""
+    source = Path(source).resolve(strict=True)
+    try:
+        os.link(source, target)
+        return 'hardlink'
+    except OSError as exc:
+        if exc.errno not in {errno.EXDEV, errno.EPERM, errno.EACCES, errno.ENOSYS,
+                             errno.EOPNOTSUPP}:
+            raise
+    try:
+        Path(target).symlink_to(source)
+    except OSError as exc:
+        raise RuntimeError('Shared cache requires hardlinks or symlinks; refusing a large copy') from exc
+    return 'symlink'
+
+
+def shared_view(admitted, destination):
+    """Reference large immutable inputs; keep only alias metadata private.
+
+    Readers load tensors into memory, never write through these links. The
+    generated Stage2 entry forbids precompute/checkpoint writers and the runner
+    checks source bytes before/after use. Hardlinks also keep bytes accessible
+    when an obsolete source directory is later removed.
+    """
+    destination = Path(destination)
+    destination.mkdir(parents=True, exist_ok=False)
+    verify_inventory(admitted['sha256'])
+    expected = admitted['contract']
+    records = []
+    for rank, name in admitted['shards'].items():
+        target = destination/(expected['model_name']+expected['suffix']+f'_rank{rank}.pt')
+        records.append(dict(source=str(Path(name).resolve()), target=str(target),
+                            kind=_reference_file(name, target), bytes=Path(name).stat().st_size))
+    private_bytes = 0
+    if admitted['prepared']:
+        prepared = Path(admitted['prepared'])
+        target_root = destination/'_prepared_checkpoints'/(expected['model_name']+'_rot_'+expected['rotation_tag'])
+        for name in admitted['sha256']:
+            path = Path(name)
+            try:
+                relative = path.relative_to(prepared)
+            except ValueError:
+                continue
+            target = target_root/relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if relative.as_posix() == 'gptqplus_fsdp_meta_checkpoint.json':
+                # The production readiness check requires the current model
+                # path alias. Never mutate shared metadata to normalize it.
+                meta = read(path)
+                meta['source_model'] = expected['model']
+                target.write_text(json.dumps(meta, indent=2), encoding='utf-8')
+                private_bytes += target.stat().st_size
+            else:
+                records.append(dict(source=str(path.resolve()), target=str(target),
+                                    kind=_reference_file(path, target), bytes=path.stat().st_size))
+    verify_inventory(admitted['sha256'])
+    report = dict(storage='shared', additional_bulk_payload_bytes=0,
+                  private_metadata_bytes=private_bytes, references=records,
+                  read_only_consumption=True, no_copy_fallback=True)
+    with (destination.parent/'shared_cache_reference.json').open('x', encoding='utf-8') as stream:
+        json.dump(report, stream, indent=2)
+    return destination
 
 
 def snapshot(admitted, destination):

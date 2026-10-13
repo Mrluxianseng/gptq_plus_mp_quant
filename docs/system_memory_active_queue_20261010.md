@@ -390,3 +390,8 @@ NEW outputs/realq-final-complete-acceptance-20261012-v1/fresh_memory_six_pair_su
 ### 2026-10-13：最新服务器缓存误拒已定位
 
 用户最新03:14日志：qwen06b-storage-formal-20261013-030440-bdd78042-precompute四卡Stage0成功571.657370531秒，之后校验误要求full FP32 Fisher在layer0退出，Stage2未启动。真实生产缓存为BF16；此前新旧缓存同类报错不能证明文件损坏。已CPU修复为生产AST绑定BF16存储schema，执行真实转换/保存映射回归，相关51tests通过，无新本地GPU实验。两次四卡缓存不删除，服务器先CPU核验全部rank/28层/SHA和prepared，再新目录启动正式运行；正式数值/覆盖/显存仍待完整验收。失败附件/CPU摘要在outputs/storage-method-cache-bf16-repair-20261013-v1；不沿用2694/2770作为当前活跃PID，只以服务器实际ps为准。
+
+
+### 2026-10-13：正式服务器默认共享缓存/模型
+
+用户明确要求每次实验不再复制大文件。新默认cache-storage=shared：Fisher及prepared权重硬链接同数据（跨FS软链接，不可用就拒绝，不fallback复制）；每臂仅私有路径元数据、日志/配置/验收。卡数变化/Fisher miss也引用匹配prepared，只新写必需Fisher。共享source前后SHA、写入守卫和原完整质量/多rank/区间point/global门槛保持；61CPUtests通过，真实load后内存更新source字节不变。outputs/storage-method-shared-storage-cpu-20261013-v1保存CPU证据，无新本地GPU。下次启动生效，原独立副本不删除，不改活动服务器源码；日志/profile仍增长，首次无匹配缓存仍需新数据。
