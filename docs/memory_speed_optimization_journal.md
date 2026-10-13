@@ -2146,3 +2146,11 @@ NEW outputs/realq-final-complete-acceptance-20261012-v1/fresh_memory_six_pair_su
 结果/验证：cache从6.5G到193M，outputs从31G到984M，仓库从约37G到1.3G，整个/output约56G到21G（du舍入）。54,951项保护条目全部存在且size/mtime/inode/链接目标未变，3个原始模型权重SHA全部一致。cache/outputs中无剩余超过100MiB文件。模型目录3.8G、huggingface7.4G、hf_cache269M、env7.8G保持。服务器当前branch realq-warmadam HEAD a1823ec，已含共享默认；未启动新GPU实验。
 
 证据/反思：服务器cleanup-generated-20261013-ssh-plan.json、cleanup-generated-result-20261013-061826-102208.jsonl、cleanup-protected-before/after-20261013.json已保留并只读取回本机outputs/server-generated-cleanup-20261013-v1。平台显示额度可能延迟更新，共享文件统计必须区分实际数据块与逻辑路径。清理是磁盘管理，不是显存收益；由于缓存/prepared已删除，下次正式启动必须重新生成一份，共享设置继续避免后续各臂复制。没有修改旧失败status/量化数学或借删除制造通过结论。
+
+### 2026-10-13：正式控制器 job_index 未赋值修复
+
+失败/归因：用户服务器Stage0生成缓存后，run_storage_method_formal.py剩余实验臂磁盘预检引用job_index，实际--run循环未赋值而UnboundLocalError退出。此前索引误加在--dry-run循环中；旧测试覆盖计划和子流程但没有执行外层--run，属于控制器接入错误，不是GPU OOM、缓存损坏或量化方法失败。原失败日志、缓存和结果保留。
+
+方法/验证：实际运行循环改为enumerate(jobs)，dry-run恢复普通循环；数学、校准、模型、共享缓存和验收规则均不变。新增真实main --run的四项CPU调度回归，覆盖auto缓存命中/成功预计算及shared/copy，两个模型各三对、12臂、每模型remaining_arms=6和交替顺序。修复前在实际主循环复现原异常（1 failed），修复后相关65项CPU回归全部通过，46.09秒。进程/缓存/质量结果由CPU fixture模拟只验证调度，不能算正式GPU成功；meta所有权、缓存原生产保存schema及日志仍由相关独立测试覆盖。输出保存outputs/formal-controller-job-index-repair-20261013-v1，不覆盖旧证据。
+
+评价/交付：此次遗漏应由外层控制器执行测试捕获，不能仅凭dry-run/compile宣布正式流程可靠。用户授权本地推送后服务器拉取；只在实际无实验进程时更新，不另启GPU、不清理新生成缓存。服务器SSH端口目前出现banner连接拒绝/超时，尚未完成拉取，后续以实际连接和HEAD核对为准。

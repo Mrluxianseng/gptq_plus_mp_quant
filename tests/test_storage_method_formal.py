@@ -178,3 +178,98 @@ def test_shared_stage2_forbids_prepared_checkpoint_writer(monkeypatch, stage0, p
     else:
         with pytest.raises(RuntimeError, match='consume its verified cache'):
             model_utils._save_prepared_checkpoint()
+
+
+@pytest.mark.parametrize('hit', [False, True])
+@pytest.mark.parametrize('storage', ['shared', 'copy'])
+def test_actual_run_auto_cache_preflight_and_all_model_pairs(tmp_path, monkeypatch, hit, storage):
+    """Run the real outer --run loop with CPU fixture pipeline processes.
+
+    Cache/schema, state/method and actual worker ownership have separate tests.
+    This regression specifically executes controller scheduling after a cache
+    hit or successful precompute, not just its --dry-run planning branch.
+    """
+    source = runner.build_entry()
+    root = tmp_path/'repo'
+    root.mkdir()
+    marker = root/'controller-source.py'
+    marker.write_text('unchanged CPU fixture source')
+    monkeypatch.setattr(runner, 'ROOT', root)
+    monkeypatch.setattr(runner, 'build_entry', lambda: source)
+    monkeypatch.setattr(runner, 'bound_source_paths', lambda: [marker])
+    models = []
+    directories, available = {}, {}
+    for name, hidden, intermediate in (('qwen06b', 1024, 3072), ('qwen17b', 2048, 6144)):
+        model = root/name
+        model.mkdir()
+        (model/'config.json').write_text(json.dumps(dict(hidden_size=hidden, intermediate_size=intermediate, num_hidden_layers=28)))
+        models.append(model)
+        directory = root/'cache'/name
+        directory.mkdir(parents=True)
+        (directory/'rank0.pt').write_bytes(b'CPU fixture cache')
+        prepared = directory/'_prepared_checkpoints'/name
+        prepared.mkdir(parents=True)
+        (prepared/'model.safetensors').write_bytes(b'CPU fixture weights')
+        directories[name], available[name] = directory, hit
+    output = root/'outputs/actual-run'
+    monkeypatch.setattr('sys.argv', ['formal', '--run', '--model06', str(models[0]), '--model17', str(models[1]),
+                                     '--devices', '0,1,2,3', '--output-directory', str(output),
+                                     '--repeats', '3', '--cache-storage', storage])
+    monkeypatch.setattr(runner.signal, 'signal', lambda *_: None)
+    monkeypatch.setattr(runner.cache_manager, 'contract', lambda command: {'model_name': Path(command[command.index('--model')+1]).name})
+    def candidates(roots, expected):
+        name = expected['model_name']
+        if not available[name]:
+            return []
+        directory = Path(roots[0]) if len(roots) == 1 else directories[name]
+        return [dict(directory=directory.resolve(), prepared=directory/'_prepared_checkpoints'/name, shards={0: directory/'rank0.pt'})]
+    monkeypatch.setattr(runner.cache_manager, 'candidates', candidates)
+    def validate(found, expected, **kwargs):
+        return dict(directory=str(found['directory']), prepared=str(found['prepared']), shards={str(k): str(v) for k,v in found['shards'].items()},
+                    sha256={str(p): runner.sha(p) for p in found['directory'].rglob('*') if p.is_file()}, contract=expected)
+    monkeypatch.setattr(runner.cache_manager, 'validate', validate)
+    monkeypatch.setattr(runner.cache_manager, 'find_prepared', lambda *_: None)
+    monkeypatch.setattr(runner.subprocess, 'check_output', lambda *args, **kwargs: '')
+    launches = []
+    class CPUProcess:
+        returncode = 0
+        def __init__(self, command, **kwargs):
+            tag = command[command.index('--tag')+1]
+            name = tag.split('-storage-formal-')[0]
+            warm = '--stage0-only' in command
+            launches.append((name, warm, list(command)))
+            directory = root/'outputs'/('full_pipeline_profile_'+tag)
+            directory.mkdir(parents=True)
+            if warm:
+                available[name] = True
+                cache = directory/'static_cache'
+                cache.mkdir()
+                (cache/'rank0.pt').write_bytes(b'CPU newly precomputed cache')
+                prepared = cache/'_prepared_checkpoints'/name
+                prepared.mkdir(parents=True)
+                (prepared/'model.safetensors').write_bytes(b'CPU newly prepared model')
+            (directory/'status.json').write_text(json.dumps(dict(valid=True, stage0=dict(returncode=0))))
+            kwargs['stdout'].write('CPU fixture pipeline completed\n')
+            kwargs['stdout'].flush()
+        def poll(self):
+            return 0
+    monkeypatch.setattr(runner.subprocess, 'Popen', CPUProcess)
+    audited = []
+    def audit(control, candidate, ranks, bindings):
+        audited.append((control, candidate))
+        return dict(valid=True, fixture='outer controller scheduling only')
+    monkeypatch.setattr(runner, 'audit_pair', audit)
+    runner.main()
+    status = runner.read(output/'status.json')
+    assert status['valid'] and len(status['completed_pairs']) == len(audited) == 6
+    assert len([row for row in launches if not row[1]]) == 12
+    assert len([row for row in launches if row[1]]) == (0 if hit else 2)
+    assert len(status['precomputations']) == (0 if hit else 2)
+    for name in directories:
+        budget = runner.read(output/f'cache_disk_preflight_{name}.json')
+        assert budget['view_count' if storage == 'shared' else 'snapshot_count'] == 6
+        assert runner.read(output/f'cache_ready_{name}.json')['prepared']
+        arms = [row[2] for row in launches if row[0] == name and not row[1]]
+        assert all('--reuse-cache' in argv for argv in arms)
+        assert ['candidate' if argv[argv.index('--tag')+1].endswith('candidate') else 'control' for argv in arms] == [
+            'control', 'candidate', 'candidate', 'control', 'control', 'candidate']

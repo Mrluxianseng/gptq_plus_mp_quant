@@ -291,3 +291,11 @@ NEW outputs/realq-final-complete-acceptance-20261012-v1/fresh_memory_six_pair_su
 ### 2026-10-13：共享磁盘输入的独立验收
 
 默认正式auto缓存/模型大文件为shared引用，不再每臂复制；单独source_model元数据仍私有，shared_cache_reference.json记录link与additional_bulk_payload_bytes=0。共享source前后SHA、完整每rank/层/module/有限值、prepared身份/旋转/架构、真实数值与显存原验收继续执行，不能因两臂同源免除质量与method检查。生产加载的safetensors和torch.load普通/mmap内存修改不可写回来源；共享prepared写入和命中后再precompute禁止。61项CPU回归通过，无新GPU结果。日志/profile和新配置首次生成数据仍占空间；原副本不自动清理。
+
+### 2026-10-13：正式控制器 job_index 未赋值修复
+
+失败/归因：用户服务器Stage0生成缓存后，run_storage_method_formal.py剩余实验臂磁盘预检引用job_index，实际--run循环未赋值而UnboundLocalError退出。此前索引误加在--dry-run循环中；旧测试覆盖计划和子流程但没有执行外层--run，属于控制器接入错误，不是GPU OOM、缓存损坏或量化方法失败。原失败日志、缓存和结果保留。
+
+方法/验证：实际运行循环改为enumerate(jobs)，dry-run恢复普通循环；数学、校准、模型、共享缓存和验收规则均不变。新增真实main --run的四项CPU调度回归，覆盖auto缓存命中/成功预计算及shared/copy，两个模型各三对、12臂、每模型remaining_arms=6和交替顺序。修复前在实际主循环复现原异常（1 failed），修复后相关65项CPU回归全部通过，46.09秒。进程/缓存/质量结果由CPU fixture模拟只验证调度，不能算正式GPU成功；meta所有权、缓存原生产保存schema及日志仍由相关独立测试覆盖。输出保存outputs/formal-controller-job-index-repair-20261013-v1，不覆盖旧证据。
+
+评价/交付：此次遗漏应由外层控制器执行测试捕获，不能仅凭dry-run/compile宣布正式流程可靠。用户授权本地推送后服务器拉取；只在实际无实验进程时更新，不另启GPU、不清理新生成缓存。服务器SSH端口目前出现banner连接拒绝/超时，尚未完成拉取，后续以实际连接和HEAD核对为准。

@@ -364,7 +364,7 @@ def main():
          note='Auto cache uses one matching complete cache for both arms; precompute is recorded separately. Fresh mode measures Stage0 per arm. No pilot canonical hashes reused as formal references.'))
     print(f'Plan: {out / "plan.json"}\n2048x2048 defaults; group_parallel_quant=none; GPUs={args.devices}; cache={args.cache_mode}', flush=True)
     if args.dry_run:
-        for job_index, job in enumerate(jobs):
+        for job in jobs:
             print(f"{job['model']} pair{job['pair']} {job['side']}: {job['result']}")
         return
     active = None
@@ -398,7 +398,7 @@ def main():
         if sha(entry) != read(out/'plan.json')['entry_sha256']:
             raise RuntimeError('Generated entry changed during run')
     try:
-        for job in jobs:
+        for job_index, job in enumerate(jobs):
             check_sources(bindings)
             if sha(entry) != read(out/'plan.json')['entry_sha256']:
                 raise RuntimeError('Generated entry changed')
