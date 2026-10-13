@@ -23,6 +23,7 @@ def fixture(tmp_path):
 def test_cleanup_preserves_original_models_data_logs_and_invalidates_prepared(tmp_path):
     root, file = fixture(tmp_path)
     fisher = file('cache/old/Qwen3_mainFisher_world4_rank0.pt')
+    logits = file('cache/ref_logits/Qwen3-0.6B_wikitext2_test_2048.cache')
     weights = file('outputs/old/static_cache/_prepared_checkpoints/Qwen3_rot/model.safetensors', b'weights')
     marker = file(str(weights.parent.relative_to(root))+'/_SUCCESS', b'ok')
     protected = [file('llmModels/Qwen3/model.safetensors'), file('outputs/final-model/model.safetensors'),
@@ -30,10 +31,10 @@ def test_cleanup_preserves_original_models_data_logs_and_invalidates_prepared(tm
                  file('cache/datasets/training.npy'), file('datasets/input.npy'),
                  file('env/lib/library.bin'), file('outputs/old/memory_profile.jsonl'), file('outputs/old/stage0.log')]
     plan = cleanup.make_plan(root, 1024)
-    assert {r['path'] for r in plan['files']} == {str(fisher), str(weights), str(marker)}
+    assert {r['path'] for r in plan['files']} == {str(fisher), str(logits), str(weights), str(marker)}
     audit = cleanup.apply_plan(plan, process_check=lambda: [])
     assert audit.is_file()
-    assert not fisher.exists() and not weights.exists() and not marker.exists()
+    assert not fisher.exists() and not logits.exists() and not weights.exists() and not marker.exists()
     assert all(p.is_file() and p.stat().st_size > 0 for p in protected)
 
 

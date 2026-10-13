@@ -395,3 +395,8 @@ NEW outputs/realq-final-complete-acceptance-20261012-v1/fresh_memory_six_pair_su
 ### 2026-10-13：正式服务器默认共享缓存/模型
 
 用户明确要求每次实验不再复制大文件。新默认cache-storage=shared：Fisher及prepared权重硬链接同数据（跨FS软链接，不可用就拒绝，不fallback复制）；每臂仅私有路径元数据、日志/配置/验收。卡数变化/Fisher miss也引用匹配prepared，只新写必需Fisher。共享source前后SHA、写入守卫和原完整质量/多rank/区间point/global门槛保持；61CPUtests通过，真实load后内存更新source字节不变。outputs/storage-method-shared-storage-cpu-20261013-v1保存CPU证据，无新本地GPU。下次启动生效，原独立副本不删除，不改活动服务器源码；日志/profile仍增长，首次无匹配缓存仍需新数据。
+
+
+### 2026-10-13：服务器旧生成大文件清理完成
+
+用户显式授权删除生成缓存和prepared权重。SSH已通过密码认证实际清理24项（8Fisher、10ref logits、3prepared权重及3完成标记），约释放35.44GiB。无活动formal/PTQ任务；仓库37G→1.3G、整个/output56G→21G。54,951保护条目无缺失/变化，3原始模型SHA不变，模型/数据/环境/日志保留。服务器HEAD a1823ec含共享默认，没有新GPU启动；下次需重生成一份Fisher/prepared。原始清理/保护报告在服务器仓库根及本机outputs/server-generated-cleanup-20261013-v1，详见主记录同日清理节。不再称此前两批四卡cache仍可复用；小日志/状态等失败证据仍保留。

@@ -18,7 +18,7 @@ import re
 import stat
 import subprocess
 
-PAYLOAD_EXTENSIONS = {'.pt', '.pth', '.npy', '.npz', '.pkl', '.pickle', '.dat', '.h5', '.hdf5'}
+PAYLOAD_EXTENSIONS = {'.pt', '.pth', '.npy', '.npz', '.pkl', '.pickle', '.dat', '.h5', '.hdf5', '.cache'}
 PREPARED_NAMES = {'_prepared_checkpoints', '_prepared_checkpoint', 'prepared_checkpoints', 'prepared_checkpoint'}
 PROTECTED_NAMES = {'tokens', 'data', 'dataset', 'datasets', 'models', 'llmmodels', 'huggingface', 'hf_cache', 'env', '.venv'}
 ACTIVE = re.compile(r'(?:^|[ /])(?:run_storage_method_formal\.(?:py|sh)|run_storage_method_pipeline\.py|'
@@ -52,6 +52,8 @@ def eligible(path, root, minimum):
     prepared = prepared_root(path, root)
     if prepared and path.suffix.lower() in {'.safetensors', '.bin', '.pt', '.pth'}:
         return True
+    if len(parts) > 2 and parts[:2] == ('cache', 'ref_logits'):
+        return path.stat().st_size >= minimum
     # Model weights outside a prepared checkpoint are protected. Most raw
     # downloaded dataset formats are not payload extensions either.
     if path.name.lower().startswith(('model', 'pytorch_model', 'qmodel', 'checkpoint')):

@@ -164,3 +164,8 @@ PLAN="cleanup-generated-$(date +%Y%m%d-%H%M%S).json"
 /output/env/bin/python tools/cleanup_generated_large_files.py --root . --plan "$PLAN"
 /output/env/bin/python tools/cleanup_generated_large_files.py --root . --apply "$PLAN"
 ```
+
+
+### 2026-10-13：实际SSH清理结果（覆盖此前“尚未清理”状态）
+
+已在用户授权范围内执行删除24项：8份Fisher、10份ref logits.cache、3份prepared权重及3个_SUCCESS。预计实际数据块释放35.44GiB，du仓库约37G→1.3G，整个/output56G→21G；模型、下载数据、环境和日志保留。54,951保护条目无变化，3份原始模型权重SHA一致。清理/保护计划和结果报告在仓库根，已取回本机outputs/server-generated-cleanup-20261013-v1。清理前无实验进程，未另启GPU。服务器当前HEAD a1823ec已启用共享默认；下次启动因为缓存已移除，仍必须新生成一份统计和prepared模型，再共享给各臂。

@@ -2135,3 +2135,14 @@ NEW outputs/realq-final-complete-acceptance-20261012-v1/fresh_memory_six_pair_su
 效果/验证：61项WSL CPUtests通过，包括完整四rank28层BF16生产保存表达式、两arm硬链接同inode/私有metadata、跨FS软链接/两种共享都失败时拒绝复制、source变动拒绝、生产保存守卫、同model/rotation prepared跨卡数复用而Fisher不误复用、实际pipeline precompute共享prepared后只生成新Fisher、两CPU进程meta所有权/完整process峰与总日志。实际safetensors.load_file及torch.load普通/mmap加载后修改内存权重/Fisher，来源SHA仍相同。无新本地CUDA实验，无新正式GPU结果或显存收益。CPU证据保存在outputs/storage-method-shared-storage-cpu-20261013-v1；已有失败/缓存/副本不改不删。
 
 评价/反思：此前独立复制便于来源审查，但非必须且忽略用户磁盘限制。现在共享输入与独立验收记录分离；hardlink目录单独du可能仍计完整逻辑大小，不能当新数据块，需按inode去重计真实占用。日志/profile/少量metadata仍增长，首次缺失配置必须保存一份新cache，fresh每臂重算属于明确独立测量而非默认复用，不能承诺所有目录字节零增长。改动下次启动生效，不中途修改服务器活动绑定文件；交付mine/realq-warmadam，用户原授权推送。
+
+
+### 2026-10-13：用户授权后的服务器生成缓存清理已完成
+
+用户明确授权删除旧生成的大文件，包括prepared checkpoint模型权重，保留原始/非prepared模型与下载数据；这覆盖此前缓存保留要求，但小型原始日志、源码、状态/指标/SHA证据继续保留。通过SSH密码认证连接ssh.openbayes.com:30516，实际主机p5bfgdbflml-dtee1zc4agd7-main，仓库/output/gptq_plus，执行前无formal/PTQ/torchrun任务。认证信息未写入脚本、仓库、清理报告或此记录。
+
+具体方法/审核：独立标准库cleanup工具只在cache/outputs内解除经完整计划及inode/size/mtime/目标重核的文件引用，不递归删除，保护模型、数据目录、tokens、环境、日志/JSON/CSV/JSONL；prepared权重删除前移除_SUCCESS以防下一次误判完整。真实盘点补充ref_logits的.cache后缀和模型名前缀例外，并通过6CPU回归。上传/tmp工具SHA e26cda9d3feaa3f1d53909615c2f3ca48f2fb26e2ab5b2f463beb51b74421fff与本机一致。按计划实际删除24项：8个Fisher分片、10个ref logits.cache、3个prepared model.safetensors、3个_SUCCESS，总allocated约35.44GiB。没有删除原始模型/数据/环境。
+
+结果/验证：cache从6.5G到193M，outputs从31G到984M，仓库从约37G到1.3G，整个/output约56G到21G（du舍入）。54,951项保护条目全部存在且size/mtime/inode/链接目标未变，3个原始模型权重SHA全部一致。cache/outputs中无剩余超过100MiB文件。模型目录3.8G、huggingface7.4G、hf_cache269M、env7.8G保持。服务器当前branch realq-warmadam HEAD a1823ec，已含共享默认；未启动新GPU实验。
+
+证据/反思：服务器cleanup-generated-20261013-ssh-plan.json、cleanup-generated-result-20261013-061826-102208.jsonl、cleanup-protected-before/after-20261013.json已保留并只读取回本机outputs/server-generated-cleanup-20261013-v1。平台显示额度可能延迟更新，共享文件统计必须区分实际数据块与逻辑路径。清理是磁盘管理，不是显存收益；由于缓存/prepared已删除，下次正式启动必须重新生成一份，共享设置继续避免后续各臂复制。没有修改旧失败status/量化数学或借删除制造通过结论。
