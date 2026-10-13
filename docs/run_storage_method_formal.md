@@ -149,3 +149,18 @@ reader会先读取当前run已有输出，再自动跟踪后续阶段/模型的�
 Fisher分片缺失或卡数改变时，控制器会独立查找相同模型身份、旋转配置、序列长度和架构的prepared模型，将它共享给一次性Stage0；该次只新生成所需Fisher，不重复保存已有prepared权重。来源字节使用前后完整核验；共享模型路径禁止prepared checkpoint写入，缓存命中禁止再次收集Fisher。共享只读指实验加载流程：外部程序仍不得写这些引用的源文件，修改会触发SHA拒绝。
 
 日志、显存采样、配置、SHA清单和少量私有元数据仍占空间，首次缺失数据必须保存新缓存；显式cache-mode=fresh为了独立测量预计算仍生成各臂统计，不能称零磁盘增长。显式cache-storage=copy保留旧独立复制策略。默认启动无需新参数，若希望命令明确，可追加--cache-storage shared。57项初版、61项完整CPU回归通过；真实safetensors/torch.load（普通和mmap）加载后内存修改不改来源字节；无新本地GPU实验。原旧副本不自动去重或删除。
+
+
+## 清理旧的大型生成文件
+
+用户授权清理旧的生成缓存和prepared权重。独立工具tools/cleanup_generated_large_files.py只扫描仓库cache/和outputs/，默认选择100MiB以上的生成张量/数组文件，prepared模型权重不受大小阈值限制；原始/非prepared模型、下载数据目录、tokens、环境、代码、日志、JSON/CSV/JSONL验收数据保留。先用--plan生成准确清单，再--apply同一计划。apply检查运行中的formal/torchrun/PTQ进程、路径范围、每个文件inode/大小/mtime/链接目标未变化；新出现的文件不加入删除。目录软链接不遍历，文件软链接只解除引用，不删除指向的数据。硬链接释放量只计所有链接名字均被清除的数据块，不把逻辑重复计作释放量。
+
+prepared权重删除时先取消其_SUCCESS完成标记，保证下一次重新构建而非加载一个不完整模型。清理会导致对应Fisher/prepared下次需要重新计算/生成一份，共享设置避免以后每臂重复复制。工具无递归删除，原有日志及验收证据保留；6项CPU测试通过，仅临时测试目录删除，没有对实际服务器执行清理。SSH root@ssh.openbayes.com:30516已尝试连接，认证失败；待用户安装清理专用公钥后才能实际盘点/执行。
+
+服务器手动用法（确认无实验进程）：
+```bash
+cd /openbayes/home/gptq_plus
+PLAN="cleanup-generated-$(date +%Y%m%d-%H%M%S).json"
+/output/env/bin/python tools/cleanup_generated_large_files.py --root . --plan "$PLAN"
+/output/env/bin/python tools/cleanup_generated_large_files.py --root . --apply "$PLAN"
+```
