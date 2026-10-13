@@ -409,3 +409,14 @@ NEW outputs/realq-final-complete-acceptance-20261012-v1/fresh_memory_six_pair_su
 
 评价/交付：此次遗漏应由外层控制器执行测试捕获，不能仅凭dry-run/compile宣布正式流程可靠。用户授权本地推送后服务器拉取；只在实际无实验进程时更新，不另启GPU、不清理新生成缓存。服务器SSH端口目前出现banner连接拒绝/超时，尚未完成拉取，后续以实际连接和HEAD核对为准。
 2026-10-13交付续记：用户给出新SSH端口32327后，已密码认证连接实际原主机。执行前无formal/PTQ/torchrun进程，服务器realq-warmadam无tracked改动；git pull --ff-only origin realq-warmadam实际acfc5fa→e685c0f，完整HEAD与GitHub e685c0f739f7626cc2465fc24af155387681349c一致，服务器Python3.10 py_compile通过。服务器未安装pytest，额外CPU回归未执行（No module named pytest工件保留）；本地65项通过仍是测试依据，不冒称服务器测试成功或GPU正式通过。绑定总日志storage-formal-20261013-062852.log确认同一job_index异常，四个world4原分片每份3347217037bytes仍存在；旧失败目录、prepared及新缓存未改未删，不另启GPU。下次新目录auto启动按完整缓存准入复用，通过全部正式阶段后才能报告结果。
+### 2026-10-13：正式QA离线缓存路径与完整state结构修复
+
+失败/证据：用户附件绑定storage-formal-20261013-065712总日志。首0.6B control量化完成（诊断6160.850375750102秒），KL0.09737192094326019/PPL21.992847442626953已算；随后PIQA下载physicaliqa-train-dev.zip被OfflineModeIsEnabled拦截，stage2退出1，全队列停止，0完整pairs。原量化state535条、rank0完整字节hash/其他rank实际meta布局均留下，但535被新审查器固定507误拒；QA异常导致rank0最终process peak和canonical trace footer未执行，也不允许从其他工件伪造完成。原日志/状态/缓存/失败全部保留。
+
+理论/具体定位：HF Datasets离线模式须指向实际已准备的dataset builder缓存，只有dataset脚本或另一个目录存在不等于命中。官方 https://huggingface.co/docs/datasets/v2.14.7/en/loading 和 lm-eval任务加载API https://github.com/EleutherAI/lm-evaluation-harness/blob/main/lm_eval/tasks/__init__.py 已核对。服务器HF_HOME=/output/huggingface，但十项QA旧缓存在/output/hf_cache/datasets；CPU原环境真实load_task PIQA复现同异常，显式HF_DATASETS_CACHE正确路径后train16113/test3084/validation1838完整加载、CUDA未初始化。不是此前清理误删数据、GPU OOM或任务deprecated告警所致。
+
+方法：保持QA十任务和离线要求，控制器统一选择已有相邻hf_cache/datasets（尊重用户显式HF_DATASETS_CACHE），将同路径传入preflight和所有worker并保存plan。新增CPU-only storage_method_qa_preflight实际调用生产任务resolver/get_task_dict，检查所有group叶任务和非空评估split；在任何Stage0/GPU量化前失败即拒绝，显式--download另用于缺失数据准备，默认不下载不加载模型。目录存在只作选择提示，不能代替完整加载准入，不复制数据。
+
+state方法/验证：两模型真实Qwen3全28层meta架构加实际rotation wrapper，均311原模型state→535包装state：507条weight（含alias路径）+28条down_proj.had_K(12×12 FP32)，CUDA未初始化。完整state数量不能沿用pilot常数。生成入口在量化timer外、量化前记录每rank独立名称/shape/dtype布局，不持有tensor；量化后所有535条字节均hash，必须逐项与自身pre-layout相同，各rank布局与control/candidate完整数值继续核对。缺失buffer、形状/dtype/名称改变、缺前置快照仍拒绝，不通过直接改成535或删buffer放宽验收。旧pilot507及其冻结审查不改。
+
+CPU效果/反思：首轮相关34tests通过；真实535状态、两模型meta、CPU小Qwen完整bytehash和异常拒绝、十任务/嵌套ceval/空数据/离线错误拒绝及真实--run阻止GPUlaunch回归后81tests通过(48.21秒)。数据路径选择新增测试正在复核，服务器仍须全部十任务真实离线准入。此前只校验Fisher/输入数据和手造507fixture，遗漏正式rotation buffer和运行末尾可选QA数据，造成长量化之后失败；必须纠正先决条件覆盖。control-only部分不是配对显存收益/正式成功，密集profile秒数不是低扰动速度。未删缓存/日志、未并发新GPU。服务器实际无formal/PTQ进程；修复测试/推送/拉取与数据全部准入完成前不重启GPU。

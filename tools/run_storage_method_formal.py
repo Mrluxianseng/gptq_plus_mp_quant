@@ -28,6 +28,7 @@ from tools.storage_method_distributed_audit import install_entry_audit, audit_di
 from tools.storage_method_log_stream import LiveFileRelay
 from tools import storage_method_cache as cache_manager
 from tools.compare_storage_cached_profiles import compare as compare_cached
+from tools.storage_method_qa_preflight import dataset_cache_directory
 
 METHOD_FLAGS = ('--research_hinv_solver_workspace', '--research_hinv_reuse_consumed_h',
                 '--research_hinv_stable_weight', '--research_replay_early_stats')
@@ -60,6 +61,7 @@ FORMAL_TOOL_SOURCES = (
     'tools/storage_method_distributed_audit.py',
     'tools/storage_method_log_stream.py',
     'tools/storage_method_cache.py',
+    'tools/storage_method_qa_preflight.py',
 )
 
 
@@ -239,7 +241,7 @@ def audit_pair(control, candidate, ranks, bindings):
     gpu_peaks = [nvml_peaks(run) for run in (control, candidate)]
     global_peaks = {k: [s[k] for s in statuses] for k in ('full_process_peak_allocated_bytes', 'full_process_peak_reserved_bytes', 'max_nvml_memory_used_mib')}
     checks = dict(complete_exact_numerics_sources_commands_runtime_gpu=legacy['full_model_quantization_validated'],
-                  complete_507_state_and_all_rank_ownership=rank_states, owner_all28_nonempty_exact=traces_ok,
+                  complete_prequant_state_and_all_rank_ownership=rank_states, owner_all28_nonempty_exact=traces_ok,
                   complete_cache_inventory=bool(caches[0]) and caches[0] == caches[1],
                   method_coverage=all(m['valid'] for m in methods),
                   stats_holding_bytes_same=all(a['stats_bytes'] == b['stats_bytes'] for a, b in zip(methods[0]['ranks'], methods[1]['ranks'])),
@@ -353,6 +355,9 @@ def main():
                PYTORCH_ALLOC_CONF='backend:native', PYTORCH_CUDA_ALLOC_CONF='backend:native',
                OMP_NUM_THREADS=os.environ.get('OMP_NUM_THREADS', '1'),
                NCCL_SHM_DISABLE=os.environ.get('NCCL_SHM_DISABLE', '1'), PYTHONUNBUFFERED='1')
+    datasets_cache = dataset_cache_directory(ROOT, env)
+    if datasets_cache:
+        env['HF_DATASETS_CACHE'] = datasets_cache
     save(out/'plan.json', dict(created=datetime.now().isoformat(), gpu_work_started=False, aggregate_worker_stdout=True,
          formal_workload=args.nsamples == 2048 and args.seq_len == 2048,
          config={k: str(v) if isinstance(v, Path) else v for k,v in vars(args).items() if k != 'models'},
@@ -361,6 +366,7 @@ def main():
          jobs=jobs, cache_mode=args.cache_mode, measurement_scope='stage2_cached' if args.cache_mode == 'auto' else 'full_pipeline',
          cache_search_roots=[str(p) for p in search_roots], optional_precompute_jobs=warm_jobs,
          cache_storage=args.cache_storage,
+         qa_datasets_cache=datasets_cache,
          note='Auto cache uses one matching complete cache for both arms; precompute is recorded separately. Fresh mode measures Stage0 per arm. No pilot canonical hashes reused as formal references.'))
     print(f'Plan: {out / "plan.json"}\n2048x2048 defaults; group_parallel_quant=none; GPUs={args.devices}; cache={args.cache_mode}', flush=True)
     if args.dry_run:
@@ -398,6 +404,14 @@ def main():
         if sha(entry) != read(out/'plan.json')['entry_sha256']:
             raise RuntimeError('Generated entry changed during run')
     try:
+        if args.qa_eval:
+            print('[qa-preflight] checking all paper QA datasets offline before any GPU launch', flush=True)
+            subprocess.run([sys.executable, '-u', str(ROOT/'tools/storage_method_qa_preflight.py'),
+                            '--output', str(out/'qa_data_preflight.json')], cwd=ROOT,
+                           env=dict(env, CUDA_VISIBLE_DEVICES='', HF_DATASETS_OFFLINE='1',
+                                    HF_HUB_OFFLINE='1', TRANSFORMERS_OFFLINE='1'), check=True)
+            if not read(out/'qa_data_preflight.json')['valid']:
+                raise RuntimeError('QA preflight did not validate all required tasks')
         for job_index, job in enumerate(jobs):
             check_sources(bindings)
             if sha(entry) != read(out/'plan.json')['entry_sha256']:

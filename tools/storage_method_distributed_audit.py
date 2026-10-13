@@ -14,12 +14,22 @@ from pathlib import Path
 SCHEMA = 'realq-state-ownership-v1'
 
 
-def state_record(model, *, cpu_master, rank, world_size):
+def state_layout(model):
+    """CPU metadata only; capture actual names/shapes/dtypes before quantizing."""
+    layout = [[name, list(tensor.shape), str(tensor.dtype)]
+              for name, tensor in sorted(model.state_dict().items())]
+    return dict(layout=layout, tensors=len(layout),
+                sha256=hashlib.sha256(json.dumps(layout, separators=(',', ':')).encode()).hexdigest())
+
+
+def state_record(model, *, cpu_master, rank, world_size, expected_layout=None):
     import torch
 
     state = sorted(model.state_dict().items())
-    layout = [(name, list(tensor.shape), str(tensor.dtype)) for name, tensor in state]
+    layout = [[name, list(tensor.shape), str(tensor.dtype)] for name, tensor in state]
     layout_sha = hashlib.sha256(json.dumps(layout, separators=(',', ':')).encode()).hexdigest()
+    if expected_layout is not None and state_layout(model) != expected_layout:
+        raise RuntimeError('State names/shapes/dtypes changed during quantization')
     authoritative = not cpu_master or rank == 0
     meta_count = sum(tensor.is_meta for _, tensor in state)
     if authoritative and meta_count:
@@ -37,6 +47,7 @@ def state_record(model, *, cpu_master, rank, world_size):
                 state_sha256=digest.hexdigest() if authoritative else None,
                 state_tensors=len(state) if authoritative else 0,
                 state_layout_sha256=layout_sha, state_layout_tensors=len(state),
+                state_layout=layout,
                 state_meta_tensors=meta_count,
                 state_scope='complete_weight_bytes' if authoritative else 'layout_only_no_weight_bytes')
 
@@ -67,13 +78,37 @@ def install_entry_audit(source):
 '''
     lines[begin.lineno-1:end.end_lineno] = [replacement]
     result = ''.join(lines)
+    anchor = '    result = original_fwrd(args, analyzer, dataloader, dev)'
+    if result.count(anchor) != 1:
+        raise RuntimeError('Expected one quantization call for pre-state layout')
+    capture = '''    from tools.storage_method_distributed_audit import state_layout as _state_layout
+    _expected_state = _state_layout(analyzer.model)
+    _state_rank = int(os.environ.get('RANK', '0'))
+    with (root / f"state_expected_layout_rank{_state_rank}.json").open('x') as _state_file:
+        json.dump(dict(rank=_state_rank, scope='before_quantization', **_expected_state), _state_file)
+'''
+    # Capture outside the quantization wall timer and retain no tensors.
+    timer = '    torch.cuda.synchronize()\n    started = time.monotonic()'
+    if result.count(timer) != 1:
+        raise RuntimeError('Quantization timer anchor changed')
+    result = result.replace(timer, capture + timer)
+    result = result.replace("world_size=int(os.environ.get('WORLD_SIZE', '1'))))",
+                            "world_size=int(os.environ.get('WORLD_SIZE', '1')), expected_layout=_expected_state))")
     compile(result, 'formal_owned_state_entry', 'exec')
     return result
 
 
-def validate_records(records, traces, *, ranks, cpu_master, tensors=507, layers=28):
+def validate_records(records, traces, *, ranks, cpu_master, tensors=507, layers=28, expected_layout=None):
     """Freshly validate raw records, with no synthesized non-owner evidence."""
     errors = []
+    if expected_layout is not None:
+        layout = expected_layout.get('layout', [])
+        digest = hashlib.sha256(json.dumps(layout, separators=(',', ':')).encode()).hexdigest()
+        if (not layout or expected_layout.get('tensors') != len(layout)
+                or expected_layout.get('sha256') != digest
+                or len({row[0] for row in layout}) != len(layout)):
+            errors.append('Invalid pre-quantization state layout')
+        tensors = len(layout)
     indexed = {r.get('rank'): r for r in records}
     if len(records) != ranks or set(indexed) != set(range(ranks)):
         errors.append('Missing/duplicate state rank')
@@ -88,6 +123,9 @@ def validate_records(records, traces, *, ranks, cpu_master, tensors=507, layers=
         if any(row.get(k) != v for k, v in expected.items()):
             errors.append(f'rank{rank}: ownership/count/schema mismatch')
         layout = row.get('state_layout_sha256')
+        if expected_layout is not None and (layout != expected_layout['sha256']
+                or row.get('state_layout') != expected_layout['layout']):
+            errors.append(f'rank{rank}: state differs from pre-quantization layout')
         digest = row.get('state_sha256')
         if not isinstance(layout, str) or len(layout) != 64:
             errors.append(f'rank{rank}: missing layout digest')
@@ -124,7 +162,24 @@ def audit_directory(directory, *, ranks, cpu_master):
                    for p in directory.glob('baseline-profile_metrics_rank*.json'))
     traces = {int(p.stem.rsplit('rank', 1)[1]): json.loads(p.read_text())
               for p in directory.glob('layer_output_fingerprints_rank*.json')}
-    report = validate_records(records, traces, ranks=ranks, cpu_master=cpu_master)
+    snapshots = []
+    snapshot_ok = True
+    for rank in range(ranks):
+        path = directory/f'state_expected_layout_rank{rank}.json'
+        if not path.exists():
+            snapshot_ok = False
+            continue
+        snapshot = json.loads(path.read_text())
+        snapshot_ok &= snapshot.pop('rank', None) == rank and snapshot.pop('scope', None) == 'before_quantization'
+        snapshots.append(snapshot)
+    if snapshots and any(snapshot != snapshots[0] for snapshot in snapshots):
+        snapshot_ok = False
+    report = validate_records(records, traces, ranks=ranks, cpu_master=cpu_master,
+                              expected_layout=snapshots[0] if snapshots else None)
+    if not snapshot_ok or len(snapshots) != ranks:
+        report['errors'].append('Missing/inconsistent pre-quantization layout for every rank')
+        report['valid'] = False
+    report['expected_state_tensors'] = snapshots[0]['tensors'] if snapshots else None
     canonical = directory/'layer_output_fingerprints.json'
     metrics = directory/'baseline-profile_metrics.json'
     owner = next((r for r in records if r.get('rank') == 0), None)

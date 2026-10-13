@@ -182,7 +182,8 @@ def test_shared_stage2_forbids_prepared_checkpoint_writer(monkeypatch, stage0, p
 
 @pytest.mark.parametrize('hit', [False, True])
 @pytest.mark.parametrize('storage', ['shared', 'copy'])
-def test_actual_run_auto_cache_preflight_and_all_model_pairs(tmp_path, monkeypatch, hit, storage):
+@pytest.mark.parametrize('qa_error', [False, True])
+def test_actual_run_auto_cache_preflight_and_all_model_pairs(tmp_path, monkeypatch, hit, storage, qa_error):
     """Run the real outer --run loop with CPU fixture pipeline processes.
 
     Cache/schema, state/method and actual worker ownership have separate tests.
@@ -230,6 +231,14 @@ def test_actual_run_auto_cache_preflight_and_all_model_pairs(tmp_path, monkeypat
     monkeypatch.setattr(runner.cache_manager, 'validate', validate)
     monkeypatch.setattr(runner.cache_manager, 'find_prepared', lambda *_: None)
     monkeypatch.setattr(runner.subprocess, 'check_output', lambda *args, **kwargs: '')
+    def qa_preflight(command, **kwargs):
+        assert kwargs['env']['CUDA_VISIBLE_DEVICES'] == ''
+        assert kwargs['env']['HF_DATASETS_OFFLINE'] == '1'
+        assert command[2].endswith('storage_method_qa_preflight.py')
+        if qa_error:
+            raise runner.subprocess.CalledProcessError(1, command)
+        Path(command[command.index('--output')+1]).write_text(json.dumps({'valid': True, 'fixture': 'CPU scheduling only'}))
+    monkeypatch.setattr(runner.subprocess, 'run', qa_preflight)
     launches = []
     class CPUProcess:
         returncode = 0
@@ -259,6 +268,12 @@ def test_actual_run_auto_cache_preflight_and_all_model_pairs(tmp_path, monkeypat
         audited.append((control, candidate))
         return dict(valid=True, fixture='outer controller scheduling only')
     monkeypatch.setattr(runner, 'audit_pair', audit)
+    if qa_error:
+        with pytest.raises(runner.subprocess.CalledProcessError):
+            runner.main()
+        assert not launches and not audited
+        assert not runner.read(output/'status.json')['valid']
+        return
     runner.main()
     status = runner.read(output/'status.json')
     assert status['valid'] and len(status['completed_pairs']) == len(audited) == 6
