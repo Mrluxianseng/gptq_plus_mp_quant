@@ -110,3 +110,33 @@ def test_commands_accepted_by_actual_production_parser(monkeypatch):
             assert args.nsamples == 2048 and args.seq_len == 2048
             assert args.grad_lr == float(runner.MODEL_LRS[model])
             assert args.grad_optimizer == 'adam' and args.group_parallel_quant == 'none'
+
+
+def test_dry_run_defaults_to_auto_cache_and_labels_scope(tmp_path, monkeypatch):
+    models = []
+    for name, hidden, intermediate in (('Qwen3-0.6B', 1024, 3072), ('Qwen3-1.7B', 2048, 6144)):
+        model = tmp_path/name
+        model.mkdir()
+        (model/'config.json').write_text(json.dumps(dict(hidden_size=hidden, intermediate_size=intermediate,
+                                                         num_hidden_layers=28)))
+        models.append(model)
+    output = tmp_path/'plan'
+    monkeypatch.setattr('sys.argv', ['run_storage_method_formal.py', '--dry-run',
+        '--model06', str(models[0]), '--model17', str(models[1]), '--devices', '0,1,2,3',
+        '--output-directory', str(output)])
+    runner.main()
+    plan = json.loads((output/'plan.json').read_text())
+    assert plan['cache_mode'] == 'auto'
+    assert plan['measurement_scope'] == 'stage2_cached'
+    assert set(plan['optional_precompute_jobs']) == {'qwen06b', 'qwen17b'}
+    assert Path(plan['cache_search_roots'][0]) == runner.ROOT/'cache'
+    assert plan['gpu_work_started'] is False
+
+    output_fresh = tmp_path/'fresh-plan'
+    monkeypatch.setattr('sys.argv', ['run_storage_method_formal.py', '--dry-run',
+        '--model06', str(models[0]), '--model17', str(models[1]), '--devices', '0,1,2,3',
+        '--output-directory', str(output_fresh), '--cache-mode', 'fresh'])
+    runner.main()
+    fresh = json.loads((output_fresh/'plan.json').read_text())
+    assert fresh['measurement_scope'] == 'full_pipeline'
+    assert fresh['optional_precompute_jobs'] == {}

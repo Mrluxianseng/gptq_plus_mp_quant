@@ -8,7 +8,11 @@
 
 默认一对/模型，顺序为0.6B control→candidate，随后1.7B control→candidate。control已含前期Stage0 block checkpoint、CE256及输入卸载；candidate在相同基础上加入上述方法。该比较测量新增方法的增量效果，不是全部工程相对早期基线的累计收益。脚本不跑warm_adam、不扫学习率，也不混入finite、all-linear写回、大小policy或compact池。
 
-两臂各自fresh Stage0预计算→自己的完整缓存→28层量化→完整WikiText-2评估及默认QA任务。缓存不复用本机pilot结果，Stage2禁止偷偷重算预计算。正式参考值由服务器同配置control生成，不能拿cal2×1024的507state hash/KL/PPL当正式结果目标。
+默认`--cache-mode auto`：启动时在仓库`cache/`、`outputs/`和额外指定目录中查找旧的静态saliency/Fisher缓存。只有模型文件身份、数据、样本数、序列长度、seed、旋转、分组、loss batch、缓存schema和world size都匹配，且所有rank分片的层数/模块/形状/dtype/有限值与SHA校验通过，才会复用。四卡旧缓存只有rank0–rank2完整、rank3为空时会被拒绝并重算；双卡启动也不会误用四卡分片。
+
+若完整rank缓存存在但没有完整旋转模型checkpoint，控制器会先复制旧分片到本次私有目录，然后只准备模型；缓存命中保护会让该阶段在缓存缺失时直接失败，避免悄悄重算Fisher。若checkpoint和分片均完整，则跳过Stage0。auto模式下每个模型只需一次准备/预计算，control和candidate及重复臂都从各自独立副本读取同一份经过验证的缓存；每个正式比较的测量范围明确标记为`stage2_cached`，Stage0准备单独记入总日志和计划，不计入配对显存峰值。两臂仍各自运行完整28层量化和KL/PPL/QA评估，比较器不会伪造Stage0状态或峰值。
+
+如需评估从空缓存开始的完整流程，可使用`--cache-mode fresh`，此时两臂各自重新运行Stage0，并按`full_pipeline`范围比较。正式参考值由服务器同配置control生成，不能拿cal2×1024的507state hash/KL/PPL当正式结果目标。
 
 ## 固定正式配置
 
@@ -47,8 +51,12 @@ export DEVICE=0,1,2,3
 # 只生成entry、完整命令及配置计划，不加载模型、不启动GPU。
 bash scripts/run_storage_method_formal.sh --dry-run
 
-# 正式运行四个串行臂。每次自动生成新目录，不覆盖旧实验。
+# 自动检查匹配缓存：完整命中则复用；缺失、不完整或配置不匹配时重算一次。
+# 结果仍按control/candidate串行执行，所有输出进入一个nohup总日志。
 bash scripts/run_storage_method_formal.sh --run
+
+# 如需每个臂都重算Stage0，比较完整Stage0到评估的流程：
+bash scripts/run_storage_method_formal.sh --run --cache-mode fresh
 ```
 
 模型不在同一父目录时，分别设置MODEL06和MODEL17。MODEL_ROOT默认沿用此前服务器路径`/minimax-avatar-new/zhangqian/realq/gptq_plus/modelzoo/Qwen3`，实际启动前按你的服务器位置修改。
@@ -67,7 +75,7 @@ bash scripts/run_storage_method_formal.sh --run --skip-qa-eval
 bash scripts/run_storage_method_formal.sh --run --repeats 3
 ```
 
-默认每个阶段超时86400秒，可用`--timeout-seconds`调整。`--nsamples/--seq-len/--bsz/--backward-bsz/--seed/--lr06/--lr17`可显式覆盖；覆盖后plan会保存实际值，nsamples或seq_len偏离2048时不标作正式2048×2048工作量。学习率覆盖是用户配置，不存在自动扫描。
+默认每个阶段超时86400秒，可用`--timeout-seconds`调整。`CACHE_ROOT`可增加旧缓存搜索目录（仓库内的`cache/`和`outputs/`仍会搜索）；也可重复传`--cache-search-root /some/cache/path`。`--nsamples/--seq-len/--bsz/--backward-bsz/--seed/--lr06/--lr17`可显式覆盖；覆盖后plan会保存实际值，nsamples或seq_len偏离2048时不标作正式2048×2048工作量。学习率覆盖是用户配置，不存在自动扫描。
 
 运行目录可用RUN_DIR指定，但必须尚不存在；OUTPUT_ROOT只控制计划、控制日志和独立审查目录。既有full-pipeline runner的每臂缓存/工件和PTQ日志仍放在仓库`outputs/full_pipeline_profile_<唯一tag>/`及`outputs/<模型>/<唯一exp>/`，因此该磁盘也必须有足够空间。所有路径在plan.json和控制台列明。
 
@@ -76,13 +84,13 @@ bash scripts/run_storage_method_formal.sh --run --repeats 3
 - `plan.json`：四臂/所有重复的命令、实际配置、模型config SHA、entry SHA及环境；dry-run不是GPU成功。
 - `source_bindings.json`与`entry.py`：本次生成入口和源码绑定，运行中不编辑。
 - `<tag>.log`及每臂`stage0.log/stage2.log`：控制日志和完整worker日志。
-- 每臂`static_cache/`：独立fresh预计算缓存；审查完整目录所有文件的字节SHA，包含Fisher，正式多卡文件数量按实际清单记录，不硬套单卡13文件。
+- 每臂`static_cache/`：来源缓存的独立副本；不对旧缓存做硬链接或原地改写。审查完整目录所有文件的字节SHA，包含Fisher，正式多卡文件数量按实际清单记录，不硬套单卡13文件。
 - `audit_<model>_pN.json`：CPU master所属rank0的完整507state、28层非空输出及KL/PPL；所有rank的state布局/身份、112inverse/reuse及28write/dead/stats、源/缓存/命令/环境/设备、精确区间峰和独立逐point/global验收。其他rank的meta布局记录不称为权重字节哈希。
 - `status.json`：仅完整执行并通过所有pair后validTrue；GPU异常、数值/来源/覆盖/遥测/全局峰失败均保留证据并停止。
 
 全局capacity主准入要求full-process allocated/reserved和各物理GPU的NVML采样峰不高于同正式control，且完整质量和方法审查通过。allocated/reserved为rank进程峰的最大值，不是多卡显存求和。区间与start/end局部回升保留为诊断，不单独否决用户11:15更新后的全局容量目标；旧strict比较结果同样完整保存。NVML采样不是连续证明，密集插桩时间不能称速度结论。
 
-截至脚本交付，本机只完成CPU/source接入和命令计划验证，没有运行服务器2048×2048或四卡GPU实验。已有双模型各三对pilot收益不是新正式配置的保证；正式结果应以服务器生成的完整审查为准。
+截至脚本交付，本机只完成CPU/source接入和命令计划验证，没有运行服务器2048×2048或四卡GPU实验。auto复用实验不测量Stage0，因此只可报告`stage2_cached`显存范围；要评估空缓存完整工作流时显式使用fresh。已有双模型各三对pilot收益不是新正式配置的保证；正式结果应以服务器生成的完整审查为准。
 
 ## 2026-10-13：双卡CPU master审查修复
 

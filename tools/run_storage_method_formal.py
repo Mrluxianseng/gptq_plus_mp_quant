@@ -26,6 +26,8 @@ from tools import compare_full_pipeline_profiles as comparator
 from tools.run_full_pipeline_memory_campaign import stop_process_tree
 from tools.storage_method_distributed_audit import install_entry_audit, audit_directory
 from tools.storage_method_log_stream import LiveFileRelay
+from tools import storage_method_cache as cache_manager
+from tools.compare_storage_cached_profiles import compare as compare_cached
 
 METHOD_FLAGS = ('--research_hinv_solver_workspace', '--research_hinv_reuse_consumed_h',
                 '--research_hinv_stable_weight', '--research_replay_early_stats')
@@ -57,7 +59,7 @@ def build_entry():
     source = install_entry_audit(source)
     anchor = "runpy.run_path('ptq.py', run_name='__main__')"
     assert source.count(anchor) == 1
-    guard = "def _forbid_precompute(*args, **kwargs):\n    raise RuntimeError('formal Stage2 must consume its fresh verified cache')\nif '--exit_after_precompute' not in sys.argv:\n    impl.collect_static_end_to_end_saliency_and_fisher=_forbid_precompute\n\n"
+    guard = "def _forbid_precompute(*args, **kwargs):\n    raise RuntimeError('cache-only stage must consume its verified cache')\nif '--exit_after_precompute' not in sys.argv or os.environ.get('RESEARCH_IMPORTED_STATIC_CACHE') == '1':\n    impl.collect_static_end_to_end_saliency_and_fisher=_forbid_precompute\n\n"
     source = source.replace(anchor, guard + anchor)
     compile(source, 'formal_storage_entry', 'exec')
     return source
@@ -157,14 +159,17 @@ def nvml_peaks(run):
 
 
 def audit_pair(control, candidate, ranks, bindings):
+    statuses = [read(run/'status.json') for run in (control, candidate)]
+    cached = all(s.get('scope') == 'stage2_cached' for s in statuses)
+    if any(s.get('scope') == 'stage2_cached' for s in statuses) and not cached:
+        raise RuntimeError('Cannot compare cached and fresh arms in one pair')
     # Register the storage marker only in this process; original checker stays intact.
     original = comparator.SYSTEM_COMMAND_FLAGS
     try:
         comparator.SYSTEM_COMMAND_FLAGS = original | {'--research_replay_early_stats'}
-        legacy = comparator.compare(control, candidate, compare_cache=True)
+        legacy = (compare_cached if cached else comparator.compare)(control, candidate, compare_cache=True)
     finally:
         comparator.SYSTEM_COMMAND_FLAGS = original
-    statuses = [read(run/'status.json') for run in (control, candidate)]
     paths = [[ROOT/f for f in s['memory_profile_files']] for s in statuses]
     points = compare_points(*(boundaries(files) for files in paths))
     rows = [intervals(files) for files in paths]
@@ -197,12 +202,13 @@ def audit_pair(control, candidate, ranks, bindings):
                   stats_holding_bytes_same=all(a['stats_bytes'] == b['stats_bytes'] for a, b in zip(methods[0]['ranks'], methods[1]['ranks'])),
                   complete_exact_intervals=bool(rows[0]) and not missing and all(r.get('peak_measurement_mode') == 'exact' for arm in rows for r in arm.values()),
                   separate_points_complete=not points['missing'] and points['matched_values'] == 4*len(rows[0]),
-                  every_stage_rank_has_intervals=all(any(k[0] == stage and k[2] == rank for k in rows[0]) for stage in ('stage0', 'stage2') for rank in range(ranks)),
+                  every_stage_rank_has_intervals=all(any(k[0] == stage and k[2] == rank for k in rows[0]) for stage in (('stage2',) if cached else ('stage0', 'stage2')) for rank in range(ranks)),
                   all_full_global_peaks_nonincreasing=all(b <= a for a, b in global_peaks.values()),
                   sampled_each_physical_gpu_peak_nonincreasing=bool(gpu_peaks[0]) and gpu_peaks[0].keys() == gpu_peaks[1].keys() and all(gpu_peaks[1][gpu] <= value for gpu, value in gpu_peaks[0].items()))
     check_sources(bindings)
     checks['bound_sources_unchanged'] = True
     return dict(valid=all(checks.values()), capacity_valid=all(checks.values()), checks=checks,
+                scope='stage2_cached' if cached else 'full_pipeline', precompute_measured=not cached,
                 full_global_peaks=global_peaks, sampled_nvml_peaks_by_uuid=gpu_peaks,
                 state_ownership=[report for report, _ in ownership],
                 cache_files=caches, method_coverage=methods, interval_count=len(rows[0]),
@@ -233,6 +239,10 @@ def parser():
     p.add_argument('--skip-qa-eval', action='store_false', dest='qa_eval', default=True,
                    help='Omit QA tasks for an initial memory-only comparison; default matches the previous formal script QA setting.')
     p.add_argument('--timeout-seconds', type=int, default=86400)
+    p.add_argument('--cache-mode', choices=('auto', 'fresh'), default='auto',
+                   help='auto: reuse compatible complete cache, otherwise precompute once per model; compare Stage2 only. fresh: precompute separately in every arm and compare the complete workflow.')
+    p.add_argument('--cache-search-root', action='append', default=[],
+                   help='Additional directory containing old per-rank caches; repeat for multiple locations. Defaults also scan repo/cache and repo/outputs.')
     return p
 
 
@@ -263,6 +273,7 @@ def main():
     save(out/'source_bindings.json', bindings)
     run_id = datetime.now().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:8]
     jobs = []
+    warm_jobs = {}
     for model in selected:
         for pair in range(1, args.repeats + 1):
             order = ('control', 'candidate') if pair % 2 else ('candidate', 'control')
@@ -280,6 +291,19 @@ def main():
                             '--exact-phase-peaks', '--gpu-indices', args.devices]
                 jobs.append(dict(model=model, pair=pair, side=side, tag=tag, launcher=launcher,
                                  result=str(ROOT/'outputs'/('full_pipeline_profile_'+tag))))
+        if args.cache_mode == 'auto':
+            first = next(job for job in jobs if job['model'] == model)
+            tag = f'{model}-storage-formal-{run_id}-precompute'
+            launch = list(first['launcher'])
+            warm_stage0 = out/f'{tag}-stage0.json'
+            warm_command = command(args, model, entry, 'stage0', False) + ['--fsdp_meta_init']
+            save(warm_stage0, dict(command=warm_command, scope='One-time cache/model preparation outside cached pair measurement'))
+            launch[launch.index('--stage0-manifest')+1] = str(warm_stage0)
+            launch[launch.index('--tag')+1] = tag
+            launch.append('--stage0-only')
+            warm_jobs[model] = dict(model=model, tag=tag, launcher=launch,
+                                    result=str(ROOT/'outputs'/('full_pipeline_profile_'+tag)))
+    search_roots = [ROOT/'cache', ROOT/'outputs', *(Path(p).resolve() for p in args.cache_search_root)]
     env = dict(os.environ, CUDA_VISIBLE_DEVICES=args.devices,
                PYTORCH_ALLOC_CONF='backend:native', PYTORCH_CUDA_ALLOC_CONF='backend:native',
                OMP_NUM_THREADS=os.environ.get('OMP_NUM_THREADS', '1'),
@@ -289,19 +313,44 @@ def main():
          config={k: str(v) if isinstance(v, Path) else v for k,v in vars(args).items() if k != 'models'},
          model_config_sha256={m: sha(args.models[m]/'config.json') for m in selected},
          entry_sha256=sha(entry), environment={k: env[k] for k in ('CUDA_VISIBLE_DEVICES', 'PYTORCH_ALLOC_CONF', 'NCCL_SHM_DISABLE', 'OMP_NUM_THREADS', 'PYTHONUNBUFFERED')},
-         jobs=jobs, note='Sequential groups, DP/FSDP across selected GPUs; fresh Stage0 per arm. No pilot canonical hashes reused as formal references.'))
-    print(f'Plan: {out / "plan.json"}\n2048x2048 defaults; group_parallel_quant=none; GPUs={args.devices}', flush=True)
+         jobs=jobs, cache_mode=args.cache_mode, measurement_scope='stage2_cached' if args.cache_mode == 'auto' else 'full_pipeline',
+         cache_search_roots=[str(p) for p in search_roots], optional_precompute_jobs=warm_jobs,
+         note='Auto cache uses one matching complete cache for both arms; precompute is recorded separately. Fresh mode measures Stage0 per arm. No pilot canonical hashes reused as formal references.'))
+    print(f'Plan: {out / "plan.json"}\n2048x2048 defaults; group_parallel_quant=none; GPUs={args.devices}; cache={args.cache_mode}', flush=True)
     if args.dry_run:
-        for job in jobs:
+        for job_index, job in enumerate(jobs):
             print(f"{job['model']} pair{job['pair']} {job['side']}: {job['result']}")
         return
     active = None
     completed = []
     results = {}
-    status = dict(valid=False, completed_pairs=completed, workload='formal server comparison')
+    ready_caches = {}
+    status = dict(valid=False, completed_pairs=completed, workload='formal server comparison', cache_mode=args.cache_mode,
+                  measurement_scope='stage2_cached' if args.cache_mode == 'auto' else 'full_pipeline', precomputations=[])
     def interrupted(*_):
         raise KeyboardInterrupt('Interrupted; original evidence retained')
     signal.signal(signal.SIGTERM, interrupted)
+    def launch(job, extra=()):
+        nonlocal active
+        check_sources(bindings)
+        query = subprocess.check_output(['nvidia-smi', f'--id={args.devices}', '--query-compute-apps=pid', '--format=csv,noheader,nounits'], text=True)
+        if any(line.strip().isdigit() for line in query.splitlines()):
+            raise RuntimeError('Selected GPU has another compute process; no concurrent launch')
+        print(f"Starting {job['tag']}; log {out/(job['tag']+'.log')}", flush=True)
+        with (out/(job['tag']+'.log')).open('x') as log:
+            active = subprocess.Popen([*job['launcher'], *extra], cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+            relay = LiveFileRelay(out/(job['tag']+'.log'))
+            while active.poll() is None:
+                relay.forward()
+                time.sleep(0.25)
+            relay.forward()
+            code = active.returncode
+        active = None
+        if code:
+            raise RuntimeError('Pipeline failed: ' + job['tag'])
+        check_sources(bindings)
+        if sha(entry) != read(out/'plan.json')['entry_sha256']:
+            raise RuntimeError('Generated entry changed during run')
     try:
         for job in jobs:
             check_sources(bindings)
@@ -310,24 +359,43 @@ def main():
             for model in selected:
                 if sha(args.models[model]/'config.json') != read(out/'plan.json')['model_config_sha256'][model]:
                     raise RuntimeError('Model config changed')
-            query = subprocess.check_output(['nvidia-smi', f'--id={args.devices}', '--query-compute-apps=pid', '--format=csv,noheader,nounits'], text=True)
-            if any(line.strip().isdigit() for line in query.splitlines()):
-                raise RuntimeError('Selected GPU has another compute process; no concurrent launch')
-            print(f"Starting {job['tag']}; log {out/(job['tag']+'.log')}", flush=True)
-            with (out/(job['tag']+'.log')).open('x') as log:
-                active = subprocess.Popen(job['launcher'], cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
-                relay = LiveFileRelay(out/(job['tag']+'.log'))
-                while active.poll() is None:
-                    relay.forward()
-                    time.sleep(0.25)
-                relay.forward()
-                code = active.returncode
-            active = None
-            if code:
-                raise RuntimeError('Full pipeline failed: ' + job['tag'])
-            check_sources(bindings)
-            if sha(entry) != read(out/'plan.json')['entry_sha256']:
-                raise RuntimeError('Generated entry changed during run')
+            if args.cache_mode == 'auto' and job['model'] not in ready_caches:
+                expected = cache_manager.contract(command(args, job['model'], entry, 'stage0', False))
+                admitted = None
+                rejected = []
+                print(f"[cache] checking {job['model']} world={args.world_size}; CPU validation/hash, no GPU launched yet", flush=True)
+                for found in cache_manager.candidates(search_roots, expected):
+                    try:
+                        admitted = cache_manager.validate(found, expected)
+                        break
+                    except Exception as exc:
+                        rejected.append(dict(directory=str(found['directory']), error=repr(exc)))
+                        print(f"[cache] REJECTED {found['directory']}: {exc}; original files retained", flush=True)
+                save(out/f"cache_search_{job['model']}.json", dict(contract=expected, admitted=admitted, rejected=rejected))
+                if admitted and admitted['prepared']:
+                    ready_caches[job['model']] = admitted['directory']
+                    print('[cache] HIT complete cache and prepared model: '+admitted['directory'], flush=True)
+                else:
+                    warm = warm_jobs[job['model']]
+                    extra = ['--initial-cache', admitted['directory']] if admitted else []
+                    print('[cache] HIT shards; preparing model without recomputing Fisher' if admitted else '[cache] MISS; precomputing once for this model', flush=True)
+                    launch(warm, extra)
+                    warm_status = read(Path(warm['result'])/'status.json')
+                    if not warm_status['valid'] or warm_status['stage0']['returncode'] != 0:
+                        raise RuntimeError('Precompute did not complete')
+                    directory = Path(warm['result'])/'static_cache'
+                    verified = next(c for c in cache_manager.candidates([directory], expected) if c['directory'] == directory.resolve())
+                    admitted = cache_manager.validate(verified, expected, require_prepared=True)
+                    ready_caches[job['model']] = str(directory)
+                    status['precomputations'].append(dict(model=job['model'], result=warm['result'], status_sha256=sha(Path(warm['result'])/'status.json'),
+                                                         reused_old_shards=bool(extra), measured_in_pair=False))
+                remaining_arms = sum(1 for future in jobs[job_index:] if future['model'] == job['model'])
+                disk_preflight = cache_manager.preflight_snapshots(admitted, ROOT/'outputs', remaining_arms)
+                save(out/f"cache_disk_preflight_{job['model']}.json", disk_preflight)
+                print(f"[cache] disk preflight for {remaining_arms} remaining arms: {disk_preflight}", flush=True)
+                save(out/f"cache_ready_{job['model']}.json", admitted)
+            extra = ['--reuse-cache', ready_caches[job['model']]] if args.cache_mode == 'auto' else []
+            launch(job, extra)
             key = (job['model'], job['pair'])
             results.setdefault(key, {})[job['side']] = Path(job['result'])
             if len(results[key]) == 2:

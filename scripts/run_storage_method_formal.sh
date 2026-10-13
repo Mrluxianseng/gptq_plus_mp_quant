@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Formal W4A16: serial 0.6B C/N then 1.7B C/N, fresh cache per arm.
+# Formal W4A16: serial 0.6B C/N then 1.7B C/N, auto-admit a matching cache.
 set -Eeuo pipefail
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 cd "$ROOT_DIR"
@@ -19,6 +19,10 @@ RUN_DIR=${RUN_DIR:-$OUTPUT_ROOT/storage-formal-$(date +%Y%m%d-%H%M%S)-$$}
 export HF_DATASETS_OFFLINE=${HF_DATASETS_OFFLINE:-1}
 export TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-1}
 export NCCL_SHM_DISABLE=${NCCL_SHM_DISABLE:-1}
+CACHE_ARGS=()
+if [[ -n ${CACHE_ROOT:-} ]]; then
+    CACHE_ARGS+=(--cache-search-root "$CACHE_ROOT")
+fi
 exec "$PYTHON_BIN" -u tools/run_storage_method_formal.py "$MODE" \
     --model06 "$MODEL06" --model17 "$MODEL17" --devices "$DEVICE" \
-    --output-directory "$RUN_DIR" "$@"
+    --output-directory "$RUN_DIR" "${CACHE_ARGS[@]}" "$@"

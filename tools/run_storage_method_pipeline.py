@@ -1,8 +1,8 @@
 """Formal server profile with explicit CPU-master state/evaluation ownership.
 
-This runner keeps a single NVML and host-process-tree sampling window around
-both commands, so the reported maximum includes the full precompute-to-eval
-workflow rather than only a run that reuses a static cache.
+This runner keeps one NVML and host-process-tree sampling window around the
+stages actually executed. Cache reuse is labeled Stage2-only; omitted Stage0
+is never represented by a fabricated status or peak.
 """
 from __future__ import annotations
 
@@ -23,6 +23,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from tools.storage_method_distributed_audit import audit_directory
 from tools.storage_method_log_stream import LiveFileRelay
+from tools.storage_method_cache import contract as cache_contract, candidates as cache_candidates, validate as validate_cache, snapshot as snapshot_cache, verify_inventory
 TRACKED = (
     "process_args.py",
     "gptq_utils/gptq_plus_utils.py",
@@ -32,6 +33,7 @@ TRACKED = (
     "ptq.py",
     "tools/storage_method_distributed_audit.py",
     "tools/storage_method_log_stream.py",
+    "tools/storage_method_cache.py",
     "tools/run_full_pipeline_memory_profile.py",
 )
 
@@ -217,11 +219,15 @@ def main() -> None:
     parser.add_argument("--exact-phase-peaks", action="store_true", help="Diagnostic allocator interval peaks; preserves process maxima in the profiler.")
     parser.add_argument("--stage0-only", action="store_true", help="Precompute diagnostic only; does not claim quantization/evaluation completion.")
     parser.add_argument("--gpu-indices", default=None, help="Physical nvidia-smi indices to monitor; comma-separated. Does not set CUDA_VISIBLE_DEVICES.")
+    parser.add_argument('--reuse-cache', type=Path, help='Validated cache for Stage2 only; Stage0 is omitted and never claimed measured.')
+    parser.add_argument('--initial-cache', type=Path, help='Import matching old shards before Stage0; missing prepared model can be built without repeating Fisher.')
     args = parser.parse_args()
     if not args.tag.replace("-", "").isalnum():
         raise ValueError("tag may contain only letters, digits, and hyphens")
     if args.timeout_seconds <= 0 or args.telemetry_interval_ms <= 0:
         raise ValueError("timeout and telemetry interval must be positive")
+    if args.reuse_cache and (args.stage0_only or args.initial_cache):
+        raise ValueError('reuse-cache requires Stage2 and cannot combine with initial-cache')
 
     stage0_source = Path(args.stage0_manifest).resolve()
     stage2_source = Path(args.stage2_manifest).resolve()
@@ -260,6 +266,15 @@ def main() -> None:
     s0[option_value(s0, "--exp")] = f"full_pipeline_{args.tag}_stage0"
     s2[option_value(s2, "--exp")] = f"full_pipeline_{args.tag}_stage2"
     cache_path = out / "static_cache"
+    cache_admission = None
+    source_cache = args.reuse_cache or args.initial_cache
+    if source_cache:
+        expected = cache_contract(s0)
+        found = next((c for c in cache_candidates([source_cache], expected) if c['directory'] == source_cache.resolve()), None)
+        if found is None:
+            raise RuntimeError('Imported cache lacks every exact matching rank shard')
+        cache_admission = validate_cache(found, expected, require_prepared=bool(args.reuse_cache))
+        snapshot_cache(cache_admission, cache_path)
     cache_path_str = str(cache_path)
     set_option(s0, "--static_cache_path", cache_path_str)
     set_option(s2, "--static_cache_path", cache_path_str)
@@ -293,6 +308,8 @@ def main() -> None:
         "stage0_command": s0,
         "stage2_command": s2,
         "fresh_static_cache": cache_path_str,
+        "cache_admission": cache_admission,
+        "cache_mode": 'stage2_cached' if args.reuse_cache else ('imported_precompute' if args.initial_cache else 'fresh'),
         "hinv_cpu_offload": args.hinv_cpu_offload,
         "hinv_cpu_offload_modules": args.hinv_cpu_offload_modules,
         "hessian_damping_inplace": args.hessian_damping_inplace,
@@ -314,6 +331,7 @@ def main() -> None:
         HF_DATASETS_OFFLINE="1",
         TRANSFORMERS_OFFLINE="1",
         REALQ_PHASE_PEAK_MODE="exact" if args.exact_phase_peaks else "sampled",
+        RESEARCH_IMPORTED_STATIC_CACHE='1' if source_cache else '0',
     )
     try:
         import psutil
@@ -346,13 +364,17 @@ def main() -> None:
         )
         started = time.monotonic()
         try:
-            stage0_result = run_stage(
-                "stage0", s0, ROOT, env, out / "stage0.log", args.timeout_seconds,
-                psutil, rss_writer,
-            )
+            if args.reuse_cache:
+                print('[cache] MATCHED: skipping Stage0; running Stage2 from verified cache', flush=True)
+                stage0_result = {'returncode': None, 'skipped': 'validated_cache_reuse', 'measured': False}
+            else:
+                stage0_result = run_stage(
+                    "stage0", s0, ROOT, env, out / "stage0.log", args.timeout_seconds,
+                    psutil, rss_writer,
+                )
             if args.stage0_only:
                 stage2_result = {"returncode": None, "skipped": "Stage-0-only diagnostic"}
-            elif stage0_result["returncode"] != 0:
+            elif not args.reuse_cache and stage0_result["returncode"] != 0:
                 stage2_result = {"returncode": None, "skipped": "Stage-0 failed"}
             else:
                 if not cache_path.exists() or not any(cache_path.rglob("*.pt")):
@@ -395,6 +417,8 @@ def main() -> None:
     stage2_rows = profile_rows(stage2_exp)
     evaluation_rows = profile_rows(stage2_exp, tag="evaluation")
     unchanged = all(sha256(Path(path)) == digest for path, digest in source_hashes.items())
+    if cache_admission:
+        verify_inventory(cache_admission['sha256'])
     process_peaks = {stage: [json.loads(path.read_text()) for path in sorted(out.glob(f"process_allocator_peak_{stage}_rank*.json"))] for stage in ("stage0", "stage2")}
     metrics_by_rank = [json.loads(path.read_text()) for path in sorted(out.glob("baseline-profile_metrics_rank*.json"))] if not args.stage0_only else []
     cpu_master = '--stage2_cpu_master' in s2
@@ -406,8 +430,9 @@ def main() -> None:
     status = {
         "stage0": stage0_result,
         "stage2": stage2_result,
-        "returncode": stage0_result["returncode"] if args.stage0_only or stage0_result["returncode"] != 0 else stage2_result.get("returncode"),
-        "scope": "stage0_only" if args.stage0_only else "full_pipeline",
+        "returncode": stage0_result["returncode"] if args.stage0_only or (not args.reuse_cache and stage0_result["returncode"] != 0) else stage2_result.get("returncode"),
+        "scope": "stage0_only" if args.stage0_only else ('stage2_cached' if args.reuse_cache else "full_pipeline"),
+        "cache_source_unchanged": True if cache_admission else None,
         "state_metrics_by_rank": metrics_by_rank,
         "state_hashes_match_across_ranks": states_match if not args.stage0_only and not cpu_master else None,
         "layer_fingerprints_match_across_ranks": fingerprints_match if not args.stage0_only and not cpu_master else None,
@@ -462,17 +487,17 @@ def main() -> None:
                            and {r.get('rank') for r in process_peaks[stage]} == set(range(expected_ranks[stage]))
                            and all(r.get('stage') == stage and r.get('scope') == 'complete_process_through_evaluation'
                                    for r in process_peaks[stage])
-                           for stage in (('stage0',) if args.stage0_only else ('stage0', 'stage2')))
+                           for stage in (('stage0',) if args.stage0_only else (('stage2',) if args.reuse_cache else ('stage0', 'stage2'))))
     status['all_rank_process_peak_identity_complete'] = peak_identity_ok
     status["valid"] = not (
         status["returncode"] != 0
         or not unchanged
         or not peak_identity_ok
         or (not args.stage0_only and (status["metrics"] is None or status["kl"] is None or status["ppl"] is None))
-        or not process_peaks["stage0"]
+        or (not args.reuse_cache and not process_peaks["stage0"])
         or (not args.stage0_only and not process_peaks["stage2"])
         or (not args.stage0_only and (not states_match or not fingerprints_match))
-        or len(process_peaks["stage0"]) != expected_ranks["stage0"]
+        or (not args.reuse_cache and len(process_peaks["stage0"]) != expected_ranks["stage0"])
         or (not args.stage0_only and (len(process_peaks["stage2"]) != expected_ranks["stage2"] or len(metrics_by_rank) != expected_ranks["stage2"] or len(fingerprint_paths) != len(expected_eval_ranks)))
     )
     (out / "status.json").write_text(json.dumps(status, indent=2))

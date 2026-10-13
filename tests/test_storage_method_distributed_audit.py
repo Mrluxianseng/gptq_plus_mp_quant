@@ -221,3 +221,65 @@ def test_actual_pipeline_main_selects_owner_and_requires_all_rank_peaks(tmp_path
     assert status['state_hashes_match_across_ranks'] is None
     assert status['layer_fingerprints_match_across_ranks'] is None
     assert len(status['state_metrics_by_rank']) == 2
+
+
+def test_cached_pipeline_skips_stage0_without_fake_peak(tmp_path, monkeypatch):
+    """A cache hit launches only Stage2 and records no invented Stage0 peak."""
+    monkeypatch.setattr(pipeline, 'ROOT', tmp_path)
+    for name in pipeline.TRACKED:
+        path = tmp_path/name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('fixture source')
+    entry = tmp_path/'entry.py'
+    entry.write_text(formal.build_entry())
+    model = tmp_path/'Qwen3-0.6B'
+    model.mkdir()
+    (model/'config.json').write_text(json.dumps({'num_hidden_layers': 28}))
+    base = ['python', '--nproc_per_node=2', str(entry), 'baseline-profile', '--model', str(model),
+            '--dataset', 'wikitext2', '--nsamples', '2048', '--seq_len', '2048', '--seed', '1',
+            '--num_groups', '4', '--exp', 'fixture', '--static_cache_path', 'fresh']
+    stage0, stage2 = tmp_path/'s0.json', tmp_path/'s2.json'
+    stage0.write_text(json.dumps({'command': [*base, '--fsdp_precompute', '--exit_after_precompute']}))
+    stage2.write_text(json.dumps({'command': [*base, '--stage2_cpu_master']}))
+    source_cache = tmp_path/'old-cache'
+    source_cache.mkdir()
+    monkeypatch.setattr(sys, 'argv', ['profile', '--stage0-manifest', str(stage0), '--stage2-manifest', str(stage2),
+                                     '--tag', 'cached-fixture', '--reuse-cache', str(source_cache)])
+    monkeypatch.setattr(pipeline, 'cache_contract', lambda _: {})
+    monkeypatch.setattr(pipeline, 'cache_candidates', lambda *_args, **_kwargs: [
+        {'directory': source_cache.resolve(), 'shards': {}, 'prepared': source_cache}])
+    monkeypatch.setattr(pipeline, 'validate_cache', lambda *_args, **_kwargs: {'sha256': {}, 'contract': {}})
+    def snapshot(_admitted, destination):
+        destination.mkdir(parents=True)
+        (destination/'rank.pt').write_bytes(b'validated fixture')
+    monkeypatch.setattr(pipeline, 'snapshot_cache', snapshot)
+    monkeypatch.setattr(pipeline, 'verify_inventory', lambda _: None)
+    def monitor(*args, **kwargs):
+        kwargs['stdout'].write('2026/10/13 00:00:00.000, 100, 8000, 1, 0, GPU-fixture\n')
+        kwargs['stdout'].flush()
+        return SimpleNamespace(terminate=lambda: None, wait=lambda **_: 0)
+    monkeypatch.setattr(pipeline.subprocess, 'Popen', monitor)
+    monkeypatch.setattr(pipeline, 'profile_rows', lambda *args, **kwargs: [])
+    calls = []
+    def run_stage(stage, command, root, env, log, *args):
+        calls.append(stage)
+        out = Path(env['RESEARCH_RUN_DIR'])
+        records, traces = records_fixture()
+        for record in records:
+            (out/f"baseline-profile_metrics_rank{record['rank']}.json").write_text(json.dumps(record))
+            (out/f"process_allocator_peak_stage2_rank{record['rank']}.json").write_text(json.dumps(
+                dict(rank=record['rank'], stage='stage2', peak_allocated_bytes=100, peak_reserved_bytes=200,
+                     scope='complete_process_through_evaluation')))
+        (out/'baseline-profile_metrics.json').write_text(json.dumps(records[0]))
+        (out/'layer_output_fingerprints_rank0.json').write_text(json.dumps(traces[0]))
+        (out/'layer_output_fingerprints.json').write_text(json.dumps(traces[0]))
+        log.write_text('Exact KL&PPL on wikitext2: 0.125, 20.0\n')
+        return {'returncode': 0}
+    monkeypatch.setattr(pipeline, 'run_stage', run_stage)
+    pipeline.main()
+    status = json.loads((tmp_path/'outputs/full_pipeline_profile_cached-fixture/status.json').read_text())
+    assert calls == ['stage2']
+    assert status['valid'] and status['scope'] == 'stage2_cached'
+    assert status['stage0'] == {'returncode': None, 'skipped': 'validated_cache_reuse', 'measured': False}
+    assert status['stage0_process_peak_allocated_bytes'] is None
+    assert status['full_process_peak_allocated_bytes'] == 100
