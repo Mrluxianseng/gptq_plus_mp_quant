@@ -33,6 +33,33 @@ METHOD_FLAGS = ('--research_hinv_solver_workspace', '--research_hinv_reuse_consu
                 '--research_hinv_stable_weight', '--research_replay_early_stats')
 MODEL_LRS = {'qwen06b': '3e-4', 'qwen17b': '5e-4'}
 
+# Only source files that participate in this formal runner's execution or
+# generated entry are bound here. Binding every file under tools/ made an
+# unrelated inventory helper abort a run after Stage 0 had completed.
+FORMAL_TOOL_SOURCES = (
+    'tools/run_storage_method_formal.py',
+    'tools/run_storage_method_pipeline.py',
+    'tools/run_hessian_solver_workspace_followup.py',
+    'tools/run_full_pipeline_memory_campaign.py',
+    'tools/run_full_pipeline_memory_profile.py',
+    'tools/run_low_overhead_speed_campaign.py',
+    'tools/hessian_solver_workspace_prototype.py',
+    'tools/hessian_inverse_lifetime_prototype.py',
+    'tools/hessian_stable_weight_prototype.py',
+    'tools/hessian_dead_subgroup_install.py',
+    'tools/hessian_dead_subgroup_input_prototype.py',
+    'tools/activation_replay_stats_install.py',
+    'tools/activation_replay_stats_lifetime_prototype.py',
+    'tools/audit_memory_boundary_points.py',
+    'tools/audit_completed_memory_pair_capacity.py',
+    'tools/run_replay_stats_full_followup_v2.py',
+    'tools/compare_full_pipeline_profiles.py',
+    'tools/compare_storage_cached_profiles.py',
+    'tools/storage_method_distributed_audit.py',
+    'tools/storage_method_log_stream.py',
+    'tools/storage_method_cache.py',
+)
+
 
 def sha(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
@@ -108,6 +135,20 @@ def check_sources(bindings):
     changed = [name for name, expected in bindings.items() if sha(ROOT/name) != expected]
     if changed:
         raise RuntimeError('Bound source changed: ' + repr(changed))
+
+
+def bound_source_paths(root=ROOT):
+    """Return the formal run's explicit tool dependencies and core sources."""
+    root = Path(root)
+    files = {root/'ptq.py', root/'process_args.py',
+             root/'scripts/run_storage_method_formal.sh',
+             root/'scripts/formal_realq_compare.sh'}
+    files.update(root/name for name in FORMAL_TOOL_SOURCES)
+    # These are imported by the generated entry and define the quantization,
+    # evaluation, and memory behavior being measured.
+    for folder in ('gptq_utils', 'utils'):
+        files.update(p for p in (root/folder).rglob('*.py') if '__pycache__' not in p.parts)
+    return sorted(files)
 
 
 def method_coverage(run, ranks, enabled, dimension=None):
@@ -267,8 +308,7 @@ def main():
     out.mkdir(parents=True, exist_ok=False)
     entry = out/'entry.py'
     entry.write_text(build_entry(), encoding='utf-8')
-    files = {ROOT/'ptq.py', ROOT/'process_args.py', Path(__file__), ROOT/'scripts/run_storage_method_formal.sh', ROOT/'scripts/formal_realq_compare.sh'}
-    files.update(p for folder in ('tools', 'gptq_utils', 'utils') for p in (ROOT/folder).rglob('*.py') if '__pycache__' not in p.parts)
+    files = bound_source_paths()
     bindings = {str(p.relative_to(ROOT)): sha(p) for p in sorted(files)}
     save(out/'source_bindings.json', bindings)
     run_id = datetime.now().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:8]

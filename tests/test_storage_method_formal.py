@@ -140,3 +140,13 @@ def test_dry_run_defaults_to_auto_cache_and_labels_scope(tmp_path, monkeypatch):
     fresh = json.loads((output_fresh/'plan.json').read_text())
     assert fresh['measurement_scope'] == 'full_pipeline'
     assert fresh['optional_precompute_jobs'] == {}
+
+
+def test_formal_source_binding_excludes_unrelated_tools_and_includes_dependencies():
+    paths = {path.relative_to(runner.ROOT).as_posix() for path in runner.bound_source_paths()}
+    assert 'tools/find_large_files.py' not in paths
+    assert 'tools/run_storage_method_pipeline.py' in paths
+    assert 'tools/hessian_solver_workspace_prototype.py' in paths
+    assert 'tools/activation_replay_stats_lifetime_prototype.py' in paths
+    assert 'tools/storage_method_cache.py' in paths
+    assert not any(name.startswith('tools/') and not (runner.ROOT/name).is_file() for name in paths)
