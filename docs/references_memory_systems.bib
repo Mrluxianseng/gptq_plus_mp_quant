@@ -103,3 +103,50 @@
   url={https://github.com/pytorch/pytorch/blob/v2.11.0/c10/cuda/CUDACachingAllocator.cpp},
   note={Accessed 2026-10-12; local SHA256 1903454eff07a535ce580c075afb26e0e12ae2fe00d0a3050671c376b4a3c8ea. Requests between 1 and 10 MiB may split a 20 MiB block. Implementation evidence, not proof of an individual run's fragmentation cause.}
 }
+
+@misc{transformers4571_cache_offloading,
+  title={Transformers 4.57.1: KV cache strategies and cache offloading},
+  author={{Hugging Face}},
+  year={2025},
+  url={https://huggingface.co/docs/transformers/v4.57.1/en/kv_cache},
+  note={Accessed 2026-10-14. Official storage-placement rationale; actual Cache prefetch/offload source and full logits must be checked separately.}
+}
+
+@misc{pytorch211_memory_pool,
+  title={PyTorch 2.11 CUDA semantics: mixing CUDA allocators and MemPool},
+  author={{PyTorch Contributors}},
+  year={2026},
+  url={https://docs.pytorch.org/docs/2.11/notes/cuda.html},
+  note={Accessed 2026-10-14. Describes selective pools and cudaMallocManaged with CPU placement; cautions that UVM may incur eviction and page-fault costs. Not a measured REAL-Q improvement.}
+}
+
+@misc{nvidia_wsl_memory_limitations,
+  title={CUDA on WSL User Guide: known limitations for Linux CUDA applications},
+  author={{NVIDIA}},
+  year={2026},
+  url={https://docs.nvidia.com/cuda/wsl-user-guide/index.html},
+  note={Accessed 2026-10-14. Full managed-memory support and concurrent CPU/GPU managed access are unavailable in WSL; pinned-memory and NVML limitations also documented. Environment constraint, not proof of a particular run's allocation cause.}
+}
+
+@misc{nvidiaCuda128MappedHost2026,
+  title={CUDA Runtime API 12.8.1: Memory Management, mapped page-locked host memory},
+  author={{NVIDIA}},
+  url={https://docs.nvidia.com/cuda/archive/12.8.1/cuda-runtime-api/group__CUDART__MEMORY.html},
+  note={Accessed 2026-10-14; distinguish mapped pinned-host UVA from managed-memory migration; actual installed runtime/header ABI bound in local probes}
+}
+
+@misc{linuxProcPss2026,
+  author = {{The Linux kernel development community}},
+  title = {The /proc Filesystem: smaps, smaps_rollup and proportional set size},
+  year = {2026},
+  url = {https://docs.kernel.org/filesystems/proc.html},
+  note = {Accessed 2026-10-14. PSS shares resident pages proportionally; sequential reads and huge-page accounting have limitations.}
+}
+
+@misc{linuxCgroupV2Memory2026,
+  author = {{The Linux kernel development community}},
+  title = {Control Group v2: memory.current and memory.max},
+  year = {2026},
+  url = {https://docs.kernel.org/admin-guide/cgroup-v2.html},
+  note = {Accessed 2026-10-14. Non-root cgroup memory usage and hard limits; unavailable namespace/root values must not be fabricated.}
+}
