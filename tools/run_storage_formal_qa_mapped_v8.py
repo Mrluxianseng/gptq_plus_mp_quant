@@ -10,6 +10,9 @@ from tools.qa_mapped_early_runtime_entry import SETUP as EARLY_SETUP
 
 def source():
     text=prior_source()
+    manifest="manifest=known.runtime_root/'formal_server_bindings.json'"
+    if text.count(manifest)!=1:raise RuntimeError('Frozen admission manifest location changed')
+    text=text.replace(manifest,"manifest=known.runtime_root/(formal_args.output_directory.name+'_admitted_sources.json')")
     anchor="extra=[ROOT/'tools/run_storage_formal_qa_mapped_v6.py',"
     if text.count(anchor)!=1:raise RuntimeError('Frozen v7 source manifest changed')
     return text.replace(anchor,"extra=[ROOT/'tools/run_storage_formal_qa_mapped_v7.py',ROOT/'tools/run_storage_formal_qa_mapped_v6.py',")
