@@ -107,3 +107,15 @@ NEW audit_qa_formal_source_handoff.py只读AST源码契约：原quant→KL→QA�
 08:00汇报用 docs/qa_memory_overnight_report_20261014.md 于北京时间07:58:48定稿，完整保留方法、两模型各范围的三global统计、主机与诊断墙钟代价、拒绝方法及正式未验边界。outputs/qa-night-report-delivery-20261014-v1 保存定稿前草稿、最终报告快照及status/SHA收据；定稿工件完整性核对True，8组新独立audit/各日志/原parent status及冻结auditor源码SHA均未变，所有本地引用存在，单池资源失败和q06hook原parent False保持。此收尾没有重跑GPU或新的full audit，不增加此前组件验收范围。
 
 当晚本地研究目标完成，报告不称正式QA最终容量已通过：最长actual1235 synthetic、raw311/未旋转535、torch_fallback/1visible；完整十任务、正确REAL-Q旋转量化/服务器FHT/allocator ABI、多卡与正式主机成本仍须恢复后验收。继续保留约6.006GB pinned段与更高worker RSS/更慢诊断墙钟、native逻辑存储计数和NVML物理采样差异，不把约1.4/2.3GiB本地峰换算服务器原19GB。当前无研究CPU/GPU，服务器仍关闭/noSSH/noPush/privatePDF未stage，正式默认未启用；不重复已接受或已完成失败GPU配置。
+
+## 2026-10-14 服务器恢复，正式QA存储验证已部署
+
+用户新授权SSH32666并要求推送到服务器做正式验证，覆盖当晚服务器关闭期间的noSSH/noPush范围。本地新代码已推送mine/realq-warmadam，服务器同提交fast-forward部署；最新部署d203692。GitHub一次TLS拉取失败后仅传输代码Git bundle恢复，未复制模型/数据或上传私有PDF。
+
+实际运行时PyTorch2.9.1+cu128/Transformers4.56.2/lm-eval0.4.4/Accelerate1.12.0/FHT，与本地不同；新SnapshotCUDA只适配无include_traces的原snapshot接口，重新编译服务器CUDA12.8分配器。runtime-v2完整真实64MiB/整块BF16 GEMM字节与原生/private/callback账、active0/host0通过。数据十任务/61叶离线通过。两模型四visible真实65request/535未旋转wrapper/实际FHT/full logits/all28/全部scores/KV/everydevice phase及point已审查，仍不是正式W4质量。0.6B原control pre-dispatch Parameter ID变化是原多卡放置行为，原False保留，CPU独立读准入将此元数据明确分离，不重跑GPU、不放宽数值；新1.7B和正式两臂直接验证dispatch后至QA完成的全部Parameter身份与alias。
+
+CPU early-setup/strPath/CLI缩写/HF config符号链接错误及服务器pytest未装均保留。入口5项CPU+实际参数1项通过，实际服务器Python3.10直接执行3项CPU检查通过；未安装或升级服务器训练运行时。Formal v5/v6在GPU前退出，v7按实际已绑定blobSHA接受配置身份。本次正式入口独立opt-in，保留原量化/KL/PPL/十QA、batch16/BF16/SDPA/full词表/use_cache原数学；新QA采用rows+逐层CPU权重+官方KV卸载+完整GPU头映射+逐批释放，全部字节/源/方法/统计及QA独立NVML/PSS窗口必须完整审查。
+
+实际控制器PID4848，根outputs/storage-formal-qa-mapped-20261014-v3，总日志storage-formal-qa-mapped-20261014-v3.log；按q06C→N再q17C→N串行，auto shared当前CPU校验四rank现有Fisher/prepared，匹配后复用不重算/复制。尚无完整formal pair，不能将本地/服务器短组件峰换算此前19GB。详见docs/qa_server_formal_validation_20261014.md和服务器outputs/qa-formal-server-20261014-v1原始准入/失败/新审查。
+
+服务器续记：formal v7四rank缓存完整命中，profile生成器因AST文本重排改变旧metrics锚点在GPU前退出，原root v3与status False保留。独立v8保留原源码文本插入早期QAsetup；本地真实profile+四设备footer集成测试1passed12.72s、服务器同实际CPU测试通过。新控制器PID5728，outputs/storage-formal-qa-mapped-20261014-v4/总日志同名.log，已使用新独立准入manifest重新开始CPU缓存准入。部署13af9dc，无GPU数学失败/无降batch精度任务，后续以actual worker/结果为准。
