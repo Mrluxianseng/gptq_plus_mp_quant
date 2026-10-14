@@ -37,8 +37,10 @@ def entry(source):
     anchor="runpy.run_path('ptq.py', run_name='__main__')"
     if len(captures)!=1 or source.count(anchor)!=1:
         raise RuntimeError('Original formal arm capture/entry changed')
-    generated,_=add_early(source.replace(anchor,SETUP+'\n'+anchor),validation_only=True)
-    return generated
+    generated,_=add_early(source,validation_only=True)
+    if generated.count(anchor)!=1:
+        raise RuntimeError('Generated original ptq entry changed')
+    return generated.replace(anchor,SETUP+'\n'+anchor)
 
 
 def require_admission(runtime_root, component_roots):
