@@ -804,3 +804,8 @@ CPU early-setup/strPath/CLI缩写/HF config符号链接错误及服务器pytest�
 服务器续记：formal v7四rank缓存完整命中，profile生成器因AST文本重排改变旧metrics锚点在GPU前退出，原root v3与status False保留。独立v8保留原源码文本插入早期QAsetup；本地真实profile+四设备footer集成测试1passed12.72s、服务器同实际CPU测试通过。新控制器PID5728，outputs/storage-formal-qa-mapped-20261014-v4/总日志同名.log，已使用新独立准入manifest重新开始CPU缓存准入。部署13af9dc，无GPU数学失败/无降batch精度任务，后续以actual worker/结果为准。
 
 actual服务器确认：v4控制器5728、pipeline6380、torchrun6540及四rankworker已启动；q06 control加载原Fisher后第0/28层量化，无Traceback，四卡各5578MiB。旧4848/v3已失败退出，不沿用。实时日志命令已给用户；完整QA与formal pair仍待，源冻结不编辑/不重开并发GPU。
+# 2026-10-14 15:45 活动项覆盖
+
+旧controller5728和q06正式N已失败退出，q17未启动。旧C十QA完成，N forward257 snapshot地址异常/随后rank0 SIGSEGV，False和所有工件保留。head-only真实几何257次复现与safe snapshot514次跨边界通过，原数学/分配器/so不改，全部raw账精确；详情qa_server_formal_validation_20261014.md。
+
+唯一活动GPU链：`outputs/storage-qa-mapped-recovery-20261014-v1`，controller104676，四worker104965..104968（只本次actual快照，勿沿用）。只恢复0.6B N，原共享cache/完成C保留，已进入reference转发，随后量化→保存verified qmodel→KL/PPL→原完整十QA→全独立审查。日志`/output/gptq_plus/storage-qa-mapped-recovery-20261014-v1.log`。禁止同时开启q17/累计基线/其他GPU；完成full audit后再决定剩余正式队列。全源已绑定冻结，不修改活动helper。用户要求的“全部优化之前”累计基线与当前增量消融不能混同；尚无该累计formal结论。

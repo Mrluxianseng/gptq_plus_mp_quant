@@ -2548,3 +2548,14 @@ CPU early-setup/strPath/CLI缩写/HF config符号链接错误及服务器pytest�
 实际控制器PID4848，根outputs/storage-formal-qa-mapped-20261014-v3，总日志storage-formal-qa-mapped-20261014-v3.log；按q06C→N再q17C→N串行，auto shared当前CPU校验四rank现有Fisher/prepared，匹配后复用不重算/复制。尚无完整formal pair，不能将本地/服务器短组件峰换算此前19GB。详见docs/qa_server_formal_validation_20261014.md和服务器outputs/qa-formal-server-20261014-v1原始准入/失败/新审查。
 
 服务器续记：formal v7四rank缓存完整命中，profile生成器因AST文本重排改变旧metrics锚点在GPU前退出，原root v3与status False保留。独立v8保留原源码文本插入早期QAsetup；本地真实profile+四设备footer集成测试1passed12.72s、服务器同实际CPU测试通过。新控制器PID5728，outputs/storage-formal-qa-mapped-20261014-v4/总日志同名.log，已使用新独立准入manifest重新开始CPU缓存准入。部署13af9dc，无GPU数学失败/无降batch精度任务，后续以actual worker/结果为准。
+# 2026-10-14 15:45 服务器正式QA第257批失败与恢复
+
+原v4 0.6B control完整十QA完成；candidate量化/KL/PPL完成，PiQA3676scores/229forward完成，HellaSwag总forward257(16×123)触发private/native账保护，cleanup后rank0 SIGSEGV/缺footer，正式False保留。不是OOM或已证明评分数学改变；原异常未flush raw head row，不能用旧metadata补造通过。q17尚未正式运行。
+
+独立真实257形状序列head-only v2精确重现call257，native/private全部字节相等而private segment地址与其first block自身矛盾，private_segments_in_native唯一False；active0后释放257/257/host0。源码归因指向Torch2.9.1过滤snapshot对pool ID borrowed引用错误owning，Python3.10超过小整数256的ID触发损坏。NEW SnapshotCUDA v2只用不带ID的global原始snapshot精确筛池，保持全部地址/字节与旧guard，不升级库/不更改旧source/so或GEMM。v3实际514calls全部guard通过、alloc/free514/514/host0，7个关键call完整BF16整GEMM原生/映射SHA精确，非完整QA或新显存收益。
+
+WSL8CPU+服务器Python3.10同8CPU通过，独立pointer重算/拒绝损坏+恢复source2CPU通过。首诊断v1首次cuBLAS持久workspace进入池导致释放失败、Win pytest datasets链接收集错误、服务器stub无spec导入失败均保留。新CPU v2正常，CUDA未初始化。正式准入不足覆盖长次数的反思：65请求短组件只能证明有限接口路径，不能证明后续数万batch；必须保留每批raw计数，补跨ID257边界压力而非放宽完整门槛。
+
+NEW `run_storage_qa_mapped_recovery_v2.py`只恢复0.6B N，复用完成C与原共享cache，原全2048×2048/四rank/十QA/16BF16数学不变。新完整逐批journal与独立实际pointer/segment/字节审查进入最终门槛；保存全quantized checkpoint+前/存/reload/后全state/Param核对。旧未存qmodel所以需重做量化，不重复control/Fisher。新root `outputs/storage-qa-mapped-recovery-20261014-v1`、日志同名`.log`，controller104676实际已启动四GPU workers104965..104968进入原reference转发，最后是否成功需完整十QA/全审查，不提前宣布19GB新峰。checkpoint/hash成本计入恢复wall，不称稳定速度。
+
+该C是增量消融control，继承早期优化；不能充当用户提出的全部优化之前累计基线。当前恢复目的明确为修复完整正式验证，不把恢复pair换算全部优化总收益。完整记录见docs/qa_server_formal_validation_20261014.md。
