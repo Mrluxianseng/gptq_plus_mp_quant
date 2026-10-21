@@ -1,0 +1,6 @@
+# Frozen source manifests bind original bytes across Linux/Windows checkouts.
+vendor/official_v4/** -text -whitespace
+portable_realq/** text eol=lf
+portable_requirements.txt text eol=lf
+README_PORTABLE.md text eol=lf
+tests/test_portable_realq.py text eol=lf

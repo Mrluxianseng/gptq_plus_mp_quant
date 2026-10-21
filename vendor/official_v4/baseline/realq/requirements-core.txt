@@ -1,0 +1,11 @@
+# Validated Python 3.10 / CUDA 12.8 runtime.
+torch==2.9.1
+transformers==4.56.2
+accelerate==1.12.0
+datasets==3.6.0
+numpy==2.2.6
+tqdm==4.70.0
+loguru==0.7.3
+sentencepiece==0.2.1
+lm-eval==0.4.4
+

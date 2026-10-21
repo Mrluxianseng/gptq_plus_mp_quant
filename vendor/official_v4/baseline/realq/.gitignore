@@ -1,0 +1,18 @@
+# Keep Python sources such as cache.py visible inside the legacy checkout.
+!*.py
+__pycache__/
+*.py[cod]
+.venv/
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+output/
+outputs/
+cache/
+models/
+modelzoo/
+datasets/
+*.nsys-rep
+*.qdstrm
+

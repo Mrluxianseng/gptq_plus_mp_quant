@@ -1,0 +1,6 @@
+include README.md requirements.txt requirements-core.txt
+include benchmarks/requirements.txt
+include utils/had_mat.pt
+recursive-include scripts *.sh
+recursive-include docs *.md
+

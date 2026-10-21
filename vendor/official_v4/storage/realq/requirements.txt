@@ -1,0 +1,35 @@
+# Full REAL-Q Python dependencies: core, GPU acceleration and reasoning eval.
+# Install core first: python -m pip install -r requirements-core.txt
+# Then: python -m pip install --no-build-isolation -r requirements.txt
+# CUDA extensions require a matching CUDA toolkit / compiler.
+-r requirements-core.txt
+
+# Packaging and CUDA extension builds.
+setuptools>=64
+wheel
+packaging
+ninja
+
+# FlashAttention-4 adapter: keep this pair pinned together.
+flash-attn-4==4.0.0b25
+quack-kernels==0.5.3
+einops==0.8.1
+# Match the Triton version required by torch 2.9.1 on Linux x86_64.
+triton==3.5.1; platform_system == "Linux" and platform_machine == "x86_64"
+# The Hadamard extension is optional at runtime (a torch fallback is bundled).
+# This revision includes CUDA 12.8 SM100 / SM120 code generation.
+fast-hadamard-transform @ git+https://github.com/Dao-AILab/fast-hadamard-transform.git@e7706faf8d1c3b9f241e36860640ad1dac644ede
+
+# Math-Verify, EvalPlus and the pinned LiveCodeBench evaluator's runtime.
+-r benchmarks/requirements.txt
+pandas
+pebble>=5.1.0
+# LiveCodeBench imports these prompt constants even for local scoring.
+anthropic>=0.42.0
+
+# LiveCodeBench source dependency (official execution scoring only):
+# https://github.com/LiveCodeBench/LiveCodeBench.git
+# revision: 28fef95ea8c9f7a547c8329f2cd3d32b92c1fa24
+# Its upstream wheel omits evaluator subpackages. Use the source checkout
+# instructions in docs/DEPENDENCIES.md and pass --lcb-source /path/to/checkout.
+# Do not install its unrelated model-serving dependencies (e.g. vLLM).
